@@ -1,0 +1,335 @@
+/*
+ * WebServer.cxx
+ *
+ * Copyright (C) 2026, Charles Chiou
+ */
+
+#include "WebServer.hxx"
+#include "WebAssets.hxx"
+#include "McpServer.hxx"
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <random>
+#include <sstream>
+#include <iomanip>
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
+#include <httplib.h>
+
+namespace fs = std::filesystem;
+
+namespace aimon {
+
+static std::string generateSessionId() {
+    static thread_local std::random_device rd;
+    static thread_local std::mt19937_64 gen(rd());
+    static thread_local std::uniform_int_distribution<uint64_t> dis;
+    uint64_t part1 = dis(gen);
+    uint64_t part2 = dis(gen);
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0') << std::setw(16) << part1 << std::setw(16) << part2;
+    return oss.str();
+}
+
+WebServer::WebServer(StateStore& stateStore, HistoryStore& historyStore,
+                     const WebConfig& config, RefreshCallback onRefresh,
+                     McpServer* mcpServer)
+    : _stateStore(stateStore),
+      _historyStore(historyStore),
+      _config(config),
+      _onRefresh(onRefresh),
+      _mcpServer(mcpServer),
+      _server(std::make_unique<httplib::Server>()) {
+}
+
+WebServer::~WebServer() {
+    stop();
+}
+
+void WebServer::setupRoutes() {
+    auto serveFileOrFallback = [](const std::string& diskPath,
+                                  const char* fallbackAsset,
+                                  const std::string& contentType,
+                                  httplib::Response& res) {
+        if (fs::exists(diskPath)) {
+            std::ifstream f(diskPath);
+            if (f.is_open()) {
+                std::string content((std::istreambuf_iterator<char>(f)),
+                                    std::istreambuf_iterator<char>());
+                res.set_content(content, contentType.c_str());
+                return;
+            }
+        }
+        res.set_content(fallbackAsset, contentType.c_str());
+    };
+
+    _server->Get("/", [serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
+        serveFileOrFallback("web/index.html", assets::INDEX_HTML, "text/html", res);
+    });
+
+    _server->Get("/style.css", [serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
+        serveFileOrFallback("web/style.css", assets::STYLE_CSS, "text/css", res);
+    });
+
+    _server->Get("/app.js", [serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
+        serveFileOrFallback("web/app.js", assets::APP_JS, "application/javascript", res);
+    });
+
+    _server->Get("/api/status", [this](const httplib::Request&, httplib::Response& res) {
+        std::string jsonStr = _stateStore.getStatus().toJson().dump(2);
+        res.set_content(jsonStr, "application/json");
+        res.set_header("Access-Control-Allow-Origin", "*");
+    });
+
+    _server->Post("/api/refresh", [this](const httplib::Request&, httplib::Response& res) {
+        if (_onRefresh) {
+            try {
+                _onRefresh();
+            } catch (...) {
+            }
+        }
+        std::string jsonStr = _stateStore.getStatus().toJson().dump(2);
+        res.set_content(jsonStr, "application/json");
+        res.set_header("Access-Control-Allow-Origin", "*");
+    });
+
+    _server->Get("/api/history", [this](const httplib::Request& req, httplib::Response& res) {
+        int limit = 50;
+        if (req.has_param("limit")) {
+            try {
+                limit = std::stoi(req.get_param_value("limit"));
+            } catch (...) {}
+        }
+        auto records = _historyStore.queryRecentRecords(limit);
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& r : records) {
+            arr.push_back({
+                {"id", r.id},
+                {"timestamp", r.timestamp},
+                {"provider", r.provider},
+                {"metric_key", r.metricKey},
+                {"metric_value", r.metricValue},
+                {"metric_limit", r.metricLimit},
+                {"delta", r.delta}
+            });
+        }
+        res.set_content(arr.dump(2), "application/json");
+        res.set_header("Access-Control-Allow-Origin", "*");
+    });
+
+    _server->Get("/sse", [this](const httplib::Request&, httplib::Response& res) {
+        if (!_mcpServer) {
+            res.status = 503;
+            res.set_content("MCP service not configured", "text/plain");
+            return;
+        }
+
+        std::string sessionId = generateSessionId();
+        auto session = std::make_shared<SseSession>();
+        session->id = sessionId;
+
+        {
+            std::lock_guard<std::mutex> lock(_sessionsMutex);
+            _sseSessions[sessionId] = session;
+        }
+
+        std::cout << "[WebServer] New SSE client connected, session: " << sessionId << std::endl;
+
+        res.set_header("Content-Type", "text/event-stream");
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("Connection", "keep-alive");
+        res.set_header("Access-Control-Allow-Origin", "*");
+
+        auto provider = [session, initialSent = false](size_t offset, httplib::DataSink& sink) mutable -> bool {
+            (void)offset;
+            if (!sink.is_writable() || session->closed.load()) {
+                return false;
+            }
+
+            if (!initialSent) {
+                std::string endpointMsg = "event: endpoint\ndata: /message?sessionId=" + session->id + "\n\n";
+                initialSent = true;
+                return sink.write(endpointMsg.data(), endpointMsg.size());
+            }
+
+            std::unique_lock<std::mutex> lock(session->mutex);
+            session->cv.wait_for(lock, std::chrono::seconds(15), [&]() {
+                return !session->messageQueue.empty() || session->closed.load();
+            });
+
+            if (session->closed.load()) {
+                return false;
+            }
+
+            if (session->messageQueue.empty()) {
+                std::string ping = ": keepalive\n\n";
+                return sink.write(ping.data(), ping.size());
+            }
+
+            std::string msg = session->messageQueue.front();
+            session->messageQueue.pop();
+            lock.unlock();
+
+            std::string sseData = "event: message\ndata: " + msg + "\n\n";
+            return sink.write(sseData.data(), sseData.size());
+        };
+
+        auto releaser = [this, sessionId, session](bool success) {
+            (void)success;
+            session->closed.store(true);
+            session->cv.notify_all();
+            std::lock_guard<std::mutex> lock(_sessionsMutex);
+            _sseSessions.erase(sessionId);
+            std::cout << "[WebServer] SSE client disconnected, session: " << sessionId << std::endl;
+        };
+
+        res.set_chunked_content_provider("text/event-stream", provider, releaser);
+    });
+
+    auto handleMcpMessage = [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, mcp-session-id");
+        if (!_mcpServer) {
+            res.status = 503;
+            res.set_content("MCP service not configured", "text/plain");
+            return;
+        }
+
+        // Extract session ID from query parameters or headers
+        std::string sessionId;
+        if (req.has_param("sessionId")) {
+            sessionId = req.get_param_value("sessionId");
+        } else if (req.has_param("session_id")) {
+            sessionId = req.get_param_value("session_id");
+        } else if (req.has_header("Mcp-Session-Id")) {
+            sessionId = req.get_header_value("Mcp-Session-Id");
+        } else if (req.has_header("mcp-session-id")) {
+            sessionId = req.get_header_value("mcp-session-id");
+        }
+
+        // Strip trailing carriage return, newline, or whitespace
+        while (!sessionId.empty() && (sessionId.back() == '\r' || sessionId.back() == '\n' || sessionId.back() == ' ')) {
+            sessionId.pop_back();
+        }
+
+        nlohmann::json reqJson;
+        try {
+            reqJson = nlohmann::json::parse(req.body);
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(std::string("Invalid JSON: ") + e.what(), "text/plain");
+            return;
+        }
+
+        std::string method = reqJson.value("method", "");
+        std::cout << "[WebServer] MCP POST: method=" << method << " session='" << sessionId << "'" << std::endl;
+
+        // Process message through MCP server engine
+        nlohmann::json respJson = _mcpServer->handleMessage(reqJson);
+        std::string respStr = respJson.is_null() ? "{}" : respJson.dump();
+
+        // Check if an SSE session exists for push notification
+        std::shared_ptr<SseSession> session;
+        if (!sessionId.empty()) {
+            std::lock_guard<std::mutex> lock(_sessionsMutex);
+            auto it = _sseSessions.find(sessionId);
+            if (it != _sseSessions.end()) {
+                session = it->second;
+            }
+        }
+
+        if (session && !respJson.is_null()) {
+            {
+                std::lock_guard<std::mutex> lock(session->mutex);
+                session->messageQueue.push(respStr);
+            }
+            session->cv.notify_one();
+        }
+
+        // Return JSON response directly in HTTP response body (supports Streamable HTTP)
+        if (!sessionId.empty()) {
+            res.set_header("Mcp-Session-Id", sessionId);
+        }
+        res.status = 200;
+        res.set_content(respStr, "application/json");
+    };
+
+    _server->Post("/message", handleMcpMessage);
+    _server->Post("/messages", handleMcpMessage);
+    _server->Post("/sse", handleMcpMessage);
+
+    auto handleOptions = [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, mcp-session-id");
+        res.status = 204;
+    };
+    _server->Options("/sse", handleOptions);
+    _server->Options("/message", handleOptions);
+    _server->Options("/messages", handleOptions);
+}
+
+bool WebServer::start(bool async) {
+    if (_running) return true;
+
+    setupRoutes();
+    _running = true;
+
+    std::cout << "[WebServer] Dashboard available at http://"
+              << _config.host << ":" << _config.port << std::endl;
+    if (_mcpServer) {
+        std::cout << "[WebServer] MCP SSE endpoint available at http://"
+                  << _config.host << ":" << _config.port << "/sse" << std::endl;
+    }
+
+    if (async) {
+        _thread = std::make_unique<std::thread>([this]() {
+            if (!_server->listen(_config.host.c_str(), _config.port)) {
+                std::cerr << "[WebServer] Failed to bind to "
+                          << _config.host << ":" << _config.port << std::endl;
+                _running = false;
+            }
+        });
+        // Short pause to allow server to bind
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return _running;
+    } else {
+        return _server->listen(_config.host.c_str(), _config.port);
+    }
+}
+
+void WebServer::stop() {
+    if (!_running) return;
+
+    _running = false;
+    {
+        std::lock_guard<std::mutex> lock(_sessionsMutex);
+        for (auto& pair : _sseSessions) {
+            pair.second->closed.store(true);
+            pair.second->cv.notify_all();
+        }
+        _sseSessions.clear();
+    }
+
+    if (_server) {
+        _server->stop();
+    }
+    if (_thread && _thread->joinable()) {
+        _thread->join();
+        _thread.reset();
+    }
+}
+
+} // namespace aimon
+
+/*
+ * Local variables:
+ * mode: C++
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * tab-width: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

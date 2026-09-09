@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>aimon | Unified AI Quota Monitor</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <header class="navbar">
+            <div class="brand">
+                <div class="logo-pulse"></div>
+                <h1>aimon <span class="badge-sub">Unified AI Quotas</span></h1>
+            </div>
+            <div class="actions">
+                <span id="last-updated" class="last-updated">Updated: Just now</span>
+                <button id="refresh-btn" class="btn-refresh" title="Force Refresh">
+                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+                        <path d="M23 4v6h-6"></path>
+                        <path d="M1 20v-6h6"></path>
+                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                    </svg>
+                    Refresh
+                </button>
+            </div>
+        </header>
+
+        <main class="dashboard-grid">
+            <!-- Google Antigravity Section -->
+            <section class="card glass-card antigravity-card">
+                <div class="card-header">
+                    <div class="provider-title">
+                        <span class="dot-status dot-online" id="ag-status-dot"></span>
+                        <h2>Google Antigravity</h2>
+                    </div>
+                    <span id="ag-plan-badge" class="badge badge-cyan">Google AI Ultra</span>
+                </div>
+
+                <div class="credits-strip">
+                    <div class="credit-pill">
+                        <span class="credit-label">Prompt Credits</span>
+                        <span id="ag-prompt-credits" class="credit-val">--</span>
+                    </div>
+                    <div class="credit-pill">
+                        <span class="credit-label">Flow Credits</span>
+                        <span id="ag-flow-credits" class="credit-val">--</span>
+                    </div>
+                </div>
+
+                <!-- Quota Groups (Gemini Models, Claude & GPT models) -->
+                <div class="quota-groups-section">
+                    <div class="section-title-row">
+                        <h3>Model Quota Limits</h3>
+                    </div>
+                    <div id="ag-quota-groups" class="quota-groups-list">
+                        <div class="gauge-loading">Scanning quota groups...</div>
+                    </div>
+                </div>
+
+                <!-- Collapsible Individual Models -->
+                <div class="models-collapsible-section">
+                    <button type="button" id="ag-models-toggle" class="btn-toggle-models">
+                        <span id="ag-models-toggle-text">Individual Model Capacities</span>
+                        <svg class="toggle-icon" id="ag-models-chevron" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                            <path d="M6 9l6 6 6-6"></path>
+                        </svg>
+                    </button>
+                    <div id="ag-models-grid" class="gauges-grid hidden">
+                        <!-- Dynamically populated model gauges -->
+                    </div>
+                </div>
+
+                <div id="ag-error" class="error-banner hidden"></div>
+            </section>
+
+            <!-- Cursor Section -->
+            <section class="card glass-card cursor-card">
+                <div class="card-header">
+                    <div class="provider-title">
+                        <span class="dot-status dot-online" id="cursor-status-dot"></span>
+                        <h2>Cursor</h2>
+                    </div>
+                    <span id="cursor-plan-badge" class="badge badge-magenta">Pro</span>
+                </div>
+
+                <div class="cursor-metrics">
+                    <div class="usage-stat-box">
+                        <div class="stat-top">
+                            <span class="stat-label">Fast Requests Pool</span>
+                            <span id="cursor-fast-ratio" class="stat-ratio">-- / --</span>
+                        </div>
+                        <div class="progress-track">
+                            <div id="cursor-progress-bar" class="progress-fill" style="width: 0%;"></div>
+                        </div>
+                        <div class="stat-bottom">
+                            <span id="cursor-remaining-txt" class="stat-sub">Calculating...</span>
+                            <span id="cursor-percent-txt" class="stat-pct">0%</span>
+                        </div>
+                    </div>
+
+                    <div class="details-list">
+                        <div class="detail-row">
+                            <span class="detail-label">Billing Cycle Reset</span>
+                            <span id="cursor-reset-date" class="detail-value">--</span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Days Remaining</span>
+                            <span id="cursor-days-remaining" class="detail-value">--</span>
+                        </div>
+                    </div>
+
+                    <!-- Personal Usage & Cumulative Spend Card -->
+                    <div class="spend-section" id="cursor-spend-section">
+                        <div class="spend-header">
+                            <div>
+                                <span class="spend-subtitle">Personal Usage</span>
+                                <h3 class="spend-title">Cumulative Spend</h3>
+                                <p class="spend-desc">Track your spend against last month.</p>
+                            </div>
+                            <div class="spend-totals">
+                                <span id="cursor-total-spend" class="spend-amount">$0.00</span>
+                                <span id="cursor-prev-spend-pill" class="spend-prev-pill hidden">vs $0.00 last month</span>
+                            </div>
+                        </div>
+
+                        <!-- Chart Container -->
+                        <div class="spend-chart-container">
+                            <svg id="cursor-spend-chart" class="spend-chart-svg" viewBox="0 0 420 170">
+                                <defs>
+                                    <linearGradient id="spendGrad" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.45"/>
+                                        <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.0"/>
+                                    </linearGradient>
+                                </defs>
+                                <!-- Grid Lines & Axis -->
+                                <line x1="50" y1="25" x2="410" y2="25" class="chart-grid-line" />
+                                <text x="42" y="29" class="chart-axis-lbl" id="chart-lbl-max">$400</text>
+
+                                <line x1="50" y1="65" x2="410" y2="65" class="chart-grid-line" />
+                                <text x="42" y="69" class="chart-axis-lbl" id="chart-lbl-mid2">$300</text>
+
+                                <line x1="50" y1="105" x2="410" y2="105" class="chart-grid-line" />
+                                <text x="42" y="109" class="chart-axis-lbl" id="chart-lbl-mid1">$200</text>
+
+                                <line x1="50" y1="145" x2="410" y2="145" class="chart-grid-line" />
+                                <text x="42" y="149" class="chart-axis-lbl">$0</text>
+
+                                <!-- Gradient Area -->
+                                <path id="spend-chart-area" d="" fill="url(#spendGrad)"></path>
+                                <!-- Trend Line -->
+                                <path id="spend-chart-line" d="" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                                <!-- Interactive Dots -->
+                                <g id="spend-chart-dots"></g>
+                            </svg>
+                            <div id="chart-dates-axis" class="chart-dates-row">
+                                <!-- Day labels populated dynamically -->
+                            </div>
+                        </div>
+
+                        <!-- Spend by Model Breakdown -->
+                        <div class="categories-breakdown" id="cursor-categories-breakdown">
+                            <div class="breakdown-header">Spend by Model</div>
+                            <div id="cursor-categories-list" class="categories-list">
+                                <!-- Dynamically populated category bars -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="cursor-error" class="error-banner hidden"></div>
+            </section>
+        </main>
+
+        <footer class="app-footer">
+            <p>aimon daemon &bull; Pure C++17 AI Quota Monitor &bull; Local loopback on 127.0.0.1</p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+#
+# lovelace_cards.yaml
+#
+# Home Assistant Dashboard Cards for aimon (AI Quota Monitor)
+# Copy and paste this into any Lovelace dashboard (Manual Card / Raw Configuration)
+#
+
+type: vertical-stack
+title: AI Quota & Subscription Monitor
+cards:
+  - type: grid
+    columns: 2
+    square: false
+    cards:
+      - type: gauge
+        name: Gemini 3.8 Flash (High)
+        entity: sensor.aimon_ag_model_gemini_3_8_flash_high
+        min: 0
+        max: 100
+        needle: true
+        severity:
+          red: 0
+          yellow: 20
+          green: 50
+      - type: gauge
+        name: Gemini 3.8 Flash (Med)
+        entity: sensor.aimon_ag_model_gemini_3_8_flash_medium
+        min: 0
+        max: 100
+        needle: true
+        severity:
+          red: 0
+          yellow: 20
+          green: 50
+
+  - type: entities
+    title: Google Antigravity Credits
+    show_header_toggle: false
+    entities:
+      - entity: sensor.aimon_ag_prompt_credits
+        name: Available Prompt Credits
+        icon: mdi:brain
+      - entity: sensor.aimon_ag_flow_credits
+        name: Available Flow Credits
+        icon: mdi:lightning-bolt
+      - entity: sensor.aimon_ag_plan_tier
+        name: Plan Tier
+        icon: mdi:account-badge
+
+  - type: entities
+    title: Cursor Usage & Plan
+    show_header_toggle: false
+    entities:
+      - entity: sensor.aimon_cursor_fast_requests_used
+        name: Fast Requests Consumed
+        icon: mdi:chart-line
+      - entity: sensor.aimon_cursor_fast_requests_limit
+        name: Fast Request Pool Limit
+        icon: mdi:gauge
+      - entity: sensor.aimon_cursor_plan_tier
+        name: Membership Tier
+        icon: mdi:account-star
+      - entity: sensor.aimon_cursor_cycle_reset
+        name: Billing Cycle Reset
+        icon: mdi:calendar-clock
