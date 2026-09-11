@@ -1083,6 +1083,134 @@ body {
     display: none;
 }
 
+/* MCP Clients Bar */
+.mcp-clients-bar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 12px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    background: rgba(15, 23, 42, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 8px;
+    flex-wrap: wrap;
+}
+
+.mcp-clients-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.mcp-clients-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+}
+
+.mcp-clients-list {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.client-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 10px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    font-size: 0.78rem;
+    color: var(--text-primary);
+    transition: all 0.2s ease;
+}
+
+.client-badge-empty {
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 0.76rem;
+    background: transparent;
+    border: 1px dashed rgba(255, 255, 255, 0.12);
+}
+
+.client-badge .dot-status {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+}
+
+.client-badge .client-name {
+    font-weight: 600;
+}
+
+.client-badge .client-ver {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+.client-badge .client-ip {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.25);
+    padding: 1px 5px;
+    border-radius: 4px;
+}
+
+.client-badge .client-uptime {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--cyan);
+}
+
+/* Brand specific badge styles */
+.client-badge.client-cursor {
+    background: rgba(121, 40, 202, 0.12);
+    border-color: rgba(121, 40, 202, 0.35);
+}
+
+.client-badge.client-cursor .client-name {
+    color: #e9d5ff;
+}
+
+.client-badge.client-antigravity {
+    background: rgba(0, 242, 254, 0.1);
+    border-color: rgba(0, 242, 254, 0.3);
+}
+
+.client-badge.client-antigravity .client-name {
+    color: #67e8f9;
+}
+
+.client-badge.client-claude {
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.35);
+}
+
+.client-badge.client-claude .client-name {
+    color: #fcd34d;
+}
+
+.client-badge.client-generic {
+    background: rgba(99, 102, 241, 0.12);
+    border-color: rgba(99, 102, 241, 0.3);
+}
+
+.client-badge.client-generic .client-name {
+    color: #a5b4fc;
+}
+
 /* Footer */
 .app-footer {
     text-align: center;

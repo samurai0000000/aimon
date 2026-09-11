@@ -9,4 +9,4 @@ build/
 *.tmp
 config.json
 .DS_Store
-doc/Plan-Win11-Taskbar-Widget.md
+plan/

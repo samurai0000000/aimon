@@ -214,6 +214,28 @@ struct AgentTask {
     }
 };
 
+struct ClientSession {
+    std::string sessionId;
+    std::string clientName = "MCP Client";
+    std::string clientVersion;
+    std::string remoteIp;
+    int64_t connectedTimeEpoch = 0;
+    int64_t lastHeartbeatEpoch = 0;
+    bool active = true;
+
+    nlohmann::json toJson() const {
+        return {
+            {"session_id", sessionId},
+            {"client_name", clientName},
+            {"client_version", clientVersion},
+            {"remote_ip", remoteIp},
+            {"connected_time_epoch", connectedTimeEpoch},
+            {"last_heartbeat_epoch", lastHeartbeatEpoch},
+            {"active", active}
+        };
+    }
+};
+
 } // namespace aimon
 
 #endif // AIMON_MODELS_HXX

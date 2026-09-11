@@ -32,6 +32,16 @@ public:
     void reapStaleTasks(std::chrono::seconds timeout = std::chrono::minutes(10));
     void handleSessionDisconnected(const std::string& sseSessionId);
 
+    // Client session tracking
+    void registerSession(const std::string& sessionId, const std::string& remoteIp,
+                         const std::string& defaultClientName = "MCP Client");
+    void updateSessionClientInfo(const std::string& sessionId, const std::string& clientName,
+                                 const std::string& clientVersion);
+    void touchSession(const std::string& sessionId);
+    void removeSession(const std::string& sessionId);
+    std::vector<ClientSession> listSessions() const;
+    bool getSessionClientName(const std::string& sessionId, std::string& outClientName) const;
+
     size_t getActiveTaskCount() const;
     void clear();
 
@@ -40,6 +50,7 @@ private:
 
     mutable std::shared_mutex _mutex;
     std::map<std::string, AgentTask> _tasks;
+    std::map<std::string, ClientSession> _sessions;
 };
 
 } // namespace aimon

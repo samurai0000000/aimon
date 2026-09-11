@@ -603,13 +603,78 @@ async function fetchTasks() {
     }
 }
 
+let currentSessions = [];
+
+function renderSessions(sessions) {
+    currentSessions = sessions || [];
+    const listEl = document.getElementById('mcp-clients-list');
+    if (!listEl) return;
+
+    if (currentSessions.length === 0) {
+        listEl.innerHTML = `
+            <span class="client-badge client-badge-empty">
+                <span class="dot-status dot-offline"></span>
+                No active MCP connections
+            </span>
+        `;
+        return;
+    }
+
+    listEl.innerHTML = currentSessions.map(s => {
+        const nameLower = (s.client_name || '').toLowerCase();
+        let brandClass = 'client-generic';
+        if (nameLower.includes('cursor')) brandClass = 'client-cursor';
+        else if (nameLower.includes('antigravity') || nameLower.includes('gemini')) brandClass = 'client-antigravity';
+        else if (nameLower.includes('claude')) brandClass = 'client-claude';
+
+        const verHtml = s.client_version ? `<span class="client-ver">v${escapeHtml(s.client_version)}</span>` : '';
+        const ipClean = s.remote_ip ? s.remote_ip.replace(/^::ffff:/, '') : '';
+        const ipHtml = ipClean ? `<span class="client-ip" title="Remote IP">${escapeHtml(ipClean)}</span>` : '';
+        const uptimeStr = s.connected_time_epoch ? formatElapsed(s.connected_time_epoch, 0) : '';
+        const uptimeHtml = uptimeStr ? `<span class="client-uptime" data-connect-epoch="${s.connected_time_epoch}" title="Connected duration">⚡ ${uptimeStr}</span>` : '';
+
+        return `
+            <div class="client-badge ${brandClass}" title="Session: ${escapeHtml(s.session_id)}">
+                <span class="dot-status dot-online"></span>
+                <span class="client-name">${escapeHtml(s.client_name || 'MCP Client')}</span>
+                ${verHtml}
+                ${ipHtml}
+                ${uptimeHtml}
+            </div>
+        `;
+    }).join('');
+}
+
+function updateSessionUptimes() {
+    const uptimes = document.querySelectorAll('#mcp-clients-list .client-uptime');
+    uptimes.forEach(el => {
+        const epoch = parseInt(el.getAttribute('data-connect-epoch'), 10);
+        if (epoch) {
+            el.textContent = `⚡ ${formatElapsed(epoch, 0)}`;
+        }
+    });
+}
+
+async function fetchSessions() {
+    try {
+        const res = await fetch('/api/sessions');
+        if (!res.ok) return;
+        const sessions = await res.json();
+        renderSessions(sessions);
+    } catch (e) {
+        console.warn('Failed to fetch sessions:', e);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
     fetchTasks();
+    fetchSessions();
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
         fetchStatus(true);
         fetchTasks();
+        fetchSessions();
     });
 
     const toggleCompletedEl = document.getElementById('toggle-completed-tasks');
@@ -636,14 +701,16 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Refresh data every 5 seconds for quotas, 2.5 seconds for tasks
+    // Refresh data: status every 5s, tasks every 2.5s, sessions every 3s
     setInterval(() => fetchStatus(false), 5000);
     setInterval(fetchTasks, 2500);
+    setInterval(fetchSessions, 3000);
 
-    // Update countdown timers and task stopwatch every second
+    // Update countdown timers, task stopwatch, and session uptime every second
     if (countdownInterval) clearInterval(countdownInterval);
     countdownInterval = setInterval(() => {
         updateCountdowns();
         updateTaskDurations();
+        updateSessionUptimes();
     }, 1000);
 });

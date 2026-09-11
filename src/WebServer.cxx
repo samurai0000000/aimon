@@ -193,7 +193,17 @@ void WebServer::setupRoutes() {
         res.set_content(nlohmann::json({{"status", "ok"}, {"cleared", true}}).dump(2), "application/json");
     });
 
-    _server->Get("/sse", [this](const httplib::Request&, httplib::Response& res) {
+    _server->Get("/api/sessions", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        auto sessions = TaskRegistry::getInstance().listSessions();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& s : sessions) {
+            arr.push_back(s.toJson());
+        }
+        res.set_content(arr.dump(2), "application/json");
+    });
+
+    _server->Get("/sse", [this](const httplib::Request& req, httplib::Response& res) {
         if (!_mcpServer) {
             res.status = 503;
             res.set_content("MCP service not configured", "text/plain");
@@ -209,7 +219,11 @@ void WebServer::setupRoutes() {
             _sseSessions[sessionId] = session;
         }
 
-        std::cout << "[WebServer] New SSE client connected, session: " << sessionId << std::endl;
+        std::string remoteIp = req.remote_addr;
+        TaskRegistry::getInstance().registerSession(sessionId, remoteIp);
+
+        std::cout << "[WebServer] New SSE client connected from " << remoteIp
+                  << ", session: " << sessionId << std::endl;
 
         res.set_header("Content-Type", "text/event-stream");
         res.set_header("Cache-Control", "no-cache");
@@ -257,6 +271,7 @@ void WebServer::setupRoutes() {
             std::lock_guard<std::mutex> lock(_sessionsMutex);
             _sseSessions.erase(sessionId);
             TaskRegistry::getInstance().handleSessionDisconnected(sessionId);
+            TaskRegistry::getInstance().removeSession(sessionId);
             std::cout << "[WebServer] SSE client disconnected, session: " << sessionId << std::endl;
         };
 
@@ -300,6 +315,24 @@ void WebServer::setupRoutes() {
 
         std::string method = reqJson.value("method", "");
         std::cout << "[WebServer] MCP POST: method=" << method << " session='" << sessionId << "'" << std::endl;
+
+        if (!sessionId.empty()) {
+            TaskRegistry::getInstance().touchSession(sessionId);
+        }
+
+        if (method == "initialize" && !sessionId.empty()) {
+            if (reqJson.contains("params") && reqJson["params"].is_object()) {
+                const auto& p = reqJson["params"];
+                if (p.contains("clientInfo") && p["clientInfo"].is_object()) {
+                    const auto& ci = p["clientInfo"];
+                    std::string cName = ci.value("name", "MCP Client");
+                    std::string cVer = ci.value("version", "");
+                    TaskRegistry::getInstance().updateSessionClientInfo(sessionId, cName, cVer);
+                    std::cout << "[WebServer] MCP client identified for session " << sessionId
+                              << ": name='" << cName << "', version='" << cVer << "'" << std::endl;
+                }
+            }
+        }
 
         if (method == "tools/call" && !sessionId.empty()) {
             if (reqJson.contains("params") && reqJson["params"].is_object()) {

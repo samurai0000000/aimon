@@ -198,13 +198,23 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         AgentTask task;
         task.taskId = args.value("task_id", "");
-        task.agentName = args.value("agent_name", "Unknown Agent");
+        task.agentName = args.value("agent_name", "");
         task.workspace = args.value("workspace", "");
         task.taskDescription = args.value("task_description", "");
         task.currentAction = args.value("current_action", "");
         task.status = args.value("status", "running");
         task.details = args.value("details", "");
         task.sseSessionId = args.value("sse_session_id", "");
+
+        if (task.agentName.empty() || task.agentName == "Unknown Agent") {
+            std::string verifiedName;
+            if (!task.sseSessionId.empty() &&
+                TaskRegistry::getInstance().getSessionClientName(task.sseSessionId, verifiedName)) {
+                task.agentName = verifiedName;
+            } else {
+                task.agentName = "Unknown Agent";
+            }
+        }
 
         std::string registeredId = TaskRegistry::getInstance().registerOrUpdateTask(task);
         AgentTask savedTask;

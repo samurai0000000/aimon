@@ -197,6 +197,26 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                     </div>
                 </div>
 
+                <!-- Live Connected MCP Clients Bar -->
+                <div class="mcp-clients-bar" id="mcp-clients-bar">
+                    <div class="mcp-clients-left">
+                        <span class="mcp-clients-title">
+                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <line x1="2" y1="12" x2="22" y2="12"></line>
+                                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                            </svg>
+                            Connected IDEs:
+                        </span>
+                    </div>
+                    <div class="mcp-clients-list" id="mcp-clients-list">
+                        <span class="client-badge client-badge-empty">
+                            <span class="dot-status dot-offline"></span>
+                            No active MCP connections
+                        </span>
+                    </div>
+                </div>
+
                 <div class="table-responsive" id="agents-table-container">
                     <table class="agents-table" id="agents-table">
                         <thead>
@@ -1318,6 +1338,134 @@ body {
     display: none;
 }
 
+/* MCP Clients Bar */
+.mcp-clients-bar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 12px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    background: rgba(15, 23, 42, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 8px;
+    flex-wrap: wrap;
+}
+
+.mcp-clients-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.mcp-clients-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+}
+
+.mcp-clients-list {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.client-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 10px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    font-size: 0.78rem;
+    color: var(--text-primary);
+    transition: all 0.2s ease;
+}
+
+.client-badge-empty {
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 0.76rem;
+    background: transparent;
+    border: 1px dashed rgba(255, 255, 255, 0.12);
+}
+
+.client-badge .dot-status {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+}
+
+.client-badge .client-name {
+    font-weight: 600;
+}
+
+.client-badge .client-ver {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+.client-badge .client-ip {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.25);
+    padding: 1px 5px;
+    border-radius: 4px;
+}
+
+.client-badge .client-uptime {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--cyan);
+}
+
+/* Brand specific badge styles */
+.client-badge.client-cursor {
+    background: rgba(121, 40, 202, 0.12);
+    border-color: rgba(121, 40, 202, 0.35);
+}
+
+.client-badge.client-cursor .client-name {
+    color: #e9d5ff;
+}
+
+.client-badge.client-antigravity {
+    background: rgba(0, 242, 254, 0.1);
+    border-color: rgba(0, 242, 254, 0.3);
+}
+
+.client-badge.client-antigravity .client-name {
+    color: #67e8f9;
+}
+
+.client-badge.client-claude {
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.35);
+}
+
+.client-badge.client-claude .client-name {
+    color: #fcd34d;
+}
+
+.client-badge.client-generic {
+    background: rgba(99, 102, 241, 0.12);
+    border-color: rgba(99, 102, 241, 0.3);
+}
+
+.client-badge.client-generic .client-name {
+    color: #a5b4fc;
+}
+
 /* Footer */
 .app-footer {
     text-align: center;
@@ -1932,13 +2080,78 @@ async function fetchTasks() {
     }
 }
 
+let currentSessions = [];
+
+function renderSessions(sessions) {
+    currentSessions = sessions || [];
+    const listEl = document.getElementById('mcp-clients-list');
+    if (!listEl) return;
+
+    if (currentSessions.length === 0) {
+        listEl.innerHTML = `
+            <span class="client-badge client-badge-empty">
+                <span class="dot-status dot-offline"></span>
+                No active MCP connections
+            </span>
+        `;
+        return;
+    }
+
+    listEl.innerHTML = currentSessions.map(s => {
+        const nameLower = (s.client_name || '').toLowerCase();
+        let brandClass = 'client-generic';
+        if (nameLower.includes('cursor')) brandClass = 'client-cursor';
+        else if (nameLower.includes('antigravity') || nameLower.includes('gemini')) brandClass = 'client-antigravity';
+        else if (nameLower.includes('claude')) brandClass = 'client-claude';
+
+        const verHtml = s.client_version ? `<span class="client-ver">v${escapeHtml(s.client_version)}</span>` : '';
+        const ipClean = s.remote_ip ? s.remote_ip.replace(/^::ffff:/, '') : '';
+        const ipHtml = ipClean ? `<span class="client-ip" title="Remote IP">${escapeHtml(ipClean)}</span>` : '';
+        const uptimeStr = s.connected_time_epoch ? formatElapsed(s.connected_time_epoch, 0) : '';
+        const uptimeHtml = uptimeStr ? `<span class="client-uptime" data-connect-epoch="${s.connected_time_epoch}" title="Connected duration">⚡ ${uptimeStr}</span>` : '';
+
+        return `
+            <div class="client-badge ${brandClass}" title="Session: ${escapeHtml(s.session_id)}">
+                <span class="dot-status dot-online"></span>
+                <span class="client-name">${escapeHtml(s.client_name || 'MCP Client')}</span>
+                ${verHtml}
+                ${ipHtml}
+                ${uptimeHtml}
+            </div>
+        `;
+    }).join('');
+}
+
+function updateSessionUptimes() {
+    const uptimes = document.querySelectorAll('#mcp-clients-list .client-uptime');
+    uptimes.forEach(el => {
+        const epoch = parseInt(el.getAttribute('data-connect-epoch'), 10);
+        if (epoch) {
+            el.textContent = `⚡ ${formatElapsed(epoch, 0)}`;
+        }
+    });
+}
+
+async function fetchSessions() {
+    try {
+        const res = await fetch('/api/sessions');
+        if (!res.ok) return;
+        const sessions = await res.json();
+        renderSessions(sessions);
+    } catch (e) {
+        console.warn('Failed to fetch sessions:', e);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
     fetchTasks();
+    fetchSessions();
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
         fetchStatus(true);
         fetchTasks();
+        fetchSessions();
     });
 
     const toggleCompletedEl = document.getElementById('toggle-completed-tasks');
@@ -1965,15 +2178,17 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Refresh data every 5 seconds for quotas, 2.5 seconds for tasks
+    // Refresh data: status every 5s, tasks every 2.5s, sessions every 3s
     setInterval(() => fetchStatus(false), 5000);
     setInterval(fetchTasks, 2500);
+    setInterval(fetchSessions, 3000);
 
-    // Update countdown timers and task stopwatch every second
+    // Update countdown timers, task stopwatch, and session uptime every second
     if (countdownInterval) clearInterval(countdownInterval);
     countdownInterval = setInterval(() => {
         updateCountdowns();
         updateTaskDurations();
+        updateSessionUptimes();
     }, 1000);
 });
 )raw_asset";

@@ -289,6 +289,13 @@ To monitor agents across heterogeneous or distributed setups (e.g. Cursor on Win
 - **Sliding TTL Reaper**: Any task marked `running` or `waiting_for_user` that receives no updates within 10 minutes automatically transitions to `stale`.
 - **SSE Lifecycle Disconnect Hook**: When an SSE client session drops, any tasks associated with that `sseSessionId` automatically transition to `disconnected`.
 
+### 5.5 MCP Client Session Tracking & Handshake Identity Extraction
+To eliminate manual agent name configuration and avoid misidentification across distributed environments:
+- **Connection Handshake Inspection**: When an MCP client (Cursor on Windows, Antigravity IDE, Claude Desktop) connects to `/sse`, `WebServer` captures its remote IP and registers an active `ClientSession`.
+- **Automatic Client Discovery**: Upon receiving the JSON-RPC `initialize` handshake, the server parses `params.clientInfo.name` and `params.clientInfo.version` (e.g. `Cursor` v0.45.6 or `antigravity`) and associates them with the session.
+- **Authoritative Identity Inheritance**: When `register_agent_task` is called without an explicit `agent_name`, `McpServer` automatically looks up the session's verified handshake identity, ensuring accurate attribution without LLM guessing.
+- **Graceful Lifecycle Removal**: When the SSE stream terminates, the session is pruned from the active session list and any associated tasks transition cleanly.
+
 ---
 
 ## 6. Embedded Web Dashboard & Visual Design
@@ -302,8 +309,10 @@ The web dashboard is served using `cpp-httplib` with embedded static assets:
   * `GET /api/refresh`: Forces an immediate collector poll and returns fresh state.
   * `GET /api/history`: Returns time-series usage history.
   * `GET /api/tasks`: Returns active/completed agent tasks (`?include_completed=true`).
+  * `GET /api/sessions`: Returns live connected MCP client sessions (IP, client name, version, connection duration).
   * `POST /api/tasks/register`: Registers or updates a task from HTTP clients.
   * `POST /api/tasks/complete`: Marks a task completed or failed with optional summary.
+  * `POST /api/tasks/clear`: Purges all in-memory tasks and sessions.
 
 ### 6.2 Visual Aesthetics & UI Specification
 The dashboard follows modern design principles:
@@ -332,6 +341,10 @@ The dashboard follows modern design principles:
      - Monospace active action chips (e.g. `replace_file_content`, `run_command`).
      - Ticking client-side elapsed stopwatch counter (`03m 42s`) updating every second.
      - "Show Completed" filter switch and responsive table layout with empty-state handling.
+  5. **Connected MCP Clients Bar**:
+     - Displays real-time connected IDE badges (e.g. Cursor on Windows, Antigravity IDE) above the fleet table.
+     - Shows connection duration uptime counter (`⚡ 04m 12s`), client version, and remote IP address.
+     - Updates dynamically when clients connect or disconnect over SSE.
 
 ---
 

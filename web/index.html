@@ -185,6 +185,26 @@
                     </div>
                 </div>
 
+                <!-- Live Connected MCP Clients Bar -->
+                <div class="mcp-clients-bar" id="mcp-clients-bar">
+                    <div class="mcp-clients-left">
+                        <span class="mcp-clients-title">
+                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <line x1="2" y1="12" x2="22" y2="12"></line>
+                                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                            </svg>
+                            Connected IDEs:
+                        </span>
+                    </div>
+                    <div class="mcp-clients-list" id="mcp-clients-list">
+                        <span class="client-badge client-badge-empty">
+                            <span class="dot-status dot-offline"></span>
+                            No active MCP connections
+                        </span>
+                    </div>
+                </div>
+
                 <div class="table-responsive" id="agents-table-container">
                     <table class="agents-table" id="agents-table">
                         <thead>
