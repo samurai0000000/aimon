@@ -52,16 +52,6 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                     <span id="ag-plan-badge" class="badge badge-cyan">Google AI Ultra</span>
                 </div>
 
-                <div class="credits-strip">
-                    <div class="credit-pill">
-                        <span class="credit-label">Prompt Credits</span>
-                        <span id="ag-prompt-credits" class="credit-val">--</span>
-                    </div>
-                    <div class="credit-pill">
-                        <span class="credit-label">Flow Credits</span>
-                        <span id="ag-flow-credits" class="credit-val">--</span>
-                    </div>
-                </div>
 
                 <!-- Quota Groups (Gemini Models, Claude & GPT models) -->
                 <div class="quota-groups-section">
@@ -100,28 +90,30 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                 </div>
 
                 <div class="cursor-metrics">
-                    <div class="usage-stat-box">
-                        <div class="stat-top">
-                            <span class="stat-label">Fast Requests Pool</span>
-                            <span id="cursor-fast-ratio" class="stat-ratio">-- / --</span>
+                    <div class="cursor-top-row">
+                        <div class="usage-stat-box">
+                            <div class="stat-top">
+                                <span class="stat-label">Fast Requests Pool</span>
+                                <span id="cursor-fast-ratio" class="stat-ratio">-- / --</span>
+                            </div>
+                            <div class="progress-track">
+                                <div id="cursor-progress-bar" class="progress-fill" style="width: 0%;"></div>
+                            </div>
+                            <div class="stat-bottom">
+                                <span id="cursor-remaining-txt" class="stat-sub">Calculating...</span>
+                                <span id="cursor-percent-txt" class="stat-pct">0%</span>
+                            </div>
                         </div>
-                        <div class="progress-track">
-                            <div id="cursor-progress-bar" class="progress-fill" style="width: 0%;"></div>
-                        </div>
-                        <div class="stat-bottom">
-                            <span id="cursor-remaining-txt" class="stat-sub">Calculating...</span>
-                            <span id="cursor-percent-txt" class="stat-pct">0%</span>
-                        </div>
-                    </div>
 
-                    <div class="details-list">
-                        <div class="detail-row">
-                            <span class="detail-label">Billing Cycle Reset</span>
-                            <span id="cursor-reset-date" class="detail-value">--</span>
-                        </div>
-                        <div class="detail-row">
-                            <span class="detail-label">Days Remaining</span>
-                            <span id="cursor-days-remaining" class="detail-value">--</span>
+                        <div class="details-box">
+                            <div class="detail-row">
+                                <span class="detail-label">Billing Cycle Reset</span>
+                                <span id="cursor-reset-date" class="detail-value">--</span>
+                            </div>
+                            <div class="detail-row">
+                                <span class="detail-label">Days Remaining</span>
+                                <span id="cursor-days-remaining" class="detail-value">--</span>
+                            </div>
                         </div>
                     </div>
 
@@ -139,51 +131,95 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <!-- Chart Container -->
-                        <div class="spend-chart-container">
-                            <svg id="cursor-spend-chart" class="spend-chart-svg" viewBox="0 0 420 170">
-                                <defs>
-                                    <linearGradient id="spendGrad" x1="0" y1="0" x2="0" y2="1">
-                                        <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.45"/>
-                                        <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.0"/>
-                                    </linearGradient>
-                                </defs>
-                                <!-- Grid Lines & Axis -->
-                                <line x1="50" y1="25" x2="410" y2="25" class="chart-grid-line" />
-                                <text x="42" y="29" class="chart-axis-lbl" id="chart-lbl-max">$400</text>
+                        <div class="spend-content-grid">
+                            <!-- Chart Container -->
+                            <div class="spend-chart-container">
+                                <svg id="cursor-spend-chart" class="spend-chart-svg" viewBox="0 0 420 160">
+                                    <defs>
+                                        <linearGradient id="spendGrad" x1="0" y1="0" x2="0" y2="1">
+                                            <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.45"/>
+                                            <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.0"/>
+                                        </linearGradient>
+                                    </defs>
+                                    <!-- Grid Lines & Axis -->
+                                    <line x1="50" y1="20" x2="410" y2="20" class="chart-grid-line" />
+                                    <text x="42" y="24" class="chart-axis-lbl" id="chart-lbl-max">$400</text>
 
-                                <line x1="50" y1="65" x2="410" y2="65" class="chart-grid-line" />
-                                <text x="42" y="69" class="chart-axis-lbl" id="chart-lbl-mid2">$300</text>
+                                    <line x1="50" y1="58" x2="410" y2="58" class="chart-grid-line" />
+                                    <text x="42" y="62" class="chart-axis-lbl" id="chart-lbl-mid2">$300</text>
 
-                                <line x1="50" y1="105" x2="410" y2="105" class="chart-grid-line" />
-                                <text x="42" y="109" class="chart-axis-lbl" id="chart-lbl-mid1">$200</text>
+                                    <line x1="50" y1="96" x2="410" y2="96" class="chart-grid-line" />
+                                    <text x="42" y="100" class="chart-axis-lbl" id="chart-lbl-mid1">$200</text>
 
-                                <line x1="50" y1="145" x2="410" y2="145" class="chart-grid-line" />
-                                <text x="42" y="149" class="chart-axis-lbl">$0</text>
+                                    <line x1="50" y1="135" x2="410" y2="135" class="chart-grid-line" />
+                                    <text x="42" y="139" class="chart-axis-lbl">$0</text>
 
-                                <!-- Gradient Area -->
-                                <path id="spend-chart-area" d="" fill="url(#spendGrad)"></path>
-                                <!-- Trend Line -->
-                                <path id="spend-chart-line" d="" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
-                                <!-- Interactive Dots -->
-                                <g id="spend-chart-dots"></g>
-                            </svg>
-                            <div id="chart-dates-axis" class="chart-dates-row">
-                                <!-- Day labels populated dynamically -->
+                                    <!-- Gradient Area -->
+                                    <path id="spend-chart-area" d="" fill="url(#spendGrad)"></path>
+                                    <!-- Trend Line -->
+                                    <path id="spend-chart-line" d="" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                                    <!-- Interactive Dots -->
+                                    <g id="spend-chart-dots"></g>
+                                </svg>
+                                <div id="chart-dates-axis" class="chart-dates-row">
+                                    <!-- Day labels populated dynamically -->
+                                </div>
                             </div>
-                        </div>
 
-                        <!-- Spend by Model Breakdown -->
-                        <div class="categories-breakdown" id="cursor-categories-breakdown">
-                            <div class="breakdown-header">Spend by Model</div>
-                            <div id="cursor-categories-list" class="categories-list">
-                                <!-- Dynamically populated category bars -->
+                            <!-- Spend by Model Breakdown -->
+                            <div class="categories-breakdown" id="cursor-categories-breakdown">
+                                <div class="breakdown-header">Spend by Model</div>
+                                <div id="cursor-categories-list" class="categories-list scrollable-categories">
+                                    <!-- Dynamically populated category bars -->
+                                </div>
                             </div>
                         </div>
                     </div>
                 </div>
 
                 <div id="cursor-error" class="error-banner hidden"></div>
+            </section>
+
+            <!-- Active Agent Fleet Section -->
+            <section class="card glass-card agents-fleet-card">
+                <div class="card-header">
+                    <div class="provider-title">
+                        <span class="dot-status dot-online" id="agents-status-dot"></span>
+                        <h2>Active Agent Fleet</h2>
+                    </div>
+                    <div class="agents-header-actions">
+                        <label class="toggle-switch-label" title="Show completed or failed tasks">
+                            <input type="checkbox" id="toggle-completed-tasks">
+                            <span class="toggle-switch-slider"></span>
+                            <span class="toggle-switch-text">Show Completed</span>
+                        </label>
+                        <span id="agents-count-badge" class="badge badge-cyan">0 Active</span>
+                    </div>
+                </div>
+
+                <div class="table-responsive" id="agents-table-container">
+                    <table class="agents-table" id="agents-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 130px;">Status</th>
+                                <th style="width: 150px;">Agent</th>
+                                <th>Task / Goal</th>
+                                <th style="width: 200px;">Active Action</th>
+                                <th style="width: 100px;">Duration</th>
+                                <th style="width: 100px;">Last Seen</th>
+                            </tr>
+                        </thead>
+                        <tbody id="agents-table-body">
+                            <!-- Populated dynamically by app.js -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <div id="agents-empty-state" class="agents-empty-state">
+                    <div class="empty-icon">🤖</div>
+                    <p class="empty-title">No AI agents currently active</p>
+                    <p class="empty-desc">Agents reporting via MCP (<code>register_agent_task</code>) or HTTP will appear here in real time.</p>
+                </div>
             </section>
         </main>
 
@@ -242,11 +278,11 @@ body {
 
 .app-container {
     width: 100%;
-    max-width: 1200px;
-    padding: 24px 20px 40px;
+    max-width: 1540px;
+    padding: 20px 24px 36px;
     display: flex;
     flex-direction: column;
-    gap: 28px;
+    gap: 20px;
 }
 
 /* Header */
@@ -343,8 +379,14 @@ body {
 /* Grid */
 .dashboard-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-    gap: 24px;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+}
+
+@media (max-width: 1080px) {
+    .dashboard-grid {
+        grid-template-columns: 1fr;
+    }
 }
 
 /* Cards */
@@ -353,10 +395,10 @@ body {
     backdrop-filter: blur(16px);
     border: 1px solid var(--border-color);
     border-radius: 18px;
-    padding: 24px;
+    padding: 20px 22px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 16px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
 }
 
@@ -505,8 +547,8 @@ body {
 
 .buckets-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 12px;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
 }
 
 .bucket-card {
@@ -738,6 +780,36 @@ body {
     color: var(--magenta-glow);
 }
 
+.cursor-top-row {
+    display: grid;
+    grid-template-columns: 1.35fr 1fr;
+    gap: 12px;
+    align-items: stretch;
+}
+
+.details-box {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+}
+
+.details-box .detail-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.details-box .detail-row:last-child {
+    border-bottom: none;
+}
+
 .details-list {
     display: flex;
     flex-direction: column;
@@ -780,11 +852,38 @@ body {
     background: rgba(255, 255, 255, 0.02);
     border: 1px solid var(--border-color);
     border-radius: 14px;
-    padding: 20px;
+    padding: 16px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 12px;
     margin-top: 4px;
+}
+
+.spend-content-grid {
+    display: grid;
+    grid-template-columns: 1.25fr 1fr;
+    gap: 16px;
+    align-items: start;
+}
+
+.scrollable-categories {
+    max-height: 185px;
+    overflow-y: auto;
+    padding-right: 6px;
+}
+
+.scrollable-categories::-webkit-scrollbar {
+    width: 4px;
+}
+
+.scrollable-categories::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 4px;
+}
+
+.scrollable-categories::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
 }
 
 .spend-header {
@@ -939,6 +1038,286 @@ body {
     transition: width 0.6s ease;
 }
 
+/* Agents Fleet Section */
+.agents-fleet-card {
+    grid-column: 1 / -1;
+}
+
+.agents-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+.toggle-switch-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    user-select: none;
+}
+
+.toggle-switch-label input[type="checkbox"] {
+    display: none;
+}
+
+.toggle-switch-slider {
+    position: relative;
+    width: 32px;
+    height: 18px;
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 9999px;
+    transition: background 0.25s ease;
+}
+
+.toggle-switch-slider::before {
+    content: '';
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    left: 3px;
+    top: 3px;
+    background: #ffffff;
+    border-radius: 50%;
+    transition: transform 0.25s ease;
+}
+
+.toggle-switch-label input[type="checkbox"]:checked + .toggle-switch-slider {
+    background: var(--cyan-deep);
+}
+
+.toggle-switch-label input[type="checkbox"]:checked + .toggle-switch-slider::before {
+    transform: translateX(14px);
+}
+
+.toggle-switch-text {
+    font-weight: 500;
+}
+
+/* Agents Table */
+.table-responsive {
+    width: 100%;
+    overflow-x: auto;
+    margin-top: 14px;
+}
+
+.agents-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+}
+
+.agents-table th {
+    text-align: left;
+    padding: 10px 12px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.agents-table td {
+    padding: 12px 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    vertical-align: middle;
+}
+
+.agents-table tr:last-child td {
+    border-bottom: none;
+}
+
+.agents-table tbody tr {
+    transition: background 0.15s ease;
+}
+
+.agents-table tbody tr:hover {
+    background: rgba(255, 255, 255, 0.025);
+}
+
+/* Status Pills */
+.status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 9999px;
+    font-size: 0.74rem;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.status-pill .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+}
+
+.status-pill.running {
+    background: rgba(16, 185, 129, 0.14);
+    color: #34d399;
+    border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.status-pill.running .dot {
+    background: #34d399;
+    box-shadow: 0 0 8px #34d399;
+    animation: pulse 1.8s infinite ease-in-out;
+}
+
+.status-pill.waiting_for_user {
+    background: rgba(245, 158, 11, 0.14);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.status-pill.waiting_for_user .dot {
+    background: #fbbf24;
+}
+
+.status-pill.completed {
+    background: rgba(59, 130, 246, 0.14);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.35);
+}
+
+.status-pill.completed .dot {
+    background: #60a5fa;
+}
+
+.status-pill.failed {
+    background: rgba(239, 68, 68, 0.14);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.status-pill.failed .dot {
+    background: #f87171;
+}
+
+.status-pill.stale,
+.status-pill.disconnected {
+    background: rgba(156, 163, 175, 0.12);
+    color: #9ca3af;
+    border: 1px solid rgba(156, 163, 175, 0.22);
+}
+
+.status-pill.stale .dot,
+.status-pill.disconnected .dot {
+    background: #9ca3af;
+}
+
+/* Agent Platform Badge */
+.badge-agent {
+    font-size: 0.74rem;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+}
+
+.badge-agent.cursor {
+    background: rgba(121, 40, 202, 0.18);
+    color: #d8b4fe;
+    border: 1px solid rgba(121, 40, 202, 0.35);
+}
+
+.badge-agent.antigravity {
+    background: rgba(0, 242, 254, 0.14);
+    color: #67e8f9;
+    border: 1px solid rgba(0, 242, 254, 0.3);
+}
+
+.badge-agent.cli {
+    background: rgba(16, 185, 129, 0.14);
+    color: #6ee7b7;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+/* Task cell */
+.task-title {
+    font-weight: 500;
+    color: var(--text-primary);
+    line-height: 1.35;
+    word-break: break-word;
+}
+
+.task-workspace {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    margin-top: 3px;
+}
+
+/* Action chip */
+.action-chip {
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border-color);
+    padding: 3px 7px;
+    border-radius: 5px;
+    color: #a5f3fc;
+    display: inline-block;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Duration & Last Seen */
+.duration-counter {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
+.last-seen-text {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+/* Empty State */
+.agents-empty-state {
+    text-align: center;
+    padding: 32px 16px;
+    color: var(--text-muted);
+}
+
+.agents-empty-state .empty-icon {
+    font-size: 2rem;
+    margin-bottom: 8px;
+    opacity: 0.75;
+}
+
+.agents-empty-state .empty-title {
+    font-size: 0.92rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+}
+
+.agents-empty-state .empty-desc {
+    font-size: 0.78rem;
+    max-width: 440px;
+    margin: 0 auto;
+    line-height: 1.4;
+}
+
+.agents-empty-state.hidden,
+.table-responsive.hidden {
+    display: none;
+}
+
 /* Footer */
 .app-footer {
     text-align: center;
@@ -1018,8 +1397,6 @@ function updateCountdowns() {
 function renderAntigravity(ag) {
     const statusDot = document.getElementById('ag-status-dot');
     const planBadge = document.getElementById('ag-plan-badge');
-    const promptVal = document.getElementById('ag-prompt-credits');
-    const flowVal = document.getElementById('ag-flow-credits');
     const quotaGroupsContainer = document.getElementById('ag-quota-groups');
     const modelsGrid = document.getElementById('ag-models-grid');
     const modelsToggleText = document.getElementById('ag-models-toggle-text');
@@ -1029,8 +1406,6 @@ function renderAntigravity(ag) {
         statusDot.className = 'dot-status dot-offline';
         planBadge.textContent = 'Offline';
         planBadge.className = 'badge';
-        promptVal.textContent = '--';
-        flowVal.textContent = '--';
         if (quotaGroupsContainer) {
             quotaGroupsContainer.innerHTML = '<div class="gauge-loading">Antigravity language server offline</div>';
         }
@@ -1047,8 +1422,6 @@ function renderAntigravity(ag) {
     statusDot.className = 'dot-status dot-online';
     planBadge.textContent = ag.plan_tier || 'Google AI Ultra';
     planBadge.className = 'badge badge-cyan';
-    promptVal.textContent = (ag.available_prompt_credits || 0).toLocaleString();
-    flowVal.textContent = (ag.available_flow_credits || 0).toLocaleString();
     errorBanner.classList.add('hidden');
 
     // Render Quota Groups (Gemini Models, Claude and GPT models)
@@ -1074,7 +1447,8 @@ function renderAntigravity(ag) {
                         textColor = '#f59e0b';
                     }
 
-                    const windowLabel = b.window === 'WEEKLY' ? 'Weekly' : (b.window === 'FIVE_HOUR' ? '5-Hour' : (b.display_name || 'Limit'));
+                    const win = (b.window || '').toLowerCase();
+                    const windowLabel = (win === 'weekly') ? 'Weekly' : ((win === '5h' || win === 'five_hour') ? '5-Hour' : (b.display_name || 'Limit'));
 
                     bucketsHtml += `
                         <div class="bucket-card">
@@ -1402,12 +1776,178 @@ async function fetchStatus(isManual = false) {
     }
 }
 
+// -------------------------------------------------------------
+// Agent Fleet Tasks Logic
+// -------------------------------------------------------------
+let currentTasks = [];
+let showCompletedTasks = false;
+
+function formatElapsed(startSec, endSec) {
+    if (!startSec) return '00m 00s';
+    const end = endSec > 0 ? endSec : Math.floor(Date.now() / 1000);
+    let diff = Math.max(0, end - startSec);
+    const hours = Math.floor(diff / 3600);
+    const minutes = Math.floor((diff % 3600) / 60);
+    const seconds = diff % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    if (hours > 0) {
+        return `${pad(hours)}h ${pad(minutes)}m ${pad(seconds)}s`;
+    }
+    return `${pad(minutes)}m ${pad(seconds)}s`;
+}
+
+function formatRelativeTime(epochSec) {
+    if (!epochSec) return '-';
+    const nowSec = Math.floor(Date.now() / 1000);
+    const diff = Math.max(0, nowSec - epochSec);
+    if (diff < 5) return 'Just now';
+    if (diff < 60) return `${diff}s ago`;
+    const min = Math.floor(diff / 60);
+    if (min < 60) return `${min}m ago`;
+    const hrs = Math.floor(min / 60);
+    return `${hrs}h ago`;
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+function renderTasks(tasks) {
+    currentTasks = tasks || [];
+    const tbody = document.getElementById('agents-table-body');
+    const emptyState = document.getElementById('agents-empty-state');
+    const tableContainer = document.getElementById('agents-table-container');
+    const countBadge = document.getElementById('agents-count-badge');
+    const statusDot = document.getElementById('agents-status-dot');
+
+    if (!tbody) return;
+
+    const visibleTasks = currentTasks.filter(t => {
+        if (!showCompletedTasks && (t.status === 'completed' || t.status === 'failed')) {
+            return false;
+        }
+        return true;
+    });
+
+    const activeCount = currentTasks.filter(t => t.status === 'running' || t.status === 'waiting_for_user').length;
+    if (countBadge) {
+        countBadge.textContent = `${activeCount} Active`;
+        countBadge.className = activeCount > 0 ? 'badge badge-cyan' : 'badge';
+    }
+
+    if (statusDot) {
+        if (activeCount > 0) {
+            statusDot.className = 'dot-status dot-online';
+        } else {
+            statusDot.className = 'dot-status';
+        }
+    }
+
+    if (visibleTasks.length === 0) {
+        if (tableContainer) tableContainer.classList.add('hidden');
+        if (emptyState) emptyState.classList.remove('hidden');
+        tbody.innerHTML = '';
+        return;
+    }
+
+    if (tableContainer) tableContainer.classList.remove('hidden');
+    if (emptyState) emptyState.classList.add('hidden');
+
+    tbody.innerHTML = visibleTasks.map(t => {
+        let statusClass = t.status || 'running';
+        let statusLabel = 'Running';
+        if (t.status === 'waiting_for_user') statusLabel = 'Waiting';
+        else if (t.status === 'completed') statusLabel = 'Completed';
+        else if (t.status === 'failed') statusLabel = 'Failed';
+        else if (t.status === 'stale') statusLabel = 'Stale';
+        else if (t.status === 'disconnected') statusLabel = 'Disconnected';
+
+        let agentClass = 'cli';
+        const nameLower = (t.agent_name || '').toLowerCase();
+        if (nameLower.includes('cursor')) agentClass = 'cursor';
+        else if (nameLower.includes('antigravity') || nameLower.includes('gemini')) agentClass = 'antigravity';
+
+        const workspaceHtml = t.workspace ? `<div class="task-workspace">${escapeHtml(t.workspace)}</div>` : '';
+        const actionHtml = t.current_action ? `<span class="action-chip" title="${escapeHtml(t.current_action)}">${escapeHtml(t.current_action)}</span>` : '<span style="color:var(--text-muted);">-</span>';
+        const durationStr = formatElapsed(t.start_time_epoch, t.completed_time_epoch);
+        const lastSeenStr = formatRelativeTime(t.last_heartbeat_epoch);
+
+        return `
+            <tr data-task-id="${escapeHtml(t.task_id)}" data-start-epoch="${t.start_time_epoch || 0}" data-end-epoch="${t.completed_time_epoch || 0}">
+                <td>
+                    <span class="status-pill ${statusClass}">
+                        <span class="dot"></span>
+                        ${statusLabel}
+                    </span>
+                </td>
+                <td>
+                    <span class="badge-agent ${agentClass}">
+                        ${escapeHtml(t.agent_name || 'Agent')}
+                    </span>
+                </td>
+                <td class="task-desc-cell">
+                    <div class="task-title">${escapeHtml(t.task_description || 'Untitled Task')}</div>
+                    ${workspaceHtml}
+                </td>
+                <td>
+                    ${actionHtml}
+                </td>
+                <td>
+                    <span class="duration-counter">${durationStr}</span>
+                </td>
+                <td>
+                    <span class="last-seen-text">${lastSeenStr}</span>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function updateTaskDurations() {
+    const rows = document.querySelectorAll('#agents-table-body tr');
+    rows.forEach(row => {
+        const startEpoch = parseInt(row.getAttribute('data-start-epoch'), 10);
+        const endEpoch = parseInt(row.getAttribute('data-end-epoch'), 10);
+        if (startEpoch && (!endEpoch || endEpoch <= 0)) {
+            const counterEl = row.querySelector('.duration-counter');
+            if (counterEl) {
+                counterEl.textContent = formatElapsed(startEpoch, 0);
+            }
+        }
+    });
+}
+
+async function fetchTasks() {
+    try {
+        const url = `/api/tasks?include_completed=true`;
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const tasks = await res.json();
+        renderTasks(tasks);
+    } catch (e) {
+        console.warn('Failed to fetch tasks:', e);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
+    fetchTasks();
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
         fetchStatus(true);
+        fetchTasks();
     });
+
+    const toggleCompletedEl = document.getElementById('toggle-completed-tasks');
+    if (toggleCompletedEl) {
+        toggleCompletedEl.addEventListener('change', (e) => {
+            showCompletedTasks = e.target.checked;
+            renderTasks(currentTasks);
+        });
+    }
 
     const modelsToggleBtn = document.getElementById('ag-models-toggle');
     const modelsChevron = document.getElementById('ag-models-chevron');
@@ -1425,12 +1965,16 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Refresh data every 5 seconds
+    // Refresh data every 5 seconds for quotas, 2.5 seconds for tasks
     setInterval(() => fetchStatus(false), 5000);
+    setInterval(fetchTasks, 2500);
 
-    // Update countdown timers every second
+    // Update countdown timers and task stopwatch every second
     if (countdownInterval) clearInterval(countdownInterval);
-    countdownInterval = setInterval(updateCountdowns, 1000);
+    countdownInterval = setInterval(() => {
+        updateCountdowns();
+        updateTaskDurations();
+    }, 1000);
 });
 )raw_asset";
 

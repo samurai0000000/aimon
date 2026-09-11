@@ -34,15 +34,9 @@ cards:
           green: 50
 
   - type: entities
-    title: Google Antigravity Credits
+    title: Google Antigravity Plan
     show_header_toggle: false
     entities:
-      - entity: sensor.aimon_ag_prompt_credits
-        name: Available Prompt Credits
-        icon: mdi:brain
-      - entity: sensor.aimon_ag_flow_credits
-        name: Available Flow Credits
-        icon: mdi:lightning-bolt
       - entity: sensor.aimon_ag_plan_tier
         name: Plan Tier
         icon: mdi:account-badge

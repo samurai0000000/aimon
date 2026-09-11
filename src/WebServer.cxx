@@ -7,6 +7,7 @@
 #include "WebServer.hxx"
 #include "WebAssets.hxx"
 #include "McpServer.hxx"
+#include "TaskRegistry.hxx"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -119,6 +120,79 @@ void WebServer::setupRoutes() {
         res.set_header("Access-Control-Allow-Origin", "*");
     });
 
+    _server->Get("/api/tasks", [this](const httplib::Request& req, httplib::Response& res) {
+        bool includeCompleted = false;
+        if (req.has_param("include_completed")) {
+            std::string val = req.get_param_value("include_completed");
+            includeCompleted = (val == "true" || val == "1");
+        }
+        auto tasks = TaskRegistry::getInstance().listTasks(includeCompleted);
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& t : tasks) {
+            arr.push_back(t.toJson());
+        }
+        res.set_content(arr.dump(2), "application/json");
+        res.set_header("Access-Control-Allow-Origin", "*");
+    });
+
+    _server->Post("/api/tasks/register", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            auto body = nlohmann::json::parse(req.body);
+            AgentTask task;
+            task.taskId = body.value("task_id", "");
+            task.agentName = body.value("agent_name", "Unknown Agent");
+            task.workspace = body.value("workspace", "");
+            task.taskDescription = body.value("task_description", "");
+            task.currentAction = body.value("current_action", "");
+            task.status = body.value("status", "running");
+            task.details = body.value("details", "");
+
+            std::string registeredId = TaskRegistry::getInstance().registerOrUpdateTask(task);
+            AgentTask savedTask;
+            TaskRegistry::getInstance().getTask(registeredId, savedTask);
+
+            nlohmann::json resp = {
+                {"status", "ok"},
+                {"task", savedTask.toJson()}
+            };
+            res.set_content(resp.dump(2), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            nlohmann::json err = {{"error", e.what()}};
+            res.set_content(err.dump(2), "application/json");
+        }
+    });
+
+    _server->Post("/api/tasks/complete", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            auto body = nlohmann::json::parse(req.body);
+            std::string taskId = body.value("task_id", "");
+            std::string status = body.value("status", "completed");
+            std::string details = body.value("details", "");
+
+            bool ok = TaskRegistry::getInstance().completeTask(taskId, status, details);
+            if (ok) {
+                AgentTask task;
+                TaskRegistry::getInstance().getTask(taskId, task);
+                res.set_content(task.toJson().dump(2), "application/json");
+            } else {
+                res.status = 404;
+                res.set_content(nlohmann::json({{"error", "Task not found"}}).dump(), "application/json");
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
+    _server->Post("/api/tasks/clear", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        TaskRegistry::getInstance().clear();
+        res.set_content(nlohmann::json({{"status", "ok"}, {"cleared", true}}).dump(2), "application/json");
+    });
+
     _server->Get("/sse", [this](const httplib::Request&, httplib::Response& res) {
         if (!_mcpServer) {
             res.status = 503;
@@ -182,6 +256,7 @@ void WebServer::setupRoutes() {
             session->cv.notify_all();
             std::lock_guard<std::mutex> lock(_sessionsMutex);
             _sseSessions.erase(sessionId);
+            TaskRegistry::getInstance().handleSessionDisconnected(sessionId);
             std::cout << "[WebServer] SSE client disconnected, session: " << sessionId << std::endl;
         };
 
@@ -225,6 +300,18 @@ void WebServer::setupRoutes() {
 
         std::string method = reqJson.value("method", "");
         std::cout << "[WebServer] MCP POST: method=" << method << " session='" << sessionId << "'" << std::endl;
+
+        if (method == "tools/call" && !sessionId.empty()) {
+            if (reqJson.contains("params") && reqJson["params"].is_object()) {
+                auto& p = reqJson["params"];
+                if (p.value("name", "") == "register_agent_task") {
+                    if (!p.contains("arguments") || !p["arguments"].is_object()) {
+                        p["arguments"] = nlohmann::json::object();
+                    }
+                    p["arguments"]["sse_session_id"] = sessionId;
+                }
+            }
+        }
 
         // Process message through MCP server engine
         nlohmann::json respJson = _mcpServer->handleMessage(reqJson);

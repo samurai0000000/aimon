@@ -140,8 +140,6 @@ bool HistoryStore::recordSnapshot(const AggregateStatus& status) {
     };
 
     if (status.antigravity.isRunning) {
-        recordMetric("antigravity", "prompt_credits", status.antigravity.availablePromptCredits, 50000.0);
-        recordMetric("antigravity", "flow_credits", status.antigravity.availableFlowCredits, 150000.0);
         for (const auto& m : status.antigravity.models) {
             recordMetric("antigravity", m.modelId, m.remainingFraction, 1.0);
         }

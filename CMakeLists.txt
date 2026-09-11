@@ -62,6 +62,7 @@ set(SOURCES
     src/StateStore.cxx
     src/AntigravityCollector.cxx
     src/CursorCollector.cxx
+    src/TaskRegistry.cxx
     src/McpServer.cxx
     src/MqttPublisher.cxx
     src/WebServer.cxx

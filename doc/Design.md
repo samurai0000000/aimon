@@ -4,7 +4,7 @@
 
 ### 1.1 Context
 Modern software engineering workflows increasingly rely on AI pair programming assistants such as **Google Antigravity** and **Cursor**. Both platforms enforce subscription tiers and rate limits:
-* **Antigravity** employs a dual-limit policy: a short-term rolling window (e.g., 5-hour refresh) alongside hard weekly model caps and monthly prompt/flow credits.
+* **Antigravity** employs a dual-limit rolling quota architecture: a short-term rolling window (5-hour refresh) alongside weekly model group caps.
 * **Cursor** enforces monthly fast-request pools, usage-based caps, and billing period cycles.
 
 ### 1.2 The Problem
@@ -136,8 +136,8 @@ The response contains structured user status:
 ```
 
 Key metrics mapped by `aimon`:
-- Tier: `userStatus.planStatus.planInfo.planName`
-- Credits: `userStatus.planStatus.availablePromptCredits`
+- Tier: `userStatus.userTier.name` / `userStatus.planStatus.planInfo.planName`
+- Quota Groups: Gemini and Claude/GPT rolling windows (`remainingFraction`, `resetTime`)
 - Models: Array of `{ label, remainingFraction, resetTime }`
 
 ---
@@ -201,9 +201,8 @@ struct ModelQuota {
 struct AntigravityStatus {
     bool is_running = false;
     std::string plan_tier;
-    int available_prompt_credits = 0;
-    int available_flow_credits = 0;
     std::vector<ModelQuota> models;
+    std::vector<QuotaGroup> quota_groups;
     std::string error_message;
 };
 
@@ -281,6 +280,14 @@ sequenceDiagram
 | `check_antigravity_quota` | None | Returns per-model remaining capacity %, prompt credits, and next reset timestamps for Antigravity. |
 | `check_cursor_usage` | None | Returns Cursor fast requests used vs limit, plan tier, and billing cycle reset date. |
 | `get_combined_ai_status` | None | Formats a comprehensive Markdown summary table covering both assistants. |
+| `register_agent_task` | `task_description` (req), `agent_name`, `current_action`, `status`, `workspace`, `task_id`, `details` | Registers or updates an active agent task and heartbeat in the in-band task registry. |
+| `list_active_tasks` | `include_completed` (optional boolean, default `false`) | Returns a Markdown summary table of active agents, current actions, runtimes, and heartbeats. |
+
+### 5.4 In-Band Task Registry Subsystem
+To monitor agents across heterogeneous or distributed setups (e.g. Cursor on Windows connecting to `aimon` on Linux via SSE):
+- **Thread-Safe In-Memory Registry**: `TaskRegistry` synchronizes agent task records using `std::shared_mutex`.
+- **Sliding TTL Reaper**: Any task marked `running` or `waiting_for_user` that receives no updates within 10 minutes automatically transitions to `stale`.
+- **SSE Lifecycle Disconnect Hook**: When an SSE client session drops, any tasks associated with that `sseSessionId` automatically transition to `disconnected`.
 
 ---
 
@@ -289,10 +296,14 @@ sequenceDiagram
 ### 6.1 Server Architecture
 The web dashboard is served using `cpp-httplib` with embedded static assets:
 * **Port**: Configurable via `--port <port>` (default: `3883`).
-* **Interface Binding**: `127.0.0.1` (ensuring access is restricted to the local workstation).
+* **Interface Binding**: `0.0.0.0` or `127.0.0.1` (configurable; defaults to all interfaces for LAN/remote access).
 * **REST API**:
   * `GET /api/status`: Returns current `AggregateStatus` as JSON.
   * `GET /api/refresh`: Forces an immediate collector poll and returns fresh state.
+  * `GET /api/history`: Returns time-series usage history.
+  * `GET /api/tasks`: Returns active/completed agent tasks (`?include_completed=true`).
+  * `POST /api/tasks/register`: Registers or updates a task from HTTP clients.
+  * `POST /api/tasks/complete`: Marks a task completed or failed with optional summary.
 
 ### 6.2 Visual Aesthetics & UI Specification
 The dashboard follows modern design principles:
@@ -315,6 +326,12 @@ The dashboard follows modern design principles:
      - Formats remaining duration dynamically: `HH:MM:SS` (e.g., `03h 42m 18s until refresh`).
   3. **Linear Progress Bars**:
      - Displays Cursor fast-request consumption against monthly pool.
+  4. **Active Agent Fleet Table**:
+     - Displays live status (🟢 Running with pulse animation, 🟡 Waiting, 🔵 Completed, ⚪ Stale).
+     - Branded agent platform badges (`Cursor (Windows)` in purple/magenta, `Antigravity` in electric cyan, `CLI Worker` in emerald).
+     - Monospace active action chips (e.g. `replace_file_content`, `run_command`).
+     - Ticking client-side elapsed stopwatch counter (`03m 42s`) updating every second.
+     - "Show Completed" filter switch and responsive table layout with empty-state handling.
 
 ---
 
@@ -337,9 +354,8 @@ The dashboard follows modern design principles:
    - Device Name: `AI Quota Monitor`
    - Model: `aimon v1.0`
 2. **Sensors Exported**:
-   - `sensor.aimon_ag_prompt_credits` (Antigravity Prompt Credits)
-   - `sensor.aimon_ag_flow_credits` (Antigravity Flow Credits)
-   - `sensor.aimon_ag_model_<model_id>` (Per-model remaining percentage with reset timestamp attributes)
+   - `sensor.aimon_ag_plan_tier` (Antigravity Plan Tier)
+   - `sensor.aimon_ag_quota_<group>_<window>` (Rolling window remaining percentages)
    - `sensor.aimon_cursor_fast_requests_used` (Cursor Fast Requests Used)
    - `sensor.aimon_cursor_fast_requests_limit` (Cursor Fast Request Capacity)
    - `sensor.aimon_cursor_cycle_reset` (Cursor Billing Cycle Reset Timestamp)

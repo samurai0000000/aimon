@@ -130,10 +130,6 @@ void MqttPublisher::publishSensorDiscovery(const std::string& sensorId,
 void MqttPublisher::publishDiscovery() {
     std::string prefix = _config.topicPrefix;
 
-    publishSensorDiscovery("ag_prompt_credits", "Antigravity Prompt Credits",
-                           prefix + "/antigravity/prompt_credits/state", "credits", "mdi:brain");
-    publishSensorDiscovery("ag_flow_credits", "Antigravity Flow Credits",
-                           prefix + "/antigravity/flow_credits/state", "credits", "mdi:lightning-bolt");
     publishSensorDiscovery("ag_plan_tier", "Antigravity Plan Tier",
                            prefix + "/antigravity/plan_tier/state", "", "mdi:account-badge");
 
@@ -160,10 +156,6 @@ void MqttPublisher::publishState(const AggregateStatus& status) {
     std::string prefix = _config.topicPrefix;
 
     if (status.antigravity.isRunning) {
-        publishMessage(prefix + "/antigravity/prompt_credits/state",
-                       std::to_string(status.antigravity.availablePromptCredits), _config.retain);
-        publishMessage(prefix + "/antigravity/flow_credits/state",
-                       std::to_string(status.antigravity.availableFlowCredits), _config.retain);
         publishMessage(prefix + "/antigravity/plan_tier/state",
                        status.antigravity.planTier, _config.retain);
 

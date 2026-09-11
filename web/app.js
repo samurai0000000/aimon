@@ -68,8 +68,6 @@ function updateCountdowns() {
 function renderAntigravity(ag) {
     const statusDot = document.getElementById('ag-status-dot');
     const planBadge = document.getElementById('ag-plan-badge');
-    const promptVal = document.getElementById('ag-prompt-credits');
-    const flowVal = document.getElementById('ag-flow-credits');
     const quotaGroupsContainer = document.getElementById('ag-quota-groups');
     const modelsGrid = document.getElementById('ag-models-grid');
     const modelsToggleText = document.getElementById('ag-models-toggle-text');
@@ -79,8 +77,6 @@ function renderAntigravity(ag) {
         statusDot.className = 'dot-status dot-offline';
         planBadge.textContent = 'Offline';
         planBadge.className = 'badge';
-        promptVal.textContent = '--';
-        flowVal.textContent = '--';
         if (quotaGroupsContainer) {
             quotaGroupsContainer.innerHTML = '<div class="gauge-loading">Antigravity language server offline</div>';
         }
@@ -97,8 +93,6 @@ function renderAntigravity(ag) {
     statusDot.className = 'dot-status dot-online';
     planBadge.textContent = ag.plan_tier || 'Google AI Ultra';
     planBadge.className = 'badge badge-cyan';
-    promptVal.textContent = (ag.available_prompt_credits || 0).toLocaleString();
-    flowVal.textContent = (ag.available_flow_credits || 0).toLocaleString();
     errorBanner.classList.add('hidden');
 
     // Render Quota Groups (Gemini Models, Claude and GPT models)
@@ -124,7 +118,8 @@ function renderAntigravity(ag) {
                         textColor = '#f59e0b';
                     }
 
-                    const windowLabel = b.window === 'WEEKLY' ? 'Weekly' : (b.window === 'FIVE_HOUR' ? '5-Hour' : (b.display_name || 'Limit'));
+                    const win = (b.window || '').toLowerCase();
+                    const windowLabel = (win === 'weekly') ? 'Weekly' : ((win === '5h' || win === 'five_hour') ? '5-Hour' : (b.display_name || 'Limit'));
 
                     bucketsHtml += `
                         <div class="bucket-card">
@@ -452,12 +447,178 @@ async function fetchStatus(isManual = false) {
     }
 }
 
+// -------------------------------------------------------------
+// Agent Fleet Tasks Logic
+// -------------------------------------------------------------
+let currentTasks = [];
+let showCompletedTasks = false;
+
+function formatElapsed(startSec, endSec) {
+    if (!startSec) return '00m 00s';
+    const end = endSec > 0 ? endSec : Math.floor(Date.now() / 1000);
+    let diff = Math.max(0, end - startSec);
+    const hours = Math.floor(diff / 3600);
+    const minutes = Math.floor((diff % 3600) / 60);
+    const seconds = diff % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    if (hours > 0) {
+        return `${pad(hours)}h ${pad(minutes)}m ${pad(seconds)}s`;
+    }
+    return `${pad(minutes)}m ${pad(seconds)}s`;
+}
+
+function formatRelativeTime(epochSec) {
+    if (!epochSec) return '-';
+    const nowSec = Math.floor(Date.now() / 1000);
+    const diff = Math.max(0, nowSec - epochSec);
+    if (diff < 5) return 'Just now';
+    if (diff < 60) return `${diff}s ago`;
+    const min = Math.floor(diff / 60);
+    if (min < 60) return `${min}m ago`;
+    const hrs = Math.floor(min / 60);
+    return `${hrs}h ago`;
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+function renderTasks(tasks) {
+    currentTasks = tasks || [];
+    const tbody = document.getElementById('agents-table-body');
+    const emptyState = document.getElementById('agents-empty-state');
+    const tableContainer = document.getElementById('agents-table-container');
+    const countBadge = document.getElementById('agents-count-badge');
+    const statusDot = document.getElementById('agents-status-dot');
+
+    if (!tbody) return;
+
+    const visibleTasks = currentTasks.filter(t => {
+        if (!showCompletedTasks && (t.status === 'completed' || t.status === 'failed')) {
+            return false;
+        }
+        return true;
+    });
+
+    const activeCount = currentTasks.filter(t => t.status === 'running' || t.status === 'waiting_for_user').length;
+    if (countBadge) {
+        countBadge.textContent = `${activeCount} Active`;
+        countBadge.className = activeCount > 0 ? 'badge badge-cyan' : 'badge';
+    }
+
+    if (statusDot) {
+        if (activeCount > 0) {
+            statusDot.className = 'dot-status dot-online';
+        } else {
+            statusDot.className = 'dot-status';
+        }
+    }
+
+    if (visibleTasks.length === 0) {
+        if (tableContainer) tableContainer.classList.add('hidden');
+        if (emptyState) emptyState.classList.remove('hidden');
+        tbody.innerHTML = '';
+        return;
+    }
+
+    if (tableContainer) tableContainer.classList.remove('hidden');
+    if (emptyState) emptyState.classList.add('hidden');
+
+    tbody.innerHTML = visibleTasks.map(t => {
+        let statusClass = t.status || 'running';
+        let statusLabel = 'Running';
+        if (t.status === 'waiting_for_user') statusLabel = 'Waiting';
+        else if (t.status === 'completed') statusLabel = 'Completed';
+        else if (t.status === 'failed') statusLabel = 'Failed';
+        else if (t.status === 'stale') statusLabel = 'Stale';
+        else if (t.status === 'disconnected') statusLabel = 'Disconnected';
+
+        let agentClass = 'cli';
+        const nameLower = (t.agent_name || '').toLowerCase();
+        if (nameLower.includes('cursor')) agentClass = 'cursor';
+        else if (nameLower.includes('antigravity') || nameLower.includes('gemini')) agentClass = 'antigravity';
+
+        const workspaceHtml = t.workspace ? `<div class="task-workspace">${escapeHtml(t.workspace)}</div>` : '';
+        const actionHtml = t.current_action ? `<span class="action-chip" title="${escapeHtml(t.current_action)}">${escapeHtml(t.current_action)}</span>` : '<span style="color:var(--text-muted);">-</span>';
+        const durationStr = formatElapsed(t.start_time_epoch, t.completed_time_epoch);
+        const lastSeenStr = formatRelativeTime(t.last_heartbeat_epoch);
+
+        return `
+            <tr data-task-id="${escapeHtml(t.task_id)}" data-start-epoch="${t.start_time_epoch || 0}" data-end-epoch="${t.completed_time_epoch || 0}">
+                <td>
+                    <span class="status-pill ${statusClass}">
+                        <span class="dot"></span>
+                        ${statusLabel}
+                    </span>
+                </td>
+                <td>
+                    <span class="badge-agent ${agentClass}">
+                        ${escapeHtml(t.agent_name || 'Agent')}
+                    </span>
+                </td>
+                <td class="task-desc-cell">
+                    <div class="task-title">${escapeHtml(t.task_description || 'Untitled Task')}</div>
+                    ${workspaceHtml}
+                </td>
+                <td>
+                    ${actionHtml}
+                </td>
+                <td>
+                    <span class="duration-counter">${durationStr}</span>
+                </td>
+                <td>
+                    <span class="last-seen-text">${lastSeenStr}</span>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function updateTaskDurations() {
+    const rows = document.querySelectorAll('#agents-table-body tr');
+    rows.forEach(row => {
+        const startEpoch = parseInt(row.getAttribute('data-start-epoch'), 10);
+        const endEpoch = parseInt(row.getAttribute('data-end-epoch'), 10);
+        if (startEpoch && (!endEpoch || endEpoch <= 0)) {
+            const counterEl = row.querySelector('.duration-counter');
+            if (counterEl) {
+                counterEl.textContent = formatElapsed(startEpoch, 0);
+            }
+        }
+    });
+}
+
+async function fetchTasks() {
+    try {
+        const url = `/api/tasks?include_completed=true`;
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const tasks = await res.json();
+        renderTasks(tasks);
+    } catch (e) {
+        console.warn('Failed to fetch tasks:', e);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
+    fetchTasks();
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
         fetchStatus(true);
+        fetchTasks();
     });
+
+    const toggleCompletedEl = document.getElementById('toggle-completed-tasks');
+    if (toggleCompletedEl) {
+        toggleCompletedEl.addEventListener('change', (e) => {
+            showCompletedTasks = e.target.checked;
+            renderTasks(currentTasks);
+        });
+    }
 
     const modelsToggleBtn = document.getElementById('ag-models-toggle');
     const modelsChevron = document.getElementById('ag-models-chevron');
@@ -475,10 +636,14 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Refresh data every 5 seconds
+    // Refresh data every 5 seconds for quotas, 2.5 seconds for tasks
     setInterval(() => fetchStatus(false), 5000);
+    setInterval(fetchTasks, 2500);
 
-    // Update countdown timers every second
+    // Update countdown timers and task stopwatch every second
     if (countdownInterval) clearInterval(countdownInterval);
-    countdownInterval = setInterval(updateCountdowns, 1000);
+    countdownInterval = setInterval(() => {
+        updateCountdowns();
+        updateTaskDurations();
+    }, 1000);
 });

@@ -72,8 +72,6 @@ struct QuotaGroup {
 struct AntigravityStatus {
     bool isRunning = false;
     std::string planTier = "Unknown";
-    int availablePromptCredits = 0;
-    int availableFlowCredits = 0;
     std::vector<ModelQuota> models;
     std::vector<QuotaGroup> quotaGroups;
     std::string errorMessage;
@@ -92,8 +90,6 @@ struct AntigravityStatus {
         return {
             {"is_running", isRunning},
             {"plan_tier", planTier},
-            {"available_prompt_credits", availablePromptCredits},
-            {"available_flow_credits", availableFlowCredits},
             {"models", modelsArray},
             {"quota_groups", groupsArray},
             {"error_message", errorMessage}
@@ -184,6 +180,36 @@ struct AggregateStatus {
             {"last_updated_epoch", epoch},
             {"antigravity", antigravity.toJson()},
             {"cursor", cursor.toJson()}
+        };
+    }
+};
+
+struct AgentTask {
+    std::string taskId;
+    std::string agentName = "Unknown Agent";
+    std::string workspace;
+    std::string taskDescription;
+    std::string currentAction;
+    std::string status = "running";
+    std::string details;
+    int64_t startTimeEpoch = 0;
+    int64_t lastHeartbeatEpoch = 0;
+    int64_t completedTimeEpoch = 0;
+    std::string sseSessionId;
+
+    nlohmann::json toJson() const {
+        return {
+            {"task_id", taskId},
+            {"agent_name", agentName},
+            {"workspace", workspace},
+            {"task_description", taskDescription},
+            {"current_action", currentAction},
+            {"status", status},
+            {"details", details},
+            {"start_time_epoch", startTimeEpoch},
+            {"last_heartbeat_epoch", lastHeartbeatEpoch},
+            {"completed_time_epoch", completedTimeEpoch},
+            {"sse_session_id", sseSessionId}
         };
     }
 };

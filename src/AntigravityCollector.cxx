@@ -271,15 +271,6 @@ AntigravityStatus AntigravityCollector::fetchStatus() {
             }
         }
 
-        if (userStatus.contains("planStatus")) {
-            const auto& ps = userStatus["planStatus"];
-            if (ps.contains("availablePromptCredits") && ps["availablePromptCredits"].is_number()) {
-                status.availablePromptCredits = ps["availablePromptCredits"];
-            }
-            if (ps.contains("availableFlowCredits") && ps["availableFlowCredits"].is_number()) {
-                status.availableFlowCredits = ps["availableFlowCredits"];
-            }
-        }
 
         if (userStatus.contains("cascadeModelConfigData") &&
             userStatus["cascadeModelConfigData"].contains("clientModelConfigs")) {

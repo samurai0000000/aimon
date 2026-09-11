@@ -28,6 +28,7 @@ private:
     std::string formatAntigravityStatus(const AntigravityStatus& ag);
     std::string formatCursorStatus(const CursorStatus& cr);
     std::string formatCombinedStatus(const AggregateStatus& status);
+    std::string formatAgentTasks(const std::vector<AgentTask>& tasks);
 
     StateStore& _stateStore;
 };
