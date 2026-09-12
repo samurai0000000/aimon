@@ -188,6 +188,6 @@ aimon/
 
 ---
 
-## License
+## License & Copyright
 
-Internal Developer Utility — Ambarella Inc.
+Copyright (C) 2026, Charles Chiou. All rights reserved.

@@ -22,6 +22,8 @@
 #include "McpServer.hxx"
 #include "MqttPublisher.hxx"
 #include "WebServer.hxx"
+#include "DynamicToolRegistry.hxx"
+#include "TcpGateway.hxx"
 #include "Version.hxx"
 
 using namespace aimon;
@@ -55,6 +57,8 @@ static void printUsage(const char* progName) {
               << "  --mqtt-broker <host>   MQTT broker hostname (default: localhost)\n"
               << "  --mqtt-port <port>     MQTT broker port (default: 1883)\n"
               << "  --cursor-token <token> Set Cursor authentication token\n"
+              << "  --gateway-port <port>  Port for TCP Tool Gateway (default: 3885)\n"
+              << "  --gateway-disable      Disable TCP Tool Gateway\n"
               << "  --version, -v          Display version and build metadata\n"
               << "  --help, -h             Display this help message\n"
               << std::endl;
@@ -73,6 +77,8 @@ int main(int argc, char* argv[]) {
     std::string optMqttBroker;
     int optMqttPort = 0;
     std::string optCursorToken;
+    int optGatewayPort = 0;
+    bool optGatewayDisable = false;
 
     int argIdx = 1;
     if (argIdx < argc && argv[argIdx][0] != '-') {
@@ -107,6 +113,10 @@ int main(int argc, char* argv[]) {
             optMqttPort = std::stoi(argv[argIdx++]);
         } else if (arg == "--cursor-token" && argIdx < argc) {
             optCursorToken = argv[argIdx++];
+        } else if (arg == "--gateway-port" && argIdx < argc) {
+            optGatewayPort = std::stoi(argv[argIdx++]);
+        } else if (arg == "--gateway-disable") {
+            optGatewayDisable = true;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             printUsage(argv[0]);
@@ -139,6 +149,8 @@ int main(int argc, char* argv[]) {
     if (!optMqttBroker.empty()) cfg.mqtt.broker = optMqttBroker;
     if (optMqttPort > 0) cfg.mqtt.port = optMqttPort;
     if (!optCursorToken.empty()) cfg.cursor.accessToken = optCursorToken;
+    if (optGatewayPort > 0) cfg.gateway.port = optGatewayPort;
+    if (optGatewayDisable) cfg.gateway.enabled = false;
 
     StateStore& stateStore = StateStore::getInstance();
     HistoryStore historyStore;
@@ -191,8 +203,22 @@ int main(int argc, char* argv[]) {
             }
         });
 
-        McpServer mcpServer(stateStore);
+        DynamicToolRegistry dynamicRegistry;
+        TcpGateway tcpGateway(dynamicRegistry);
+        if (cfg.gateway.enabled) {
+            tcpGateway.start(cfg.gateway.host, cfg.gateway.port);
+        }
+
+        McpServer mcpServer(stateStore, &dynamicRegistry, &tcpGateway);
+        tcpGateway.setToolsChangedCallback([&]() {
+            mcpServer.notifyToolsListChanged();
+        });
+
         mcpServer.run();
+
+        if (cfg.gateway.enabled) {
+            tcpGateway.stop();
+        }
 
         g_shutdown = true;
         g_cv.notify_all();
@@ -203,13 +229,32 @@ int main(int argc, char* argv[]) {
     }
 
     // Web or Daemon mode
-    McpServer mcpServer(stateStore);
+    DynamicToolRegistry dynamicRegistry;
+    TcpGateway tcpGateway(dynamicRegistry);
+
+    McpServer mcpServer(stateStore, &dynamicRegistry, &tcpGateway);
     WebServer webServer(stateStore, historyStore, cfg.web, [&]() {
         pollOnce();
     }, &mcpServer);
 
+    mcpServer.setNotificationBroadcaster([&](const std::string& notif) {
+        webServer.broadcastSseNotification(notif);
+    });
+
+    tcpGateway.setToolsChangedCallback([&]() {
+        mcpServer.notifyToolsListChanged();
+    });
+
+    if (cfg.gateway.enabled) {
+        if (!tcpGateway.start(cfg.gateway.host, cfg.gateway.port)) {
+            std::cerr << "[aimon] Warning: failed to start TCP Gateway on "
+                      << cfg.gateway.host << ":" << cfg.gateway.port << std::endl;
+        }
+    }
+
     if (!webServer.start(true)) {
         std::cerr << "[aimon] Error: failed to start web server" << std::endl;
+        tcpGateway.stop();
         return 1;
     }
 
@@ -234,6 +279,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n[aimon] Shutting down cleanly..." << std::endl;
+    tcpGateway.stop();
     webServer.stop();
     if (mqttPublisher) {
         mqttPublisher->stop();

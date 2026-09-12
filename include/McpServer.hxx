@@ -8,17 +8,30 @@
 #define AIMON_MCP_SERVER_HXX
 
 #include <string>
+#include <functional>
 #include "StateStore.hxx"
 #include <nlohmann/json.hpp>
 
 namespace aimon {
 
+class DynamicToolRegistry;
+class TcpGateway;
+
 class McpServer {
 public:
-    explicit McpServer(StateStore& stateStore);
+    explicit McpServer(StateStore& stateStore,
+                       DynamicToolRegistry* dynamicRegistry = nullptr,
+                       TcpGateway* tcpGateway = nullptr);
 
     void run();
     nlohmann::json handleMessage(const nlohmann::json& request);
+
+    void setDynamicRegistry(DynamicToolRegistry* reg) { _dynamicRegistry = reg; }
+    void setTcpGateway(TcpGateway* gw) { _tcpGateway = gw; }
+    void setNotificationBroadcaster(std::function<void(const std::string&)> broadcaster) {
+        _notificationBroadcaster = broadcaster;
+    }
+    void notifyToolsListChanged();
 
 private:
     nlohmann::json handleInitialize(const nlohmann::json& id, const nlohmann::json& params);
@@ -31,6 +44,9 @@ private:
     std::string formatAgentTasks(const std::vector<AgentTask>& tasks);
 
     StateStore& _stateStore;
+    DynamicToolRegistry* _dynamicRegistry = nullptr;
+    TcpGateway* _tcpGateway = nullptr;
+    std::function<void(const std::string&)> _notificationBroadcaster;
 };
 
 } // namespace aimon

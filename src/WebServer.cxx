@@ -420,6 +420,20 @@ bool WebServer::start(bool async) {
     }
 }
 
+void WebServer::broadcastSseNotification(const std::string& jsonRpcNotification) {
+    std::lock_guard<std::mutex> lock(_sessionsMutex);
+    for (auto& pair : _sseSessions) {
+        auto& session = pair.second;
+        if (session && !session->closed.load()) {
+            {
+                std::lock_guard<std::mutex> sLock(session->mutex);
+                session->messageQueue.push(jsonRpcNotification);
+            }
+            session->cv.notify_one();
+        }
+    }
+}
+
 void WebServer::stop() {
     if (!_running) return;
 

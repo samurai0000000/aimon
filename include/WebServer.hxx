@@ -49,6 +49,7 @@ public:
 
     bool start(bool async = false);
     void stop();
+    void broadcastSseNotification(const std::string& jsonRpcNotification);
 
 private:
     void setupRoutes();

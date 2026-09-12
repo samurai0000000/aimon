@@ -51,6 +51,12 @@ struct CursorConfig {
     std::string accessToken;
 };
 
+struct GatewayConfig {
+    bool enabled = true;
+    std::string host = "0.0.0.0";
+    int port = 3885;
+};
+
 struct AimonConfig {
     PollingConfig polling;
     WebConfig web;
@@ -58,6 +64,7 @@ struct AimonConfig {
     HistoryConfig history;
     AntigravityConfig antigravity;
     CursorConfig cursor;
+    GatewayConfig gateway;
 
     nlohmann::json toJson() const;
     void fromJson(const nlohmann::json& j);

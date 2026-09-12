@@ -49,6 +49,11 @@ nlohmann::json AimonConfig::toJson() const {
             {"auto_discover", cursor.autoDiscover},
             {"db_path", cursor.dbPath},
             {"access_token", cursor.accessToken}
+        }},
+        {"gateway", {
+            {"enabled", gateway.enabled},
+            {"host", gateway.host},
+            {"port", gateway.port}
         }}
     };
 }
@@ -97,6 +102,13 @@ void AimonConfig::fromJson(const nlohmann::json& j) {
         if (c.contains("auto_discover")) cursor.autoDiscover = c["auto_discover"];
         if (c.contains("db_path")) cursor.dbPath = c["db_path"];
         if (c.contains("access_token")) cursor.accessToken = c["access_token"];
+    }
+
+    if (j.contains("gateway")) {
+        const auto& g = j["gateway"];
+        if (g.contains("enabled")) gateway.enabled = g["enabled"];
+        if (g.contains("host")) gateway.host = g["host"];
+        if (g.contains("port")) gateway.port = g["port"];
     }
 }
 

@@ -5,6 +5,8 @@
  */
 
 #include "McpServer.hxx"
+#include "DynamicToolRegistry.hxx"
+#include "TcpGateway.hxx"
 #include "TaskRegistry.hxx"
 #include <iostream>
 #include <sstream>
@@ -12,8 +14,23 @@
 
 namespace aimon {
 
-McpServer::McpServer(StateStore& stateStore)
-    : _stateStore(stateStore) {
+McpServer::McpServer(StateStore& stateStore,
+                     DynamicToolRegistry* dynamicRegistry,
+                     TcpGateway* tcpGateway)
+    : _stateStore(stateStore),
+      _dynamicRegistry(dynamicRegistry),
+      _tcpGateway(tcpGateway) {
+}
+
+void McpServer::notifyToolsListChanged() {
+    if (_notificationBroadcaster) {
+        nlohmann::json notif = {
+            {"jsonrpc", "2.0"},
+            {"method", "notifications/tools/list_changed"},
+            {"params", nlohmann::json::object()}
+        };
+        _notificationBroadcaster(notif.dump());
+    }
 }
 
 void McpServer::run() {
@@ -97,7 +114,7 @@ nlohmann::json McpServer::handleInitialize(const nlohmann::json& id, const nlohm
 }
 
 nlohmann::json McpServer::handleToolsList(const nlohmann::json& id) {
-    return {
+    nlohmann::json resp = {
         {"jsonrpc", "2.0"},
         {"id", id},
         {"result", {
@@ -181,6 +198,17 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id) {
             }}
         }}
     };
+
+    if (_dynamicRegistry) {
+        nlohmann::json dynTools = _dynamicRegistry->getToolsListJson();
+        if (dynTools.is_array()) {
+            for (const auto& dt : dynTools) {
+                resp["result"]["tools"].push_back(dt);
+            }
+        }
+    }
+
+    return resp;
 }
 
 nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohmann::json& params) {
@@ -238,6 +266,29 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         bool includeCompleted = args.value("include_completed", false);
         auto tasks = TaskRegistry::getInstance().listTasks(includeCompleted);
         contentText = formatAgentTasks(tasks);
+    } else if (_dynamicRegistry && _tcpGateway && _dynamicRegistry->hasTool(toolName)) {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        nlohmann::json gwResult;
+        std::string gwError;
+        bool ok = _tcpGateway->callTool(toolName, args, gwResult, gwError);
+        if (!ok) {
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"error", {
+                    {"code", -32000},
+                    {"message", "Subsystem tool call failed: " + gwError}
+                }}
+            };
+        }
+        if (gwResult.contains("content")) {
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"result", gwResult}
+            };
+        }
+        contentText = gwResult.is_string() ? gwResult.get<std::string>() : gwResult.dump(2);
     } else {
         return {
             {"jsonrpc", "2.0"},
