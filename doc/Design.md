@@ -16,7 +16,7 @@ Modern software engineering workflows increasingly rely on AI pair programming a
 `aimon` operates as a unified, privacy-first local monitoring engine and **Central MCP Tool Gateway Hub**:
 1. **AI Quota & Subscription Monitoring**: Directly gathers metrics from the Cursor Desktop API (`api2.cursor.sh`) and Antigravity Language Server loopback RPC (`127.0.0.1`).
 2. **Central MCP Tool Gateway**: Acts as the sole MCP integration point for AI agents (Antigravity and Cursor) over HTTP Server-Sent Events (SSE on port `3883`).
-3. **Multiplexed TCP Gateway for Subsystems**: Runs a TCP gateway server on port `3885` accepting connections from specialized network daemons (`meshmon` on `fox`, `netmon` on `rhino`). When daemons connect, they dynamically register their toolsets; `aimon` merges these tools into its global MCP registry and proxies RPC invocations transparently.
+3. **Multiplexed TCP Gateway for Subsystems**: Runs a TCP gateway server on port `3885` accepting connections from specialized network daemons (e.g. `meshmon` LoRa radio gateway, `netmon` LAN monitor). When daemons connect, they dynamically register their toolsets; `aimon` merges these tools into its global MCP registry and proxies RPC invocations transparently.
 4. **Embedded Web & Home Assistant Interfaces**: Real-time browser dashboard (`http://localhost:3883`) and native Home Assistant MQTT Auto-Discovery.
 
 ---
@@ -81,7 +81,7 @@ Upon establishing a TCP connection, the satellite daemon sends a `gateway/regist
   "params": {
     "subsystem": "meshmon",
     "version": "1.0.0",
-    "hostname": "fox",
+    "hostname": "lora-gateway",
     "tools": [
       {
         "name": "meshmon_get_node_status",
@@ -207,16 +207,16 @@ The architecture implements a self-healing, loosely coupled state machine design
 │                           Process Failure Lifecycle                            │
 └────────────────────────────────────────────────────────────────────────────────┘
 
-1. Satellite Drops (e.g. meshmon on fox restarts or reboots):
+1. Satellite Drops (e.g. meshmon satellite restarts or reboots):
    - aimon detects socket closure (read EOF / ECONNRESET).
    - aimon unbinds meshmon_* tools from DynamicToolRegistry.
    - aimon pushes notifications/tools/list_changed to IDE.
    - In-flight calls cleanly return: "Subsystem 'meshmon' is currently offline."
 
-2. Satellite Autonomous Reconnect (AimonGatewayClient on fox):
+2. Satellite Autonomous Reconnect (AimonGatewayClient on satellite):
    - Background worker detects disconnect, enters exponential backoff (1s, 2s, 4s... max 30s).
    - Local radio ingestion, SQLite logging, and MQTT keep running unaffected.
-   - Once network or process is restored, opens TCP to builder:3885 and sends gateway/register.
+   - Once network or process is restored, opens TCP to <gateway-host>:3885 and sends gateway/register.
 
 3. Gateway Re-registration:
    - aimon binds the tools and pushes notifications/tools/list_changed to AI.
