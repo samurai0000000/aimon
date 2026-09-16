@@ -29,6 +29,7 @@ class Response;
 namespace aimon {
 
 class McpServer;
+class CollabOrchestrator;
 
 struct SseSession {
     std::string id;
@@ -50,6 +51,7 @@ public:
     bool start(bool async = false);
     void stop();
     void broadcastSseNotification(const std::string& jsonRpcNotification);
+    void setCollabOrchestrator(CollabOrchestrator* orch) { _collabOrch = orch; }
 
 private:
     void setupRoutes();
@@ -59,6 +61,7 @@ private:
     WebConfig _config;
     RefreshCallback _onRefresh;
     McpServer* _mcpServer = nullptr;
+    CollabOrchestrator* _collabOrch = nullptr;
 
     std::map<std::string, std::shared_ptr<SseSession>> _sseSessions;
     std::mutex _sessionsMutex;

@@ -21,6 +21,7 @@
 namespace aimon {
 
 class NcursesConsole;
+class CollabOrchestrator;
 
 class NcursesStreamBuf : public std::streambuf {
 public:
@@ -64,6 +65,7 @@ public:
     void updateHeader();
 
     void setShutdownCallback(ShutdownCallback cb);
+    void setCollabOrchestrator(CollabOrchestrator* orch) { _collabOrch = orch; }
 
 private:
     struct OutputLine {
@@ -83,6 +85,7 @@ private:
 
     StateStore& _stateStore;
     ShutdownCallback _shutdownCb;
+    CollabOrchestrator* _collabOrch = nullptr;
 
     std::mutex _uiMutex;
     std::atomic<bool> _running{false};

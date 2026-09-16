@@ -7,6 +7,7 @@
 #include "NcursesConsole.hxx"
 #include "TaskRegistry.hxx"
 #include "AgentMessageBus.hxx"
+#include "CollabOrchestrator.hxx"
 #include "Version.hxx"
 #include <sstream>
 #include <iomanip>
@@ -218,6 +219,29 @@ void NcursesConsole::updateHeader() {
     }
 
     ss << "Agents: " << sessions.size() << " connected ";
+
+    auto collab = AgentMessageBus::getInstance().getActiveCollaboration();
+    if (collab.status == CollaborationStatus::IN_PROGRESS ||
+        collab.status == CollaborationStatus::OPERATOR_REVIEW) {
+        std::string fileName = collab.planFile;
+        size_t slash = fileName.find_last_of('/');
+        if (slash != std::string::npos) fileName = fileName.substr(slash + 1);
+        ss << "| Collab: [" << fileName << " T" << (collab.currentTurn + 1)
+           << " " << AgentMessageBus::statusToString(collab.status);
+        if (_collabOrch) {
+            auto orchSt = _collabOrch->statusJson();
+            if (orchSt.value("is_executing", false)) {
+                std::string actor = orchSt.value("executing_actor", "");
+                size_t hy = actor.find('-');
+                if (hy != std::string::npos) actor = actor.substr(hy + 1);
+                ss << " RUN(" << actor << ")";
+            }
+            if (_collabOrch->isAutoDrive()) {
+                ss << " AUTO";
+            }
+        }
+        ss << "] ";
+    }
 
     std::string text = ss.str();
     if ((int)text.size() < _termCols) {
@@ -441,11 +465,138 @@ void NcursesConsole::processCommand(const std::string& line) {
         addOutputLine("  agents, list          List connected network agent sessions with numeric IDs", PAIR_INFO, false);
         addOutputLine("  chat <id>             Enter interactive chat mode with agent <id> (Press Ctrl+D to exit)", PAIR_INFO, false);
         addOutputLine("  msg, send <id> <text> Send a one-off asynchronous message to agent <id>", PAIR_INFO, false);
+        addOutputLine("  collab <file> [init]  Start plan collaboration between agents", PAIR_INFO, false);
+        addOutputLine("  collab status         Show current collaboration session state", PAIR_INFO, false);
+        addOutputLine("  collab nudge          Send a wakeup nudge to active collaboration session", PAIR_INFO, false);
+        addOutputLine("  collab takeover [id]  Takeover turn or assign to agent ID", PAIR_INFO, false);
+        addOutputLine("  collab abort          Abort active collaboration session", PAIR_INFO, false);
         addOutputLine("  status                Display quota metrics and daemon status", PAIR_INFO, false);
         addOutputLine("  clear                 Clear the command outputs history buffer", PAIR_INFO, false);
         addOutputLine("  help, ?               Show this command help", PAIR_INFO, false);
         addOutputLine("  quit, exit            Shutdown the aimon daemon", PAIR_INFO, false);
         addOutputLine("", 0, false);
+    } else if (cmd == "collab" || cmd == "collaborate") {
+        std::string subCmd;
+        iss >> subCmd;
+        if (subCmd.empty() || subCmd == "status") {
+            auto session = AgentMessageBus::getInstance().getActiveCollaboration();
+            if (session.status == CollaborationStatus::IDLE) {
+                addOutputLine("No active collaboration session.", PAIR_INFO, false);
+            } else {
+                addOutputLine("=== Active Collaboration Session ===", PAIR_INFO, true);
+                addOutputLine("  Plan File    : " + session.planFile, PAIR_TEXT, false);
+                addOutputLine("  Status       : " + AgentMessageBus::statusToString(session.status),
+                              (session.status == CollaborationStatus::OPERATOR_REVIEW ? PAIR_ERROR : PAIR_INFO), true);
+                addOutputLine("  Current Turn : " + std::to_string(session.currentTurn) + " / " + std::to_string(session.maxTurns), PAIR_TEXT, false);
+                addOutputLine("  Next Actor   : " + session.nextActorId, PAIR_PROMPT, true);
+                addOutputLine("  Initiator    : " + session.initiatorId, PAIR_TEXT, false);
+                addOutputLine("  Reviewer     : " + session.reviewerId, PAIR_TEXT, false);
+                if (!session.claimedBy.empty()) {
+                    addOutputLine("  Claimed By   : " + session.claimedBy, PAIR_TEXT, false);
+                }
+                if (!session.executor.empty()) {
+                    addOutputLine("  Executor     : " + session.executor, PAIR_TEXT, false);
+                }
+                if (_collabOrch) {
+                    addOutputLine("  Auto Drive   : " + std::string(_collabOrch->isAutoDrive() ? "ON" : "OFF"), PAIR_TEXT, false);
+                    auto orchSt = _collabOrch->statusJson();
+                    if (orchSt.value("is_executing", false)) {
+                        addOutputLine("  Running Proxy: " + orchSt.value("executing_actor", ""), PAIR_INFO, true);
+                    }
+                }
+                if (!session.lastRunError.empty()) {
+                    addOutputLine("  Last Error   : " + session.lastRunError, PAIR_ERROR, true);
+                }
+                addOutputLine("  Last Message : " + session.lastSideChannelMessage, PAIR_TEXT, false);
+            }
+            addOutputLine("", 0, false);
+        } else if (subCmd == "auto") {
+            std::string state;
+            iss >> state;
+            if (_collabOrch) {
+                bool enable = (state == "on" || state == "1" || state == "true");
+                _collabOrch->setAutoDrive(enable);
+                addOutputLine("[Collab Auto-Drive] Set to " + std::string(enable ? "ON" : "OFF"), PAIR_INFO, true);
+            } else {
+                addOutputLine("[Collab Error] Orchestrator not initialized.", PAIR_ERROR, true);
+            }
+            addOutputLine("", 0, false);
+        } else if (subCmd == "run") {
+            std::string planFile;
+            std::string initId = "agent-antigravity-builder";
+            std::string revId = "agent-cursor-windows";
+            iss >> planFile >> initId >> revId;
+            if (_collabOrch) {
+                std::string err;
+                if (_collabOrch->runUntilConsensus(planFile, initId, revId, &err)) {
+                    addOutputLine("[Collab Run] Orchestrator driving session for " + planFile, PAIR_INFO, true);
+                } else {
+                    addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
+                }
+            } else {
+                addOutputLine("[Collab Error] Orchestrator not initialized.", PAIR_ERROR, true);
+            }
+            addOutputLine("", 0, false);
+        } else if (subCmd == "step") {
+            if (_collabOrch) {
+                std::string err;
+                if (_collabOrch->stepTurn(&err)) {
+                    addOutputLine("[Collab Step] Executing single turn proxy...", PAIR_INFO, true);
+                } else {
+                    addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
+                }
+            } else {
+                addOutputLine("[Collab Error] Orchestrator not initialized.", PAIR_ERROR, true);
+            }
+            addOutputLine("", 0, false);
+        } else if (subCmd == "nudge") {
+            std::string err;
+            if (AgentMessageBus::getInstance().nudgeCollaboration(&err)) {
+                addOutputLine("[Collab] Nudge sent to active session.", PAIR_INFO, true);
+            } else {
+                addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
+            }
+            addOutputLine("", 0, false);
+        } else if (subCmd == "takeover") {
+            std::string targetAgent = "operator";
+            iss >> targetAgent;
+            std::string err;
+            if (AgentMessageBus::getInstance().takeoverCollaboration(targetAgent, &err)) {
+                addOutputLine("[Collab] Takeover authorized: turn assigned to " + targetAgent, PAIR_INFO, true);
+            } else {
+                addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
+            }
+            addOutputLine("", 0, false);
+        } else if (subCmd == "abort") {
+            std::string err;
+            bool ok = false;
+            if (_collabOrch) {
+                ok = _collabOrch->abortRun(&err);
+            } else {
+                ok = AgentMessageBus::getInstance().abortCollaboration(&err);
+            }
+            if (ok) {
+                addOutputLine("[Collab] Active session aborted.", PAIR_INFO, true);
+            } else {
+                addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
+            }
+            addOutputLine("", 0, false);
+        } else {
+            std::string planFile = subCmd;
+            std::string initId = "agent-antigravity-builder";
+            std::string revId = "agent-cursor-windows";
+            iss >> initId;
+            iss >> revId;
+
+            std::string err;
+            bool ok = AgentMessageBus::getInstance().startCollaboration(planFile, initId, revId, &err);
+            if (ok) {
+                addOutputLine("[Collab Started] Plan: " + planFile + " | Initiator: " + initId + " | Reviewer: " + revId, PAIR_INFO, true);
+            } else {
+                addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
+            }
+            addOutputLine("", 0, false);
+        }
     } else if (cmd == "agents" || cmd == "list") {
         auto sessions = TaskRegistry::getInstance().listSessions();
         if (sessions.empty()) {

@@ -226,6 +226,63 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id) {
                         }},
                         {"required", {"message_id", "reply_text"}}
                     }}
+                },
+                {
+                    {"name", "agent_collaborate"},
+                    {"description", "Signals completion of an agent's turn in a collaborative plan document and notifies the peer agent."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"plan_file", {
+                                {"type", "string"},
+                                {"description", "Path to the plan file on disk (e.g. 'plan/plan_new_feature.md')."}
+                            }},
+                            {"turn_number", {
+                                {"type", "integer"},
+                                {"description", "The turn number just completed (e.g. 1, 2, 3...)."}
+                            }},
+                            {"agent_id", {
+                                {"type", "string"},
+                                {"description", "Canonical ID of calling agent ('agent-antigravity-builder' or 'agent-cursor-windows')."}
+                            }},
+                            {"agent_model", {
+                                {"type", "string"},
+                                {"description", "Model identifier string (e.g. 'Gemini 3.8 Flash High', 'Cursor Grok 4.6 High')."}
+                            }},
+                            {"status", {
+                                {"type", "string"},
+                                {"enum", {"IN_PROGRESS", "CONSENSUS_REACHED"}},
+                                {"description", "Session status ('IN_PROGRESS' or 'CONSENSUS_REACHED')."}
+                            }},
+                            {"side_channel_message", {
+                                {"type", "string"},
+                                {"description", "Optional brief note or highlight passed out-of-band to the peer and displayed on operator console."}
+                            }}
+                        }},
+                        {"required", {"plan_file", "turn_number", "agent_id", "agent_model", "status"}}
+                    }}
+                },
+                {
+                    {"name", "agent_wait_turn"},
+                    {"description", "Waits or polls for this agent's turn to execute in an active plan collaboration session. Does not consume or pop the latch on read."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"plan_file", {
+                                {"type", "string"},
+                                {"description", "Path to the plan file to wait for (e.g. 'plan/plan_new_feature.md')."}
+                            }},
+                            {"agent_id", {
+                                {"type", "string"},
+                                {"description", "Canonical ID of calling agent ('agent-antigravity-builder' or 'agent-cursor-windows')."}
+                            }},
+                            {"timeout_seconds", {
+                                {"type", "integer"},
+                                {"description", "Seconds to wait. 0 for indefinite blocking (kernel CV wait). >0 for short polling (default: 0)."}
+                            }}
+                        }},
+                        {"required", {"plan_file", "agent_id"}}
+                    }}
                 }
             }}
         }}
@@ -343,6 +400,51 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
             {"message_id", msgId}
         };
         contentText = res.dump(2);
+    } else if (toolName == "agent_collaborate") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string planFile = args.value("plan_file", "");
+        int turnNumber = args.value("turn_number", 0);
+        std::string agentId = args.value("agent_id", "");
+        std::string agentModel = args.value("agent_model", "");
+        std::string status = args.value("status", "IN_PROGRESS");
+        std::string sideChannelMessage = args.value("side_channel_message", "");
+
+        nlohmann::json outResult;
+        std::string error;
+        bool ok = AgentMessageBus::getInstance().signalCollaborationTurn(
+            planFile, turnNumber, agentId, agentModel, status, sideChannelMessage, outResult, &error
+        );
+
+        if (!ok) {
+            nlohmann::json errJson = {
+                {"status", "error"},
+                {"error", error}
+            };
+            contentText = errJson.dump(2);
+        } else {
+            contentText = outResult.dump(2);
+        }
+    } else if (toolName == "agent_wait_turn") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string planFile = args.value("plan_file", "");
+        std::string agentId = args.value("agent_id", "");
+        int timeoutSeconds = args.value("timeout_seconds", 0);
+
+        nlohmann::json outResult;
+        std::string error;
+        bool ok = AgentMessageBus::getInstance().waitCollaborationTurn(
+            planFile, agentId, timeoutSeconds, outResult, &error
+        );
+
+        if (!ok) {
+            nlohmann::json errJson = {
+                {"status", "error"},
+                {"error", error}
+            };
+            contentText = errJson.dump(2);
+        } else {
+            contentText = outResult.dump(2);
+        }
     } else if (_dynamicRegistry && _tcpGateway && _dynamicRegistry->hasTool(toolName)) {
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         nlohmann::json gwResult;

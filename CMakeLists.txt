@@ -70,6 +70,8 @@ set(SOURCES
     src/MqttPublisher.cxx
     src/WebServer.cxx
     src/AgentMessageBus.cxx
+    src/AgentRunner.cxx
+    src/CollabOrchestrator.cxx
     src/NcursesConsole.cxx
 )
 

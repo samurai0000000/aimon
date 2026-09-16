@@ -54,7 +54,29 @@ nlohmann::json AimonConfig::toJson() const {
             {"enabled", gateway.enabled},
             {"host", gateway.host},
             {"port", gateway.port}
-        }}
+        }},
+        {"collaboration", [this]() {
+            nlohmann::json rObj = nlohmann::json::object();
+            for (const auto& kv : collaboration.runners) {
+                rObj[kv.first] = {
+                    {"read_command", kv.second.readCommand},
+                    {"write_command", kv.second.writeCommand},
+                    {"script_bridge", kv.second.scriptBridge},
+                    {"timeout_seconds", kv.second.timeoutSeconds}
+                };
+            }
+            return nlohmann::json{
+                {"auto_drive", collaboration.autoDrive},
+                {"live_waiter_grace_seconds", collaboration.liveWaiterGraceSeconds},
+                {"runner_backoff_seconds", collaboration.runnerBackoffSeconds},
+                {"write_timeout_seconds", collaboration.writeTimeoutSeconds},
+                {"read_timeout_seconds", collaboration.readTimeoutSeconds},
+                {"max_turns", collaboration.maxTurns},
+                {"max_retries_per_turn", collaboration.maxRetriesPerTurn},
+                {"min_cursor_quota", collaboration.minCursorQuota},
+                {"runners", rObj}
+            };
+        }()}
     };
 }
 
@@ -109,6 +131,29 @@ void AimonConfig::fromJson(const nlohmann::json& j) {
         if (g.contains("enabled")) gateway.enabled = g["enabled"];
         if (g.contains("host")) gateway.host = g["host"];
         if (g.contains("port")) gateway.port = g["port"];
+    }
+
+    if (j.contains("collaboration")) {
+        const auto& col = j["collaboration"];
+        if (col.contains("auto_drive")) collaboration.autoDrive = col["auto_drive"];
+        if (col.contains("claim_window_seconds")) collaboration.liveWaiterGraceSeconds = col["claim_window_seconds"];
+        if (col.contains("live_waiter_grace_seconds")) collaboration.liveWaiterGraceSeconds = col["live_waiter_grace_seconds"];
+        if (col.contains("runner_backoff_seconds")) collaboration.runnerBackoffSeconds = col["runner_backoff_seconds"];
+        if (col.contains("write_timeout_seconds")) collaboration.writeTimeoutSeconds = col["write_timeout_seconds"];
+        if (col.contains("read_timeout_seconds")) collaboration.readTimeoutSeconds = col["read_timeout_seconds"];
+        if (col.contains("max_turns")) collaboration.maxTurns = col["max_turns"];
+        if (col.contains("max_retries_per_turn")) collaboration.maxRetriesPerTurn = col["max_retries_per_turn"];
+        if (col.contains("min_cursor_quota")) collaboration.minCursorQuota = col["min_cursor_quota"];
+        if (col.contains("runners") && col["runners"].is_object()) {
+            for (auto it = col["runners"].begin(); it != col["runners"].end(); ++it) {
+                AgentRunnerConfig r;
+                if (it.value().contains("read_command")) r.readCommand = it.value()["read_command"];
+                if (it.value().contains("write_command")) r.writeCommand = it.value()["write_command"];
+                if (it.value().contains("script_bridge")) r.scriptBridge = it.value()["script_bridge"];
+                if (it.value().contains("timeout_seconds")) r.timeoutSeconds = it.value()["timeout_seconds"];
+                collaboration.runners[it.key()] = r;
+            }
+        }
     }
 }
 
