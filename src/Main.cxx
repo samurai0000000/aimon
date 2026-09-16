@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <unistd.h>
 #include "ConfigManager.hxx"
 #include "PathUtils.hxx"
 #include "Models.hxx"
@@ -24,6 +25,8 @@
 #include "WebServer.hxx"
 #include "DynamicToolRegistry.hxx"
 #include "TcpGateway.hxx"
+#include "AgentMessageBus.hxx"
+#include "NcursesConsole.hxx"
 #include "Version.hxx"
 
 using namespace aimon;
@@ -31,10 +34,14 @@ using namespace aimon;
 static std::atomic<bool> g_shutdown(false);
 static std::condition_variable g_cv;
 static std::mutex g_cvMutex;
+static NcursesConsole* g_console = nullptr;
 
 static void signalHandler(int sig) {
     (void)sig;
     g_shutdown = true;
+    if (g_console) {
+        g_console->shutdown();
+    }
     g_cv.notify_all();
 }
 
@@ -59,6 +66,7 @@ static void printUsage(const char* progName) {
               << "  --cursor-token <token> Set Cursor authentication token\n"
               << "  --gateway-port <port>  Port for TCP Tool Gateway (default: 3885)\n"
               << "  --gateway-disable      Disable TCP Tool Gateway\n"
+              << "  --no-ncurses           Disable split-screen ncurses terminal interface\n"
               << "  --version, -v          Display version and build metadata\n"
               << "  --help, -h             Display this help message\n"
               << std::endl;
@@ -79,6 +87,7 @@ int main(int argc, char* argv[]) {
     std::string optCursorToken;
     int optGatewayPort = 0;
     bool optGatewayDisable = false;
+    bool optNoNcurses = false;
 
     int argIdx = 1;
     if (argIdx < argc && argv[argIdx][0] != '-') {
@@ -117,6 +126,8 @@ int main(int argc, char* argv[]) {
             optGatewayPort = std::stoi(argv[argIdx++]);
         } else if (arg == "--gateway-disable") {
             optGatewayDisable = true;
+        } else if (arg == "--no-ncurses") {
+            optNoNcurses = true;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             printUsage(argv[0]);
@@ -259,23 +270,85 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "[aimon] Running in " << command << " mode (PID: " << getpid() << ")" << std::endl;
-    std::cout << "[aimon] Press Ctrl+C to stop." << std::endl;
 
-    // Adaptive polling loop
-    while (!g_shutdown) {
-        std::unique_lock<std::mutex> lock(g_cvMutex);
+    bool isTty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    const char* termEnv = std::getenv("TERM");
+    if (termEnv && std::string(termEnv) == "dumb") {
+        isTty = false;
+    }
+    if (optNoNcurses) {
+        isTty = false;
+    }
 
-        AggregateStatus current = stateStore.getStatus();
-        int waitSec = cfg.polling.baseIntervalSec;
-        if (!current.antigravity.isRunning && !current.cursor.isAuthenticated) {
-            waitSec = cfg.polling.idleIntervalSec;
+    std::unique_ptr<NcursesConsole> console;
+    if (isTty && (command == "daemon" || command == "web")) {
+        console = std::make_unique<NcursesConsole>(stateStore);
+        g_console = console.get();
+        console->setShutdownCallback([&]() {
+            g_shutdown = true;
+            g_cv.notify_all();
+        });
+
+        AgentMessageBus::getInstance().setReplyCallback([&](const std::string& sessId,
+                                                            const std::string& msgId,
+                                                            const std::string& reply) {
+            if (console) {
+                console->logAgentReply(sessId, msgId, reply);
+            }
+        });
+
+        console->init();
+    } else {
+        AgentMessageBus::getInstance().setReplyCallback([&](const std::string& sessId,
+                                                            const std::string& msgId,
+                                                            const std::string& reply) {
+            std::cout << "\n[Agent (" << sessId.substr(0, 8) << ") ref: " << msgId << "]:\n"
+                      << reply << "\n" << std::endl;
+        });
+        std::cout << "[aimon] Press Ctrl+C to stop." << std::endl;
+    }
+
+    // Background poller thread
+    std::thread pollerThread([&]() {
+        while (!g_shutdown) {
+            std::unique_lock<std::mutex> lock(g_cvMutex);
+
+            AggregateStatus current = stateStore.getStatus();
+            int waitSec = cfg.polling.baseIntervalSec;
+            if (!current.antigravity.isRunning && !current.cursor.isAuthenticated) {
+                waitSec = cfg.polling.idleIntervalSec;
+            }
+
+            if (g_cv.wait_for(lock, std::chrono::seconds(waitSec), [] { return g_shutdown.load(); })) {
+                break;
+            }
+
+            pollOnce();
+            if (console) {
+                console->updateHeader();
+            }
         }
+    });
 
-        if (g_cv.wait_for(lock, std::chrono::seconds(waitSec), [] { return g_shutdown.load(); })) {
-            break;
+    if (console) {
+        console->run();
+    } else {
+        while (!g_shutdown) {
+            std::unique_lock<std::mutex> lock(g_cvMutex);
+            g_cv.wait(lock, [] { return g_shutdown.load(); });
         }
+    }
 
-        pollOnce();
+    g_shutdown = true;
+    g_cv.notify_all();
+
+    if (pollerThread.joinable()) {
+        pollerThread.join();
+    }
+
+    if (console) {
+        g_console = nullptr;
+        console->shutdown();
     }
 
     std::cout << "\n[aimon] Shutting down cleanly..." << std::endl;

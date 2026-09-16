@@ -8,6 +8,7 @@
 #include "DynamicToolRegistry.hxx"
 #include "TcpGateway.hxx"
 #include "TaskRegistry.hxx"
+#include "AgentMessageBus.hxx"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -194,6 +195,37 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id) {
                             }}
                         }}
                     }}
+                },
+                {
+                    {"name", "agent_check_inbox"},
+                    {"description", "Polls the aimon operator console for pending messages or instructions sent to this agent. Waits indefinitely if timeout_seconds is 0."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"timeout_seconds", {
+                                {"type", "integer"},
+                                {"description", "Maximum time in seconds to wait for a message before returning keep-alive (0 for indefinite blocking, default: 0)."}
+                            }}
+                        }}
+                    }}
+                },
+                {
+                    {"name", "agent_send_reply"},
+                    {"description", "Delivers a reply back to the aimon operator console for a previously received message."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"message_id", {
+                                {"type", "string"},
+                                {"description", "The ID of the message being replied to."}
+                            }},
+                            {"reply_text", {
+                                {"type", "string"},
+                                {"description", "The text response to deliver back to the aimon operator console."}
+                            }}
+                        }},
+                        {"required", {"message_id", "reply_text"}}
+                    }}
                 }
             }}
         }}
@@ -266,6 +298,51 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         bool includeCompleted = args.value("include_completed", false);
         auto tasks = TaskRegistry::getInstance().listTasks(includeCompleted);
         contentText = formatAgentTasks(tasks);
+    } else if (toolName == "agent_check_inbox") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        int timeoutSec = args.value("timeout_seconds", 0);
+        std::string sessionId = args.value("sse_session_id", "");
+
+        AgentMessage msg;
+        bool gotMsg = AgentMessageBus::getInstance().fetchNextMessageForAgent(sessionId, timeoutSec, msg);
+        if (gotMsg) {
+            nlohmann::json res = {
+                {"status", "message"},
+                {"message_id", msg.messageId},
+                {"session_id", msg.sessionId},
+                {"text", msg.text},
+                {"timestamp_epoch", msg.timestampEpoch}
+            };
+            contentText = res.dump(2);
+        } else {
+            nlohmann::json res = {
+                {"status", "idle"},
+                {"action", "poll_again"}
+            };
+            contentText = res.dump(2);
+        }
+    } else if (toolName == "agent_send_reply") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string msgId = args.value("message_id", "");
+        std::string replyText = args.value("reply_text", "");
+        std::string sessionId = args.value("sse_session_id", "");
+        if (sessionId.empty()) {
+            sessionId = args.value("session_id", "");
+        }
+
+        if (sessionId.empty()) {
+            auto sessions = TaskRegistry::getInstance().listSessions();
+            if (!sessions.empty()) {
+                sessionId = sessions.front().sessionId;
+            }
+        }
+
+        bool delivered = AgentMessageBus::getInstance().postReplyFromAgent(sessionId, msgId, replyText);
+        nlohmann::json res = {
+            {"status", delivered ? "delivered" : "no_listener"},
+            {"message_id", msgId}
+        };
+        contentText = res.dump(2);
     } else if (_dynamicRegistry && _tcpGateway && _dynamicRegistry->hasTool(toolName)) {
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         nlohmann::json gwResult;

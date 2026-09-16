@@ -337,7 +337,10 @@ void WebServer::setupRoutes() {
         if (method == "tools/call" && !sessionId.empty()) {
             if (reqJson.contains("params") && reqJson["params"].is_object()) {
                 auto& p = reqJson["params"];
-                if (p.value("name", "") == "register_agent_task") {
+                std::string tName = p.value("name", "");
+                if (tName == "register_agent_task" ||
+                    tName == "agent_check_inbox" ||
+                    tName == "agent_send_reply") {
                     if (!p.contains("arguments") || !p["arguments"].is_object()) {
                         p["arguments"] = nlohmann::json::object();
                     }

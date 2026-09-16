@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.1 LANGUAGES CXX)
+project(aimon VERSION 1.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,6 +50,7 @@ configure_file(
 find_package(OpenSSL REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(Threads REQUIRED)
+find_package(Curses REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 
@@ -68,6 +69,8 @@ set(SOURCES
     src/McpServer.cxx
     src/MqttPublisher.cxx
     src/WebServer.cxx
+    src/AgentMessageBus.cxx
+    src/NcursesConsole.cxx
 )
 
 add_executable(aimon ${SOURCES})
@@ -81,6 +84,7 @@ target_include_directories(aimon PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
     ${MOSQUITTO_INCLUDE_DIRS}
+    ${CURSES_INCLUDE_DIRS}
 )
 
 target_link_libraries(aimon PRIVATE
@@ -89,6 +93,7 @@ target_link_libraries(aimon PRIVATE
     SQLite::SQLite3
     Threads::Threads
     ${MOSQUITTO_LIBRARIES}
+    ${CURSES_LIBRARIES}
 )
 
 if(MOSQUITTO_LIBRARY_DIRS)
