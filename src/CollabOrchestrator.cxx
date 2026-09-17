@@ -367,6 +367,12 @@ bool CollabOrchestrator::executeInitiatorTurn(const CollaborationSession& sessio
             &signalErr);
 
         if (!ok) {
+            auto currentSession = AgentMessageBus::getInstance().getActiveCollaboration();
+            if (currentSession.currentTurn >= turnToExecute) {
+                // The turn has already been successfully advanced (e.g. by a previous attempt or concurrent signal),
+                // so we do not need to treat this as an error. Break out of the retry loop.
+                break;
+            }
             AgentMessageBus::getInstance().restorePlanFileSnapshot(session.planFile, turnToExecute);
             if (retriesLeft > 0) {
                 retriesLeft--;

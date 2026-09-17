@@ -29,6 +29,8 @@
 #include "NcursesConsole.hxx"
 #include "AgentRunner.hxx"
 #include "CollabOrchestrator.hxx"
+#include "TranscriptSink.hxx"
+#include "InterlockManager.hxx"
 #include "Version.hxx"
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -337,6 +339,11 @@ int main(int argc, char* argv[]) {
     // Web or Daemon mode
     DynamicToolRegistry dynamicRegistry;
     TcpGateway tcpGateway(dynamicRegistry);
+
+    TranscriptSink& transcriptSink = TranscriptSink::getInstance();
+    InterlockManager& interlockManager = InterlockManager::getInstance();
+    (void)transcriptSink;
+    (void)interlockManager;
 
     McpServer mcpServer(stateStore, &dynamicRegistry, &tcpGateway);
     WebServer webServer(stateStore, historyStore, cfg.web, [&]() {

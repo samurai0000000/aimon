@@ -72,6 +72,8 @@ set(SOURCES
     src/AgentMessageBus.cxx
     src/AgentRunner.cxx
     src/CollabOrchestrator.cxx
+    src/TranscriptSink.cxx
+    src/InterlockManager.cxx
     src/NcursesConsole.cxx
 )
 

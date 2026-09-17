@@ -1,0 +1,30 @@
+{
+  "name": "exec_start_run",
+  "description": "Starts a new plan execution run and initializes the transcript sink.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "plan_file": {
+        "description": "Path to plan document being executed.",
+        "type": "string"
+      },
+      "workspace": {
+        "description": "Target workspace path or name.",
+        "type": "string"
+      },
+      "target_alias": {
+        "description": "Hardware device or environment alias (e.g. 'n1-655-devkit').",
+        "type": "string"
+      },
+      "executor_id": {
+        "description": "Canonical ID of executor agent (default: 'agent-antigravity-builder').",
+        "type": "string"
+      },
+      "initiator_id": {
+        "description": "Canonical ID of initiator/reviewer agent (default: 'agent-cursor-windows').",
+        "type": "string"
+      }
+    },
+    "required": ["plan_file", "target_alias"]
+  }
+}

@@ -229,6 +229,94 @@
                     <p class="empty-desc">Agents reporting via MCP (<code>register_agent_task</code>) or HTTP will appear here in real time.</p>
                 </div>
             </section>
+
+            <!-- Execution Runs & Interlock Section -->
+            <section class="card glass-card exec-runs-card" id="exec-runs-section">
+                <div class="card-header">
+                    <div class="provider-title">
+                        <span class="dot-status dot-online" id="exec-status-dot"></span>
+                        <h2>Execution Runs &amp; Interlock</h2>
+                    </div>
+                    <div class="exec-header-actions">
+                        <span id="exec-run-badge" class="badge">No Active Run</span>
+                    </div>
+                </div>
+
+                <!-- Pending Interlock Banner -->
+                <div id="interlock-banner" class="interlock-banner hidden">
+                    <div class="interlock-header">
+                        <div class="interlock-icon-title">
+                            <span class="interlock-icon">⚠️</span>
+                            <div>
+                                <h3 class="interlock-title">Operator Approval Required</h3>
+                                <div class="interlock-sub" id="interlock-sub">Checkpoint action awaiting human sign-off</div>
+                            </div>
+                        </div>
+                        <span class="badge badge-amber" id="interlock-id-badge">intk-...</span>
+                    </div>
+
+                    <div class="interlock-body">
+                        <div class="interlock-box">
+                            <span class="interlock-label">Description / Reason</span>
+                            <div class="interlock-val" id="interlock-desc-text">--</div>
+                        </div>
+                        <div class="interlock-box" id="interlock-action-box">
+                            <span class="interlock-label">Proposed Action</span>
+                            <pre class="interlock-code-val" id="interlock-action-text">--</pre>
+                        </div>
+                    </div>
+
+                    <div class="interlock-actions-row" id="interlock-buttons-row">
+                        <button type="button" class="btn-interlock btn-approve" id="btn-interlock-approve">
+                            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                            Approve Action
+                        </button>
+                        <button type="button" class="btn-interlock btn-reject" id="btn-interlock-reject">
+                            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                            Reject Action
+                        </button>
+                    </div>
+
+                    <div id="interlock-reject-box" class="interlock-reject-box hidden">
+                        <input type="text" id="interlock-reject-reason" class="input-reject-reason" placeholder="Enter reason for rejection (optional)...">
+                        <button type="button" class="btn-action-confirm" id="btn-confirm-reject">Confirm Reject</button>
+                        <button type="button" class="btn-action-cancel" id="btn-cancel-reject">Cancel</button>
+                    </div>
+                </div>
+
+                <!-- Active Run Details -->
+                <div id="exec-run-details" class="exec-run-details hidden">
+                    <div class="exec-meta-grid">
+                        <div class="exec-meta-item">
+                            <span class="meta-label">Target Alias</span>
+                            <span class="meta-val" id="exec-meta-target">--</span>
+                        </div>
+                        <div class="exec-meta-item">
+                            <span class="meta-label">Plan Document</span>
+                            <span class="meta-val" id="exec-meta-plan">--</span>
+                        </div>
+                        <div class="exec-meta-item">
+                            <span class="meta-label">Actors</span>
+                            <span class="meta-val" id="exec-meta-actors">--</span>
+                        </div>
+                        <div class="exec-meta-item">
+                            <span class="meta-label">Elapsed Time</span>
+                            <span class="meta-val" id="exec-meta-duration">00m 00s</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Transcript Events Stream -->
+                <div class="exec-transcript-section">
+                    <div class="transcript-header-row">
+                        <h3>Event Transcript</h3>
+                        <span class="transcript-count-badge" id="transcript-count">0 events</span>
+                    </div>
+                    <div class="transcript-stream-container" id="transcript-stream">
+                        <div class="transcript-empty" id="transcript-empty">No execution runs or events recorded yet</div>
+                    </div>
+                </div>
+            </section>
         </main>
 
         <footer class="app-footer">

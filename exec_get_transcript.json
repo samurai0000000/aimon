@@ -1,0 +1,18 @@
+{
+  "name": "exec_get_transcript",
+  "description": "Fetches structured transcript events for a run, optionally starting after since_seq.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "description": "Run ID to fetch transcript for (default: active run).",
+        "type": "string"
+      },
+      "since_seq": {
+        "description": "Only fetch events with sequence number greater than this value (default: 0).",
+        "type": "integer"
+      }
+    },
+    "required": ["run_id"]
+  }
+}

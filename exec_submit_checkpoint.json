@@ -1,0 +1,44 @@
+{
+  "name": "exec_submit_checkpoint",
+  "description": "Records the result of an executed checkpoint in the current run transcript.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "description": "Active run ID.",
+        "type": "string"
+      },
+      "checkpoint_id": {
+        "description": "Checkpoint identifier (e.g. 'cp-01', 'step-5').",
+        "type": "string"
+      },
+      "commands": {
+        "description": "List of commands executed.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "exit_codes": {
+        "description": "List of command exit status codes.",
+        "items": {
+          "type": "integer"
+        },
+        "type": "array"
+      },
+      "dmesg_excerpt": {
+        "description": "Kernel logs, dmesg, or diagnostic snippet.",
+        "type": "string"
+      },
+      "artifacts": {
+        "description": "Key-value map of hashes, output paths, or artifacts generated.",
+        "type": "object"
+      },
+      "notes": {
+        "description": "Observations, analysis, or explanation of checkpoint execution.",
+        "type": "string"
+      }
+    },
+    "required": ["run_id", "checkpoint_id"]
+  }
+}

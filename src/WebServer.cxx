@@ -10,6 +10,8 @@
 #include "TaskRegistry.hxx"
 #include "AgentMessageBus.hxx"
 #include "CollabOrchestrator.hxx"
+#include "TranscriptSink.hxx"
+#include "InterlockManager.hxx"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -56,6 +58,23 @@ void WebServer::setupRoutes() {
         nlohmann::json evt = {
             {"event", eventType},
             {"session", session.toJson()}
+        };
+        std::string sseData = evt.dump();
+        std::lock_guard<std::mutex> lock(_sessionsMutex);
+        for (auto& pair : _sseSessions) {
+            auto s = pair.second;
+            if (s && !s->closed.load()) {
+                std::lock_guard<std::mutex> slock(s->mutex);
+                s->messageQueue.push(sseData);
+                s->cv.notify_one();
+            }
+        }
+    });
+
+    InterlockManager::getInstance().setNotifyCallback([this](const InterlockRequest& req, const std::string& eventType) {
+        nlohmann::json evt = {
+            {"event", eventType},
+            {"interlock", req.toJson()}
         };
         std::string sseData = evt.dump();
         std::lock_guard<std::mutex> lock(_sessionsMutex);
@@ -413,6 +432,114 @@ void WebServer::setupRoutes() {
             nlohmann::json resp;
             resp["status"] = "aborted";
             res.set_content(resp.dump(2), "application/json");
+        }
+    });
+
+    // --- Execution Runs & Transcript Endpoints ---
+    _server->Get("/api/exec/runs", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        auto runs = TranscriptSink::getInstance().listRuns();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& r : runs) {
+            arr.push_back(r.toJson());
+        }
+        nlohmann::json resp = {
+            {"active_run_id", TranscriptSink::getInstance().getActiveRunId()},
+            {"runs", arr}
+        };
+        res.set_content(resp.dump(2), "application/json");
+    });
+
+    _server->Post(R"(/api/exec/runs/([^/]+)/end)", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string runId = req.matches[1].str();
+        std::string status = "completed";
+        if (!req.body.empty()) {
+            try {
+                auto body = nlohmann::json::parse(req.body);
+                status = body.value("status", "completed");
+            } catch (...) {}
+        }
+        std::string err;
+        bool ok = TranscriptSink::getInstance().endRun(runId, status, err);
+        if (!ok) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"error", err}}).dump(2), "application/json");
+        } else {
+            res.set_content(nlohmann::json({
+                {"status", "ok"},
+                {"run_id", runId},
+                {"terminal_status", status}
+            }).dump(2), "application/json");
+        }
+    });
+
+    _server->Get(R"(/api/exec/runs/([^/]+)/transcript)", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string runId = req.matches[1].str();
+        int sinceSeq = 0;
+        if (req.has_param("since_seq")) {
+            try {
+                sinceSeq = std::stoi(req.get_param_value("since_seq"));
+            } catch (...) {}
+        }
+        auto events = TranscriptSink::getInstance().getTranscript(runId, sinceSeq);
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& ev : events) {
+            arr.push_back(ev.toJson());
+        }
+        RunMetadata meta;
+        bool hasMeta = TranscriptSink::getInstance().getRunMetadata(runId, meta);
+        nlohmann::json resp = {
+            {"run_id", runId},
+            {"metadata", hasMeta ? meta.toJson() : nlohmann::json::object()},
+            {"event_count", (int)arr.size()},
+            {"events", arr}
+        };
+        res.set_content(resp.dump(2), "application/json");
+    });
+
+    _server->Get("/api/exec/interlocks", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string runId = req.has_param("run_id") ? req.get_param_value("run_id") : "";
+        bool includeResolved = req.has_param("include_resolved") &&
+            (req.get_param_value("include_resolved") == "true" || req.get_param_value("include_resolved") == "1");
+
+        auto list = includeResolved ?
+            InterlockManager::getInstance().listInterlocks(runId) :
+            InterlockManager::getInstance().getPendingInterlocks(runId);
+
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& item : list) {
+            arr.push_back(item.toJson());
+        }
+        res.set_content(arr.dump(2), "application/json");
+    });
+
+    _server->Post(R"(/api/exec/interlocks/([^/]+)/resolve)", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string interlockId = req.matches[1].str();
+        try {
+            auto body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
+            bool approved = body.value("approved", false);
+            std::string reason = body.value("reason", "");
+            bool ok = InterlockManager::getInstance().resolveInterlock(interlockId, approved, reason);
+            if (!ok) {
+                res.status = 404;
+                res.set_content(nlohmann::json({
+                    {"error", "Interlock not found or already resolved: " + interlockId}
+                }).dump(2), "application/json");
+            } else {
+                res.set_content(nlohmann::json({
+                    {"status", "ok"},
+                    {"interlock_id", interlockId},
+                    {"approved", approved},
+                    {"reason", reason}
+                }).dump(2), "application/json");
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"error", e.what()}}).dump(2), "application/json");
         }
     });
 

@@ -666,16 +666,335 @@ async function fetchSessions() {
     }
 }
 
+// -------------------------------------------------------------
+// Execution Runs & Interlock Logic
+// -------------------------------------------------------------
+let currentActiveRun = null;
+let currentPendingInterlock = null;
+let currentTranscriptEvents = [];
+let activeRunStartEpoch = 0;
+
+async function fetchExecState() {
+    try {
+        // 1. Fetch runs list & active run
+        const runsRes = await fetch('/api/exec/runs');
+        if (runsRes.ok) {
+            const runsData = await runsRes.json();
+            const activeRunId = runsData.active_run_id;
+            const runs = runsData.runs || [];
+
+            if (activeRunId) {
+                currentActiveRun = runs.find(r => r.run_id === activeRunId) || { run_id: activeRunId };
+            } else if (runs.length > 0) {
+                currentActiveRun = runs[0];
+            } else {
+                currentActiveRun = null;
+            }
+            renderActiveRun(currentActiveRun, activeRunId);
+        }
+
+        // 2. Fetch pending interlocks
+        const intkRes = await fetch('/api/exec/interlocks');
+        if (intkRes.ok) {
+            const interlocks = await intkRes.json();
+            currentPendingInterlock = interlocks.length > 0 ? interlocks[0] : null;
+            renderInterlockBanner(currentPendingInterlock);
+        }
+
+        // 3. Fetch transcript for current run
+        if (currentActiveRun && currentActiveRun.run_id) {
+            const txRes = await fetch(`/api/exec/runs/${encodeURIComponent(currentActiveRun.run_id)}/transcript`);
+            if (txRes.ok) {
+                const txData = await txRes.json();
+                currentTranscriptEvents = txData.events || [];
+                renderTranscript(currentTranscriptEvents);
+            }
+        } else {
+            renderTranscript([]);
+        }
+    } catch (e) {
+        console.warn('Failed to fetch exec state:', e);
+    }
+}
+
+function renderActiveRun(run, activeRunId) {
+    const badgeEl = document.getElementById('exec-run-badge');
+    const detailsEl = document.getElementById('exec-run-details');
+    const dotEl = document.getElementById('exec-status-dot');
+
+    if (!run) {
+        if (badgeEl) {
+            badgeEl.textContent = 'No Active Run';
+            badgeEl.className = 'badge';
+        }
+        if (detailsEl) detailsEl.classList.add('hidden');
+        if (dotEl) dotEl.className = 'dot-status dot-offline';
+        activeRunStartEpoch = 0;
+        return;
+    }
+
+    const isActive = (run.run_id === activeRunId && (!run.terminal_status || run.terminal_status === 'running'));
+    if (dotEl) {
+        dotEl.className = isActive ? 'dot-status dot-online' : 'dot-status';
+    }
+
+    if (badgeEl) {
+        badgeEl.textContent = isActive ? `Active: ${run.run_id}` : `Run: ${run.run_id} (${run.terminal_status || 'ended'})`;
+        badgeEl.className = isActive ? 'badge badge-cyan' : 'badge';
+    }
+
+    if (detailsEl) {
+        detailsEl.classList.remove('hidden');
+        const targetEl = document.getElementById('exec-meta-target');
+        const planEl = document.getElementById('exec-meta-plan');
+        const actorsEl = document.getElementById('exec-meta-actors');
+        const durationEl = document.getElementById('exec-meta-duration');
+
+        if (targetEl) targetEl.textContent = run.target_alias || '--';
+        if (planEl) planEl.textContent = run.plan_file || '--';
+        if (actorsEl) {
+            const init = run.initiator_id ? run.initiator_id.replace('agent-', '') : '';
+            const exec = run.executor_id ? run.executor_id.replace('agent-', '') : '';
+            actorsEl.textContent = `${init} ➔ ${exec}`;
+        }
+        activeRunStartEpoch = run.start_epoch || 0;
+        if (durationEl) {
+            durationEl.textContent = formatElapsed(run.start_epoch, run.end_epoch);
+        }
+    }
+}
+
+function renderInterlockBanner(intk) {
+    const banner = document.getElementById('interlock-banner');
+    if (!banner) return;
+
+    if (!intk) {
+        banner.classList.add('hidden');
+        return;
+    }
+
+    banner.classList.remove('hidden');
+    const badgeId = document.getElementById('interlock-id-badge');
+    const descText = document.getElementById('interlock-desc-text');
+    const actionText = document.getElementById('interlock-action-text');
+    const actionBox = document.getElementById('interlock-action-box');
+    const rejectBox = document.getElementById('interlock-reject-box');
+    const buttonsRow = document.getElementById('interlock-buttons-row');
+
+    if (badgeId) badgeId.textContent = intk.interlock_id || 'intk';
+    if (descText) descText.textContent = intk.description || 'No description provided';
+    if (actionText) {
+        if (intk.proposed_action) {
+            actionText.textContent = intk.proposed_action;
+            if (actionBox) actionBox.classList.remove('hidden');
+        } else {
+            if (actionBox) actionBox.classList.add('hidden');
+        }
+    }
+
+    if (rejectBox) rejectBox.classList.add('hidden');
+    if (buttonsRow) buttonsRow.classList.remove('hidden');
+}
+
+async function resolveInterlock(approved, reason = '') {
+    if (!currentPendingInterlock || !currentPendingInterlock.interlock_id) return;
+    const id = currentPendingInterlock.interlock_id;
+
+    try {
+        const res = await fetch(`/api/exec/interlocks/${encodeURIComponent(id)}/resolve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ approved, reason })
+        });
+        if (res.ok) {
+            currentPendingInterlock = null;
+            renderInterlockBanner(null);
+            fetchExecState();
+        } else {
+            alert('Failed to resolve interlock: HTTP ' + res.status);
+        }
+    } catch (e) {
+        console.error('Error resolving interlock:', e);
+        alert('Network error resolving interlock: ' + e.message);
+    }
+}
+
+function renderTranscript(events) {
+    const countBadge = document.getElementById('transcript-count');
+    const stream = document.getElementById('transcript-stream');
+    if (!stream) return;
+
+    if (countBadge) {
+        countBadge.textContent = `${events.length} event${events.length === 1 ? '' : 's'}`;
+    }
+
+    if (!events || events.length === 0) {
+        stream.innerHTML = '<div class="transcript-empty">No execution runs or events recorded yet</div>';
+        return;
+    }
+
+    stream.innerHTML = events.map(ev => {
+        const kind = (ev.kind || '').toLowerCase();
+        const actor = (ev.actor || '').toLowerCase();
+        let actorClass = 'tx-actor-aimon';
+        if (actor.includes('gemini') || actor.includes('antigravity')) actorClass = 'tx-actor-gemini';
+        else if (actor.includes('cursor')) actorClass = 'tx-actor-cursor';
+        else if (actor.includes('human')) actorClass = 'tx-actor-human';
+
+        const seqStr = `#${ev.seq}`;
+        const timeStr = ev.ts_epoch ? new Date(ev.ts_epoch * 1000).toLocaleTimeString() : '';
+        const cpBadge = ev.checkpoint_id ? `<span class="tx-checkpoint-pill">${escapeHtml(ev.checkpoint_id)}</span>` : '';
+
+        // Decision pill
+        let decHtml = '';
+        if (ev.decision) {
+            const decLower = ev.decision.toLowerCase();
+            let decClass = 'tx-dec-continue';
+            if (decLower.includes('human')) decClass = 'tx-dec-wait_human';
+            else if (decLower.includes('stop')) decClass = 'tx-dec-stop';
+            else if (decLower.includes('recover')) decClass = 'tx-dec-recover';
+            else if (decLower.includes('approved')) decClass = 'tx-dec-approved';
+            else if (decLower.includes('rejected')) decClass = 'tx-dec-rejected';
+            decHtml = `<span class="tx-decision-pill ${decClass}">${escapeHtml(ev.decision)}</span>`;
+        }
+
+        // Commands list
+        let cmdsHtml = '';
+        if (Array.isArray(ev.commands) && ev.commands.length > 0) {
+            const items = ev.commands.map((cmd, i) => {
+                const exitCode = (Array.isArray(ev.exit_codes) && i < ev.exit_codes.length) ? ev.exit_codes[i] : null;
+                let exitHtml = '';
+                if (exitCode !== null) {
+                    const exitClass = exitCode === 0 ? 'exit-ok' : 'exit-err';
+                    exitHtml = `<span class="tx-code-exit ${exitClass}">[${exitCode}]</span>`;
+                }
+                return `<li><code>${escapeHtml(cmd)}</code>${exitHtml}</li>`;
+            }).join('');
+            cmdsHtml = `<ul class="tx-commands-list">${items}</ul>`;
+        }
+
+        // Dmesg / diagnostic excerpt
+        let dmesgHtml = '';
+        if (ev.dmesg_excerpt) {
+            dmesgHtml = `<pre class="tx-dmesg-box">${escapeHtml(ev.dmesg_excerpt)}</pre>`;
+        }
+
+        // Notes
+        let notesHtml = '';
+        if (ev.notes) {
+            notesHtml = `<div class="tx-notes-text">${escapeHtml(ev.notes)}</div>`;
+        }
+
+        // Proposed next
+        let nextHtml = '';
+        if (ev.proposal_next) {
+            nextHtml = `<div class="tx-notes-text" style="color: #67e8f9;"><strong>Next:</strong> ${escapeHtml(ev.proposal_next)}</div>`;
+        }
+
+        return `
+            <div class="tx-event-card kind-${escapeHtml(kind)}">
+                <div class="tx-event-top">
+                    <div class="tx-event-left">
+                        <span class="tx-seq">${seqStr}</span>
+                        <span class="tx-badge-actor ${actorClass}">${escapeHtml(ev.actor || 'agent')}</span>
+                        <span class="tx-badge-kind">${escapeHtml(kind.toUpperCase())}</span>
+                        ${cpBadge}
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        ${decHtml}
+                        <span class="tx-event-time">${timeStr}</span>
+                    </div>
+                </div>
+                ${cmdsHtml}
+                ${dmesgHtml}
+                ${notesHtml}
+                ${nextHtml}
+            </div>
+        `;
+    }).join('');
+}
+
+function updateExecDuration() {
+    if (activeRunStartEpoch > 0) {
+        const durationEl = document.getElementById('exec-meta-duration');
+        if (durationEl && currentActiveRun && (!currentActiveRun.terminal_status || currentActiveRun.terminal_status === 'running')) {
+            durationEl.textContent = formatElapsed(activeRunStartEpoch, 0);
+        }
+    }
+}
+
+function setupSse() {
+    try {
+        const source = new EventSource('/sse');
+        source.onmessage = (e) => {
+            try {
+                const data = JSON.parse(e.data);
+                if (data.event === 'interlock_request' || data.event === 'interlock_resolved') {
+                    fetchExecState();
+                }
+            } catch (_) {}
+        };
+        source.onerror = () => {
+            // Auto reconnects
+        };
+    } catch (e) {
+        console.warn('SSE connection error:', e);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
     fetchTasks();
     fetchSessions();
+    fetchExecState();
+    setupSse();
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
         fetchStatus(true);
         fetchTasks();
         fetchSessions();
+        fetchExecState();
     });
+
+    // Interlock Buttons
+    const btnApprove = document.getElementById('btn-interlock-approve');
+    const btnReject = document.getElementById('btn-interlock-reject');
+    const btnConfirmReject = document.getElementById('btn-confirm-reject');
+    const btnCancelReject = document.getElementById('btn-cancel-reject');
+    const rejectBox = document.getElementById('interlock-reject-box');
+    const buttonsRow = document.getElementById('interlock-buttons-row');
+    const rejectInput = document.getElementById('interlock-reject-reason');
+
+    if (btnApprove) {
+        btnApprove.addEventListener('click', () => {
+            resolveInterlock(true, '');
+        });
+    }
+
+    if (btnReject) {
+        btnReject.addEventListener('click', () => {
+            if (rejectBox) rejectBox.classList.remove('hidden');
+            if (buttonsRow) buttonsRow.classList.add('hidden');
+            if (rejectInput) {
+                rejectInput.value = '';
+                rejectInput.focus();
+            }
+        });
+    }
+
+    if (btnConfirmReject) {
+        btnConfirmReject.addEventListener('click', () => {
+            const reason = rejectInput ? rejectInput.value.trim() : '';
+            resolveInterlock(false, reason);
+        });
+    }
+
+    if (btnCancelReject) {
+        btnCancelReject.addEventListener('click', () => {
+            if (rejectBox) rejectBox.classList.add('hidden');
+            if (buttonsRow) buttonsRow.classList.remove('hidden');
+        });
+    }
 
     const toggleCompletedEl = document.getElementById('toggle-completed-tasks');
     if (toggleCompletedEl) {
@@ -701,16 +1020,18 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Refresh data: status every 5s, tasks every 2.5s, sessions every 3s
+    // Refresh data: status every 5s, tasks every 2.5s, sessions every 3s, exec state every 2.5s
     setInterval(() => fetchStatus(false), 5000);
     setInterval(fetchTasks, 2500);
     setInterval(fetchSessions, 3000);
+    setInterval(fetchExecState, 2500);
 
-    // Update countdown timers, task stopwatch, and session uptime every second
+    // Update countdown timers, task stopwatch, session uptime, and exec duration every second
     if (countdownInterval) clearInterval(countdownInterval);
     countdownInterval = setInterval(() => {
         updateCountdowns();
         updateTaskDurations();
         updateSessionUptimes();
+        updateExecDuration();
     }, 1000);
 });

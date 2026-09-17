@@ -1,0 +1,35 @@
+{
+  "name": "exec_review_checkpoint",
+  "description": "Records a reviewer decision on an executed checkpoint. Triggers human interlock if decision is wait_human.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "description": "Active run ID.",
+        "type": "string"
+      },
+      "seq": {
+        "description": "Sequence number of the checkpoint result event being reviewed.",
+        "type": "integer"
+      },
+      "decision": {
+        "description": "Review decision: 'continue', 'stop', 'recover', or 'wait_human'.",
+        "enum": ["continue", "stop", "recover", "wait_human"],
+        "type": "string"
+      },
+      "next_instructions": {
+        "description": "Instructions or command modifications for the executor next turn.",
+        "type": "string"
+      },
+      "notes": {
+        "description": "Review findings or rationale for decision.",
+        "type": "string"
+      },
+      "proposed_action": {
+        "description": "What action requires human approval if decision is 'wait_human'.",
+        "type": "string"
+      }
+    },
+    "required": ["run_id", "decision"]
+  }
+}

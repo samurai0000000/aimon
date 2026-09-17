@@ -9,6 +9,8 @@
 #include "TcpGateway.hxx"
 #include "TaskRegistry.hxx"
 #include "AgentMessageBus.hxx"
+#include "TranscriptSink.hxx"
+#include "InterlockManager.hxx"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -283,6 +285,147 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id) {
                         }},
                         {"required", {"plan_file", "agent_id"}}
                     }}
+                },
+                {
+                    {"name", "exec_start_run"},
+                    {"description", "Starts a new plan execution run and initializes the transcript sink."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"plan_file", {
+                                {"type", "string"},
+                                {"description", "Path to plan document being executed."}
+                            }},
+                            {"workspace", {
+                                {"type", "string"},
+                                {"description", "Target workspace path or name."}
+                            }},
+                            {"target_alias", {
+                                {"type", "string"},
+                                {"description", "Hardware device or environment alias (e.g. 'n1-655-devkit')."}
+                            }},
+                            {"executor_id", {
+                                {"type", "string"},
+                                {"description", "Canonical ID of executor agent (default: 'agent-antigravity-builder')."}
+                            }},
+                            {"initiator_id", {
+                                {"type", "string"},
+                                {"description", "Canonical ID of initiator/reviewer agent (default: 'agent-cursor-windows')."}
+                            }}
+                        }},
+                        {"required", {"plan_file", "target_alias"}}
+                    }}
+                },
+                {
+                    {"name", "exec_submit_checkpoint"},
+                    {"description", "Records the result of an executed checkpoint in the current run transcript."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"run_id", {
+                                {"type", "string"},
+                                {"description", "Active run ID."}
+                            }},
+                            {"checkpoint_id", {
+                                {"type", "string"},
+                                {"description", "Checkpoint identifier (e.g. 'cp-01', 'step-5')."}
+                            }},
+                            {"commands", {
+                                {"type", "array"},
+                                {"items", {{"type", "string"}}},
+                                {"description", "List of commands executed."}
+                            }},
+                            {"exit_codes", {
+                                {"type", "array"},
+                                {"items", {{"type", "integer"}}},
+                                {"description", "List of command exit status codes."}
+                            }},
+                            {"dmesg_excerpt", {
+                                {"type", "string"},
+                                {"description", "Kernel logs, dmesg, or diagnostic snippet."}
+                            }},
+                            {"artifacts", {
+                                {"type", "object"},
+                                {"description", "Key-value map of hashes, output paths, or artifacts generated."}
+                            }},
+                            {"notes", {
+                                {"type", "string"},
+                                {"description", "Observations, analysis, or explanation of checkpoint execution."}
+                            }}
+                        }},
+                        {"required", {"run_id", "checkpoint_id"}}
+                    }}
+                },
+                {
+                    {"name", "exec_review_checkpoint"},
+                    {"description", "Records a reviewer decision on an executed checkpoint. Triggers human interlock if decision is wait_human."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"run_id", {
+                                {"type", "string"},
+                                {"description", "Active run ID."}
+                            }},
+                            {"seq", {
+                                {"type", "integer"},
+                                {"description", "Sequence number of the checkpoint result event being reviewed."}
+                            }},
+                            {"decision", {
+                                {"type", "string"},
+                                {"enum", {"continue", "stop", "recover", "wait_human"}},
+                                {"description", "Review decision: 'continue', 'stop', 'recover', or 'wait_human'."}
+                            }},
+                            {"next_instructions", {
+                                {"type", "string"},
+                                {"description", "Instructions or command modifications for the executor next turn."}
+                            }},
+                            {"notes", {
+                                {"type", "string"},
+                                {"description", "Review findings or rationale for decision."}
+                            }},
+                            {"proposed_action", {
+                                {"type", "string"},
+                                {"description", "What action requires human approval if decision is 'wait_human'."}
+                            }}
+                        }},
+                        {"required", {"run_id", "decision"}}
+                    }}
+                },
+                {
+                    {"name", "exec_interlock_wait"},
+                    {"description", "Blocks until the human operator responds with Approve or Reject on the aimon dashboard."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"run_id", {
+                                {"type", "string"},
+                                {"description", "Run ID currently awaiting operator approval."}
+                            }},
+                            {"timeout_seconds", {
+                                {"type", "integer"},
+                                {"description", "Timeout in seconds (0 for indefinite blocking, default: 300)."}
+                            }}
+                        }},
+                        {"required", {"run_id"}}
+                    }}
+                },
+                {
+                    {"name", "exec_get_transcript"},
+                    {"description", "Fetches structured transcript events for a run, optionally starting after since_seq."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"run_id", {
+                                {"type", "string"},
+                                {"description", "Run ID to fetch transcript for (default: active run)."}
+                            }},
+                            {"since_seq", {
+                                {"type", "integer"},
+                                {"description", "Only fetch events with sequence number greater than this value (default: 0)."}
+                            }}
+                        }},
+                        {"required", {"run_id"}}
+                    }}
                 }
             }}
         }}
@@ -445,6 +588,144 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         } else {
             contentText = outResult.dump(2);
         }
+    } else if (toolName == "exec_start_run") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        RunMetadata meta;
+        meta.planFile = args.value("plan_file", "");
+        meta.workspace = args.value("workspace", "");
+        meta.targetAlias = args.value("target_alias", "");
+        meta.executorId = args.value("executor_id", "agent-antigravity-builder");
+        meta.initiatorId = args.value("initiator_id", "agent-cursor-windows");
+        if (args.contains("run_id")) {
+            meta.runId = args.value("run_id", "");
+        }
+
+        std::string runId;
+        std::string err;
+        bool ok = TranscriptSink::getInstance().startRun(meta, runId, err);
+        if (!ok) {
+            contentText = nlohmann::json({
+                {"status", "error"},
+                {"error", err}
+            }).dump(2);
+        } else {
+            contentText = nlohmann::json({
+                {"status", "started"},
+                {"run_id", runId},
+                {"target_alias", meta.targetAlias}
+            }).dump(2);
+        }
+    } else if (toolName == "exec_submit_checkpoint") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        TranscriptEvent ev;
+        ev.runId = args.value("run_id", "");
+        ev.checkpointId = args.value("checkpoint_id", "");
+        ev.actor = args.value("actor", "gemini");
+        ev.kind = "result";
+        if (args.contains("commands") && args["commands"].is_array()) {
+            ev.commands = args["commands"];
+        }
+        if (args.contains("exit_codes") && args["exit_codes"].is_array()) {
+            ev.exitCodes = args["exit_codes"];
+        }
+        if (args.contains("artifacts") && args["artifacts"].is_object()) {
+            ev.artifacts = args["artifacts"];
+        }
+        ev.dmesgExcerpt = args.value("dmesg_excerpt", "");
+        ev.notes = args.value("notes", "");
+
+        std::string err;
+        int seq = TranscriptSink::getInstance().appendEvent(ev, err);
+        if (seq < 0) {
+            contentText = nlohmann::json({
+                {"status", "error"},
+                {"error", err}
+            }).dump(2);
+        } else {
+            contentText = nlohmann::json({
+                {"status", "ok"},
+                {"run_id", ev.runId},
+                {"checkpoint_id", ev.checkpointId},
+                {"seq", seq}
+            }).dump(2);
+        }
+    } else if (toolName == "exec_review_checkpoint") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        TranscriptEvent ev;
+        ev.runId = args.value("run_id", "");
+        ev.seq = args.value("seq", 0);
+        ev.actor = args.value("actor", "cursor");
+        ev.kind = "review";
+        ev.decision = args.value("decision", "continue");
+        ev.proposalNext = args.value("next_instructions", "");
+        ev.notes = args.value("notes", "");
+
+        std::string err;
+        int seq = TranscriptSink::getInstance().appendEvent(ev, err);
+        if (seq < 0) {
+            contentText = nlohmann::json({
+                {"status", "error"},
+                {"error", err}
+            }).dump(2);
+        } else {
+            std::string interlockId;
+            if (ev.decision == "wait_human") {
+                std::string proposed = args.value("proposed_action", ev.proposalNext);
+                interlockId = InterlockManager::getInstance().createInterlock(
+                    ev.runId, ev.checkpointId, seq, ev.notes, proposed
+                );
+            }
+            nlohmann::json res = {
+                {"status", "ok"},
+                {"run_id", ev.runId},
+                {"seq", seq},
+                {"decision", ev.decision}
+            };
+            if (!interlockId.empty()) {
+                res["interlock_id"] = interlockId;
+            }
+            contentText = res.dump(2);
+        }
+    } else if (toolName == "exec_interlock_wait") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string runId = args.value("run_id", "");
+        std::string interlockId = args.value("interlock_id", "");
+        int timeoutSec = args.value("timeout_seconds", 300);
+
+        std::string target = !interlockId.empty() ? interlockId : runId;
+        InterlockRequest result;
+        bool ok = InterlockManager::getInstance().waitInterlock(target, timeoutSec, result);
+        if (!ok) {
+            contentText = nlohmann::json({
+                {"status", "timeout"},
+                {"approved", false},
+                {"reject_reason", "Timeout waiting for operator response"}
+            }).dump(2);
+        } else {
+            contentText = nlohmann::json({
+                {"status", "resolved"},
+                {"interlock_id", result.interlockId},
+                {"run_id", result.runId},
+                {"approved", result.approved},
+                {"reject_reason", result.rejectReason}
+            }).dump(2);
+        }
+    } else if (toolName == "exec_get_transcript") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string runId = args.value("run_id", "");
+        int sinceSeq = args.value("since_seq", 0);
+
+        auto events = TranscriptSink::getInstance().getTranscript(runId, sinceSeq);
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& ev : events) {
+            arr.push_back(ev.toJson());
+        }
+        nlohmann::json res = {
+            {"run_id", runId.empty() ? TranscriptSink::getInstance().getActiveRunId() : runId},
+            {"event_count", (int)arr.size()},
+            {"events", arr}
+        };
+        contentText = res.dump(2);
     } else if (_dynamicRegistry && _tcpGateway && _dynamicRegistry->hasTool(toolName)) {
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         nlohmann::json gwResult;
