@@ -50,6 +50,8 @@ static void signalHandler(int sig) {
     if (g_console) {
         g_console->shutdown();
     }
+    AgentMessageBus::getInstance().shutdown();
+    InterlockManager::getInstance().shutdown();
     g_cv.notify_all();
 }
 
@@ -461,6 +463,8 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n[aimon] Shutting down cleanly..." << std::endl;
+    AgentMessageBus::getInstance().shutdown();
+    InterlockManager::getInstance().shutdown();
     collabOrchestrator.stop();
     tcpGateway.stop();
     webServer.stop();

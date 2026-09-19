@@ -244,7 +244,12 @@ std::string AgentMessageBus::postMessageToAgent(const std::string& sessionId, co
 bool AgentMessageBus::fetchNextMessageForAgent(const std::string& sessionId, int timeoutSec, AgentMessage& outMsg) {
     std::unique_lock<std::mutex> lock(_mutex);
 
+    if (_shutdown.load()) {
+        return false;
+    }
+
     auto hasMsg = [&]() {
+        if (_shutdown.load()) return true;
         auto it = _inboxes.find(sessionId);
         if (it != _inboxes.end() && !it->second.empty()) return true;
         auto itAll = _inboxes.find("");
@@ -252,11 +257,14 @@ bool AgentMessageBus::fetchNextMessageForAgent(const std::string& sessionId, int
         return false;
     };
 
-    if (timeoutSec <= 0) {
+    if (timeoutSec == 0) {
+        if (!hasMsg() || _shutdown.load()) return false;
+    } else if (timeoutSec < 0) {
         _cv.wait(lock, hasMsg);
+        if (_shutdown.load()) return false;
     } else {
         bool arrived = _cv.wait_for(lock, std::chrono::seconds(timeoutSec), hasMsg);
-        if (!arrived) return false;
+        if (!arrived || _shutdown.load()) return false;
     }
 
     auto it = _inboxes.find(sessionId);
@@ -294,6 +302,13 @@ bool AgentMessageBus::postReplyFromAgent(const std::string& sessionId,
 void AgentMessageBus::setReplyCallback(ReplyCallback callback) {
     std::lock_guard<std::mutex> lock(_mutex);
     _replyCallback = callback;
+}
+
+void AgentMessageBus::shutdown() {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _shutdown = true;
+    _cv.notify_all();
+    _collabCv.notify_all();
 }
 
 // --- Document-Centric Collaboration Methods ---
@@ -614,11 +629,19 @@ bool AgentMessageBus::waitCollaborationTurn(const std::string& planFile,
             return true;
         }
 
+        if (_shutdown.load()) {
+            if (outError) *outError = "Service is shutting down";
+            return true;
+        }
+
         // Step 6: Session IN_PROGRESS, but not ready for this agent
         return false;
     };
 
     if (evaluate()) {
+        if (_shutdown.load()) {
+            return false;
+        }
         return true;
     }
     if (outError && !outError->empty()) {
@@ -646,11 +669,19 @@ bool AgentMessageBus::waitCollaborationTurn(const std::string& planFile,
         _collabCv.wait(lock, [&]() {
             return evaluate();
         });
+        if (_shutdown.load()) {
+            if (outError) *outError = "Service is shutting down";
+            return false;
+        }
         return true;
     } else {
         bool ready = _collabCv.wait_for(lock, std::chrono::seconds(timeoutSeconds), [&]() {
             return evaluate();
         });
+        if (_shutdown.load()) {
+            if (outError) *outError = "Service is shutting down";
+            return false;
+        }
         if (ready) {
             return true;
         }

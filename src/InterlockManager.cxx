@@ -139,18 +139,26 @@ bool InterlockManager::waitInterlock(const std::string& interlockIdOrRunId,
         return latest;
     };
 
+    if (_shutdown.load()) {
+        return false;
+    }
+
     auto isResolved = [&]() -> bool {
+        if (_shutdown.load()) return true;
         InterlockRequest* req = findInterlock();
         return req != nullptr && req->resolved;
     };
 
     if (timeoutSeconds > 0) {
         bool ok = _cv.wait_for(lock, std::chrono::seconds(timeoutSeconds), isResolved);
-        if (!ok) {
+        if (!ok || _shutdown.load()) {
             return false;
         }
     } else {
         _cv.wait(lock, isResolved);
+        if (_shutdown.load()) {
+            return false;
+        }
     }
 
     InterlockRequest* req = findInterlock();
@@ -160,6 +168,12 @@ bool InterlockManager::waitInterlock(const std::string& interlockIdOrRunId,
     }
 
     return false;
+}
+
+void InterlockManager::shutdown() {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _shutdown = true;
+    _cv.notify_all();
 }
 
 bool InterlockManager::resolveInterlock(const std::string& interlockId,

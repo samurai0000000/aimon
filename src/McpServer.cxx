@@ -203,13 +203,13 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id) {
                 },
                 {
                     {"name", "agent_check_inbox"},
-                    {"description", "Polls the aimon operator console for pending messages or instructions sent to this agent. Waits indefinitely if timeout_seconds is 0."},
+                    {"description", "Polls the aimon operator console for pending messages or instructions sent to this agent. Returns immediately if timeout_seconds is 0."},
                     {"inputSchema", {
                         {"type", "object"},
                         {"properties", {
                             {"timeout_seconds", {
                                 {"type", "integer"},
-                                {"description", "Maximum time in seconds to wait for a message before returning keep-alive (0 for indefinite blocking, default: 0)."}
+                                {"description", "Maximum time in seconds to wait for a message before returning idle (0 for non-blocking check, default: 0). Negative values wait indefinitely."}
                             }}
                         }}
                     }}

@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <functional>
 #include <cstdint>
 #include <nlohmann/json.hpp>
@@ -63,6 +64,7 @@ public:
     std::vector<InterlockRequest> listInterlocks(const std::string& runId = "") const;
 
     void setNotifyCallback(InterlockNotifyCallback cb);
+    void shutdown();
 
 private:
     std::string generateInterlockId() const;
@@ -71,6 +73,7 @@ private:
     std::condition_variable _cv;
     std::map<std::string, InterlockRequest> _interlocks;
     InterlockNotifyCallback _notifyCb;
+    std::atomic<bool> _shutdown{false};
 };
 
 } // namespace aimon

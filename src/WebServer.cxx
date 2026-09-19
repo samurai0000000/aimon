@@ -988,6 +988,8 @@ void WebServer::stop() {
     if (!_running) return;
 
     _running = false;
+    AgentMessageBus::getInstance().shutdown();
+    InterlockManager::getInstance().shutdown();
     {
         std::lock_guard<std::mutex> lock(_sessionsMutex);
         for (auto& pair : _sseSessions) {

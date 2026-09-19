@@ -76,6 +76,7 @@ public:
                             const std::string& messageId,
                             const std::string& replyText);
     void setReplyCallback(ReplyCallback callback);
+    void shutdown();
 
     // --- Document-Centric Collaboration Signaling ---
     bool startCollaboration(const std::string& planFile,
@@ -155,6 +156,7 @@ private:
     std::condition_variable _collabCv;
     CollaborationCallback _collabCallback;
     std::map<std::string, int> _liveWaiters;
+    std::atomic<bool> _shutdown{false};
 };
 
 } // namespace aimon
