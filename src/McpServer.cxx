@@ -11,7 +11,10 @@
 #include "AgentMessageBus.hxx"
 #include "TranscriptSink.hxx"
 #include "InterlockManager.hxx"
+#include "CollabOrchestrator.hxx"
+#include "RunMetrics.hxx"
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <iomanip>
 
@@ -426,6 +429,121 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id) {
                         }},
                         {"required", {"run_id"}}
                     }}
+                },
+                {
+                    {"name", "collab_start"},
+                    {"description", "Initiates a document-centric collaboration session between initiator and reviewer agents."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"plan_file", {
+                                {"type", "string"},
+                                {"description", "Path to plan document on disk (e.g. 'plan/plan_execution_metrics_and_waterfall.md')."}
+                            }},
+                            {"initiator_id", {
+                                {"type", "string"},
+                                {"description", "Canonical ID of initiator agent (default: 'agent-antigravity-builder')."}
+                            }},
+                            {"reviewer_id", {
+                                {"type", "string"},
+                                {"description", "Canonical ID of reviewer agent (default: 'agent-cursor-windows')."}
+                            }},
+                            {"max_turns", {
+                                {"type", "integer"},
+                                {"description", "Maximum turns before operator escalation (default: 8)."}
+                            }}
+                        }},
+                        {"required", {"plan_file"}}
+                    }}
+                },
+                {
+                    {"name", "collab_run"},
+                    {"description", "Instructs aimon to autonomously drive the collaboration session turn-by-turn until consensus."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"plan_file", {
+                                {"type", "string"},
+                                {"description", "Path to plan document on disk (e.g. 'plan/plan_execution_metrics_and_waterfall.md')."}
+                            }},
+                            {"initiator_id", {
+                                {"type", "string"},
+                                {"description", "Canonical ID of initiator agent (default: 'agent-antigravity-builder')."}
+                            }},
+                            {"reviewer_id", {
+                                {"type", "string"},
+                                {"description", "Canonical ID of reviewer agent (default: 'agent-cursor-windows')."}
+                            }},
+                            {"max_turns", {
+                                {"type", "integer"},
+                                {"description", "Maximum turns before operator escalation (default: 8)."}
+                            }}
+                        }},
+                        {"required", {"plan_file"}}
+                    }}
+                },
+                {
+                    {"name", "collab_step"},
+                    {"description", "Manually steps a single turn in the collaboration orchestrator."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", nlohmann::json::object()}
+                    }}
+                },
+                {
+                    {"name", "collab_get_status"},
+                    {"description", "Returns active collaboration session status, current turn, next actor, and orchestrator state."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", nlohmann::json::object()}
+                    }}
+                },
+                {
+                    {"name", "collab_abort"},
+                    {"description", "Aborts active collaboration session and halts running proxies."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", nlohmann::json::object()}
+                    }}
+                },
+                {
+                    {"name", "exec_end_run"},
+                    {"description", "Concludes an active execution run and updates run metadata and markdown report."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"run_id", {
+                                {"type", "string"},
+                                {"description", "Run ID to conclude (default: active run)."}
+                            }},
+                            {"terminal_status", {
+                                {"type", "string"},
+                                {"enum", {"completed", "aborted", "failed"}},
+                                {"description", "Terminal status ('completed', 'aborted', 'failed', default: 'completed')."}
+                            }}
+                        }}
+                    }}
+                },
+                {
+                    {"name", "exec_list_runs"},
+                    {"description", "Lists all execution runs with metadata and active run ID."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", nlohmann::json::object()}
+                    }}
+                },
+                {
+                    {"name", "exec_get_run_metrics"},
+                    {"description", "Calculates and returns phase latencies, waterfall segments, command reliability, and AI quota attribution deltas for an execution run."},
+                    {"inputSchema", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"run_id", {
+                                {"type", "string"},
+                                {"description", "Run ID to analyze (default: active run)."}
+                            }}
+                        }}
+                    }}
                 }
             }}
         }}
@@ -525,6 +643,11 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         std::string msgId = args.value("message_id", "");
         std::string replyText = args.value("reply_text", "");
+        if (replyText.empty() && args.contains("text") && args["text"].is_string()) replyText = args["text"].get<std::string>();
+        if (replyText.empty() && args.contains("message") && args["message"].is_string()) replyText = args["message"].get<std::string>();
+        if (replyText.empty() && args.contains("reply") && args["reply"].is_string()) replyText = args["reply"].get<std::string>();
+        if (replyText.empty() && args.contains("data") && args["data"].is_string()) replyText = args["data"].get<std::string>();
+        if (replyText.empty() && args.contains("input") && args["input"].is_string()) replyText = args["input"].get<std::string>();
         std::string sessionId = args.value("sse_session_id", "");
         if (sessionId.empty()) {
             sessionId = args.value("session_id", "");
@@ -546,11 +669,17 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
     } else if (toolName == "agent_collaborate") {
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         std::string planFile = args.value("plan_file", "");
+        if (planFile.empty() && args.contains("plan") && args["plan"].is_string()) planFile = args["plan"].get<std::string>();
+        if (planFile.empty() && args.contains("file") && args["file"].is_string()) planFile = args["file"].get<std::string>();
         int turnNumber = args.value("turn_number", 0);
         std::string agentId = args.value("agent_id", "");
         std::string agentModel = args.value("agent_model", "");
         std::string status = args.value("status", "IN_PROGRESS");
         std::string sideChannelMessage = args.value("side_channel_message", "");
+        if (sideChannelMessage.empty() && args.contains("message") && args["message"].is_string()) sideChannelMessage = args["message"].get<std::string>();
+        if (sideChannelMessage.empty() && args.contains("text") && args["text"].is_string()) sideChannelMessage = args["text"].get<std::string>();
+        if (sideChannelMessage.empty() && args.contains("data") && args["data"].is_string()) sideChannelMessage = args["data"].get<std::string>();
+        if (sideChannelMessage.empty() && args.contains("input") && args["input"].is_string()) sideChannelMessage = args["input"].get<std::string>();
 
         nlohmann::json outResult;
         std::string error;
@@ -570,6 +699,8 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
     } else if (toolName == "agent_wait_turn") {
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         std::string planFile = args.value("plan_file", "");
+        if (planFile.empty() && args.contains("plan") && args["plan"].is_string()) planFile = args["plan"].get<std::string>();
+        if (planFile.empty() && args.contains("file") && args["file"].is_string()) planFile = args["file"].get<std::string>();
         std::string agentId = args.value("agent_id", "");
         int timeoutSeconds = args.value("timeout_seconds", 0);
 
@@ -592,6 +723,8 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         RunMetadata meta;
         meta.planFile = args.value("plan_file", "");
+        if (meta.planFile.empty() && args.contains("plan") && args["plan"].is_string()) meta.planFile = args["plan"].get<std::string>();
+        if (meta.planFile.empty() && args.contains("file") && args["file"].is_string()) meta.planFile = args["file"].get<std::string>();
         meta.workspace = args.value("workspace", "");
         meta.targetAlias = args.value("target_alias", "");
         meta.executorId = args.value("executor_id", "agent-antigravity-builder");
@@ -726,6 +859,183 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
             {"events", arr}
         };
         contentText = res.dump(2);
+    } else if (toolName == "collab_start") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string planFile = args.value("plan_file", "");
+        if (planFile.empty() && args.contains("plan") && args["plan"].is_string()) planFile = args["plan"].get<std::string>();
+        if (planFile.empty() && args.contains("file") && args["file"].is_string()) planFile = args["file"].get<std::string>();
+        std::string initiatorId = args.value("initiator_id", "agent-antigravity-builder");
+        std::string reviewerId = args.value("reviewer_id", "agent-cursor-windows");
+        int maxTurns = args.value("max_turns", 8);
+
+        std::string err;
+        bool ok = AgentMessageBus::getInstance().startCollaboration(planFile, initiatorId, reviewerId, &err);
+        if (!ok) {
+            contentText = nlohmann::json({
+                {"status", "error"},
+                {"error", err}
+            }).dump(2);
+        } else {
+            if (maxTurns > 0) {
+                AgentMessageBus::getInstance().setMaxTurns(maxTurns);
+            }
+            auto session = AgentMessageBus::getInstance().getActiveCollaboration();
+            contentText = nlohmann::json({
+                {"status", "ok"},
+                {"session", session.toJson()}
+            }).dump(2);
+        }
+    } else if (toolName == "collab_run") {
+        if (!_collabOrch) {
+            contentText = nlohmann::json({
+                {"status", "error"},
+                {"error", "Orchestrator not initialized"}
+            }).dump(2);
+        } else {
+            nlohmann::json args = params.value("arguments", nlohmann::json::object());
+            std::string planFile = args.value("plan_file", "");
+            if (planFile.empty() && args.contains("plan") && args["plan"].is_string()) planFile = args["plan"].get<std::string>();
+            if (planFile.empty() && args.contains("file") && args["file"].is_string()) planFile = args["file"].get<std::string>();
+            std::string initiatorId = args.value("initiator_id", "agent-antigravity-builder");
+            std::string reviewerId = args.value("reviewer_id", "agent-cursor-windows");
+            int maxTurns = args.value("max_turns", 8);
+
+            std::string err;
+            if (!_collabOrch->runUntilConsensus(planFile, initiatorId, reviewerId, &err)) {
+                contentText = nlohmann::json({
+                    {"status", "error"},
+                    {"error", err}
+                }).dump(2);
+            } else {
+                if (maxTurns > 0) {
+                    AgentMessageBus::getInstance().setMaxTurns(maxTurns);
+                }
+                contentText = nlohmann::json({
+                    {"status", "ok"},
+                    {"message", "Orchestrator driving session"}
+                }).dump(2);
+            }
+        }
+    } else if (toolName == "collab_step") {
+        if (!_collabOrch) {
+            contentText = nlohmann::json({
+                {"status", "error"},
+                {"error", "Orchestrator not initialized"}
+            }).dump(2);
+        } else {
+            std::string err;
+            if (!_collabOrch->stepTurn(&err)) {
+                contentText = nlohmann::json({
+                    {"status", "error"},
+                    {"error", err}
+                }).dump(2);
+            } else {
+                contentText = nlohmann::json({
+                    {"status", "ok"},
+                    {"message", "Step requested"}
+                }).dump(2);
+            }
+        }
+    } else if (toolName == "collab_get_status") {
+        auto session = AgentMessageBus::getInstance().getActiveCollaboration();
+        nlohmann::json res = session.toJson();
+        if (_collabOrch) {
+            res["orchestrator"] = _collabOrch->statusJson();
+        }
+        contentText = res.dump(2);
+    } else if (toolName == "collab_abort") {
+        std::string orchErr;
+        if (_collabOrch) {
+            _collabOrch->abortRun(&orchErr);
+        }
+        std::string busErr;
+        bool ok = AgentMessageBus::getInstance().abortCollaboration(&busErr);
+        if (!ok && busErr.empty()) {
+            busErr = orchErr;
+        }
+        if (!ok) {
+            contentText = nlohmann::json({
+                {"status", "error"},
+                {"error", busErr.empty() ? "Failed to abort collaboration" : busErr}
+            }).dump(2);
+        } else {
+            contentText = nlohmann::json({
+                {"status", "aborted"}
+            }).dump(2);
+        }
+    } else if (toolName == "exec_end_run") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string runId = args.value("run_id", "");
+        if (runId.empty()) {
+            runId = TranscriptSink::getInstance().getActiveRunId();
+        }
+        std::string terminalStatus = args.value("terminal_status", "completed");
+
+        std::string err;
+        bool ok = TranscriptSink::getInstance().endRun(runId, terminalStatus, err);
+        if (!ok) {
+            contentText = nlohmann::json({
+                {"status", "error"},
+                {"error", err}
+            }).dump(2);
+        } else {
+            contentText = nlohmann::json({
+                {"status", "ok"},
+                {"run_id", runId},
+                {"terminal_status", terminalStatus}
+            }).dump(2);
+        }
+    } else if (toolName == "exec_list_runs") {
+        auto runs = TranscriptSink::getInstance().listRuns();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& r : runs) {
+            arr.push_back(r.toJson());
+        }
+        nlohmann::json res = {
+            {"active_run_id", TranscriptSink::getInstance().getActiveRunId()},
+            {"runs", arr}
+        };
+        contentText = res.dump(2);
+    } else if (toolName == "exec_get_run_metrics") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string runId = args.value("run_id", "");
+        if (runId.empty()) {
+            runId = TranscriptSink::getInstance().getActiveRunId();
+        }
+        if (runId.empty()) {
+            contentText = nlohmann::json({
+                {"status", "error"},
+                {"error", "No active run and no run_id specified"}
+            }).dump(2);
+        } else {
+            std::string runDir = TranscriptSink::getInstance().getRunDirectory(runId);
+            std::string metaFile = runDir + "/run.json";
+            if (!std::filesystem::exists(metaFile)) {
+                contentText = nlohmann::json({
+                    {"status", "error"},
+                    {"error", "Run not found: " + runId}
+                }).dump(2);
+            } else {
+                RunMetadata meta;
+                try {
+                    std::ifstream mf(metaFile);
+                    nlohmann::json j;
+                    mf >> j;
+                    meta = RunMetadata::fromJson(j);
+                } catch (const std::exception& e) {
+                    contentText = nlohmann::json({
+                        {"status", "error"},
+                        {"error", std::string("Error reading run metadata: ") + e.what()}
+                    }).dump(2);
+                }
+                if (contentText.empty()) {
+                    auto events = TranscriptSink::getInstance().getTranscript(runId, 0);
+                    AggregateStatus cur = _stateStore.getStatus();
+                    RunMetrics metrics = RunMetricsAnalyzer::analyze(meta, events, cur);
+                    contentText = metrics.toJson().dump(2);
+                }
+            }
+        }
     } else if (_dynamicRegistry && _tcpGateway && _dynamicRegistry->hasTool(toolName)) {
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         nlohmann::json gwResult;

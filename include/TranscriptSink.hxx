@@ -26,6 +26,7 @@ struct RunMetadata {
     int64_t startEpoch = 0;
     int64_t endEpoch = 0;
     std::string terminalStatus = "running";
+    nlohmann::json initialQuota = nlohmann::json::object();
 
     nlohmann::json toJson() const;
     static RunMetadata fromJson(const nlohmann::json& j);

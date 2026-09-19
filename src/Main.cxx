@@ -354,6 +354,7 @@ int main(int argc, char* argv[]) {
     CollabOrchestrator collabOrchestrator(agentRunner, configMgr);
     collabOrchestrator.start();
     webServer.setCollabOrchestrator(&collabOrchestrator);
+    mcpServer.setCollabOrchestrator(&collabOrchestrator);
 
     mcpServer.setNotificationBroadcaster([&](const std::string& notif) {
         webServer.broadcastSseNotification(notif);

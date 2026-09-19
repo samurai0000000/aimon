@@ -6,6 +6,7 @@
 
 #include "TranscriptSink.hxx"
 #include "PathUtils.hxx"
+#include "StateStore.hxx"
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -30,7 +31,8 @@ nlohmann::json RunMetadata::toJson() const {
         {"policy_id", policyId},
         {"start_epoch", startEpoch},
         {"end_epoch", endEpoch},
-        {"terminal_status", terminalStatus}
+        {"terminal_status", terminalStatus},
+        {"initial_quota", initialQuota}
     };
 }
 
@@ -46,6 +48,9 @@ RunMetadata RunMetadata::fromJson(const nlohmann::json& j) {
     m.startEpoch = j.value("start_epoch", (int64_t)0);
     m.endEpoch = j.value("end_epoch", (int64_t)0);
     m.terminalStatus = j.value("terminal_status", "running");
+    if (j.contains("initial_quota") && j["initial_quota"].is_object()) {
+        m.initialQuota = j["initial_quota"];
+    }
     return m;
 }
 
@@ -127,7 +132,27 @@ std::string TranscriptSink::generateRunId() const {
 
 std::string TranscriptSink::getActiveRunId() const {
     std::lock_guard<std::mutex> lock(_mutex);
-    return _activeRunId;
+    if (!_activeRunId.empty()) {
+        return _activeRunId;
+    }
+    try {
+        if (fs::exists(_baseDir)) {
+            for (const auto& entry : fs::directory_iterator(_baseDir)) {
+                if (entry.is_directory()) {
+                    std::string metaPath = entry.path().string() + "/run.json";
+                    if (fs::exists(metaPath)) {
+                        std::ifstream f(metaPath);
+                        nlohmann::json j;
+                        f >> j;
+                        if (j.value("terminal_status", "") == "running" && j.value("end_epoch", (int64_t)0) == 0) {
+                            return j.value("run_id", "");
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+    return "";
 }
 
 bool TranscriptSink::startRun(const RunMetadata& metadata, std::string& outRunId, std::string& outError) {
@@ -147,6 +172,12 @@ bool TranscriptSink::startRun(const RunMetadata& metadata, std::string& outRunId
             std::chrono::system_clock::now().time_since_epoch()).count();
     }
     meta.terminalStatus = "running";
+
+    AggregateStatus cur = StateStore::getInstance().getStatus();
+    meta.initialQuota = nlohmann::json({
+        {"cursor_fast_requests", cur.cursor.fastRequestsUsed},
+        {"cursor_total_spend_usd", cur.cursor.totalSpendUsd}
+    });
 
     std::string runDir = _baseDir + "/" + meta.runId;
     if (!PathUtils::ensureDirectoryExists(runDir)) {
@@ -207,8 +238,6 @@ int TranscriptSink::appendEvent(TranscriptEvent& event, std::string& outError) {
             std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
-    event.seq = _nextSeq++;
-
     std::string runDir = _baseDir + "/" + event.runId;
     if (!fs::exists(runDir)) {
         outError = "Run directory not found: " + runDir;
@@ -216,6 +245,24 @@ int TranscriptSink::appendEvent(TranscriptEvent& event, std::string& outError) {
     }
 
     std::string txFile = runDir + "/transcript.jsonl";
+    if (fs::exists(txFile)) {
+        std::ifstream tfIn(txFile);
+        std::string line;
+        int maxSeq = 0;
+        while (std::getline(tfIn, line)) {
+            if (line.empty()) continue;
+            try {
+                auto j = nlohmann::json::parse(line);
+                int s = j.value("seq", 0);
+                if (s > maxSeq) maxSeq = s;
+            } catch (...) {}
+        }
+        if (_nextSeq <= maxSeq) {
+            _nextSeq = maxSeq + 1;
+        }
+    }
+
+    event.seq = _nextSeq++;
     std::ofstream tf(txFile, std::ios::app);
     if (!tf.is_open()) {
         outError = "Failed to open transcript file for append: " + txFile;

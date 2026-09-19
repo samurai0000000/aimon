@@ -56,12 +56,20 @@ public:
 private:
     void setupRoutes();
 
+    std::string createUiSession();
+    bool isValidUiSession(const httplib::Request& req) const;
+    static std::string getMcpHintForPath(const std::string& path, const std::string& body);
+
     StateStore& _stateStore;
     HistoryStore& _historyStore;
     WebConfig _config;
     RefreshCallback _onRefresh;
     McpServer* _mcpServer = nullptr;
     CollabOrchestrator* _collabOrch = nullptr;
+
+    bool _endpointsEnabled = false;
+    mutable std::mutex _sessionMutex;
+    std::map<std::string, time_t> _uiSessions;
 
     std::map<std::string, std::shared_ptr<SseSession>> _sseSessions;
     std::mutex _sessionsMutex;

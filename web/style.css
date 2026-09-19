@@ -1624,6 +1624,161 @@ body {
     line-height: 1.35;
 }
 
+/* Executive KPI Bar */
+.exec-kpi-bar {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+@media (max-width: 900px) {
+    .exec-kpi-bar {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.kpi-card {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.kpi-label {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+}
+
+.kpi-val-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.kpi-val {
+    font-size: 1.25rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+}
+
+.kpi-sub {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+}
+
+.text-cyan { color: #06b6d4; }
+.text-green { color: #10b981; }
+.text-purple { color: #a855f7; }
+.text-magenta { color: #ec4899; }
+.text-amber { color: #f59e0b; }
+
+/* Segmented Waterfall Timeline */
+.exec-waterfall-section {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+    position: relative;
+}
+
+.waterfall-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.waterfall-title-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.waterfall-title-row h3 {
+    margin: 0;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.waterfall-legend {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.dot-exec, .wf-phase-execution { background: #10b981; }
+.dot-review, .wf-phase-review { background: #a855f7; }
+.dot-interlock, .wf-phase-interlock { background: #f59e0b; }
+.dot-recovery, .wf-phase-recovery { background: #f97316; }
+.dot-setup, .wf-phase-setup { background: #64748b; }
+
+.waterfall-bar-track {
+    display: flex;
+    height: 24px;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+}
+
+.waterfall-segment {
+    height: 100%;
+    position: relative;
+    cursor: pointer;
+    transition: opacity 0.15s ease, filter 0.15s ease;
+    min-width: 4px;
+}
+
+.waterfall-segment:hover {
+    filter: brightness(1.25);
+    z-index: 2;
+}
+
+.waterfall-tooltip {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #0f172a;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.75rem;
+    color: #f8fafc;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+    pointer-events: none;
+    white-space: nowrap;
+    z-index: 10;
+}
+
 /* Footer */
 .app-footer {
     text-align: center;

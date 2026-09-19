@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.2 LANGUAGES CXX)
+project(aimon VERSION 1.0.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,6 +74,7 @@ set(SOURCES
     src/CollabOrchestrator.cxx
     src/TranscriptSink.cxx
     src/InterlockManager.cxx
+    src/RunMetrics.cxx
     src/NcursesConsole.cxx
 )
 

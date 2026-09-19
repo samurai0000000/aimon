@@ -21,6 +21,7 @@ struct PollingConfig {
 struct WebConfig {
     std::string host = "0.0.0.0";
     int port = 3883;
+    bool endpointsEnabled = false;
 };
 
 struct MqttConfig {

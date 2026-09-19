@@ -1,0 +1,8 @@
+{
+  "name": "collab_step",
+  "description": "Manually steps a single turn in the collaboration orchestrator.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

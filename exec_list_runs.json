@@ -1,0 +1,8 @@
+{
+  "name": "exec_list_runs",
+  "description": "Lists all execution runs with metadata and active run ID.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

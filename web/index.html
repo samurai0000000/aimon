@@ -306,6 +306,58 @@
                     </div>
                 </div>
 
+                <!-- Executive KPI Bar -->
+                <div id="exec-kpi-bar" class="exec-kpi-bar hidden">
+                    <div class="kpi-card">
+                        <span class="kpi-label">Autonomous / Gating</span>
+                        <div class="kpi-val-row">
+                            <span class="kpi-val text-cyan" id="kpi-auto-pct">--%</span>
+                            <span class="kpi-sub" id="kpi-gating-pct">(Human: --%)</span>
+                        </div>
+                    </div>
+                    <div class="kpi-card">
+                        <span class="kpi-label">Command Reliability</span>
+                        <div class="kpi-val-row">
+                            <span class="kpi-val text-green" id="kpi-cmd-rate">--%</span>
+                            <span class="kpi-sub" id="kpi-cmd-counts">(-- passed)</span>
+                        </div>
+                    </div>
+                    <div class="kpi-card">
+                        <span class="kpi-label">Checkpoints / Recovery</span>
+                        <div class="kpi-val-row">
+                            <span class="kpi-val text-purple" id="kpi-checkpoints">0</span>
+                            <span class="kpi-sub" id="kpi-recovery">(-- loops)</span>
+                        </div>
+                    </div>
+                    <div class="kpi-card">
+                        <span class="kpi-label">AI Quota Delta</span>
+                        <div class="kpi-val-row">
+                            <span class="kpi-val text-magenta" id="kpi-quota-delta">0 fast</span>
+                            <span class="kpi-sub" id="kpi-quota-spend">($0.00)</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Segmented Waterfall Timeline -->
+                <div id="exec-waterfall-section" class="exec-waterfall-section hidden">
+                    <div class="waterfall-header-row">
+                        <div class="waterfall-title-row">
+                            <h3>Waterfall Timeline</h3>
+                            <span class="badge badge-sub" id="waterfall-total-time">0s</span>
+                        </div>
+                        <div class="waterfall-legend">
+                            <span class="legend-item"><span class="legend-dot dot-exec"></span> Execution</span>
+                            <span class="legend-item"><span class="legend-dot dot-review"></span> Review</span>
+                            <span class="legend-item"><span class="legend-dot dot-interlock"></span> Human Gating</span>
+                            <span class="legend-item"><span class="legend-dot dot-recovery"></span> Recovery</span>
+                        </div>
+                    </div>
+                    <div class="waterfall-bar-track" id="waterfall-bar-track">
+                        <!-- Populated dynamically with segments -->
+                    </div>
+                    <div class="waterfall-tooltip hidden" id="waterfall-tooltip"></div>
+                </div>
+
                 <!-- Transcript Events Stream -->
                 <div class="exec-transcript-section">
                     <div class="transcript-header-row">

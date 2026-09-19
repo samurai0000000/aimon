@@ -1,0 +1,8 @@
+{
+  "name": "collab_get_status",
+  "description": "Returns active collaboration session status, current turn, next actor, and orchestrator state.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

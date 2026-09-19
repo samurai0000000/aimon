@@ -701,20 +701,130 @@ async function fetchExecState() {
             renderInterlockBanner(currentPendingInterlock);
         }
 
-        // 3. Fetch transcript for current run
+        // 3. Fetch transcript & metrics for current run
         if (currentActiveRun && currentActiveRun.run_id) {
-            const txRes = await fetch(`/api/exec/runs/${encodeURIComponent(currentActiveRun.run_id)}/transcript`);
+            const runIdEncoded = encodeURIComponent(currentActiveRun.run_id);
+            const txRes = await fetch(`/api/exec/runs/${runIdEncoded}/transcript`);
             if (txRes.ok) {
                 const txData = await txRes.json();
                 currentTranscriptEvents = txData.events || [];
                 renderTranscript(currentTranscriptEvents);
             }
+
+            const metricsRes = await fetch(`/api/exec/runs/${runIdEncoded}/metrics`);
+            if (metricsRes.ok) {
+                const metricsData = await metricsRes.json();
+                renderKpiBar(metricsData);
+                renderWaterfall(metricsData);
+            } else {
+                renderKpiBar(null);
+                renderWaterfall(null);
+            }
         } else {
             renderTranscript([]);
+            renderKpiBar(null);
+            renderWaterfall(null);
         }
     } catch (e) {
         console.warn('Failed to fetch exec state:', e);
     }
+}
+
+function renderKpiBar(metrics) {
+    const kpiBar = document.getElementById('exec-kpi-bar');
+    if (!kpiBar) return;
+    if (!metrics) {
+        kpiBar.classList.add('hidden');
+        return;
+    }
+    kpiBar.classList.remove('hidden');
+
+    const autoPct = Math.round((metrics.autonomous_ratio || 0) * 100);
+    const gatingPct = Math.round((metrics.human_gating_ratio || 0) * 100);
+    const autoEl = document.getElementById('kpi-auto-pct');
+    const gatingEl = document.getElementById('kpi-gating-pct');
+    if (autoEl) autoEl.textContent = `${autoPct}%`;
+    if (gatingEl) gatingEl.textContent = `(Human: ${gatingPct}%)`;
+
+    const cmdRate = Math.round((metrics.command_success_rate || 0) * 100);
+    const rateEl = document.getElementById('kpi-cmd-rate');
+    const countsEl = document.getElementById('kpi-cmd-counts');
+    if (rateEl) rateEl.textContent = `${cmdRate}%`;
+    if (countsEl) {
+        countsEl.textContent = `(${metrics.successful_commands || 0}/${metrics.total_commands || 0} passed)`;
+    }
+
+    const cpEl = document.getElementById('kpi-checkpoints');
+    const recEl = document.getElementById('kpi-recovery');
+    if (cpEl) cpEl.textContent = metrics.total_checkpoints || 0;
+    if (recEl) recEl.textContent = `(${metrics.recovery_count || 0} recovery)`;
+
+    const qDelta = metrics.quota_delta || {};
+    const deltaEl = document.getElementById('kpi-quota-delta');
+    const spendEl = document.getElementById('kpi-quota-spend');
+    if (deltaEl) {
+        deltaEl.textContent = `${qDelta.cursor_fast_requests_delta || 0} fast`;
+    }
+    if (spendEl) {
+        const spend = (qDelta.cursor_spend_usd_delta || 0).toFixed(2);
+        spendEl.textContent = `($${spend})`;
+    }
+}
+
+function renderWaterfall(metrics) {
+    const sec = document.getElementById('exec-waterfall-section');
+    const track = document.getElementById('waterfall-bar-track');
+    const totalTimeEl = document.getElementById('waterfall-total-time');
+    const tooltip = document.getElementById('waterfall-tooltip');
+    if (!sec || !track) return;
+
+    if (!metrics || !Array.isArray(metrics.waterfall) || metrics.waterfall.length === 0) {
+        sec.classList.add('hidden');
+        return;
+    }
+    sec.classList.remove('hidden');
+
+    const totalSec = Math.max(1, metrics.total_duration_seconds || 1);
+    if (totalTimeEl) totalTimeEl.textContent = `${totalSec}s`;
+
+    track.innerHTML = metrics.waterfall.map(seg => {
+        const phase = (seg.phase || 'setup').toLowerCase();
+        const dur = Math.max(0, seg.duration_seconds || 0);
+        const pct = Math.max(dur > 0 ? 1 : 0.5, (dur / totalSec) * 100);
+        const cp = seg.checkpoint_id ? `[${escapeHtml(seg.checkpoint_id)}] ` : '';
+        const title = `${cp}${seg.phase} (${dur}s) - ${escapeHtml(seg.summary || '')}`;
+
+        return `<div class="waterfall-segment wf-phase-${escapeHtml(phase)}"
+                     style="width: ${pct.toFixed(2)}%;"
+                     data-phase="${escapeHtml(phase)}"
+                     data-duration="${dur}"
+                     data-summary="${escapeHtml(seg.summary || '')}"
+                     data-actor="${escapeHtml(seg.actor || '')}"
+                     data-cp="${escapeHtml(seg.checkpoint_id || '')}"
+                     title="${title}"></div>`;
+    }).join('');
+
+    const segments = track.querySelectorAll('.waterfall-segment');
+    segments.forEach(el => {
+        el.addEventListener('mouseenter', () => {
+            if (!tooltip) return;
+            const phase = el.getAttribute('data-phase');
+            const dur = el.getAttribute('data-duration');
+            const summary = el.getAttribute('data-summary');
+            const cp = el.getAttribute('data-cp');
+            const actor = el.getAttribute('data-actor');
+            const cpTag = cp ? `<strong>${escapeHtml(cp)}</strong> ` : '';
+            tooltip.innerHTML = `${cpTag}<em>${escapeHtml(phase)}</em> &bull; ${dur}s &bull; ${escapeHtml(actor)}<br><span style="color:#94a3b8">${escapeHtml(summary)}</span>`;
+            tooltip.classList.remove('hidden');
+
+            const rect = el.getBoundingClientRect();
+            const parentRect = sec.getBoundingClientRect();
+            tooltip.style.left = `${rect.left + rect.width / 2 - parentRect.left}px`;
+        });
+        el.addEventListener('mouseleave', () => {
+            if (tooltip) tooltip.classList.add('hidden');
+        });
+    });
 }
 
 function renderActiveRun(run, activeRunId) {

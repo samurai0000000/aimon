@@ -438,7 +438,7 @@ void CollabOrchestrator::orchestratorLoop() {
     while (_running) {
         std::unique_lock<std::mutex> lock(_mutex);
         _cv.wait_for(lock, std::chrono::seconds(2), [&]() {
-            return !_running || _stepRequested || _autoDrive;
+            return !_running || _stepRequested;
         });
 
         if (!_running) break;

@@ -318,6 +318,58 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                     </div>
                 </div>
 
+                <!-- Executive KPI Bar -->
+                <div id="exec-kpi-bar" class="exec-kpi-bar hidden">
+                    <div class="kpi-card">
+                        <span class="kpi-label">Autonomous / Gating</span>
+                        <div class="kpi-val-row">
+                            <span class="kpi-val text-cyan" id="kpi-auto-pct">--%</span>
+                            <span class="kpi-sub" id="kpi-gating-pct">(Human: --%)</span>
+                        </div>
+                    </div>
+                    <div class="kpi-card">
+                        <span class="kpi-label">Command Reliability</span>
+                        <div class="kpi-val-row">
+                            <span class="kpi-val text-green" id="kpi-cmd-rate">--%</span>
+                            <span class="kpi-sub" id="kpi-cmd-counts">(-- passed)</span>
+                        </div>
+                    </div>
+                    <div class="kpi-card">
+                        <span class="kpi-label">Checkpoints / Recovery</span>
+                        <div class="kpi-val-row">
+                            <span class="kpi-val text-purple" id="kpi-checkpoints">0</span>
+                            <span class="kpi-sub" id="kpi-recovery">(-- loops)</span>
+                        </div>
+                    </div>
+                    <div class="kpi-card">
+                        <span class="kpi-label">AI Quota Delta</span>
+                        <div class="kpi-val-row">
+                            <span class="kpi-val text-magenta" id="kpi-quota-delta">0 fast</span>
+                            <span class="kpi-sub" id="kpi-quota-spend">($0.00)</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Segmented Waterfall Timeline -->
+                <div id="exec-waterfall-section" class="exec-waterfall-section hidden">
+                    <div class="waterfall-header-row">
+                        <div class="waterfall-title-row">
+                            <h3>Waterfall Timeline</h3>
+                            <span class="badge badge-sub" id="waterfall-total-time">0s</span>
+                        </div>
+                        <div class="waterfall-legend">
+                            <span class="legend-item"><span class="legend-dot dot-exec"></span> Execution</span>
+                            <span class="legend-item"><span class="legend-dot dot-review"></span> Review</span>
+                            <span class="legend-item"><span class="legend-dot dot-interlock"></span> Human Gating</span>
+                            <span class="legend-item"><span class="legend-dot dot-recovery"></span> Recovery</span>
+                        </div>
+                    </div>
+                    <div class="waterfall-bar-track" id="waterfall-bar-track">
+                        <!-- Populated dynamically with segments -->
+                    </div>
+                    <div class="waterfall-tooltip hidden" id="waterfall-tooltip"></div>
+                </div>
+
                 <!-- Transcript Events Stream -->
                 <div class="exec-transcript-section">
                     <div class="transcript-header-row">
@@ -1967,6 +2019,161 @@ body {
     line-height: 1.35;
 }
 
+/* Executive KPI Bar */
+.exec-kpi-bar {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+@media (max-width: 900px) {
+    .exec-kpi-bar {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.kpi-card {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.kpi-label {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+}
+
+.kpi-val-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.kpi-val {
+    font-size: 1.25rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+}
+
+.kpi-sub {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+}
+
+.text-cyan { color: #06b6d4; }
+.text-green { color: #10b981; }
+.text-purple { color: #a855f7; }
+.text-magenta { color: #ec4899; }
+.text-amber { color: #f59e0b; }
+
+/* Segmented Waterfall Timeline */
+.exec-waterfall-section {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+    position: relative;
+}
+
+.waterfall-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.waterfall-title-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.waterfall-title-row h3 {
+    margin: 0;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.waterfall-legend {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.dot-exec, .wf-phase-execution { background: #10b981; }
+.dot-review, .wf-phase-review { background: #a855f7; }
+.dot-interlock, .wf-phase-interlock { background: #f59e0b; }
+.dot-recovery, .wf-phase-recovery { background: #f97316; }
+.dot-setup, .wf-phase-setup { background: #64748b; }
+
+.waterfall-bar-track {
+    display: flex;
+    height: 24px;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+}
+
+.waterfall-segment {
+    height: 100%;
+    position: relative;
+    cursor: pointer;
+    transition: opacity 0.15s ease, filter 0.15s ease;
+    min-width: 4px;
+}
+
+.waterfall-segment:hover {
+    filter: brightness(1.25);
+    z-index: 2;
+}
+
+.waterfall-tooltip {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #0f172a;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.75rem;
+    color: #f8fafc;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+    pointer-events: none;
+    white-space: nowrap;
+    z-index: 10;
+}
+
 /* Footer */
 .app-footer {
     text-align: center;
@@ -2679,20 +2886,130 @@ async function fetchExecState() {
             renderInterlockBanner(currentPendingInterlock);
         }
 
-        // 3. Fetch transcript for current run
+        // 3. Fetch transcript & metrics for current run
         if (currentActiveRun && currentActiveRun.run_id) {
-            const txRes = await fetch(`/api/exec/runs/${encodeURIComponent(currentActiveRun.run_id)}/transcript`);
+            const runIdEncoded = encodeURIComponent(currentActiveRun.run_id);
+            const txRes = await fetch(`/api/exec/runs/${runIdEncoded}/transcript`);
             if (txRes.ok) {
                 const txData = await txRes.json();
                 currentTranscriptEvents = txData.events || [];
                 renderTranscript(currentTranscriptEvents);
             }
+
+            const metricsRes = await fetch(`/api/exec/runs/${runIdEncoded}/metrics`);
+            if (metricsRes.ok) {
+                const metricsData = await metricsRes.json();
+                renderKpiBar(metricsData);
+                renderWaterfall(metricsData);
+            } else {
+                renderKpiBar(null);
+                renderWaterfall(null);
+            }
         } else {
             renderTranscript([]);
+            renderKpiBar(null);
+            renderWaterfall(null);
         }
     } catch (e) {
         console.warn('Failed to fetch exec state:', e);
     }
+}
+
+function renderKpiBar(metrics) {
+    const kpiBar = document.getElementById('exec-kpi-bar');
+    if (!kpiBar) return;
+    if (!metrics) {
+        kpiBar.classList.add('hidden');
+        return;
+    }
+    kpiBar.classList.remove('hidden');
+
+    const autoPct = Math.round((metrics.autonomous_ratio || 0) * 100);
+    const gatingPct = Math.round((metrics.human_gating_ratio || 0) * 100);
+    const autoEl = document.getElementById('kpi-auto-pct');
+    const gatingEl = document.getElementById('kpi-gating-pct');
+    if (autoEl) autoEl.textContent = `${autoPct}%`;
+    if (gatingEl) gatingEl.textContent = `(Human: ${gatingPct}%)`;
+
+    const cmdRate = Math.round((metrics.command_success_rate || 0) * 100);
+    const rateEl = document.getElementById('kpi-cmd-rate');
+    const countsEl = document.getElementById('kpi-cmd-counts');
+    if (rateEl) rateEl.textContent = `${cmdRate}%`;
+    if (countsEl) {
+        countsEl.textContent = `(${metrics.successful_commands || 0}/${metrics.total_commands || 0} passed)`;
+    }
+
+    const cpEl = document.getElementById('kpi-checkpoints');
+    const recEl = document.getElementById('kpi-recovery');
+    if (cpEl) cpEl.textContent = metrics.total_checkpoints || 0;
+    if (recEl) recEl.textContent = `(${metrics.recovery_count || 0} recovery)`;
+
+    const qDelta = metrics.quota_delta || {};
+    const deltaEl = document.getElementById('kpi-quota-delta');
+    const spendEl = document.getElementById('kpi-quota-spend');
+    if (deltaEl) {
+        deltaEl.textContent = `${qDelta.cursor_fast_requests_delta || 0} fast`;
+    }
+    if (spendEl) {
+        const spend = (qDelta.cursor_spend_usd_delta || 0).toFixed(2);
+        spendEl.textContent = `($${spend})`;
+    }
+}
+
+function renderWaterfall(metrics) {
+    const sec = document.getElementById('exec-waterfall-section');
+    const track = document.getElementById('waterfall-bar-track');
+    const totalTimeEl = document.getElementById('waterfall-total-time');
+    const tooltip = document.getElementById('waterfall-tooltip');
+    if (!sec || !track) return;
+
+    if (!metrics || !Array.isArray(metrics.waterfall) || metrics.waterfall.length === 0) {
+        sec.classList.add('hidden');
+        return;
+    }
+    sec.classList.remove('hidden');
+
+    const totalSec = Math.max(1, metrics.total_duration_seconds || 1);
+    if (totalTimeEl) totalTimeEl.textContent = `${totalSec}s`;
+
+    track.innerHTML = metrics.waterfall.map(seg => {
+        const phase = (seg.phase || 'setup').toLowerCase();
+        const dur = Math.max(0, seg.duration_seconds || 0);
+        const pct = Math.max(dur > 0 ? 1 : 0.5, (dur / totalSec) * 100);
+        const cp = seg.checkpoint_id ? `[${escapeHtml(seg.checkpoint_id)}] ` : '';
+        const title = `${cp}${seg.phase} (${dur}s) - ${escapeHtml(seg.summary || '')}`;
+
+        return `<div class="waterfall-segment wf-phase-${escapeHtml(phase)}"
+                     style="width: ${pct.toFixed(2)}%;"
+                     data-phase="${escapeHtml(phase)}"
+                     data-duration="${dur}"
+                     data-summary="${escapeHtml(seg.summary || '')}"
+                     data-actor="${escapeHtml(seg.actor || '')}"
+                     data-cp="${escapeHtml(seg.checkpoint_id || '')}"
+                     title="${title}"></div>`;
+    }).join('');
+
+    const segments = track.querySelectorAll('.waterfall-segment');
+    segments.forEach(el => {
+        el.addEventListener('mouseenter', () => {
+            if (!tooltip) return;
+            const phase = el.getAttribute('data-phase');
+            const dur = el.getAttribute('data-duration');
+            const summary = el.getAttribute('data-summary');
+            const cp = el.getAttribute('data-cp');
+            const actor = el.getAttribute('data-actor');
+            const cpTag = cp ? `<strong>${escapeHtml(cp)}</strong> ` : '';
+            tooltip.innerHTML = `${cpTag}<em>${escapeHtml(phase)}</em> &bull; ${dur}s &bull; ${escapeHtml(actor)}<br><span style="color:#94a3b8">${escapeHtml(summary)}</span>`;
+            tooltip.classList.remove('hidden');
+
+            const rect = el.getBoundingClientRect();
+            const parentRect = sec.getBoundingClientRect();
+            tooltip.style.left = `${rect.left + rect.width / 2 - parentRect.left}px`;
+        });
+        el.addEventListener('mouseleave', () => {
+            if (tooltip) tooltip.classList.add('hidden');
+        });
+    });
 }
 
 function renderActiveRun(run, activeRunId) {

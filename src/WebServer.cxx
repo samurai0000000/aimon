@@ -12,6 +12,7 @@
 #include "CollabOrchestrator.hxx"
 #include "TranscriptSink.hxx"
 #include "InterlockManager.hxx"
+#include "RunMetrics.hxx"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -46,6 +47,7 @@ WebServer::WebServer(StateStore& stateStore, HistoryStore& historyStore,
       _config(config),
       _onRefresh(onRefresh),
       _mcpServer(mcpServer),
+      _endpointsEnabled(config.endpointsEnabled),
       _server(std::make_unique<httplib::Server>()) {
 }
 
@@ -53,7 +55,140 @@ WebServer::~WebServer() {
     stop();
 }
 
+std::string WebServer::createUiSession() {
+    static thread_local std::random_device rd;
+    static thread_local std::mt19937_64 gen(rd());
+    static thread_local std::uniform_int_distribution<uint64_t> dis;
+
+    uint64_t p1 = dis(gen);
+    uint64_t p2 = dis(gen);
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0') << std::setw(16) << p1 << std::setw(16) << p2;
+    std::string token = oss.str();
+
+    std::lock_guard<std::mutex> lock(_sessionMutex);
+    time_t now = time(nullptr);
+    for (auto it = _uiSessions.begin(); it != _uiSessions.end(); ) {
+        if (now - it->second > 86400 * 7) {
+            it = _uiSessions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    _uiSessions[token] = now;
+    return token;
+}
+
+bool WebServer::isValidUiSession(const httplib::Request& req) const {
+    // 1. Block command-line agents and automated scripts
+    if (req.has_header("User-Agent")) {
+        std::string ua = req.get_header_value("User-Agent");
+        for (char &c : ua) c = tolower(c);
+        if (ua.find("curl/") != std::string::npos ||
+            ua.find("python") != std::string::npos ||
+            ua.find("wget/") != std::string::npos ||
+            ua.find("httpie") != std::string::npos ||
+            ua.find("aiohttp") != std::string::npos ||
+            ua.find("go-http-client") != std::string::npos) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    // 2. Extract session token
+    std::string token;
+    if (req.has_header("X-UI-Session")) {
+        token = req.get_header_value("X-UI-Session");
+    } else if (req.has_header("Cookie")) {
+        std::string cookie = req.get_header_value("Cookie");
+        size_t pos = cookie.find("aimon_session=");
+        if (pos != std::string::npos) {
+            size_t start = pos + 14;
+            size_t end = cookie.find(';', start);
+            token = (end == std::string::npos) ? cookie.substr(start) : cookie.substr(start, end - start);
+        }
+    }
+
+    if (token.empty()) {
+        return false;
+    }
+
+    // 3. Verify token exists and is fresh
+    std::lock_guard<std::mutex> lock(_sessionMutex);
+    auto it = _uiSessions.find(token);
+    if (it != _uiSessions.end()) {
+        time_t now = time(nullptr);
+        if (now - it->second < 86400 * 7) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::string WebServer::getMcpHintForPath(const std::string& path, const std::string& body) {
+    (void)body;
+    if (path == "/api/status" || path == "/api/history") {
+        return "Use official MCP tool 'get_combined_ai_status', 'check_antigravity_quota', or 'check_cursor_usage'.";
+    }
+    if (path == "/api/tasks" || path.rfind("/api/tasks/", 0) == 0) {
+        return "Use official MCP tool 'list_active_tasks' or 'register_agent_task'.";
+    }
+    if (path == "/api/collaboration/start") {
+        return "Use official MCP tool 'collab_start' with argument {\"plan_file\": \"...\"}.";
+    }
+    if (path == "/api/collaboration/run") {
+        return "Use official MCP tool 'collab_run' with argument {\"plan_file\": \"...\"}.";
+    }
+    if (path == "/api/collaboration/step") {
+        return "Use official MCP tool 'collab_step'.";
+    }
+    if (path == "/api/collaboration/status") {
+        return "Use official MCP tool 'collab_get_status'.";
+    }
+    if (path == "/api/collaboration/abort") {
+        return "Use official MCP tool 'collab_abort'.";
+    }
+    if (path.find("/transcript") != std::string::npos) {
+        return "Use official MCP tool 'exec_get_transcript' with argument {\"run_id\": \"<id>\"}.";
+    }
+    if (path.find("/metrics") != std::string::npos || path.find("/stats") != std::string::npos) {
+        return "Use official MCP tool 'exec_get_run_metrics' with argument {\"run_id\": \"<id>\"}.";
+    }
+    if (path.rfind("/api/exec/runs", 0) == 0) {
+        return "Use official MCP tool 'exec_list_runs' or 'exec_start_run'.";
+    }
+    if (path == "/api/exec/interlocks") {
+        return "Use official MCP tool 'exec_interlock_wait'.";
+    }
+    if (path.find("/resolve") != std::string::npos) {
+        return "Use official MCP tool 'exec_review_checkpoint' with argument {\"run_id\": \"...\", \"decision\": \"...\"}.";
+    }
+    return "Use official MCP tools ('aimon' gateway or native tools). Direct REST API access is disabled.";
+}
+
 void WebServer::setupRoutes() {
+    // Gate REST API endpoints if disabled by configuration, unless request is from an authenticated Web UI session
+    if (!_endpointsEnabled) {
+        _server->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+            if (req.path == "/api" || req.path.rfind("/api/", 0) == 0) {
+                if (!isValidUiSession(req)) {
+                    res.status = 403;
+                    std::string hint = getMcpHintForPath(req.path, req.body);
+                    nlohmann::json err = {
+                        {"error", "Direct REST API endpoint access is disabled by configuration."},
+                        {"hint", hint},
+                        {"daemon", "aimon"}
+                    };
+                    res.set_content(err.dump(2), "application/json");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+    }
+
     AgentMessageBus::getInstance().setCollaborationCallback([this](const CollaborationSession& session, const std::string& eventType) {
         nlohmann::json evt = {
             {"event", eventType},
@@ -104,8 +239,50 @@ void WebServer::setupRoutes() {
         res.set_content(fallbackAsset, contentType.c_str());
     };
 
-    _server->Get("/", [serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
-        serveFileOrFallback("web/index.html", assets::INDEX_HTML, "text/html", res);
+    _server->Get("/", [this, serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
+        std::string token = createUiSession();
+        res.set_header("Set-Cookie", "aimon_session=" + token + "; Path=/; SameSite=Strict");
+
+        std::string html;
+        if (fs::exists("web/index.html")) {
+            std::ifstream f("web/index.html");
+            if (f.is_open()) {
+                html = std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            }
+        }
+        if (html.empty()) {
+            html = assets::INDEX_HTML;
+        }
+
+        std::string sessionScript = "<script>\n"
+            "window.__UI_SESSION_TOKEN__ = \"" + token + "\";\n"
+            "(function() {\n"
+            "    const originalFetch = window.fetch;\n"
+            "    window.fetch = function(url, options) {\n"
+            "        options = options || {};\n"
+            "        options.headers = options.headers || {};\n"
+            "        if (window.__UI_SESSION_TOKEN__) {\n"
+            "            if (options.headers instanceof Headers) {\n"
+            "                options.headers.set('X-UI-Session', window.__UI_SESSION_TOKEN__);\n"
+            "            } else if (Array.isArray(options.headers)) {\n"
+            "                options.headers.push(['X-UI-Session', window.__UI_SESSION_TOKEN__]);\n"
+            "            } else {\n"
+            "                options.headers['X-UI-Session'] = window.__UI_SESSION_TOKEN__;\n"
+            "            }\n"
+            "        }\n"
+            "        return originalFetch(url, options);\n"
+            "    };\n"
+            "})();\n"
+            "</script>\n";
+
+        size_t headPos = html.find("</head>");
+        if (headPos != std::string::npos) {
+            html.insert(headPos, sessionScript);
+        } else {
+            html = sessionScript + html;
+        }
+
+        res.set_content(html, "text/html");
     });
 
     _server->Get("/style.css", [serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
@@ -499,6 +676,33 @@ void WebServer::setupRoutes() {
         res.set_content(resp.dump(2), "application/json");
     });
 
+    _server->Get(R"(/api/exec/runs/([^/]+)/metrics)", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string runId = req.matches[1].str();
+        std::string runDir = TranscriptSink::getInstance().getRunDirectory(runId);
+        std::string metaFile = runDir + "/run.json";
+        if (!std::filesystem::exists(metaFile)) {
+            res.status = 404;
+            res.set_content(nlohmann::json({{"error", "Run not found: " + runId}}).dump(2), "application/json");
+            return;
+        }
+        RunMetadata meta;
+        try {
+            std::ifstream mf(metaFile);
+            nlohmann::json j;
+            mf >> j;
+            meta = RunMetadata::fromJson(j);
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(nlohmann::json({{"error", e.what()}}).dump(2), "application/json");
+            return;
+        }
+        auto events = TranscriptSink::getInstance().getTranscript(runId, 0);
+        AggregateStatus cur = _stateStore.getStatus();
+        RunMetrics metrics = RunMetricsAnalyzer::analyze(meta, events, cur);
+        res.set_content(metrics.toJson().dump(2), "application/json");
+    });
+
     _server->Get("/api/exec/interlocks", [](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string runId = req.has_param("run_id") ? req.get_param_value("run_id") : "";
@@ -739,6 +943,9 @@ bool WebServer::start(bool async) {
 
     setupRoutes();
     _running = true;
+
+    _server->set_read_timeout(1, 0);
+    _server->set_write_timeout(5, 0);
 
     std::cout << "[WebServer] Dashboard available at http://"
               << _config.host << ":" << _config.port << std::endl;

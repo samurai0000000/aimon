@@ -16,6 +16,7 @@ namespace aimon {
 
 class DynamicToolRegistry;
 class TcpGateway;
+class CollabOrchestrator;
 
 class McpServer {
 public:
@@ -31,6 +32,7 @@ public:
     void setNotificationBroadcaster(std::function<void(const std::string&)> broadcaster) {
         _notificationBroadcaster = broadcaster;
     }
+    void setCollabOrchestrator(CollabOrchestrator* orch) { _collabOrch = orch; }
     void notifyToolsListChanged();
 
 private:
@@ -46,6 +48,7 @@ private:
     StateStore& _stateStore;
     DynamicToolRegistry* _dynamicRegistry = nullptr;
     TcpGateway* _tcpGateway = nullptr;
+    CollabOrchestrator* _collabOrch = nullptr;
     std::function<void(const std::string&)> _notificationBroadcaster;
 };
 

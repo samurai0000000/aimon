@@ -24,7 +24,8 @@ nlohmann::json AimonConfig::toJson() const {
         }},
         {"web", {
             {"host", web.host},
-            {"port", web.port}
+            {"port", web.port},
+            {"endpoints_enabled", web.endpointsEnabled}
         }},
         {"mqtt", {
             {"enabled", mqtt.enabled},
@@ -92,6 +93,7 @@ void AimonConfig::fromJson(const nlohmann::json& j) {
         const auto& w = j["web"];
         if (w.contains("host")) web.host = w["host"];
         if (w.contains("port")) web.port = w["port"];
+        if (w.contains("endpoints_enabled")) web.endpointsEnabled = w["endpoints_enabled"];
     }
 
     if (j.contains("mqtt")) {
