@@ -25,12 +25,7 @@
 #include "WebServer.hxx"
 #include "DynamicToolRegistry.hxx"
 #include "TcpGateway.hxx"
-#include "AgentMessageBus.hxx"
 #include "NcursesConsole.hxx"
-#include "AgentRunner.hxx"
-#include "CollabOrchestrator.hxx"
-#include "TranscriptSink.hxx"
-#include "InterlockManager.hxx"
 #include "Version.hxx"
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -50,8 +45,6 @@ static void signalHandler(int sig) {
     if (g_console) {
         g_console->shutdown();
     }
-    AgentMessageBus::getInstance().shutdown();
-    InterlockManager::getInstance().shutdown();
     g_cv.notify_all();
 }
 
@@ -65,10 +58,10 @@ static void printUsage(const char* progName) {
               << "Commands:\n"
               << "  daemon                 Run full background daemon (Web + Poller + MQTT) [Default]\n"
               << "  web                    Run embedded web dashboard server\n"
-              << "  mcp                    Run as stdio JSON-RPC 2.0 MCP server for AI agents\n"
-              << "  collab <subcmd> [...]  Inter-agent collaboration controls (run, step, auto, status, abort)\n\n"
+              << "  mcp                    Run as stdio JSON-RPC 2.0 MCP server for AI agents\n\n"
               << "Options:\n"
               << "  --config <path>        Custom path to configuration file (default: ~/.config/aimon/config.json)\n"
+              << "  --profile <profile>    Default MCP tool profile (core, embedded, network, mesh, all)\n"
               << "  --host <host>          Host interface for web dashboard (default: 0.0.0.0)\n"
               << "  --port <port>          Port for web dashboard (default: 3883)\n"
               << "  --mqtt-enable          Enable MQTT publishing to Home Assistant\n"
@@ -89,6 +82,7 @@ int main(int argc, char* argv[]) {
 
     std::string command = "daemon";
     std::string customConfigPath;
+    std::string optProfile;
     std::string optHost;
     int optPort = 0;
     bool optMqttEnable = false;
@@ -106,9 +100,6 @@ int main(int argc, char* argv[]) {
     }
 
     while (argIdx < argc) {
-        if (command == "collab") {
-            break;
-        }
         std::string arg = argv[argIdx++];
         if (arg == "--help" || arg == "-h") {
             printUsage(argv[0]);
@@ -120,6 +111,10 @@ int main(int argc, char* argv[]) {
             return 0;
         } else if (arg == "--config" && argIdx < argc) {
             customConfigPath = argv[argIdx++];
+        } else if (arg == "--profile" && argIdx < argc) {
+            optProfile = argv[argIdx++];
+        } else if (arg.rfind("--profile=", 0) == 0) {
+            optProfile = arg.substr(10);
         } else if (arg == "--host" && argIdx < argc) {
             optHost = argv[argIdx++];
         } else if (arg == "--port" && argIdx < argc) {
@@ -154,91 +149,6 @@ int main(int argc, char* argv[]) {
                   << "Built: " << AIMON_WHOAMI << "@" << AIMON_HOSTNAME
                   << " " << AIMON_DATE << "\n";
         return 0;
-    }
-
-    if (command == "collab") {
-        ConfigManager configMgr;
-        configMgr.load(customConfigPath);
-        int port = (optPort > 0) ? optPort : configMgr.getConfig().web.port;
-        std::string host = optHost.empty() ? "127.0.0.1" : optHost;
-
-        std::string subCmd = (argIdx < argc) ? argv[argIdx++] : "status";
-        httplib::Client cli(host, port);
-        cli.set_connection_timeout(5, 0);
-
-        if (subCmd == "status") {
-            auto res = cli.Get("/api/collaboration/status");
-            if (!res || res->status != 200) {
-                std::cerr << "Failed to connect to aimon daemon at " << host << ":" << port << "\n";
-                return 1;
-            }
-            std::cout << res->body << "\n";
-            return 0;
-        } else if (subCmd == "run") {
-            std::string planFile = (argIdx < argc) ? argv[argIdx++] : "";
-            std::string initId = (argIdx < argc) ? argv[argIdx++] : "agent-antigravity-builder";
-            std::string revId = (argIdx < argc) ? argv[argIdx++] : "agent-cursor-windows";
-            if (planFile.empty()) {
-                std::cerr << "Usage: " << argv[0] << " collab run <plan_file> [initiator] [reviewer]\n";
-                return 1;
-            }
-            nlohmann::json reqBody = {
-                {"plan_file", planFile},
-                {"initiator_id", initId},
-                {"reviewer_id", revId}
-            };
-            auto res = cli.Post("/api/collaboration/run", reqBody.dump(), "application/json");
-            if (!res) {
-                std::cerr << "Failed to connect to aimon daemon at " << host << ":" << port << "\n";
-                return 1;
-            }
-            std::cout << res->body << "\n";
-            return (res->status == 200 ? 0 : 1);
-        } else if (subCmd == "step") {
-            auto res = cli.Post("/api/collaboration/step", "{}", "application/json");
-            if (!res) {
-                std::cerr << "Failed to connect to aimon daemon at " << host << ":" << port << "\n";
-                return 1;
-            }
-            std::cout << res->body << "\n";
-            return (res->status == 200 ? 0 : 1);
-        } else if (subCmd == "auto") {
-            std::string mode = (argIdx < argc) ? argv[argIdx++] : "on";
-            bool enable = (mode == "on" || mode == "1" || mode == "true");
-            nlohmann::json reqBody = {{"enabled", enable}};
-            auto res = cli.Post("/api/collaboration/auto", reqBody.dump(), "application/json");
-            if (!res) {
-                std::cerr << "Failed to connect to aimon daemon at " << host << ":" << port << "\n";
-                return 1;
-            }
-            std::cout << res->body << "\n";
-            return (res->status == 200 ? 0 : 1);
-        } else if (subCmd == "abort") {
-            auto res = cli.Post("/api/collaboration/abort", "{}", "application/json");
-            if (!res) {
-                std::cerr << "Failed to connect to aimon daemon at " << host << ":" << port << "\n";
-                return 1;
-            }
-            std::cout << res->body << "\n";
-            return (res->status == 200 ? 0 : 1);
-        } else {
-            // Treat subCmd as planFile to start collaboration
-            std::string planFile = subCmd;
-            std::string initId = (argIdx < argc) ? argv[argIdx++] : "agent-antigravity-builder";
-            std::string revId = (argIdx < argc) ? argv[argIdx++] : "agent-cursor-windows";
-            nlohmann::json reqBody = {
-                {"plan_file", planFile},
-                {"initiator_id", initId},
-                {"reviewer_id", revId}
-            };
-            auto res = cli.Post("/api/collaboration/start", reqBody.dump(), "application/json");
-            if (!res) {
-                std::cerr << "Failed to connect to aimon daemon at " << host << ":" << port << "\n";
-                return 1;
-            }
-            std::cout << res->body << "\n";
-            return (res->status == 200 ? 0 : 1);
-        }
     }
 
     if (command != "daemon" && command != "web" && command != "mcp") {
@@ -320,6 +230,9 @@ int main(int argc, char* argv[]) {
         }
 
         McpServer mcpServer(stateStore, &dynamicRegistry, &tcpGateway);
+        if (!optProfile.empty()) {
+            mcpServer.setDefaultProfile(optProfile);
+        }
         tcpGateway.setToolsChangedCallback([&]() {
             mcpServer.notifyToolsListChanged();
         });
@@ -342,21 +255,13 @@ int main(int argc, char* argv[]) {
     DynamicToolRegistry dynamicRegistry;
     TcpGateway tcpGateway(dynamicRegistry);
 
-    TranscriptSink& transcriptSink = TranscriptSink::getInstance();
-    InterlockManager& interlockManager = InterlockManager::getInstance();
-    (void)transcriptSink;
-    (void)interlockManager;
-
     McpServer mcpServer(stateStore, &dynamicRegistry, &tcpGateway);
+    if (!optProfile.empty()) {
+        mcpServer.setDefaultProfile(optProfile);
+    }
     WebServer webServer(stateStore, historyStore, cfg.web, [&]() {
         pollOnce();
     }, &mcpServer);
-
-    AgentRunner agentRunner(cfg.collaboration);
-    CollabOrchestrator collabOrchestrator(agentRunner, configMgr);
-    collabOrchestrator.start();
-    webServer.setCollabOrchestrator(&collabOrchestrator);
-    mcpServer.setCollabOrchestrator(&collabOrchestrator);
 
     mcpServer.setNotificationBroadcaster([&](const std::string& notif) {
         webServer.broadcastSseNotification(notif);
@@ -398,24 +303,8 @@ int main(int argc, char* argv[]) {
             g_shutdown = true;
             g_cv.notify_all();
         });
-
-        AgentMessageBus::getInstance().setReplyCallback([&](const std::string& sessId,
-                                                            const std::string& msgId,
-                                                            const std::string& reply) {
-            if (console) {
-                console->logAgentReply(sessId, msgId, reply);
-            }
-        });
-
-        console->setCollabOrchestrator(&collabOrchestrator);
         console->init();
     } else {
-        AgentMessageBus::getInstance().setReplyCallback([&](const std::string& sessId,
-                                                            const std::string& msgId,
-                                                            const std::string& reply) {
-            std::cout << "\n[Agent (" << sessId.substr(0, 8) << ") ref: " << msgId << "]:\n"
-                      << reply << "\n" << std::endl;
-        });
         std::cout << "[aimon] Press Ctrl+C to stop." << std::endl;
     }
 
@@ -463,9 +352,6 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n[aimon] Shutting down cleanly..." << std::endl;
-    AgentMessageBus::getInstance().shutdown();
-    InterlockManager::getInstance().shutdown();
-    collabOrchestrator.stop();
     tcpGateway.stop();
     webServer.stop();
     if (mqttPublisher) {

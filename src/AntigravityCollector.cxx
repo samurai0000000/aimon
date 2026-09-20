@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <ctime>
 #include <algorithm>
+#include <functional>
 #include <set>
 #include <unistd.h>
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -139,14 +140,6 @@ std::vector<int> AntigravityCollector::findCandidateListeningPorts(pid_t pid) {
 }
 
 bool AntigravityCollector::discoverProcess(int& outPort, std::string& outCsrf) {
-    if (_cachedPort > 0 && !_cachedCsrf.empty()) {
-        if (probePort(_cachedPort, _cachedCsrf)) {
-            outPort = _cachedPort;
-            outCsrf = _cachedCsrf;
-            return true;
-        }
-    }
-
     if (!_config.csrfToken.empty() && _config.port > 0) {
         if (probePort(_config.port, _config.csrfToken)) {
             _cachedPort = _config.port;
@@ -167,6 +160,7 @@ bool AntigravityCollector::discoverProcess(int& outPort, std::string& outCsrf) {
         return false;
     }
 
+    std::vector<pid_t> candidatePids;
     try {
         for (const auto& entry : fs::directory_iterator("/proc")) {
             if (!entry.is_directory()) continue;
@@ -174,48 +168,72 @@ bool AntigravityCollector::discoverProcess(int& outPort, std::string& outCsrf) {
             if (!std::all_of(dirName.begin(), dirName.end(), ::isdigit)) continue;
 
             pid_t pid = std::stoi(dirName);
-            std::string cmdlinePath = entry.path().string() + "/cmdline";
-            std::ifstream cmdlineFile(cmdlinePath);
-            if (!cmdlineFile.is_open()) continue;
-
-            std::string content((std::istreambuf_iterator<char>(cmdlineFile)),
-                                 std::istreambuf_iterator<char>());
-            if (content.find("language_server") == std::string::npos) {
-                continue;
-            }
-
-            // Extract CSRF token
-            std::string discoveredCsrf;
-            size_t pos = 0;
-            while (pos < content.size()) {
-                std::string arg = content.c_str() + pos;
-                if (arg == "--csrf_token" && (pos + arg.length() + 1) < content.size()) {
-                    discoveredCsrf = content.c_str() + pos + arg.length() + 1;
-                    break;
-                }
-                pos += arg.length() + 1;
-            }
-
-            if (discoveredCsrf.empty() && !envCsrf.empty()) {
-                discoveredCsrf = envCsrf;
-            }
-
-            if (discoveredCsrf.empty()) {
-                continue;
-            }
-
-            std::vector<int> ports = findCandidateListeningPorts(pid);
-            for (int p : ports) {
-                if (probePort(p, discoveredCsrf)) {
-                    _cachedPort = p;
-                    _cachedCsrf = discoveredCsrf;
-                    outPort = p;
-                    outCsrf = discoveredCsrf;
-                    return true;
-                }
-            }
+            candidatePids.push_back(pid);
         }
     } catch (...) {
+    }
+
+    // Sort PIDs in descending order (highest/newest PID first)
+    std::sort(candidatePids.begin(), candidatePids.end(), std::greater<pid_t>());
+
+    for (pid_t pid : candidatePids) {
+        std::string cmdlinePath = "/proc/" + std::to_string(pid) + "/cmdline";
+        std::ifstream cmdlineFile(cmdlinePath);
+        if (!cmdlineFile.is_open()) continue;
+
+        std::string content((std::istreambuf_iterator<char>(cmdlineFile)),
+                             std::istreambuf_iterator<char>());
+        if (content.find("language_server") == std::string::npos) {
+            continue;
+        }
+
+        // Extract CSRF token
+        std::string discoveredCsrf;
+        size_t pos = 0;
+        while (pos < content.size()) {
+            std::string arg = content.c_str() + pos;
+            if (arg == "--csrf_token" && (pos + arg.length() + 1) < content.size()) {
+                discoveredCsrf = content.c_str() + pos + arg.length() + 1;
+                break;
+            }
+            pos += arg.length() + 1;
+        }
+
+        if (discoveredCsrf.empty() && !envCsrf.empty()) {
+            discoveredCsrf = envCsrf;
+        }
+
+        if (discoveredCsrf.empty()) {
+            continue;
+        }
+
+        // If this PID matches our cached PID and port, probe it first
+        if (pid == _cachedPid && _cachedPort > 0 && probePort(_cachedPort, discoveredCsrf)) {
+            outPort = _cachedPort;
+            outCsrf = discoveredCsrf;
+            return true;
+        }
+
+        std::vector<int> ports = findCandidateListeningPorts(pid);
+        for (int p : ports) {
+            if (probePort(p, discoveredCsrf)) {
+                _cachedPid = pid;
+                _cachedPort = p;
+                _cachedCsrf = discoveredCsrf;
+                outPort = p;
+                outCsrf = discoveredCsrf;
+                return true;
+            }
+        }
+    }
+
+    // Fallback: if cached port and CSRF still respond
+    if (_cachedPort > 0 && !_cachedCsrf.empty()) {
+        if (probePort(_cachedPort, _cachedCsrf)) {
+            outPort = _cachedPort;
+            outCsrf = _cachedCsrf;
+            return true;
+        }
     }
 
     return false;
@@ -268,6 +286,63 @@ AntigravityStatus AntigravityCollector::fetchStatus() {
             const auto& ps = userStatus["planStatus"];
             if (ps.contains("planInfo") && ps["planInfo"].contains("planName")) {
                 status.planTier = ps["planInfo"]["planName"];
+            }
+        }
+
+        auto parseIntOrString = [](const nlohmann::json& jVal, int defaultVal = 0) -> int {
+            if (jVal.is_number_integer()) {
+                return jVal.get<int>();
+            } else if (jVal.is_string()) {
+                try {
+                    return std::stoi(jVal.get<std::string>());
+                } catch (...) {}
+            }
+            return defaultVal;
+        };
+
+        // Parse available credits from userTier or userStatus
+        const nlohmann::json* creditsArray = nullptr;
+        if (userStatus.contains("userTier") && userStatus["userTier"].contains("availableCredits") &&
+            userStatus["userTier"]["availableCredits"].is_array()) {
+            creditsArray = &userStatus["userTier"]["availableCredits"];
+        } else if (userStatus.contains("availableCredits") && userStatus["availableCredits"].is_array()) {
+            creditsArray = &userStatus["availableCredits"];
+        }
+
+        if (creditsArray) {
+            for (const auto& c : *creditsArray) {
+                if (!c.is_object()) continue;
+                UserCredit uc;
+                if (c.contains("creditType") && c["creditType"].is_string()) {
+                    uc.creditType = c["creditType"].get<std::string>();
+                }
+                if (c.contains("creditAmount")) {
+                    uc.creditAmount = parseIntOrString(c["creditAmount"], 0);
+                }
+                if (c.contains("minimumCreditAmountForUsage")) {
+                    uc.minimumCreditAmountForUsage = parseIntOrString(c["minimumCreditAmountForUsage"], 0);
+                }
+                status.availableCredits.push_back(uc);
+            }
+        }
+
+        // Parse prompt and flow credits from planStatus
+        if (userStatus.contains("planStatus") && userStatus["planStatus"].is_object()) {
+            const auto& ps = userStatus["planStatus"];
+            if (ps.contains("availablePromptCredits")) {
+                status.availablePromptCredits = parseIntOrString(ps["availablePromptCredits"], 0);
+            }
+            if (ps.contains("availableFlowCredits")) {
+                status.availableFlowCredits = parseIntOrString(ps["availableFlowCredits"], 0);
+            }
+            if (ps.contains("planInfo") && ps["planInfo"].is_object()) {
+                const auto& pi = ps["planInfo"];
+                if (pi.contains("monthlyPromptCredits")) {
+                    status.monthlyPromptCredits = parseIntOrString(pi["monthlyPromptCredits"], 0);
+                }
+                if (pi.contains("monthlyFlowCredits")) {
+                    status.monthlyFlowCredits = parseIntOrString(pi["monthlyFlowCredits"], 0);
+                }
             }
         }
 

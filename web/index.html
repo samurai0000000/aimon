@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=1.0.4">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -40,6 +40,23 @@
                     <span id="ag-plan-badge" class="badge badge-cyan">Google AI Ultra</span>
                 </div>
 
+                <!-- Credits & Allowances Strip -->
+                <div class="credits-strip" id="ag-credits-strip">
+                    <div class="credit-pill">
+                        <div class="credit-top-row">
+                            <span class="credit-label">Google One AI Credits</span>
+                            <span class="badge-sub" id="ag-credit-min">Min 50 / req</span>
+                        </div>
+                        <span id="ag-available-credits" class="credit-val highlight-cyan">--</span>
+                    </div>
+                    <div class="credit-pill">
+                        <div class="credit-top-row">
+                            <span class="credit-label">Prompt & Flow Balance</span>
+                            <span class="badge-sub" id="ag-credit-tier">Monthly</span>
+                        </div>
+                        <span id="ag-prompt-flow" class="credit-val">--</span>
+                    </div>
+                </div>
 
                 <!-- Quota Groups (Gemini Models, Claude & GPT models) -->
                 <div class="quota-groups-section">
@@ -168,20 +185,15 @@
                 <div id="cursor-error" class="error-banner hidden"></div>
             </section>
 
-            <!-- Active Agent Fleet Section -->
+            <!-- Connected MCP Clients Section -->
             <section class="card glass-card agents-fleet-card">
                 <div class="card-header">
                     <div class="provider-title">
                         <span class="dot-status dot-online" id="agents-status-dot"></span>
-                        <h2>Active Agent Fleet</h2>
+                        <h2>Connected MCP Clients</h2>
                     </div>
                     <div class="agents-header-actions">
-                        <label class="toggle-switch-label" title="Show completed or failed tasks">
-                            <input type="checkbox" id="toggle-completed-tasks">
-                            <span class="toggle-switch-slider"></span>
-                            <span class="toggle-switch-text">Show Completed</span>
-                        </label>
-                        <span id="agents-count-badge" class="badge badge-cyan">0 Active</span>
+                        <span id="agents-count-badge" class="badge badge-cyan">0 Sessions</span>
                     </div>
                 </div>
 
@@ -194,7 +206,7 @@
                                 <line x1="2" y1="12" x2="22" y2="12"></line>
                                 <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
                             </svg>
-                            Connected IDEs:
+                            Active Sessions:
                         </span>
                     </div>
                     <div class="mcp-clients-list" id="mcp-clients-list">
@@ -202,170 +214,6 @@
                             <span class="dot-status dot-offline"></span>
                             No active MCP connections
                         </span>
-                    </div>
-                </div>
-
-                <div class="table-responsive" id="agents-table-container">
-                    <table class="agents-table" id="agents-table">
-                        <thead>
-                            <tr>
-                                <th style="width: 130px;">Status</th>
-                                <th style="width: 150px;">Agent</th>
-                                <th>Task / Goal</th>
-                                <th style="width: 200px;">Active Action</th>
-                                <th style="width: 100px;">Duration</th>
-                                <th style="width: 100px;">Last Seen</th>
-                            </tr>
-                        </thead>
-                        <tbody id="agents-table-body">
-                            <!-- Populated dynamically by app.js -->
-                        </tbody>
-                    </table>
-                </div>
-
-                <div id="agents-empty-state" class="agents-empty-state">
-                    <div class="empty-icon">🤖</div>
-                    <p class="empty-title">No AI agents currently active</p>
-                    <p class="empty-desc">Agents reporting via MCP (<code>register_agent_task</code>) or HTTP will appear here in real time.</p>
-                </div>
-            </section>
-
-            <!-- Execution Runs & Interlock Section -->
-            <section class="card glass-card exec-runs-card" id="exec-runs-section">
-                <div class="card-header">
-                    <div class="provider-title">
-                        <span class="dot-status dot-online" id="exec-status-dot"></span>
-                        <h2>Execution Runs &amp; Interlock</h2>
-                    </div>
-                    <div class="exec-header-actions">
-                        <span id="exec-run-badge" class="badge">No Active Run</span>
-                    </div>
-                </div>
-
-                <!-- Pending Interlock Banner -->
-                <div id="interlock-banner" class="interlock-banner hidden">
-                    <div class="interlock-header">
-                        <div class="interlock-icon-title">
-                            <span class="interlock-icon">⚠️</span>
-                            <div>
-                                <h3 class="interlock-title">Operator Approval Required</h3>
-                                <div class="interlock-sub" id="interlock-sub">Checkpoint action awaiting human sign-off</div>
-                            </div>
-                        </div>
-                        <span class="badge badge-amber" id="interlock-id-badge">intk-...</span>
-                    </div>
-
-                    <div class="interlock-body">
-                        <div class="interlock-box">
-                            <span class="interlock-label">Description / Reason</span>
-                            <div class="interlock-val" id="interlock-desc-text">--</div>
-                        </div>
-                        <div class="interlock-box" id="interlock-action-box">
-                            <span class="interlock-label">Proposed Action</span>
-                            <pre class="interlock-code-val" id="interlock-action-text">--</pre>
-                        </div>
-                    </div>
-
-                    <div class="interlock-actions-row" id="interlock-buttons-row">
-                        <button type="button" class="btn-interlock btn-approve" id="btn-interlock-approve">
-                            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                            Approve Action
-                        </button>
-                        <button type="button" class="btn-interlock btn-reject" id="btn-interlock-reject">
-                            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                            Reject Action
-                        </button>
-                    </div>
-
-                    <div id="interlock-reject-box" class="interlock-reject-box hidden">
-                        <input type="text" id="interlock-reject-reason" class="input-reject-reason" placeholder="Enter reason for rejection (optional)...">
-                        <button type="button" class="btn-action-confirm" id="btn-confirm-reject">Confirm Reject</button>
-                        <button type="button" class="btn-action-cancel" id="btn-cancel-reject">Cancel</button>
-                    </div>
-                </div>
-
-                <!-- Active Run Details -->
-                <div id="exec-run-details" class="exec-run-details hidden">
-                    <div class="exec-meta-grid">
-                        <div class="exec-meta-item">
-                            <span class="meta-label">Target Alias</span>
-                            <span class="meta-val" id="exec-meta-target">--</span>
-                        </div>
-                        <div class="exec-meta-item">
-                            <span class="meta-label">Plan Document</span>
-                            <span class="meta-val" id="exec-meta-plan">--</span>
-                        </div>
-                        <div class="exec-meta-item">
-                            <span class="meta-label">Actors</span>
-                            <span class="meta-val" id="exec-meta-actors">--</span>
-                        </div>
-                        <div class="exec-meta-item">
-                            <span class="meta-label">Elapsed Time</span>
-                            <span class="meta-val" id="exec-meta-duration">00m 00s</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Executive KPI Bar -->
-                <div id="exec-kpi-bar" class="exec-kpi-bar hidden">
-                    <div class="kpi-card">
-                        <span class="kpi-label">Autonomous / Gating</span>
-                        <div class="kpi-val-row">
-                            <span class="kpi-val text-cyan" id="kpi-auto-pct">--%</span>
-                            <span class="kpi-sub" id="kpi-gating-pct">(Human: --%)</span>
-                        </div>
-                    </div>
-                    <div class="kpi-card">
-                        <span class="kpi-label">Command Reliability</span>
-                        <div class="kpi-val-row">
-                            <span class="kpi-val text-green" id="kpi-cmd-rate">--%</span>
-                            <span class="kpi-sub" id="kpi-cmd-counts">(-- passed)</span>
-                        </div>
-                    </div>
-                    <div class="kpi-card">
-                        <span class="kpi-label">Checkpoints / Recovery</span>
-                        <div class="kpi-val-row">
-                            <span class="kpi-val text-purple" id="kpi-checkpoints">0</span>
-                            <span class="kpi-sub" id="kpi-recovery">(-- loops)</span>
-                        </div>
-                    </div>
-                    <div class="kpi-card">
-                        <span class="kpi-label">AI Quota Delta</span>
-                        <div class="kpi-val-row">
-                            <span class="kpi-val text-magenta" id="kpi-quota-delta">0 fast</span>
-                            <span class="kpi-sub" id="kpi-quota-spend">($0.00)</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Segmented Waterfall Timeline -->
-                <div id="exec-waterfall-section" class="exec-waterfall-section hidden">
-                    <div class="waterfall-header-row">
-                        <div class="waterfall-title-row">
-                            <h3>Waterfall Timeline</h3>
-                            <span class="badge badge-sub" id="waterfall-total-time">0s</span>
-                        </div>
-                        <div class="waterfall-legend">
-                            <span class="legend-item"><span class="legend-dot dot-exec"></span> Execution</span>
-                            <span class="legend-item"><span class="legend-dot dot-review"></span> Review</span>
-                            <span class="legend-item"><span class="legend-dot dot-interlock"></span> Human Gating</span>
-                            <span class="legend-item"><span class="legend-dot dot-recovery"></span> Recovery</span>
-                        </div>
-                    </div>
-                    <div class="waterfall-bar-track" id="waterfall-bar-track">
-                        <!-- Populated dynamically with segments -->
-                    </div>
-                    <div class="waterfall-tooltip hidden" id="waterfall-tooltip"></div>
-                </div>
-
-                <!-- Transcript Events Stream -->
-                <div class="exec-transcript-section">
-                    <div class="transcript-header-row">
-                        <h3>Event Transcript</h3>
-                        <span class="transcript-count-badge" id="transcript-count">0 events</span>
-                    </div>
-                    <div class="transcript-stream-container" id="transcript-stream">
-                        <div class="transcript-empty" id="transcript-empty">No execution runs or events recorded yet</div>
                     </div>
                 </div>
             </section>
@@ -376,6 +224,6 @@
         </footer>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=1.0.4"></script>
 </body>
 </html>

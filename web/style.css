@@ -239,6 +239,13 @@ body {
     gap: 4px;
 }
 
+.credit-top-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
 .credit-label {
     font-size: 0.75rem;
     color: var(--text-secondary);
@@ -251,6 +258,11 @@ body {
     font-weight: 700;
     font-family: var(--font-mono);
     color: var(--text-primary);
+}
+
+.credit-val.highlight-cyan {
+    color: var(--cyan-glow);
+    text-shadow: 0 0 16px rgba(0, 242, 254, 0.35);
 }
 
 /* Quota Groups */

@@ -16,7 +16,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=1.0.4">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -52,6 +52,23 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                     <span id="ag-plan-badge" class="badge badge-cyan">Google AI Ultra</span>
                 </div>
 
+                <!-- Credits & Allowances Strip -->
+                <div class="credits-strip" id="ag-credits-strip">
+                    <div class="credit-pill">
+                        <div class="credit-top-row">
+                            <span class="credit-label">Google One AI Credits</span>
+                            <span class="badge-sub" id="ag-credit-min">Min 50 / req</span>
+                        </div>
+                        <span id="ag-available-credits" class="credit-val highlight-cyan">--</span>
+                    </div>
+                    <div class="credit-pill">
+                        <div class="credit-top-row">
+                            <span class="credit-label">Prompt & Flow Balance</span>
+                            <span class="badge-sub" id="ag-credit-tier">Monthly</span>
+                        </div>
+                        <span id="ag-prompt-flow" class="credit-val">--</span>
+                    </div>
+                </div>
 
                 <!-- Quota Groups (Gemini Models, Claude & GPT models) -->
                 <div class="quota-groups-section">
@@ -180,20 +197,15 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                 <div id="cursor-error" class="error-banner hidden"></div>
             </section>
 
-            <!-- Active Agent Fleet Section -->
+            <!-- Connected MCP Clients Section -->
             <section class="card glass-card agents-fleet-card">
                 <div class="card-header">
                     <div class="provider-title">
                         <span class="dot-status dot-online" id="agents-status-dot"></span>
-                        <h2>Active Agent Fleet</h2>
+                        <h2>Connected MCP Clients</h2>
                     </div>
                     <div class="agents-header-actions">
-                        <label class="toggle-switch-label" title="Show completed or failed tasks">
-                            <input type="checkbox" id="toggle-completed-tasks">
-                            <span class="toggle-switch-slider"></span>
-                            <span class="toggle-switch-text">Show Completed</span>
-                        </label>
-                        <span id="agents-count-badge" class="badge badge-cyan">0 Active</span>
+                        <span id="agents-count-badge" class="badge badge-cyan">0 Sessions</span>
                     </div>
                 </div>
 
@@ -206,7 +218,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                                 <line x1="2" y1="12" x2="22" y2="12"></line>
                                 <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
                             </svg>
-                            Connected IDEs:
+                            Active Sessions:
                         </span>
                     </div>
                     <div class="mcp-clients-list" id="mcp-clients-list">
@@ -214,170 +226,6 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                             <span class="dot-status dot-offline"></span>
                             No active MCP connections
                         </span>
-                    </div>
-                </div>
-
-                <div class="table-responsive" id="agents-table-container">
-                    <table class="agents-table" id="agents-table">
-                        <thead>
-                            <tr>
-                                <th style="width: 130px;">Status</th>
-                                <th style="width: 150px;">Agent</th>
-                                <th>Task / Goal</th>
-                                <th style="width: 200px;">Active Action</th>
-                                <th style="width: 100px;">Duration</th>
-                                <th style="width: 100px;">Last Seen</th>
-                            </tr>
-                        </thead>
-                        <tbody id="agents-table-body">
-                            <!-- Populated dynamically by app.js -->
-                        </tbody>
-                    </table>
-                </div>
-
-                <div id="agents-empty-state" class="agents-empty-state">
-                    <div class="empty-icon">🤖</div>
-                    <p class="empty-title">No AI agents currently active</p>
-                    <p class="empty-desc">Agents reporting via MCP (<code>register_agent_task</code>) or HTTP will appear here in real time.</p>
-                </div>
-            </section>
-
-            <!-- Execution Runs & Interlock Section -->
-            <section class="card glass-card exec-runs-card" id="exec-runs-section">
-                <div class="card-header">
-                    <div class="provider-title">
-                        <span class="dot-status dot-online" id="exec-status-dot"></span>
-                        <h2>Execution Runs &amp; Interlock</h2>
-                    </div>
-                    <div class="exec-header-actions">
-                        <span id="exec-run-badge" class="badge">No Active Run</span>
-                    </div>
-                </div>
-
-                <!-- Pending Interlock Banner -->
-                <div id="interlock-banner" class="interlock-banner hidden">
-                    <div class="interlock-header">
-                        <div class="interlock-icon-title">
-                            <span class="interlock-icon">⚠️</span>
-                            <div>
-                                <h3 class="interlock-title">Operator Approval Required</h3>
-                                <div class="interlock-sub" id="interlock-sub">Checkpoint action awaiting human sign-off</div>
-                            </div>
-                        </div>
-                        <span class="badge badge-amber" id="interlock-id-badge">intk-...</span>
-                    </div>
-
-                    <div class="interlock-body">
-                        <div class="interlock-box">
-                            <span class="interlock-label">Description / Reason</span>
-                            <div class="interlock-val" id="interlock-desc-text">--</div>
-                        </div>
-                        <div class="interlock-box" id="interlock-action-box">
-                            <span class="interlock-label">Proposed Action</span>
-                            <pre class="interlock-code-val" id="interlock-action-text">--</pre>
-                        </div>
-                    </div>
-
-                    <div class="interlock-actions-row" id="interlock-buttons-row">
-                        <button type="button" class="btn-interlock btn-approve" id="btn-interlock-approve">
-                            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                            Approve Action
-                        </button>
-                        <button type="button" class="btn-interlock btn-reject" id="btn-interlock-reject">
-                            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                            Reject Action
-                        </button>
-                    </div>
-
-                    <div id="interlock-reject-box" class="interlock-reject-box hidden">
-                        <input type="text" id="interlock-reject-reason" class="input-reject-reason" placeholder="Enter reason for rejection (optional)...">
-                        <button type="button" class="btn-action-confirm" id="btn-confirm-reject">Confirm Reject</button>
-                        <button type="button" class="btn-action-cancel" id="btn-cancel-reject">Cancel</button>
-                    </div>
-                </div>
-
-                <!-- Active Run Details -->
-                <div id="exec-run-details" class="exec-run-details hidden">
-                    <div class="exec-meta-grid">
-                        <div class="exec-meta-item">
-                            <span class="meta-label">Target Alias</span>
-                            <span class="meta-val" id="exec-meta-target">--</span>
-                        </div>
-                        <div class="exec-meta-item">
-                            <span class="meta-label">Plan Document</span>
-                            <span class="meta-val" id="exec-meta-plan">--</span>
-                        </div>
-                        <div class="exec-meta-item">
-                            <span class="meta-label">Actors</span>
-                            <span class="meta-val" id="exec-meta-actors">--</span>
-                        </div>
-                        <div class="exec-meta-item">
-                            <span class="meta-label">Elapsed Time</span>
-                            <span class="meta-val" id="exec-meta-duration">00m 00s</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Executive KPI Bar -->
-                <div id="exec-kpi-bar" class="exec-kpi-bar hidden">
-                    <div class="kpi-card">
-                        <span class="kpi-label">Autonomous / Gating</span>
-                        <div class="kpi-val-row">
-                            <span class="kpi-val text-cyan" id="kpi-auto-pct">--%</span>
-                            <span class="kpi-sub" id="kpi-gating-pct">(Human: --%)</span>
-                        </div>
-                    </div>
-                    <div class="kpi-card">
-                        <span class="kpi-label">Command Reliability</span>
-                        <div class="kpi-val-row">
-                            <span class="kpi-val text-green" id="kpi-cmd-rate">--%</span>
-                            <span class="kpi-sub" id="kpi-cmd-counts">(-- passed)</span>
-                        </div>
-                    </div>
-                    <div class="kpi-card">
-                        <span class="kpi-label">Checkpoints / Recovery</span>
-                        <div class="kpi-val-row">
-                            <span class="kpi-val text-purple" id="kpi-checkpoints">0</span>
-                            <span class="kpi-sub" id="kpi-recovery">(-- loops)</span>
-                        </div>
-                    </div>
-                    <div class="kpi-card">
-                        <span class="kpi-label">AI Quota Delta</span>
-                        <div class="kpi-val-row">
-                            <span class="kpi-val text-magenta" id="kpi-quota-delta">0 fast</span>
-                            <span class="kpi-sub" id="kpi-quota-spend">($0.00)</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Segmented Waterfall Timeline -->
-                <div id="exec-waterfall-section" class="exec-waterfall-section hidden">
-                    <div class="waterfall-header-row">
-                        <div class="waterfall-title-row">
-                            <h3>Waterfall Timeline</h3>
-                            <span class="badge badge-sub" id="waterfall-total-time">0s</span>
-                        </div>
-                        <div class="waterfall-legend">
-                            <span class="legend-item"><span class="legend-dot dot-exec"></span> Execution</span>
-                            <span class="legend-item"><span class="legend-dot dot-review"></span> Review</span>
-                            <span class="legend-item"><span class="legend-dot dot-interlock"></span> Human Gating</span>
-                            <span class="legend-item"><span class="legend-dot dot-recovery"></span> Recovery</span>
-                        </div>
-                    </div>
-                    <div class="waterfall-bar-track" id="waterfall-bar-track">
-                        <!-- Populated dynamically with segments -->
-                    </div>
-                    <div class="waterfall-tooltip hidden" id="waterfall-tooltip"></div>
-                </div>
-
-                <!-- Transcript Events Stream -->
-                <div class="exec-transcript-section">
-                    <div class="transcript-header-row">
-                        <h3>Event Transcript</h3>
-                        <span class="transcript-count-badge" id="transcript-count">0 events</span>
-                    </div>
-                    <div class="transcript-stream-container" id="transcript-stream">
-                        <div class="transcript-empty" id="transcript-empty">No execution runs or events recorded yet</div>
                     </div>
                 </div>
             </section>
@@ -388,7 +236,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
         </footer>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=1.0.4"></script>
 </body>
 </html>
 )raw_asset";
@@ -634,6 +482,13 @@ body {
     gap: 4px;
 }
 
+.credit-top-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
 .credit-label {
     font-size: 0.75rem;
     color: var(--text-secondary);
@@ -646,6 +501,11 @@ body {
     font-weight: 700;
     font-family: var(--font-mono);
     color: var(--text-primary);
+}
+
+.credit-val.highlight-cyan {
+    color: var(--cyan-glow);
+    text-shadow: 0 0 16px rgba(0, 242, 254, 0.35);
 }
 
 /* Quota Groups */
@@ -2268,6 +2128,10 @@ function renderAntigravity(ag) {
         if (modelsGrid) {
             modelsGrid.innerHTML = '';
         }
+        const availableCreditsEl = document.getElementById('ag-available-credits');
+        const promptFlowEl = document.getElementById('ag-prompt-flow');
+        if (availableCreditsEl) availableCreditsEl.textContent = '--';
+        if (promptFlowEl) promptFlowEl.textContent = '--';
         if (ag && ag.error_message) {
             errorBanner.textContent = ag.error_message;
             errorBanner.classList.remove('hidden');
@@ -2279,6 +2143,42 @@ function renderAntigravity(ag) {
     planBadge.textContent = ag.plan_tier || 'Google AI Ultra';
     planBadge.className = 'badge badge-cyan';
     errorBanner.classList.add('hidden');
+
+    // Render Credits & Allowances Strip
+    const availableCreditsEl = document.getElementById('ag-available-credits');
+    const creditMinEl = document.getElementById('ag-credit-min');
+    const promptFlowEl = document.getElementById('ag-prompt-flow');
+    const creditTierEl = document.getElementById('ag-credit-tier');
+
+    if (availableCreditsEl) {
+        if (ag.available_credits && ag.available_credits.length > 0) {
+            const firstCredit = ag.available_credits[0];
+            availableCreditsEl.textContent = Number(firstCredit.credit_amount).toLocaleString();
+            availableCreditsEl.className = 'credit-val highlight-cyan';
+            if (creditMinEl && firstCredit.minimum_credit_amount_for_usage) {
+                creditMinEl.textContent = `Min ${firstCredit.minimum_credit_amount_for_usage} / req`;
+            }
+        } else {
+            availableCreditsEl.textContent = '0';
+            availableCreditsEl.className = 'credit-val';
+        }
+    }
+
+    if (promptFlowEl) {
+        const availPrompt = ag.available_prompt_credits !== undefined ? ag.available_prompt_credits : 0;
+        const availFlow = ag.available_flow_credits !== undefined ? ag.available_flow_credits : 0;
+        const monthlyPrompt = ag.monthly_prompt_credits !== undefined ? ag.monthly_prompt_credits : 0;
+        const monthlyFlow = ag.monthly_flow_credits !== undefined ? ag.monthly_flow_credits : 0;
+
+        if (availPrompt > 0 || availFlow > 0 || monthlyPrompt > 0) {
+            promptFlowEl.textContent = `${availPrompt.toLocaleString()} / ${availFlow.toLocaleString()}`;
+            if (creditTierEl && (monthlyPrompt > 0 || monthlyFlow > 0)) {
+                creditTierEl.textContent = `Mo: ${(monthlyPrompt / 1000).toFixed(0)}k / ${(monthlyFlow / 1000).toFixed(0)}k`;
+            }
+        } else {
+            promptFlowEl.textContent = '--';
+        }
+    }
 
     // Render Quota Groups (Gemini Models, Claude and GPT models)
     if (quotaGroupsContainer) {
@@ -2632,11 +2532,10 @@ async function fetchStatus(isManual = false) {
     }
 }
 
+//// -------------------------------------------------------------
+// MCP Sessions & Client Connections
 // -------------------------------------------------------------
-// Agent Fleet Tasks Logic
-// -------------------------------------------------------------
-let currentTasks = [];
-let showCompletedTasks = false;
+let currentSessions = [];
 
 function formatElapsed(startSec, endSec) {
     if (!startSec) return '00m 00s';
@@ -2652,18 +2551,6 @@ function formatElapsed(startSec, endSec) {
     return `${pad(minutes)}m ${pad(seconds)}s`;
 }
 
-function formatRelativeTime(epochSec) {
-    if (!epochSec) return '-';
-    const nowSec = Math.floor(Date.now() / 1000);
-    const diff = Math.max(0, nowSec - epochSec);
-    if (diff < 5) return 'Just now';
-    if (diff < 60) return `${diff}s ago`;
-    const min = Math.floor(diff / 60);
-    if (min < 60) return `${min}m ago`;
-    const hrs = Math.floor(min / 60);
-    return `${hrs}h ago`;
-}
-
 function escapeHtml(str) {
     if (!str) return '';
     const div = document.createElement('div');
@@ -2671,128 +2558,21 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
-function renderTasks(tasks) {
-    currentTasks = tasks || [];
-    const tbody = document.getElementById('agents-table-body');
-    const emptyState = document.getElementById('agents-empty-state');
-    const tableContainer = document.getElementById('agents-table-container');
-    const countBadge = document.getElementById('agents-count-badge');
-    const statusDot = document.getElementById('agents-status-dot');
-
-    if (!tbody) return;
-
-    const visibleTasks = currentTasks.filter(t => {
-        if (!showCompletedTasks && (t.status === 'completed' || t.status === 'failed')) {
-            return false;
-        }
-        return true;
-    });
-
-    const activeCount = currentTasks.filter(t => t.status === 'running' || t.status === 'waiting_for_user').length;
-    if (countBadge) {
-        countBadge.textContent = `${activeCount} Active`;
-        countBadge.className = activeCount > 0 ? 'badge badge-cyan' : 'badge';
-    }
-
-    if (statusDot) {
-        if (activeCount > 0) {
-            statusDot.className = 'dot-status dot-online';
-        } else {
-            statusDot.className = 'dot-status';
-        }
-    }
-
-    if (visibleTasks.length === 0) {
-        if (tableContainer) tableContainer.classList.add('hidden');
-        if (emptyState) emptyState.classList.remove('hidden');
-        tbody.innerHTML = '';
-        return;
-    }
-
-    if (tableContainer) tableContainer.classList.remove('hidden');
-    if (emptyState) emptyState.classList.add('hidden');
-
-    tbody.innerHTML = visibleTasks.map(t => {
-        let statusClass = t.status || 'running';
-        let statusLabel = 'Running';
-        if (t.status === 'waiting_for_user') statusLabel = 'Waiting';
-        else if (t.status === 'completed') statusLabel = 'Completed';
-        else if (t.status === 'failed') statusLabel = 'Failed';
-        else if (t.status === 'stale') statusLabel = 'Stale';
-        else if (t.status === 'disconnected') statusLabel = 'Disconnected';
-
-        let agentClass = 'cli';
-        const nameLower = (t.agent_name || '').toLowerCase();
-        if (nameLower.includes('cursor')) agentClass = 'cursor';
-        else if (nameLower.includes('antigravity') || nameLower.includes('gemini')) agentClass = 'antigravity';
-
-        const workspaceHtml = t.workspace ? `<div class="task-workspace">${escapeHtml(t.workspace)}</div>` : '';
-        const actionHtml = t.current_action ? `<span class="action-chip" title="${escapeHtml(t.current_action)}">${escapeHtml(t.current_action)}</span>` : '<span style="color:var(--text-muted);">-</span>';
-        const durationStr = formatElapsed(t.start_time_epoch, t.completed_time_epoch);
-        const lastSeenStr = formatRelativeTime(t.last_heartbeat_epoch);
-
-        return `
-            <tr data-task-id="${escapeHtml(t.task_id)}" data-start-epoch="${t.start_time_epoch || 0}" data-end-epoch="${t.completed_time_epoch || 0}">
-                <td>
-                    <span class="status-pill ${statusClass}">
-                        <span class="dot"></span>
-                        ${statusLabel}
-                    </span>
-                </td>
-                <td>
-                    <span class="badge-agent ${agentClass}">
-                        ${escapeHtml(t.agent_name || 'Agent')}
-                    </span>
-                </td>
-                <td class="task-desc-cell">
-                    <div class="task-title">${escapeHtml(t.task_description || 'Untitled Task')}</div>
-                    ${workspaceHtml}
-                </td>
-                <td>
-                    ${actionHtml}
-                </td>
-                <td>
-                    <span class="duration-counter">${durationStr}</span>
-                </td>
-                <td>
-                    <span class="last-seen-text">${lastSeenStr}</span>
-                </td>
-            </tr>
-        `;
-    }).join('');
-}
-
-function updateTaskDurations() {
-    const rows = document.querySelectorAll('#agents-table-body tr');
-    rows.forEach(row => {
-        const startEpoch = parseInt(row.getAttribute('data-start-epoch'), 10);
-        const endEpoch = parseInt(row.getAttribute('data-end-epoch'), 10);
-        if (startEpoch && (!endEpoch || endEpoch <= 0)) {
-            const counterEl = row.querySelector('.duration-counter');
-            if (counterEl) {
-                counterEl.textContent = formatElapsed(startEpoch, 0);
-            }
-        }
-    });
-}
-
-async function fetchTasks() {
-    try {
-        const url = `/api/tasks?include_completed=true`;
-        const res = await fetch(url);
-        if (!res.ok) return;
-        const tasks = await res.json();
-        renderTasks(tasks);
-    } catch (e) {
-        console.warn('Failed to fetch tasks:', e);
-    }
-}
-
-let currentSessions = [];
-
 function renderSessions(sessions) {
     currentSessions = sessions || [];
     const listEl = document.getElementById('mcp-clients-list');
+    const countBadge = document.getElementById('agents-count-badge');
+    const statusDot = document.getElementById('agents-status-dot');
+
+    if (countBadge) {
+        countBadge.textContent = `${currentSessions.length} Sessions`;
+        countBadge.className = currentSessions.length > 0 ? 'badge badge-cyan' : 'badge';
+    }
+
+    if (statusDot) {
+        statusDot.className = currentSessions.length > 0 ? 'dot-status dot-online' : 'dot-status';
+    }
+
     if (!listEl) return;
 
     if (currentSessions.length === 0) {
@@ -2851,381 +2631,14 @@ async function fetchSessions() {
     }
 }
 
-// -------------------------------------------------------------
-// Execution Runs & Interlock Logic
-// -------------------------------------------------------------
-let currentActiveRun = null;
-let currentPendingInterlock = null;
-let currentTranscriptEvents = [];
-let activeRunStartEpoch = 0;
-
-async function fetchExecState() {
-    try {
-        // 1. Fetch runs list & active run
-        const runsRes = await fetch('/api/exec/runs');
-        if (runsRes.ok) {
-            const runsData = await runsRes.json();
-            const activeRunId = runsData.active_run_id;
-            const runs = runsData.runs || [];
-
-            if (activeRunId) {
-                currentActiveRun = runs.find(r => r.run_id === activeRunId) || { run_id: activeRunId };
-            } else if (runs.length > 0) {
-                currentActiveRun = runs[0];
-            } else {
-                currentActiveRun = null;
-            }
-            renderActiveRun(currentActiveRun, activeRunId);
-        }
-
-        // 2. Fetch pending interlocks
-        const intkRes = await fetch('/api/exec/interlocks');
-        if (intkRes.ok) {
-            const interlocks = await intkRes.json();
-            currentPendingInterlock = interlocks.length > 0 ? interlocks[0] : null;
-            renderInterlockBanner(currentPendingInterlock);
-        }
-
-        // 3. Fetch transcript & metrics for current run
-        if (currentActiveRun && currentActiveRun.run_id) {
-            const runIdEncoded = encodeURIComponent(currentActiveRun.run_id);
-            const txRes = await fetch(`/api/exec/runs/${runIdEncoded}/transcript`);
-            if (txRes.ok) {
-                const txData = await txRes.json();
-                currentTranscriptEvents = txData.events || [];
-                renderTranscript(currentTranscriptEvents);
-            }
-
-            const metricsRes = await fetch(`/api/exec/runs/${runIdEncoded}/metrics`);
-            if (metricsRes.ok) {
-                const metricsData = await metricsRes.json();
-                renderKpiBar(metricsData);
-                renderWaterfall(metricsData);
-            } else {
-                renderKpiBar(null);
-                renderWaterfall(null);
-            }
-        } else {
-            renderTranscript([]);
-            renderKpiBar(null);
-            renderWaterfall(null);
-        }
-    } catch (e) {
-        console.warn('Failed to fetch exec state:', e);
-    }
-}
-
-function renderKpiBar(metrics) {
-    const kpiBar = document.getElementById('exec-kpi-bar');
-    if (!kpiBar) return;
-    if (!metrics) {
-        kpiBar.classList.add('hidden');
-        return;
-    }
-    kpiBar.classList.remove('hidden');
-
-    const autoPct = Math.round((metrics.autonomous_ratio || 0) * 100);
-    const gatingPct = Math.round((metrics.human_gating_ratio || 0) * 100);
-    const autoEl = document.getElementById('kpi-auto-pct');
-    const gatingEl = document.getElementById('kpi-gating-pct');
-    if (autoEl) autoEl.textContent = `${autoPct}%`;
-    if (gatingEl) gatingEl.textContent = `(Human: ${gatingPct}%)`;
-
-    const cmdRate = Math.round((metrics.command_success_rate || 0) * 100);
-    const rateEl = document.getElementById('kpi-cmd-rate');
-    const countsEl = document.getElementById('kpi-cmd-counts');
-    if (rateEl) rateEl.textContent = `${cmdRate}%`;
-    if (countsEl) {
-        countsEl.textContent = `(${metrics.successful_commands || 0}/${metrics.total_commands || 0} passed)`;
-    }
-
-    const cpEl = document.getElementById('kpi-checkpoints');
-    const recEl = document.getElementById('kpi-recovery');
-    if (cpEl) cpEl.textContent = metrics.total_checkpoints || 0;
-    if (recEl) recEl.textContent = `(${metrics.recovery_count || 0} recovery)`;
-
-    const qDelta = metrics.quota_delta || {};
-    const deltaEl = document.getElementById('kpi-quota-delta');
-    const spendEl = document.getElementById('kpi-quota-spend');
-    if (deltaEl) {
-        deltaEl.textContent = `${qDelta.cursor_fast_requests_delta || 0} fast`;
-    }
-    if (spendEl) {
-        const spend = (qDelta.cursor_spend_usd_delta || 0).toFixed(2);
-        spendEl.textContent = `($${spend})`;
-    }
-}
-
-function renderWaterfall(metrics) {
-    const sec = document.getElementById('exec-waterfall-section');
-    const track = document.getElementById('waterfall-bar-track');
-    const totalTimeEl = document.getElementById('waterfall-total-time');
-    const tooltip = document.getElementById('waterfall-tooltip');
-    if (!sec || !track) return;
-
-    if (!metrics || !Array.isArray(metrics.waterfall) || metrics.waterfall.length === 0) {
-        sec.classList.add('hidden');
-        return;
-    }
-    sec.classList.remove('hidden');
-
-    const totalSec = Math.max(1, metrics.total_duration_seconds || 1);
-    if (totalTimeEl) totalTimeEl.textContent = `${totalSec}s`;
-
-    track.innerHTML = metrics.waterfall.map(seg => {
-        const phase = (seg.phase || 'setup').toLowerCase();
-        const dur = Math.max(0, seg.duration_seconds || 0);
-        const pct = Math.max(dur > 0 ? 1 : 0.5, (dur / totalSec) * 100);
-        const cp = seg.checkpoint_id ? `[${escapeHtml(seg.checkpoint_id)}] ` : '';
-        const title = `${cp}${seg.phase} (${dur}s) - ${escapeHtml(seg.summary || '')}`;
-
-        return `<div class="waterfall-segment wf-phase-${escapeHtml(phase)}"
-                     style="width: ${pct.toFixed(2)}%;"
-                     data-phase="${escapeHtml(phase)}"
-                     data-duration="${dur}"
-                     data-summary="${escapeHtml(seg.summary || '')}"
-                     data-actor="${escapeHtml(seg.actor || '')}"
-                     data-cp="${escapeHtml(seg.checkpoint_id || '')}"
-                     title="${title}"></div>`;
-    }).join('');
-
-    const segments = track.querySelectorAll('.waterfall-segment');
-    segments.forEach(el => {
-        el.addEventListener('mouseenter', () => {
-            if (!tooltip) return;
-            const phase = el.getAttribute('data-phase');
-            const dur = el.getAttribute('data-duration');
-            const summary = el.getAttribute('data-summary');
-            const cp = el.getAttribute('data-cp');
-            const actor = el.getAttribute('data-actor');
-            const cpTag = cp ? `<strong>${escapeHtml(cp)}</strong> ` : '';
-            tooltip.innerHTML = `${cpTag}<em>${escapeHtml(phase)}</em> &bull; ${dur}s &bull; ${escapeHtml(actor)}<br><span style="color:#94a3b8">${escapeHtml(summary)}</span>`;
-            tooltip.classList.remove('hidden');
-
-            const rect = el.getBoundingClientRect();
-            const parentRect = sec.getBoundingClientRect();
-            tooltip.style.left = `${rect.left + rect.width / 2 - parentRect.left}px`;
-        });
-        el.addEventListener('mouseleave', () => {
-            if (tooltip) tooltip.classList.add('hidden');
-        });
-    });
-}
-
-function renderActiveRun(run, activeRunId) {
-    const badgeEl = document.getElementById('exec-run-badge');
-    const detailsEl = document.getElementById('exec-run-details');
-    const dotEl = document.getElementById('exec-status-dot');
-
-    if (!run) {
-        if (badgeEl) {
-            badgeEl.textContent = 'No Active Run';
-            badgeEl.className = 'badge';
-        }
-        if (detailsEl) detailsEl.classList.add('hidden');
-        if (dotEl) dotEl.className = 'dot-status dot-offline';
-        activeRunStartEpoch = 0;
-        return;
-    }
-
-    const isActive = (run.run_id === activeRunId && (!run.terminal_status || run.terminal_status === 'running'));
-    if (dotEl) {
-        dotEl.className = isActive ? 'dot-status dot-online' : 'dot-status';
-    }
-
-    if (badgeEl) {
-        badgeEl.textContent = isActive ? `Active: ${run.run_id}` : `Run: ${run.run_id} (${run.terminal_status || 'ended'})`;
-        badgeEl.className = isActive ? 'badge badge-cyan' : 'badge';
-    }
-
-    if (detailsEl) {
-        detailsEl.classList.remove('hidden');
-        const targetEl = document.getElementById('exec-meta-target');
-        const planEl = document.getElementById('exec-meta-plan');
-        const actorsEl = document.getElementById('exec-meta-actors');
-        const durationEl = document.getElementById('exec-meta-duration');
-
-        if (targetEl) targetEl.textContent = run.target_alias || '--';
-        if (planEl) planEl.textContent = run.plan_file || '--';
-        if (actorsEl) {
-            const init = run.initiator_id ? run.initiator_id.replace('agent-', '') : '';
-            const exec = run.executor_id ? run.executor_id.replace('agent-', '') : '';
-            actorsEl.textContent = `${init} ➔ ${exec}`;
-        }
-        activeRunStartEpoch = run.start_epoch || 0;
-        if (durationEl) {
-            durationEl.textContent = formatElapsed(run.start_epoch, run.end_epoch);
-        }
-    }
-}
-
-function renderInterlockBanner(intk) {
-    const banner = document.getElementById('interlock-banner');
-    if (!banner) return;
-
-    if (!intk) {
-        banner.classList.add('hidden');
-        return;
-    }
-
-    banner.classList.remove('hidden');
-    const badgeId = document.getElementById('interlock-id-badge');
-    const descText = document.getElementById('interlock-desc-text');
-    const actionText = document.getElementById('interlock-action-text');
-    const actionBox = document.getElementById('interlock-action-box');
-    const rejectBox = document.getElementById('interlock-reject-box');
-    const buttonsRow = document.getElementById('interlock-buttons-row');
-
-    if (badgeId) badgeId.textContent = intk.interlock_id || 'intk';
-    if (descText) descText.textContent = intk.description || 'No description provided';
-    if (actionText) {
-        if (intk.proposed_action) {
-            actionText.textContent = intk.proposed_action;
-            if (actionBox) actionBox.classList.remove('hidden');
-        } else {
-            if (actionBox) actionBox.classList.add('hidden');
-        }
-    }
-
-    if (rejectBox) rejectBox.classList.add('hidden');
-    if (buttonsRow) buttonsRow.classList.remove('hidden');
-}
-
-async function resolveInterlock(approved, reason = '') {
-    if (!currentPendingInterlock || !currentPendingInterlock.interlock_id) return;
-    const id = currentPendingInterlock.interlock_id;
-
-    try {
-        const res = await fetch(`/api/exec/interlocks/${encodeURIComponent(id)}/resolve`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ approved, reason })
-        });
-        if (res.ok) {
-            currentPendingInterlock = null;
-            renderInterlockBanner(null);
-            fetchExecState();
-        } else {
-            alert('Failed to resolve interlock: HTTP ' + res.status);
-        }
-    } catch (e) {
-        console.error('Error resolving interlock:', e);
-        alert('Network error resolving interlock: ' + e.message);
-    }
-}
-
-function renderTranscript(events) {
-    const countBadge = document.getElementById('transcript-count');
-    const stream = document.getElementById('transcript-stream');
-    if (!stream) return;
-
-    if (countBadge) {
-        countBadge.textContent = `${events.length} event${events.length === 1 ? '' : 's'}`;
-    }
-
-    if (!events || events.length === 0) {
-        stream.innerHTML = '<div class="transcript-empty">No execution runs or events recorded yet</div>';
-        return;
-    }
-
-    stream.innerHTML = events.map(ev => {
-        const kind = (ev.kind || '').toLowerCase();
-        const actor = (ev.actor || '').toLowerCase();
-        let actorClass = 'tx-actor-aimon';
-        if (actor.includes('gemini') || actor.includes('antigravity')) actorClass = 'tx-actor-gemini';
-        else if (actor.includes('cursor')) actorClass = 'tx-actor-cursor';
-        else if (actor.includes('human')) actorClass = 'tx-actor-human';
-
-        const seqStr = `#${ev.seq}`;
-        const timeStr = ev.ts_epoch ? new Date(ev.ts_epoch * 1000).toLocaleTimeString() : '';
-        const cpBadge = ev.checkpoint_id ? `<span class="tx-checkpoint-pill">${escapeHtml(ev.checkpoint_id)}</span>` : '';
-
-        // Decision pill
-        let decHtml = '';
-        if (ev.decision) {
-            const decLower = ev.decision.toLowerCase();
-            let decClass = 'tx-dec-continue';
-            if (decLower.includes('human')) decClass = 'tx-dec-wait_human';
-            else if (decLower.includes('stop')) decClass = 'tx-dec-stop';
-            else if (decLower.includes('recover')) decClass = 'tx-dec-recover';
-            else if (decLower.includes('approved')) decClass = 'tx-dec-approved';
-            else if (decLower.includes('rejected')) decClass = 'tx-dec-rejected';
-            decHtml = `<span class="tx-decision-pill ${decClass}">${escapeHtml(ev.decision)}</span>`;
-        }
-
-        // Commands list
-        let cmdsHtml = '';
-        if (Array.isArray(ev.commands) && ev.commands.length > 0) {
-            const items = ev.commands.map((cmd, i) => {
-                const exitCode = (Array.isArray(ev.exit_codes) && i < ev.exit_codes.length) ? ev.exit_codes[i] : null;
-                let exitHtml = '';
-                if (exitCode !== null) {
-                    const exitClass = exitCode === 0 ? 'exit-ok' : 'exit-err';
-                    exitHtml = `<span class="tx-code-exit ${exitClass}">[${exitCode}]</span>`;
-                }
-                return `<li><code>${escapeHtml(cmd)}</code>${exitHtml}</li>`;
-            }).join('');
-            cmdsHtml = `<ul class="tx-commands-list">${items}</ul>`;
-        }
-
-        // Dmesg / diagnostic excerpt
-        let dmesgHtml = '';
-        if (ev.dmesg_excerpt) {
-            dmesgHtml = `<pre class="tx-dmesg-box">${escapeHtml(ev.dmesg_excerpt)}</pre>`;
-        }
-
-        // Notes
-        let notesHtml = '';
-        if (ev.notes) {
-            notesHtml = `<div class="tx-notes-text">${escapeHtml(ev.notes)}</div>`;
-        }
-
-        // Proposed next
-        let nextHtml = '';
-        if (ev.proposal_next) {
-            nextHtml = `<div class="tx-notes-text" style="color: #67e8f9;"><strong>Next:</strong> ${escapeHtml(ev.proposal_next)}</div>`;
-        }
-
-        return `
-            <div class="tx-event-card kind-${escapeHtml(kind)}">
-                <div class="tx-event-top">
-                    <div class="tx-event-left">
-                        <span class="tx-seq">${seqStr}</span>
-                        <span class="tx-badge-actor ${actorClass}">${escapeHtml(ev.actor || 'agent')}</span>
-                        <span class="tx-badge-kind">${escapeHtml(kind.toUpperCase())}</span>
-                        ${cpBadge}
-                    </div>
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                        ${decHtml}
-                        <span class="tx-event-time">${timeStr}</span>
-                    </div>
-                </div>
-                ${cmdsHtml}
-                ${dmesgHtml}
-                ${notesHtml}
-                ${nextHtml}
-            </div>
-        `;
-    }).join('');
-}
-
-function updateExecDuration() {
-    if (activeRunStartEpoch > 0) {
-        const durationEl = document.getElementById('exec-meta-duration');
-        if (durationEl && currentActiveRun && (!currentActiveRun.terminal_status || currentActiveRun.terminal_status === 'running')) {
-            durationEl.textContent = formatElapsed(activeRunStartEpoch, 0);
-        }
-    }
-}
-
 function setupSse() {
     try {
         const source = new EventSource('/sse');
         source.onmessage = (e) => {
             try {
                 const data = JSON.parse(e.data);
-                if (data.event === 'interlock_request' || data.event === 'interlock_resolved') {
-                    fetchExecState();
+                if (data.event === 'tools_changed') {
+                    fetchSessions();
                 }
             } catch (_) {}
         };
@@ -3239,65 +2652,13 @@ function setupSse() {
 
 document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
-    fetchTasks();
     fetchSessions();
-    fetchExecState();
     setupSse();
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
         fetchStatus(true);
-        fetchTasks();
         fetchSessions();
-        fetchExecState();
     });
-
-    // Interlock Buttons
-    const btnApprove = document.getElementById('btn-interlock-approve');
-    const btnReject = document.getElementById('btn-interlock-reject');
-    const btnConfirmReject = document.getElementById('btn-confirm-reject');
-    const btnCancelReject = document.getElementById('btn-cancel-reject');
-    const rejectBox = document.getElementById('interlock-reject-box');
-    const buttonsRow = document.getElementById('interlock-buttons-row');
-    const rejectInput = document.getElementById('interlock-reject-reason');
-
-    if (btnApprove) {
-        btnApprove.addEventListener('click', () => {
-            resolveInterlock(true, '');
-        });
-    }
-
-    if (btnReject) {
-        btnReject.addEventListener('click', () => {
-            if (rejectBox) rejectBox.classList.remove('hidden');
-            if (buttonsRow) buttonsRow.classList.add('hidden');
-            if (rejectInput) {
-                rejectInput.value = '';
-                rejectInput.focus();
-            }
-        });
-    }
-
-    if (btnConfirmReject) {
-        btnConfirmReject.addEventListener('click', () => {
-            const reason = rejectInput ? rejectInput.value.trim() : '';
-            resolveInterlock(false, reason);
-        });
-    }
-
-    if (btnCancelReject) {
-        btnCancelReject.addEventListener('click', () => {
-            if (rejectBox) rejectBox.classList.add('hidden');
-            if (buttonsRow) buttonsRow.classList.remove('hidden');
-        });
-    }
-
-    const toggleCompletedEl = document.getElementById('toggle-completed-tasks');
-    if (toggleCompletedEl) {
-        toggleCompletedEl.addEventListener('change', (e) => {
-            showCompletedTasks = e.target.checked;
-            renderTasks(currentTasks);
-        });
-    }
 
     const modelsToggleBtn = document.getElementById('ag-models-toggle');
     const modelsChevron = document.getElementById('ag-models-chevron');
@@ -3315,19 +2676,15 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Refresh data: status every 5s, tasks every 2.5s, sessions every 3s, exec state every 2.5s
+    // Refresh data: status every 5s, sessions every 3s
     setInterval(() => fetchStatus(false), 5000);
-    setInterval(fetchTasks, 2500);
     setInterval(fetchSessions, 3000);
-    setInterval(fetchExecState, 2500);
 
-    // Update countdown timers, task stopwatch, session uptime, and exec duration every second
+    // Update countdown timers and session uptime every second
     if (countdownInterval) clearInterval(countdownInterval);
     countdownInterval = setInterval(() => {
         updateCountdowns();
-        updateTaskDurations();
         updateSessionUptimes();
-        updateExecDuration();
     }, 1000);
 });
 )raw_asset";
@@ -3336,13 +2693,3 @@ document.addEventListener('DOMContentLoaded', () => {
 } // namespace aimon
 
 #endif // AIMON_WEB_ASSETS_HXX
-
-/*
- * Local variables:
- * mode: C++
- * c-file-style: "BSD"
- * c-basic-offset: 4
- * tab-width: 4
- * indent-tabs-mode: nil
- * End:
- */

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.3 LANGUAGES CXX)
+project(aimon VERSION 1.0.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -69,12 +69,6 @@ set(SOURCES
     src/McpServer.cxx
     src/MqttPublisher.cxx
     src/WebServer.cxx
-    src/AgentMessageBus.cxx
-    src/AgentRunner.cxx
-    src/CollabOrchestrator.cxx
-    src/TranscriptSink.cxx
-    src/InterlockManager.cxx
-    src/RunMetrics.cxx
     src/NcursesConsole.cxx
 )
 

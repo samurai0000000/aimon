@@ -23,15 +23,6 @@ public:
     TaskRegistry();
     ~TaskRegistry() = default;
 
-    std::string registerOrUpdateTask(const AgentTask& task);
-    bool completeTask(const std::string& taskId, const std::string& status = "completed",
-                      const std::string& details = "");
-    bool getTask(const std::string& taskId, AgentTask& outTask) const;
-    std::vector<AgentTask> listTasks(bool includeCompleted = false);
-
-    void reapStaleTasks(std::chrono::seconds timeout = std::chrono::minutes(10));
-    void handleSessionDisconnected(const std::string& sseSessionId);
-
     // Client session tracking
     void registerSession(const std::string& sessionId, const std::string& remoteIp,
                          const std::string& defaultClientName = "MCP Client");
@@ -42,14 +33,10 @@ public:
     std::vector<ClientSession> listSessions() const;
     bool getSessionClientName(const std::string& sessionId, std::string& outClientName) const;
 
-    size_t getActiveTaskCount() const;
     void clear();
 
 private:
-    std::string generateTaskId();
-
     mutable std::shared_mutex _mutex;
-    std::map<std::string, AgentTask> _tasks;
     std::map<std::string, ClientSession> _sessions;
 };
 

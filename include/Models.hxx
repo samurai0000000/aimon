@@ -69,11 +69,30 @@ struct QuotaGroup {
     }
 };
 
+struct UserCredit {
+    std::string creditType;
+    int creditAmount = 0;
+    int minimumCreditAmountForUsage = 0;
+
+    nlohmann::json toJson() const {
+        return {
+            {"credit_type", creditType},
+            {"credit_amount", creditAmount},
+            {"minimum_credit_amount_for_usage", minimumCreditAmountForUsage}
+        };
+    }
+};
+
 struct AntigravityStatus {
     bool isRunning = false;
     std::string planTier = "Unknown";
     std::vector<ModelQuota> models;
     std::vector<QuotaGroup> quotaGroups;
+    std::vector<UserCredit> availableCredits;
+    int availablePromptCredits = 0;
+    int availableFlowCredits = 0;
+    int monthlyPromptCredits = 0;
+    int monthlyFlowCredits = 0;
     std::string errorMessage;
 
     nlohmann::json toJson() const {
@@ -87,11 +106,21 @@ struct AntigravityStatus {
             groupsArray.push_back(g.toJson());
         }
 
+        nlohmann::json creditsArray = nlohmann::json::array();
+        for (const auto& c : availableCredits) {
+            creditsArray.push_back(c.toJson());
+        }
+
         return {
             {"is_running", isRunning},
             {"plan_tier", planTier},
             {"models", modelsArray},
             {"quota_groups", groupsArray},
+            {"available_credits", creditsArray},
+            {"available_prompt_credits", availablePromptCredits},
+            {"available_flow_credits", availableFlowCredits},
+            {"monthly_prompt_credits", monthlyPromptCredits},
+            {"monthly_flow_credits", monthlyFlowCredits},
             {"error_message", errorMessage}
         };
     }
@@ -184,35 +213,7 @@ struct AggregateStatus {
     }
 };
 
-struct AgentTask {
-    std::string taskId;
-    std::string agentName = "Unknown Agent";
-    std::string workspace;
-    std::string taskDescription;
-    std::string currentAction;
-    std::string status = "running";
-    std::string details;
-    int64_t startTimeEpoch = 0;
-    int64_t lastHeartbeatEpoch = 0;
-    int64_t completedTimeEpoch = 0;
-    std::string sseSessionId;
 
-    nlohmann::json toJson() const {
-        return {
-            {"task_id", taskId},
-            {"agent_name", agentName},
-            {"workspace", workspace},
-            {"task_description", taskDescription},
-            {"current_action", currentAction},
-            {"status", status},
-            {"details", details},
-            {"start_time_epoch", startTimeEpoch},
-            {"last_heartbeat_epoch", lastHeartbeatEpoch},
-            {"completed_time_epoch", completedTimeEpoch},
-            {"sse_session_id", sseSessionId}
-        };
-    }
-};
 
 struct ClientSession {
     std::string sessionId;

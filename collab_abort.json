@@ -1,8 +1,0 @@
-{
-  "name": "collab_abort",
-  "description": "Aborts active collaboration session and halts running proxies.",
-  "parameters": {
-    "type": "object",
-    "properties": {}
-  }
-}

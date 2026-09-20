@@ -37,10 +37,10 @@ Modern software engineering workflows increasingly rely on AI pair programming a
 │   ┌───────────────────────────────────┐  ┌──────────────────────────────┐   │
 │   │ Native AI Quota Toolset           │  │ Dynamic Toolset Registry     │   │
 │   │  - check_antigravity_quota        │  │  - Subsystem tool schemas    │   │
-│   │  - check_cursor_usage             │  │  - Dynamic RPC routing table │   │
-│   │  - get_combined_ai_status         │  │  - Tool state notifications  │   │
-│   │  - register_agent_task            │  │  - Lifecycle / heartbeats    │   │
-│   │  - list_active_tasks              │  │                              │   │
+│   │  - check_cursor_usage             │  │  - Scoped MCP Profiling      │   │
+│   │  - get_combined_ai_status         │  │  - Dynamic RPC routing table │   │
+│   │                                   │  │  - Tool state notifications  │   │
+│   │                                   │  │  - Lifecycle / heartbeats    │   │
 │   └───────────────────────────────────┘  └──────────────┬───────────────┘   │
 │                                                         │                   │
 │   ┌─────────────────────────────────────────────────────┴───────────────┐   │
@@ -274,22 +274,49 @@ All services typically run as systemd daemons or inside persistent terminal mult
 
 ---
 
-## 5. AI Toolset Matrix: Analytics, Management & Workflow Automation
+## 5. AI Toolset Matrix: Quota Analytics & Gateway Telemetry
 
-`aimon` exports a focused suite of native MCP tools designed for real-time developer quota awareness and multi-agent coordination:
+`aimon` exports a focused suite of native MCP tools designed for real-time developer quota awareness and hardware/network telemetry proxying:
 
 | Tool Name | Operation Mode | Utility Description |
 | :--- | :--- | :--- |
 | `check_antigravity_quota` | **Analytics** | Queries remaining 5-hour rolling capacity %, prompt/flow credits, model tiers, and reset countdown timestamps for Google Antigravity / Gemini models. |
 | `check_cursor_usage` | **Analytics** | Queries fast requests used vs plan limit, total billing spend ($), and monthly billing cycle reset date for Cursor. |
 | `get_combined_ai_status` | **Analytics** | Formats an executive summary contrasting both Google Antigravity and Cursor subscriptions in a single Markdown card. |
-| `register_agent_task` | **Management & Workflow** | Autonomous agents register their current high-level goal, active file/step, and status to prevent duplicate work and inform the web dashboard. |
-| `list_active_tasks` | **Workflow Automation** | Inspects active agent fleet tasks across local and remote sessions, enabling multi-agent coordination and status monitoring. |
 
-### Practical Agent Usage Scenarios
-- **Analytics**:
-  - *"Do I have enough Cursor fast requests remaining to do a large codebase refactor, or should I wait for tomorrow's billing cycle reset?"*
-  - *"Check my Gemini 3.6 capacity and tell me when the 5-hour rolling bucket refreshes."*
-- **Workflow Automation & Self-Throttling**:
-  - Autonomous agents can call `check_antigravity_quota` before beginning a high-volume task; if capacity is below 10%, the agent can self-throttle or choose a lighter model tier.
-  - During complex multi-file migrations, agents call `register_agent_task` at each milestone, allowing human developers and peer agents to track live progress on the `aimon` web dashboard (`localhost:3883`).
+### Satellite-Proxied Toolsets
+Connected subsystem daemons dynamically export their domain-specific MCP tools through `aimon`:
+- **`embdevenv`** (Embedded Hardware): `embdevenv_mcu_*`, `embdevenv_console_*`, `embdevenv_flash_*`, `embdevenv_list_targets`, `embdevenv_get_target_status` (16 tools).
+- **`netmon`** (Network Security & Sniffer): `firewall_*`, `lan_*`, `snmp_*` (13 tools).
+- **`meshmon`** (LoRa Radio Mesh): `meshmon_get_node_status`, `meshmon_get_rf_analytics`, `meshmon_query_db`, `meshmon_send_message`, etc. (6 tools).
+
+---
+
+## 6. Scoped MCP Tool Profiling & Auto-Scoping
+
+To prevent agent context pollution and minimize token consumption across diverse software workspaces, `aimon` provides compile-time and runtime profile filtering:
+
+| Profile | Purpose / Domain | Included Tools |
+| :--- | :--- | :--- |
+| `core` | Default / general programming | `check_antigravity_quota`, `check_cursor_usage`, `get_combined_ai_status` |
+| `embedded` | Target boardbringup (`boards`, `embdevenv`) | Core tools + all `embdevenv_*` tools (19 tools total) |
+| `network` | Network diagnostics & firewall (`netmon`, `network`) | Core tools + `firewall_*`, `lan_*`, `snmp_*` |
+| `mesh` | LoRa RF telemetry (`meshmon`) | Core tools + `meshmon_*` tools |
+| `all` | Full gateway administrator | Complete catalog across all connected satellites |
+
+### Profile Selection Mechanisms
+1. **Automatic Workspace Detection**: When an AI agent connects via MCP `initialize`, `aimon` inspects `workspaceFolders` or `rootUri`. If the workspace matches a known hardware or network domain (e.g. `boards`, `embdevenv`, `netmon`, `meshmon`), `aimon` automatically scopes the session.
+2. **Explicit URL Query Parameter**: Clients connecting via SSE specify `http://<host>:3883/sse?profile=<profile>`.
+3. **HTTP Header**: Clients pass `X-Aimon-Profile: <profile>`.
+4. **CLI Stdio Mode**: When spawned as a pipe process, pass `--profile=<profile>`.
+
+Tools invoked outside the active profile are rejected with JSON-RPC error code `-32601` (`Tool '<name>' is not available under active profile '<profile>'`).
+
+---
+
+## 7. Strict MCP Primacy & Direct API Access Control
+
+All AI agents in the ecosystem must interact with `aimon` exclusively through the official Model Context Protocol (JSON-RPC 2.0).
+- Direct REST/HTTP endpoint queries (`/api/*`) are restricted and return HTTP `403 Forbidden` for non-dashboard clients.
+- Autonomous scripts or agents must never bypass MCP by calling raw socket, Telnet, or REST interfaces.
+- When an MCP tool call fails or times out, agents must adhere to the **Strict Stop-and-Report** protocol without attempting side-channel workarounds.

@@ -106,18 +106,31 @@ This starts:
 - The MQTT publisher for Home Assistant auto-discovery.
 
 ### 3. Model Context Protocol (MCP) Server (Client-Server SSE)
-When `aimon` runs in `daemon` or `web` mode, it provides an official MCP Server-Sent Events (**SSE**) HTTP endpoint on port `3883`. This enables IDE AI assistants across your network to connect directly as HTTP clients without process spawning:
+When `aimon` runs in `daemon` or `web` mode, it provides an official MCP Server-Sent Events (**SSE**) HTTP endpoint on port `3883`. This enables IDE AI assistants across your network to connect directly as HTTP clients without process spawning.
+
+#### Scoped MCP Tool Profiles
+To prevent token exhaustion and eliminate irrelevant context in specialized workspaces, `aimon` supports scoped tool profiles:
+
+| Profile | Target Domain | Tools Included |
+| :--- | :--- | :--- |
+| `core` | General development, prompt tracking | `check_antigravity_quota`, `check_cursor_usage`, `get_combined_ai_status` (3 tools) |
+| `embedded` | Embedded hardware development (`boards`, `embdevenv`) | Core + all `embdevenv_*` tools (19 tools) |
+| `network` | Network monitoring & security (`netmon`, `network`) | Core + `firewall_*`, `lan_*`, `snmp_*` tools (19 tools) |
+| `mesh` | LoRa wireless mesh networking (`meshmon`) | Core + all `meshmon_*` tools (9 tools) |
+| `all` | Full administrative & gateway access | Full unified catalog across all satellites (48+ tools) |
+
+`aimon` detects profiles automatically from workspace folder names during MCP client initialization (e.g. `boards` -> `embedded`), or you can explicitly select a profile via URL query parameter:
 
 #### Configuring in Cursor (SSE)
 In Cursor **Settings > Features > MCP > Add New Server** (Type: `sse`):
-- **URL**: `http://localhost:3883/sse` *(or `http://<server-host>:3883/sse`)*
+- **URL**: `http://localhost:3883/sse?profile=embedded` *(or `http://<server-host>:3883/sse?profile=core`)*
 
 Or edit `~/.cursor/mcp.json`:
 ```json
 {
   "mcpServers": {
     "aimon": {
-      "url": "http://localhost:3883/sse"
+      "url": "http://localhost:3883/sse?profile=core"
     }
   }
 }
@@ -129,13 +142,13 @@ Add `aimon` to your Antigravity MCP server configuration (`mcp_config.json`):
 {
   "mcpServers": {
     "aimon": {
-      "serverUrl": "http://localhost:3883/sse"
+      "serverUrl": "http://localhost:3883/sse?profile=embedded"
     }
   }
 }
 ```
 
-*(Note: Stdio transport is also supported for pipe testing via `./build/aimon mcp`.)*
+*(Note: Stdio transport is also supported for pipe testing via `./build/aimon mcp --profile=core`.)*
 
 Once configured, ask your assistant:
 > *"Check my Antigravity quota and Cursor usage."*
@@ -158,25 +171,33 @@ aimon/
 │   ├── AntigravityCollector.hxx   # Antigravity local process probe & Connect-RPC client
 │   ├── ConfigManager.hxx          # Configuration manager (~/.config/aimon/config.json)
 │   ├── CursorCollector.hxx        # Cursor SQLite & API client
+│   ├── DynamicToolRegistry.hxx    # Thread-safe satellite tool registry & routing
 │   ├── HistoryStore.hxx           # SQLite3 time-series diff store (~/.config/aimon/history.db)
-│   ├── McpServer.hxx              # JSON-RPC 2.0 stdio engine
+│   ├── McpServer.hxx              # JSON-RPC 2.0 stdio & SSE engine with scoped profiling
 │   ├── Models.hxx                 # Core data structures and metrics
 │   ├── MqttPublisher.hxx          # Home Assistant MQTT auto-discovery publisher
+│   ├── NcursesConsole.hxx         # Interactive split-screen terminal monitor
 │   ├── PathUtils.hxx              # Cross-platform config & database path utilities
 │   ├── StateStore.hxx             # Thread-safe in-memory state cache
+│   ├── TaskRegistry.hxx           # Client session tracking
+│   ├── TcpGateway.hxx             # TCP port 3885 satellite multiplexer
 │   ├── WebAssets.hxx              # Embedded fallback dashboard assets
-│   └── WebServer.hxx              # Embedded HTTP dashboard server
+│   └── WebServer.hxx              # Embedded HTTP dashboard server & SSE endpoint
 ├── src/
 │   ├── AntigravityCollector.cxx   # Antigravity collector implementation
 │   ├── ConfigManager.cxx          # Config manager implementation
 │   ├── CursorCollector.cxx        # Cursor collector implementation
+│   ├── DynamicToolRegistry.cxx    # Dynamic tool registry implementation
 │   ├── HistoryStore.cxx           # History & usage diff store implementation
 │   ├── Main.cxx                   # Application entrypoint & subcommand dispatch
-│   ├── McpServer.cxx              # MCP tool registration and handlers
+│   ├── McpServer.cxx              # MCP tool registration, profiling, and handlers
 │   ├── MqttPublisher.cxx          # MQTT auto-discovery and state publisher
+│   ├── NcursesConsole.cxx         # Split-screen ncurses console implementation
 │   ├── PathUtils.cxx              # Path resolution utilities
 │   ├── StateStore.cxx             # State store cache implementation
-│   └── WebServer.cxx              # Dashboard handler and REST endpoints
+│   ├── TaskRegistry.cxx           # Session registry implementation
+│   ├── TcpGateway.cxx             # TCP satellite gateway multiplexer implementation
+│   └── WebServer.cxx              # Dashboard handler, SSE, and REST endpoints
 ├── third_party/
 │   ├── cpp-httplib/               # Git submodule (https://github.com/yhirose/cpp-httplib)
 │   └── json/                      # Git submodule (https://github.com/nlohmann/json)

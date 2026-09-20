@@ -58,29 +58,6 @@ struct GatewayConfig {
     int port = 3885;
 };
 
-struct AgentRunnerConfig {
-    std::string readCommand;
-    std::string writeCommand;
-    std::string scriptBridge;
-    int timeoutSeconds = 300;
-};
-
-struct CollaborationConfig {
-    bool autoDrive = true;
-    // Only applies while a desktop agent is genuinely blocked in
-    // agent_wait_turn. With no live waiter the proxy starts immediately.
-    int liveWaiterGraceSeconds = 120;
-    // Pause before re-spawning a proxy that could not run at all, so an
-    // unusable CLI does not respawn every poll cycle.
-    int runnerBackoffSeconds = 60;
-    int writeTimeoutSeconds = 600;
-    int readTimeoutSeconds = 300;
-    int maxTurns = 8;
-    int maxRetriesPerTurn = 1;
-    int minCursorQuota = 10;
-    std::map<std::string, AgentRunnerConfig> runners;
-};
-
 struct AimonConfig {
     PollingConfig polling;
     WebConfig web;
@@ -89,7 +66,6 @@ struct AimonConfig {
     AntigravityConfig antigravity;
     CursorConfig cursor;
     GatewayConfig gateway;
-    CollaborationConfig collaboration;
 
     nlohmann::json toJson() const;
     void fromJson(const nlohmann::json& j);

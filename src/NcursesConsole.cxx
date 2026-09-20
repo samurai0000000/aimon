@@ -6,8 +6,6 @@
 
 #include "NcursesConsole.hxx"
 #include "TaskRegistry.hxx"
-#include "AgentMessageBus.hxx"
-#include "CollabOrchestrator.hxx"
 #include "Version.hxx"
 #include <sstream>
 #include <iomanip>
@@ -141,7 +139,7 @@ void NcursesConsole::setupWindows() {
     // Initial output
     if (_cmdHistory.empty()) {
         addOutputLine("--- Welcome to aimon console ---", PAIR_INFO, true);
-        addOutputLine("Type 'help' for available commands. Type 'chat <id>' to chat with an agent.", PAIR_INFO, false);
+        addOutputLine("Type 'help' for available commands.", PAIR_INFO, false);
         addOutputLine("", 0, false);
     }
 
@@ -218,30 +216,7 @@ void NcursesConsole::updateHeader() {
         ss << "Cursor: [NO AUTH] | ";
     }
 
-    ss << "Agents: " << sessions.size() << " connected ";
-
-    auto collab = AgentMessageBus::getInstance().getActiveCollaboration();
-    if (collab.status == CollaborationStatus::IN_PROGRESS ||
-        collab.status == CollaborationStatus::OPERATOR_REVIEW) {
-        std::string fileName = collab.planFile;
-        size_t slash = fileName.find_last_of('/');
-        if (slash != std::string::npos) fileName = fileName.substr(slash + 1);
-        ss << "| Collab: [" << fileName << " T" << (collab.currentTurn + 1)
-           << " " << AgentMessageBus::statusToString(collab.status);
-        if (_collabOrch) {
-            auto orchSt = _collabOrch->statusJson();
-            if (orchSt.value("is_executing", false)) {
-                std::string actor = orchSt.value("executing_actor", "");
-                size_t hy = actor.find('-');
-                if (hy != std::string::npos) actor = actor.substr(hy + 1);
-                ss << " RUN(" << actor << ")";
-            }
-            if (_collabOrch->isAutoDrive()) {
-                ss << " AUTO";
-            }
-        }
-        ss << "] ";
-    }
+    ss << "Clients: " << sessions.size() << " connected ";
 
     std::string text = ss.str();
     if ((int)text.size() < _termCols) {
@@ -280,7 +255,7 @@ void NcursesConsole::renderMiddlePanel() {
     werase(_midSepWin);
     whline(_midSepWin, ACS_HLINE, _termCols);
 
-    std::string title = "--- Command Outputs & Agent Chat [Up/Down/PgUp/PgDn to scroll]";
+    std::string title = "--- Command Outputs [Up/Down/PgUp/PgDn to scroll]";
     if (_scrollOffset > 0) {
         title += " [^ " + std::to_string(_scrollOffset) + " lines scrolled]";
     }
@@ -325,11 +300,7 @@ void NcursesConsole::redrawInputLine() {
 
     werase(_inputWin);
     wattron(_inputWin, COLOR_PAIR(PAIR_PROMPT) | A_BOLD);
-    if (_activeChatAgentId > 0) {
-        mvwprintw(_inputWin, 0, 0, "[#%d %s]> ", _activeChatAgentId, _activeChatClientName.c_str());
-    } else {
-        mvwprintw(_inputWin, 0, 0, "aimon> ");
-    }
+    mvwprintw(_inputWin, 0, 0, "aimon> ");
     wattroff(_inputWin, COLOR_PAIR(PAIR_PROMPT) | A_BOLD);
 
     wattron(_inputWin, COLOR_PAIR(PAIR_TEXT));
@@ -373,85 +344,11 @@ void NcursesConsole::logServer(const std::string& text, int colorPair) {
     redrawInputLine();
 }
 
-void NcursesConsole::logAgentReply(const std::string& sessionId,
-                                   const std::string& messageId,
-                                   const std::string& replyText) {
-    std::lock_guard<std::mutex> lock(_uiMutex);
-
-    auto sessions = TaskRegistry::getInstance().listSessions();
-    int agentIndex = 0;
-    std::string agentName = "Unknown Agent";
-    std::string remoteIp = "network";
-
-    for (size_t i = 0; i < sessions.size(); ++i) {
-        if (sessions[i].sessionId == sessionId) {
-            agentIndex = static_cast<int>(i + 1);
-            agentName = sessions[i].clientName;
-            remoteIp = sessions[i].remoteIp;
-            break;
-        }
-    }
-
-    std::string header;
-    if (agentIndex > 0) {
-        header = "[#" + std::to_string(agentIndex) + " " + agentName + " (" + remoteIp + ")] (ref: " + messageId + "):";
-    } else {
-        header = "[Agent (" + sessionId.substr(0, 8) + ")] (ref: " + messageId + "):";
-    }
-
-    addOutputLine("", 0, false);
-    addOutputLine(header, PAIR_AGENT, true);
-
-    std::istringstream iss(replyText);
-    std::string line;
-    while (std::getline(iss, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        addOutputLine(line, PAIR_TEXT, false);
-    }
-    addOutputLine("", 0, false);
-
-    _scrollOffset = 0; // Snap to latest on incoming reply
-    renderMiddlePanel();
-    redrawInputLine();
-}
-
 void NcursesConsole::processCommand(const std::string& line) {
     if (line.empty()) {
         return;
     }
 
-    // --- Case 1: In dedicated chat <id> mode ---
-    if (_activeChatAgentId > 0) {
-        // Direct chat text! Echo user message in prompt color
-        addOutputLine("[You -> #" + std::to_string(_activeChatAgentId) + " " + _activeChatClientName + "]: " + line, PAIR_PROMPT, true);
-
-        auto sessions = TaskRegistry::getInstance().listSessions();
-        bool sessionValid = false;
-        for (const auto& s : sessions) {
-            if (s.sessionId == _activeChatSessionId) {
-                sessionValid = true;
-                break;
-            }
-        }
-
-        if (!sessionValid) {
-            addOutputLine("[Chat] Agent #" + std::to_string(_activeChatAgentId) + " disconnected. Exited chat mode.", PAIR_ERROR, true);
-            _activeChatAgentId = 0;
-        } else {
-            std::string msgId = AgentMessageBus::getInstance().postMessageToAgent(_activeChatSessionId, line);
-            addOutputLine("[Sent " + msgId + "]", PAIR_INFO, false);
-        }
-
-        addOutputLine("", 0, false);
-        _scrollOffset = 0;
-        renderMiddlePanel();
-        redrawInputLine();
-        return;
-    }
-
-    // --- Case 2: In top-level aimon> mode ---
     addOutputLine("aimon> " + line, PAIR_PROMPT, false);
 
     std::istringstream iss(line);
@@ -462,148 +359,19 @@ void NcursesConsole::processCommand(const std::string& line) {
 
     if (cmd == "help" || cmd == "?") {
         addOutputLine("Available commands:", PAIR_INFO, true);
-        addOutputLine("  agents, list          List connected network agent sessions with numeric IDs", PAIR_INFO, false);
-        addOutputLine("  chat <id>             Enter interactive chat mode with agent <id> (Press Ctrl+D to exit)", PAIR_INFO, false);
-        addOutputLine("  msg, send <id> <text> Send a one-off asynchronous message to agent <id>", PAIR_INFO, false);
-        addOutputLine("  collab <file> [init]  Start plan collaboration between agents", PAIR_INFO, false);
-        addOutputLine("  collab status         Show current collaboration session state", PAIR_INFO, false);
-        addOutputLine("  collab nudge          Send a wakeup nudge to active collaboration session", PAIR_INFO, false);
-        addOutputLine("  collab takeover [id]  Takeover turn or assign to agent ID", PAIR_INFO, false);
-        addOutputLine("  collab abort          Abort active collaboration session", PAIR_INFO, false);
+        addOutputLine("  sessions, list        List connected network client sessions", PAIR_INFO, false);
         addOutputLine("  status                Display quota metrics and daemon status", PAIR_INFO, false);
         addOutputLine("  clear                 Clear the command outputs history buffer", PAIR_INFO, false);
         addOutputLine("  help, ?               Show this command help", PAIR_INFO, false);
         addOutputLine("  quit, exit            Shutdown the aimon daemon", PAIR_INFO, false);
         addOutputLine("", 0, false);
-    } else if (cmd == "collab" || cmd == "collaborate") {
-        std::string subCmd;
-        iss >> subCmd;
-        if (subCmd.empty() || subCmd == "status") {
-            auto session = AgentMessageBus::getInstance().getActiveCollaboration();
-            if (session.status == CollaborationStatus::IDLE) {
-                addOutputLine("No active collaboration session.", PAIR_INFO, false);
-            } else {
-                addOutputLine("=== Active Collaboration Session ===", PAIR_INFO, true);
-                addOutputLine("  Plan File    : " + session.planFile, PAIR_TEXT, false);
-                addOutputLine("  Status       : " + AgentMessageBus::statusToString(session.status),
-                              (session.status == CollaborationStatus::OPERATOR_REVIEW ? PAIR_ERROR : PAIR_INFO), true);
-                addOutputLine("  Current Turn : " + std::to_string(session.currentTurn) + " / " + std::to_string(session.maxTurns), PAIR_TEXT, false);
-                addOutputLine("  Next Actor   : " + session.nextActorId, PAIR_PROMPT, true);
-                addOutputLine("  Initiator    : " + session.initiatorId, PAIR_TEXT, false);
-                addOutputLine("  Reviewer     : " + session.reviewerId, PAIR_TEXT, false);
-                if (!session.claimedBy.empty()) {
-                    addOutputLine("  Claimed By   : " + session.claimedBy, PAIR_TEXT, false);
-                }
-                if (!session.executor.empty()) {
-                    addOutputLine("  Executor     : " + session.executor, PAIR_TEXT, false);
-                }
-                if (_collabOrch) {
-                    addOutputLine("  Auto Drive   : " + std::string(_collabOrch->isAutoDrive() ? "ON" : "OFF"), PAIR_TEXT, false);
-                    auto orchSt = _collabOrch->statusJson();
-                    if (orchSt.value("is_executing", false)) {
-                        addOutputLine("  Running Proxy: " + orchSt.value("executing_actor", ""), PAIR_INFO, true);
-                    }
-                }
-                if (!session.lastRunError.empty()) {
-                    addOutputLine("  Last Error   : " + session.lastRunError, PAIR_ERROR, true);
-                }
-                addOutputLine("  Last Message : " + session.lastSideChannelMessage, PAIR_TEXT, false);
-            }
-            addOutputLine("", 0, false);
-        } else if (subCmd == "auto") {
-            std::string state;
-            iss >> state;
-            if (_collabOrch) {
-                bool enable = (state == "on" || state == "1" || state == "true");
-                _collabOrch->setAutoDrive(enable);
-                addOutputLine("[Collab Auto-Drive] Set to " + std::string(enable ? "ON" : "OFF"), PAIR_INFO, true);
-            } else {
-                addOutputLine("[Collab Error] Orchestrator not initialized.", PAIR_ERROR, true);
-            }
-            addOutputLine("", 0, false);
-        } else if (subCmd == "run") {
-            std::string planFile;
-            std::string initId = "agent-antigravity-builder";
-            std::string revId = "agent-cursor-windows";
-            iss >> planFile >> initId >> revId;
-            if (_collabOrch) {
-                std::string err;
-                if (_collabOrch->runUntilConsensus(planFile, initId, revId, &err)) {
-                    addOutputLine("[Collab Run] Orchestrator driving session for " + planFile, PAIR_INFO, true);
-                } else {
-                    addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
-                }
-            } else {
-                addOutputLine("[Collab Error] Orchestrator not initialized.", PAIR_ERROR, true);
-            }
-            addOutputLine("", 0, false);
-        } else if (subCmd == "step") {
-            if (_collabOrch) {
-                std::string err;
-                if (_collabOrch->stepTurn(&err)) {
-                    addOutputLine("[Collab Step] Executing single turn proxy...", PAIR_INFO, true);
-                } else {
-                    addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
-                }
-            } else {
-                addOutputLine("[Collab Error] Orchestrator not initialized.", PAIR_ERROR, true);
-            }
-            addOutputLine("", 0, false);
-        } else if (subCmd == "nudge") {
-            std::string err;
-            if (AgentMessageBus::getInstance().nudgeCollaboration(&err)) {
-                addOutputLine("[Collab] Nudge sent to active session.", PAIR_INFO, true);
-            } else {
-                addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
-            }
-            addOutputLine("", 0, false);
-        } else if (subCmd == "takeover") {
-            std::string targetAgent = "operator";
-            iss >> targetAgent;
-            std::string err;
-            if (AgentMessageBus::getInstance().takeoverCollaboration(targetAgent, &err)) {
-                addOutputLine("[Collab] Takeover authorized: turn assigned to " + targetAgent, PAIR_INFO, true);
-            } else {
-                addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
-            }
-            addOutputLine("", 0, false);
-        } else if (subCmd == "abort") {
-            std::string err;
-            bool ok = false;
-            if (_collabOrch) {
-                ok = _collabOrch->abortRun(&err);
-            } else {
-                ok = AgentMessageBus::getInstance().abortCollaboration(&err);
-            }
-            if (ok) {
-                addOutputLine("[Collab] Active session aborted.", PAIR_INFO, true);
-            } else {
-                addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
-            }
-            addOutputLine("", 0, false);
-        } else {
-            std::string planFile = subCmd;
-            std::string initId = "agent-antigravity-builder";
-            std::string revId = "agent-cursor-windows";
-            iss >> initId;
-            iss >> revId;
-
-            std::string err;
-            bool ok = AgentMessageBus::getInstance().startCollaboration(planFile, initId, revId, &err);
-            if (ok) {
-                addOutputLine("[Collab Started] Plan: " + planFile + " | Initiator: " + initId + " | Reviewer: " + revId, PAIR_INFO, true);
-            } else {
-                addOutputLine("[Collab Error] " + err, PAIR_ERROR, true);
-            }
-            addOutputLine("", 0, false);
-        }
-    } else if (cmd == "agents" || cmd == "list") {
+    } else if (cmd == "sessions" || cmd == "agents" || cmd == "list") {
         auto sessions = TaskRegistry::getInstance().listSessions();
         if (sessions.empty()) {
-            addOutputLine("No agents currently connected via SSE.", PAIR_INFO, false);
+            addOutputLine("No clients currently connected via SSE.", PAIR_INFO, false);
             addOutputLine("", 0, false);
         } else {
-            addOutputLine("Connected Agents (" + std::to_string(sessions.size()) + "):", PAIR_INFO, true);
+            addOutputLine("Connected Client Sessions (" + std::to_string(sessions.size()) + "):", PAIR_INFO, true);
             for (size_t i = 0; i < sessions.size(); ++i) {
                 const auto& s = sessions[i];
                 std::string row = "  [" + std::to_string(i + 1) + "] " + s.clientName +
@@ -613,64 +381,6 @@ void NcursesConsole::processCommand(const std::string& line) {
                 addOutputLine(row, PAIR_TEXT, false);
             }
             addOutputLine("", 0, false);
-        }
-    } else if (cmd == "chat") {
-        int agentId = 0;
-        if (!(iss >> agentId)) {
-            addOutputLine("Usage: chat <agent_id>", PAIR_ERROR, false);
-            addOutputLine("", 0, false);
-        } else {
-            auto sessions = TaskRegistry::getInstance().listSessions();
-            if (agentId < 1 || agentId > static_cast<int>(sessions.size())) {
-                addOutputLine("Error: Invalid agent ID " + std::to_string(agentId) +
-                              " (must be 1 to " + std::to_string(sessions.size()) + ").", PAIR_ERROR, false);
-                addOutputLine("", 0, false);
-            } else {
-                const auto& targetSession = sessions[agentId - 1];
-                _activeChatAgentId = agentId;
-                _activeChatSessionId = targetSession.sessionId;
-                _activeChatClientName = targetSession.clientName;
-                _activeChatRemoteIp = targetSession.remoteIp;
-
-                addOutputLine("--- Entering Chat Mode with [#" + std::to_string(agentId) + " " +
-                              targetSession.clientName + " (" + targetSession.remoteIp + ")] ---", PAIR_INFO, true);
-                addOutputLine("Type messages to send directly. Press Ctrl+D to exit chat and return to aimon> prompt.", PAIR_INFO, false);
-                addOutputLine("", 0, false);
-            }
-        }
-    } else if (cmd == "msg" || cmd == "send") {
-        int agentId = 0;
-        if (!(iss >> agentId)) {
-            addOutputLine("Usage: msg <id> <message text>", PAIR_ERROR, false);
-            addOutputLine("", 0, false);
-        } else {
-            std::string text;
-            std::getline(iss, text);
-            size_t start = text.find_first_not_of(" \t");
-            if (start != std::string::npos) {
-                text = text.substr(start);
-            }
-
-            if (text.empty()) {
-                addOutputLine("Error: empty message text.", PAIR_ERROR, false);
-                addOutputLine("", 0, false);
-            } else {
-                auto sessions = TaskRegistry::getInstance().listSessions();
-                if (agentId < 1 || agentId > static_cast<int>(sessions.size())) {
-                    addOutputLine("Error: Invalid agent ID " + std::to_string(agentId) +
-                                  " (must be 1 to " + std::to_string(sessions.size()) + ").", PAIR_ERROR, false);
-                    addOutputLine("", 0, false);
-                } else {
-                    const auto& targetSession = sessions[agentId - 1];
-                    std::string msgId = AgentMessageBus::getInstance().postMessageToAgent(
-                        targetSession.sessionId, text);
-
-                    addOutputLine("[Dispatch] Message " + msgId + " dispatched to [" +
-                                  std::to_string(agentId) + "] " + targetSession.clientName +
-                                  " (" + targetSession.remoteIp + ").", PAIR_INFO, false);
-                    addOutputLine("", 0, false);
-                }
-            }
         }
     } else if (cmd == "status") {
         AggregateStatus st = _stateStore.getStatus();
@@ -697,21 +407,15 @@ void NcursesConsole::processCommand(const std::string& line) {
         addOutputLine("History cleared.", PAIR_INFO, false);
         addOutputLine("", 0, false);
     } else if (cmd == "quit" || cmd == "exit") {
-        std::string extra;
-        if (iss >> extra) {
-            addOutputLine("Unknown command: '" + line + "'. To chat with an agent, use 'chat <id>'.", PAIR_ERROR, false);
-            addOutputLine("", 0, false);
-        } else {
-            addOutputLine("Shutting down aimon daemon...", PAIR_INFO, true);
-            renderMiddlePanel();
-            _running = false;
-            if (_shutdownCb) {
-                _shutdownCb();
-            }
-            return;
+        addOutputLine("Shutting down aimon daemon...", PAIR_INFO, true);
+        renderMiddlePanel();
+        _running = false;
+        if (_shutdownCb) {
+            _shutdownCb();
         }
+        return;
     } else {
-        addOutputLine("Unknown command: '" + cmd + "'. Type 'help' for available commands or 'chat <id>' to chat.", PAIR_ERROR, false);
+        addOutputLine("Unknown command: '" + cmd + "'. Type 'help' for available commands.", PAIR_ERROR, false);
         addOutputLine("", 0, false);
     }
 
@@ -746,16 +450,7 @@ void NcursesConsole::run() {
 
         // Ctrl+D (ASCII 4) handler
         if (ch == 4) {
-            if (_activeChatAgentId > 0) {
-                addOutputLine("[Chat] Exited chat mode. Returned to aimon> prompt.", PAIR_INFO, true);
-                addOutputLine("", 0, false);
-                _activeChatAgentId = 0;
-                _scrollOffset = 0;
-                _inputBuffer.clear();
-                renderMiddlePanel();
-                redrawInputLine();
-                continue;
-            } else if (_inputBuffer.empty()) {
+            if (_inputBuffer.empty()) {
                 addOutputLine("Shutting down aimon daemon...", PAIR_INFO, true);
                 renderMiddlePanel();
                 _running = false;

@@ -8,11 +8,6 @@
 #include "WebAssets.hxx"
 #include "McpServer.hxx"
 #include "TaskRegistry.hxx"
-#include "AgentMessageBus.hxx"
-#include "CollabOrchestrator.hxx"
-#include "TranscriptSink.hxx"
-#include "InterlockManager.hxx"
-#include "RunMetrics.hxx"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -132,39 +127,6 @@ std::string WebServer::getMcpHintForPath(const std::string& path, const std::str
     if (path == "/api/status" || path == "/api/history") {
         return "Use official MCP tool 'get_combined_ai_status', 'check_antigravity_quota', or 'check_cursor_usage'.";
     }
-    if (path == "/api/tasks" || path.rfind("/api/tasks/", 0) == 0) {
-        return "Use official MCP tool 'list_active_tasks' or 'register_agent_task'.";
-    }
-    if (path == "/api/collaboration/start") {
-        return "Use official MCP tool 'collab_start' with argument {\"plan_file\": \"...\"}.";
-    }
-    if (path == "/api/collaboration/run") {
-        return "Use official MCP tool 'collab_run' with argument {\"plan_file\": \"...\"}.";
-    }
-    if (path == "/api/collaboration/step") {
-        return "Use official MCP tool 'collab_step'.";
-    }
-    if (path == "/api/collaboration/status") {
-        return "Use official MCP tool 'collab_get_status'.";
-    }
-    if (path == "/api/collaboration/abort") {
-        return "Use official MCP tool 'collab_abort'.";
-    }
-    if (path.find("/transcript") != std::string::npos) {
-        return "Use official MCP tool 'exec_get_transcript' with argument {\"run_id\": \"<id>\"}.";
-    }
-    if (path.find("/metrics") != std::string::npos || path.find("/stats") != std::string::npos) {
-        return "Use official MCP tool 'exec_get_run_metrics' with argument {\"run_id\": \"<id>\"}.";
-    }
-    if (path.rfind("/api/exec/runs", 0) == 0) {
-        return "Use official MCP tool 'exec_list_runs' or 'exec_start_run'.";
-    }
-    if (path == "/api/exec/interlocks") {
-        return "Use official MCP tool 'exec_interlock_wait'.";
-    }
-    if (path.find("/resolve") != std::string::npos) {
-        return "Use official MCP tool 'exec_review_checkpoint' with argument {\"run_id\": \"...\", \"decision\": \"...\"}.";
-    }
     return "Use official MCP tools ('aimon' gateway or native tools). Direct REST API access is disabled.";
 }
 
@@ -189,44 +151,13 @@ void WebServer::setupRoutes() {
         });
     }
 
-    AgentMessageBus::getInstance().setCollaborationCallback([this](const CollaborationSession& session, const std::string& eventType) {
-        nlohmann::json evt = {
-            {"event", eventType},
-            {"session", session.toJson()}
-        };
-        std::string sseData = evt.dump();
-        std::lock_guard<std::mutex> lock(_sessionsMutex);
-        for (auto& pair : _sseSessions) {
-            auto s = pair.second;
-            if (s && !s->closed.load()) {
-                std::lock_guard<std::mutex> slock(s->mutex);
-                s->messageQueue.push(sseData);
-                s->cv.notify_one();
-            }
-        }
-    });
-
-    InterlockManager::getInstance().setNotifyCallback([this](const InterlockRequest& req, const std::string& eventType) {
-        nlohmann::json evt = {
-            {"event", eventType},
-            {"interlock", req.toJson()}
-        };
-        std::string sseData = evt.dump();
-        std::lock_guard<std::mutex> lock(_sessionsMutex);
-        for (auto& pair : _sseSessions) {
-            auto s = pair.second;
-            if (s && !s->closed.load()) {
-                std::lock_guard<std::mutex> slock(s->mutex);
-                s->messageQueue.push(sseData);
-                s->cv.notify_one();
-            }
-        }
-    });
-
     auto serveFileOrFallback = [](const std::string& diskPath,
                                   const char* fallbackAsset,
                                   const std::string& contentType,
                                   httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Expires", "0");
         if (fs::exists(diskPath)) {
             std::ifstream f(diskPath);
             if (f.is_open()) {
@@ -242,6 +173,9 @@ void WebServer::setupRoutes() {
     _server->Get("/", [this, serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
         std::string token = createUiSession();
         res.set_header("Set-Cookie", "aimon_session=" + token + "; Path=/; SameSite=Strict");
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Expires", "0");
 
         std::string html;
         if (fs::exists("web/index.html")) {
@@ -295,6 +229,9 @@ void WebServer::setupRoutes() {
 
     _server->Get("/api/status", [this](const httplib::Request&, httplib::Response& res) {
         std::string jsonStr = _stateStore.getStatus().toJson().dump(2);
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Expires", "0");
         res.set_content(jsonStr, "application/json");
         res.set_header("Access-Control-Allow-Origin", "*");
     });
@@ -307,6 +244,9 @@ void WebServer::setupRoutes() {
             }
         }
         std::string jsonStr = _stateStore.getStatus().toJson().dump(2);
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Expires", "0");
         res.set_content(jsonStr, "application/json");
         res.set_header("Access-Control-Allow-Origin", "*");
     });
@@ -335,79 +275,6 @@ void WebServer::setupRoutes() {
         res.set_header("Access-Control-Allow-Origin", "*");
     });
 
-    _server->Get("/api/tasks", [this](const httplib::Request& req, httplib::Response& res) {
-        bool includeCompleted = false;
-        if (req.has_param("include_completed")) {
-            std::string val = req.get_param_value("include_completed");
-            includeCompleted = (val == "true" || val == "1");
-        }
-        auto tasks = TaskRegistry::getInstance().listTasks(includeCompleted);
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto& t : tasks) {
-            arr.push_back(t.toJson());
-        }
-        res.set_content(arr.dump(2), "application/json");
-        res.set_header("Access-Control-Allow-Origin", "*");
-    });
-
-    _server->Post("/api/tasks/register", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        try {
-            auto body = nlohmann::json::parse(req.body);
-            AgentTask task;
-            task.taskId = body.value("task_id", "");
-            task.agentName = body.value("agent_name", "Unknown Agent");
-            task.workspace = body.value("workspace", "");
-            task.taskDescription = body.value("task_description", "");
-            task.currentAction = body.value("current_action", "");
-            task.status = body.value("status", "running");
-            task.details = body.value("details", "");
-
-            std::string registeredId = TaskRegistry::getInstance().registerOrUpdateTask(task);
-            AgentTask savedTask;
-            TaskRegistry::getInstance().getTask(registeredId, savedTask);
-
-            nlohmann::json resp = {
-                {"status", "ok"},
-                {"task", savedTask.toJson()}
-            };
-            res.set_content(resp.dump(2), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            nlohmann::json err = {{"error", e.what()}};
-            res.set_content(err.dump(2), "application/json");
-        }
-    });
-
-    _server->Post("/api/tasks/complete", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        try {
-            auto body = nlohmann::json::parse(req.body);
-            std::string taskId = body.value("task_id", "");
-            std::string status = body.value("status", "completed");
-            std::string details = body.value("details", "");
-
-            bool ok = TaskRegistry::getInstance().completeTask(taskId, status, details);
-            if (ok) {
-                AgentTask task;
-                TaskRegistry::getInstance().getTask(taskId, task);
-                res.set_content(task.toJson().dump(2), "application/json");
-            } else {
-                res.status = 404;
-                res.set_content(nlohmann::json({{"error", "Task not found"}}).dump(), "application/json");
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-        }
-    });
-
-    _server->Post("/api/tasks/clear", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        TaskRegistry::getInstance().clear();
-        res.set_content(nlohmann::json({{"status", "ok"}, {"cleared", true}}).dump(2), "application/json");
-    });
-
     _server->Get("/api/sessions", [this](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         auto sessions = TaskRegistry::getInstance().listSessions();
@@ -418,335 +285,6 @@ void WebServer::setupRoutes() {
         res.set_content(arr.dump(2), "application/json");
     });
 
-    _server->Get("/api/collaboration/status", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        auto session = AgentMessageBus::getInstance().getActiveCollaboration();
-        nlohmann::json j = session.toJson();
-        if (_collabOrch) {
-            j["orchestrator"] = _collabOrch->statusJson();
-        }
-        res.set_content(j.dump(2), "application/json");
-    });
-
-    _server->Post("/api/collaboration/auto", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        if (!_collabOrch) {
-            res.status = 503;
-            res.set_content(nlohmann::json({{"error", "Orchestrator not initialized"}}).dump(), "application/json");
-            return;
-        }
-        try {
-            auto body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-            bool enable = body.value("enabled", true);
-            _collabOrch->setAutoDrive(enable);
-            res.set_content(nlohmann::json({{"status", "ok"}, {"auto_drive", enable}}).dump(2), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-        }
-    });
-
-    _server->Post("/api/collaboration/run", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        if (!_collabOrch) {
-            res.status = 503;
-            res.set_content(nlohmann::json({{"error", "Orchestrator not initialized"}}).dump(), "application/json");
-            return;
-        }
-        try {
-            auto body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-            std::string planFile = body.value("plan_file", "");
-            std::string initId = body.value("initiator_id", "agent-antigravity-builder");
-            std::string revId = body.value("reviewer_id", "agent-cursor-windows");
-            std::string err;
-            if (!_collabOrch->runUntilConsensus(planFile, initId, revId, &err)) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", err}}).dump(), "application/json");
-            } else {
-                if (body.contains("max_turns") && body["max_turns"].is_number()) {
-                    AgentMessageBus::getInstance().setMaxTurns(body["max_turns"].get<int>());
-                }
-                res.set_content(nlohmann::json({{"status", "ok"}, {"message", "Orchestrator driving session"}}).dump(2), "application/json");
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-        }
-    });
-
-    _server->Post("/api/collaboration/step", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        if (!_collabOrch) {
-            res.status = 503;
-            res.set_content(nlohmann::json({{"error", "Orchestrator not initialized"}}).dump(), "application/json");
-            return;
-        }
-        std::string err;
-        if (!_collabOrch->stepTurn(&err)) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", err}}).dump(), "application/json");
-        } else {
-            res.set_content(nlohmann::json({{"status", "ok"}, {"message", "Step requested"}}).dump(2), "application/json");
-        }
-    });
-
-    _server->Post("/api/collaboration/start", [](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        try {
-            auto body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-            std::string planFile = body.value("plan_file", "");
-            std::string initiatorId = body.value("initiator_id", "agent-antigravity-builder");
-            std::string reviewerId = body.value("reviewer_id", "agent-cursor-windows");
-            std::string err;
-            bool ok = AgentMessageBus::getInstance().startCollaboration(planFile, initiatorId, reviewerId, &err);
-            if (!ok) {
-                res.status = 409;
-                nlohmann::json errObj;
-                errObj["error"] = err;
-                res.set_content(errObj.dump(2), "application/json");
-            } else {
-                if (body.contains("max_turns") && body["max_turns"].is_number()) {
-                    AgentMessageBus::getInstance().setMaxTurns(body["max_turns"].get<int>());
-                }
-                auto session = AgentMessageBus::getInstance().getActiveCollaboration();
-                nlohmann::json resp;
-                resp["status"] = "ok";
-                resp["session"] = session.toJson();
-                res.set_content(resp.dump(2), "application/json");
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            nlohmann::json errObj;
-            errObj["error"] = e.what();
-            res.set_content(errObj.dump(2), "application/json");
-        }
-    });
-
-    _server->Post("/api/collaboration/collaborate", [](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        try {
-            auto body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-            std::string planFile = body.value("plan_file", "");
-            int turnNumber = body.value("turn_number", 0);
-            std::string agentId = body.value("agent_id", "");
-            std::string agentModel = body.value("agent_model", "");
-            std::string status = body.value("status", "IN_PROGRESS");
-            std::string sideChannelMessage = body.value("side_channel_message", "");
-
-            nlohmann::json outResult;
-            std::string err;
-            bool ok = AgentMessageBus::getInstance().signalCollaborationTurn(
-                planFile, turnNumber, agentId, agentModel, status, sideChannelMessage, outResult, &err
-            );
-            if (!ok) {
-                res.status = 400;
-                nlohmann::json errObj;
-                errObj["error"] = err;
-                res.set_content(errObj.dump(2), "application/json");
-            } else {
-                res.set_content(outResult.dump(2), "application/json");
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            nlohmann::json errObj;
-            errObj["error"] = e.what();
-            res.set_content(errObj.dump(2), "application/json");
-        }
-    });
-
-    _server->Post("/api/collaboration/nudge", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        std::string err;
-        bool ok = AgentMessageBus::getInstance().nudgeCollaboration(&err);
-        if (!ok) {
-            res.status = 400;
-            nlohmann::json errObj;
-            errObj["error"] = err;
-            res.set_content(errObj.dump(2), "application/json");
-        } else {
-            nlohmann::json resp;
-            resp["status"] = "nudged";
-            res.set_content(resp.dump(2), "application/json");
-        }
-    });
-
-    _server->Post("/api/collaboration/takeover", [](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        try {
-            auto body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-            std::string agentId = body.value("agent_id", "operator");
-            std::string err;
-            bool ok = AgentMessageBus::getInstance().takeoverCollaboration(agentId, &err);
-            if (!ok) {
-                res.status = 400;
-                nlohmann::json errObj;
-                errObj["error"] = err;
-                res.set_content(errObj.dump(2), "application/json");
-            } else {
-                nlohmann::json resp;
-                resp["status"] = "taken_over";
-                resp["next_actor_id"] = agentId;
-                res.set_content(resp.dump(2), "application/json");
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            nlohmann::json errObj;
-            errObj["error"] = e.what();
-            res.set_content(errObj.dump(2), "application/json");
-        }
-    });
-
-    _server->Post("/api/collaboration/abort", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        std::string err;
-        bool ok = AgentMessageBus::getInstance().abortCollaboration(&err);
-        if (!ok) {
-            res.status = 400;
-            nlohmann::json errObj;
-            errObj["error"] = err;
-            res.set_content(errObj.dump(2), "application/json");
-        } else {
-            nlohmann::json resp;
-            resp["status"] = "aborted";
-            res.set_content(resp.dump(2), "application/json");
-        }
-    });
-
-    // --- Execution Runs & Transcript Endpoints ---
-    _server->Get("/api/exec/runs", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        auto runs = TranscriptSink::getInstance().listRuns();
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto& r : runs) {
-            arr.push_back(r.toJson());
-        }
-        nlohmann::json resp = {
-            {"active_run_id", TranscriptSink::getInstance().getActiveRunId()},
-            {"runs", arr}
-        };
-        res.set_content(resp.dump(2), "application/json");
-    });
-
-    _server->Post(R"(/api/exec/runs/([^/]+)/end)", [](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        std::string runId = req.matches[1].str();
-        std::string status = "completed";
-        if (!req.body.empty()) {
-            try {
-                auto body = nlohmann::json::parse(req.body);
-                status = body.value("status", "completed");
-            } catch (...) {}
-        }
-        std::string err;
-        bool ok = TranscriptSink::getInstance().endRun(runId, status, err);
-        if (!ok) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", err}}).dump(2), "application/json");
-        } else {
-            res.set_content(nlohmann::json({
-                {"status", "ok"},
-                {"run_id", runId},
-                {"terminal_status", status}
-            }).dump(2), "application/json");
-        }
-    });
-
-    _server->Get(R"(/api/exec/runs/([^/]+)/transcript)", [](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        std::string runId = req.matches[1].str();
-        int sinceSeq = 0;
-        if (req.has_param("since_seq")) {
-            try {
-                sinceSeq = std::stoi(req.get_param_value("since_seq"));
-            } catch (...) {}
-        }
-        auto events = TranscriptSink::getInstance().getTranscript(runId, sinceSeq);
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto& ev : events) {
-            arr.push_back(ev.toJson());
-        }
-        RunMetadata meta;
-        bool hasMeta = TranscriptSink::getInstance().getRunMetadata(runId, meta);
-        nlohmann::json resp = {
-            {"run_id", runId},
-            {"metadata", hasMeta ? meta.toJson() : nlohmann::json::object()},
-            {"event_count", (int)arr.size()},
-            {"events", arr}
-        };
-        res.set_content(resp.dump(2), "application/json");
-    });
-
-    _server->Get(R"(/api/exec/runs/([^/]+)/metrics)", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        std::string runId = req.matches[1].str();
-        std::string runDir = TranscriptSink::getInstance().getRunDirectory(runId);
-        std::string metaFile = runDir + "/run.json";
-        if (!std::filesystem::exists(metaFile)) {
-            res.status = 404;
-            res.set_content(nlohmann::json({{"error", "Run not found: " + runId}}).dump(2), "application/json");
-            return;
-        }
-        RunMetadata meta;
-        try {
-            std::ifstream mf(metaFile);
-            nlohmann::json j;
-            mf >> j;
-            meta = RunMetadata::fromJson(j);
-        } catch (const std::exception& e) {
-            res.status = 500;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(2), "application/json");
-            return;
-        }
-        auto events = TranscriptSink::getInstance().getTranscript(runId, 0);
-        AggregateStatus cur = _stateStore.getStatus();
-        RunMetrics metrics = RunMetricsAnalyzer::analyze(meta, events, cur);
-        res.set_content(metrics.toJson().dump(2), "application/json");
-    });
-
-    _server->Get("/api/exec/interlocks", [](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        std::string runId = req.has_param("run_id") ? req.get_param_value("run_id") : "";
-        bool includeResolved = req.has_param("include_resolved") &&
-            (req.get_param_value("include_resolved") == "true" || req.get_param_value("include_resolved") == "1");
-
-        auto list = includeResolved ?
-            InterlockManager::getInstance().listInterlocks(runId) :
-            InterlockManager::getInstance().getPendingInterlocks(runId);
-
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto& item : list) {
-            arr.push_back(item.toJson());
-        }
-        res.set_content(arr.dump(2), "application/json");
-    });
-
-    _server->Post(R"(/api/exec/interlocks/([^/]+)/resolve)", [](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        std::string interlockId = req.matches[1].str();
-        try {
-            auto body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-            bool approved = body.value("approved", false);
-            std::string reason = body.value("reason", "");
-            bool ok = InterlockManager::getInstance().resolveInterlock(interlockId, approved, reason);
-            if (!ok) {
-                res.status = 404;
-                res.set_content(nlohmann::json({
-                    {"error", "Interlock not found or already resolved: " + interlockId}
-                }).dump(2), "application/json");
-            } else {
-                res.set_content(nlohmann::json({
-                    {"status", "ok"},
-                    {"interlock_id", interlockId},
-                    {"approved", approved},
-                    {"reason", reason}
-                }).dump(2), "application/json");
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(2), "application/json");
-        }
-    });
-
     _server->Get("/sse", [this](const httplib::Request& req, httplib::Response& res) {
         if (!_mcpServer) {
             res.status = 503;
@@ -754,9 +292,17 @@ void WebServer::setupRoutes() {
             return;
         }
 
+        std::string profile;
+        if (req.has_param("profile")) {
+            profile = req.get_param_value("profile");
+        } else if (req.has_header("X-Aimon-Profile")) {
+            profile = req.get_header_value("X-Aimon-Profile");
+        }
+
         std::string sessionId = generateSessionId();
         auto session = std::make_shared<SseSession>();
         session->id = sessionId;
+        session->profile = profile;
 
         {
             std::lock_guard<std::mutex> lock(_sessionsMutex);
@@ -767,7 +313,11 @@ void WebServer::setupRoutes() {
         TaskRegistry::getInstance().registerSession(sessionId, remoteIp);
 
         std::cout << "[WebServer] New SSE client connected from " << remoteIp
-                  << ", session: " << sessionId << std::endl;
+                  << ", session: " << sessionId;
+        if (!profile.empty()) {
+            std::cout << ", profile: " << profile;
+        }
+        std::cout << std::endl;
 
         res.set_header("Content-Type", "text/event-stream");
         res.set_header("Cache-Control", "no-cache");
@@ -781,7 +331,7 @@ void WebServer::setupRoutes() {
             }
 
             if (!initialSent) {
-                std::string endpointMsg = "event: endpoint\ndata: /message?sessionId=" + session->id + "\n\n";
+                std::string endpointMsg = "event: endpoint\ndata: /message?sessionId=" + session->id + (!session->profile.empty() ? ("&profile=" + session->profile) : "") + "\n\n";
                 initialSent = true;
                 return sink.write(endpointMsg.data(), endpointMsg.size());
             }
@@ -814,7 +364,6 @@ void WebServer::setupRoutes() {
             session->cv.notify_all();
             std::lock_guard<std::mutex> lock(_sessionsMutex);
             _sseSessions.erase(sessionId);
-            TaskRegistry::getInstance().handleSessionDisconnected(sessionId);
             TaskRegistry::getInstance().removeSession(sessionId);
             std::cout << "[WebServer] SSE client disconnected, session: " << sessionId << std::endl;
         };
@@ -824,7 +373,7 @@ void WebServer::setupRoutes() {
 
     auto handleMcpMessage = [this](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, mcp-session-id");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, mcp-session-id, X-Aimon-Profile");
         if (!_mcpServer) {
             res.status = 503;
             res.set_content("MCP service not configured", "text/plain");
@@ -848,6 +397,26 @@ void WebServer::setupRoutes() {
             sessionId.pop_back();
         }
 
+        // Check if an SSE session exists for push notification
+        std::shared_ptr<SseSession> session;
+        if (!sessionId.empty()) {
+            std::lock_guard<std::mutex> lock(_sessionsMutex);
+            auto it = _sseSessions.find(sessionId);
+            if (it != _sseSessions.end()) {
+                session = it->second;
+            }
+        }
+
+        // Extract profile from query params, headers, or existing SSE session
+        std::string profile;
+        if (req.has_param("profile")) {
+            profile = req.get_param_value("profile");
+        } else if (req.has_header("X-Aimon-Profile")) {
+            profile = req.get_header_value("X-Aimon-Profile");
+        } else if (session && !session->profile.empty()) {
+            profile = session->profile;
+        }
+
         nlohmann::json reqJson;
         try {
             reqJson = nlohmann::json::parse(req.body);
@@ -858,7 +427,11 @@ void WebServer::setupRoutes() {
         }
 
         std::string method = reqJson.value("method", "");
-        std::cout << "[WebServer] MCP POST: method=" << method << " session='" << sessionId << "'" << std::endl;
+        std::cout << "[WebServer] MCP POST: method=" << method << " session='" << sessionId << "'";
+        if (!profile.empty()) {
+            std::cout << " profile='" << profile << "'";
+        }
+        std::cout << std::endl;
 
         if (!sessionId.empty()) {
             TaskRegistry::getInstance().touchSession(sessionId);
@@ -893,19 +466,9 @@ void WebServer::setupRoutes() {
             }
         }
 
-        // Process message through MCP server engine
-        nlohmann::json respJson = _mcpServer->handleMessage(reqJson);
+        // Process message through MCP server engine with profile filtering
+        nlohmann::json respJson = _mcpServer->handleMessage(reqJson, profile);
         std::string respStr = respJson.is_null() ? "{}" : respJson.dump();
-
-        // Check if an SSE session exists for push notification
-        std::shared_ptr<SseSession> session;
-        if (!sessionId.empty()) {
-            std::lock_guard<std::mutex> lock(_sessionsMutex);
-            auto it = _sseSessions.find(sessionId);
-            if (it != _sseSessions.end()) {
-                session = it->second;
-            }
-        }
 
         if (session && !respJson.is_null()) {
             {
@@ -988,8 +551,6 @@ void WebServer::stop() {
     if (!_running) return;
 
     _running = false;
-    AgentMessageBus::getInstance().shutdown();
-    InterlockManager::getInstance().shutdown();
     {
         std::lock_guard<std::mutex> lock(_sessionsMutex);
         for (auto& pair : _sseSessions) {

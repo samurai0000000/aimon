@@ -21,7 +21,6 @@
 namespace aimon {
 
 class NcursesConsole;
-class CollabOrchestrator;
 
 class NcursesStreamBuf : public std::streambuf {
 public:
@@ -57,15 +56,9 @@ public:
     // Writes to top log pane (Server stdout/stderr logs)
     void logServer(const std::string& text, int colorPair = 0);
 
-    // Formatted agent reply arriving in main panel
-    void logAgentReply(const std::string& sessionId,
-                       const std::string& messageId,
-                       const std::string& replyText);
-
     void updateHeader();
 
     void setShutdownCallback(ShutdownCallback cb);
-    void setCollabOrchestrator(CollabOrchestrator* orch) { _collabOrch = orch; }
 
 private:
     struct OutputLine {
@@ -85,7 +78,6 @@ private:
 
     StateStore& _stateStore;
     ShutdownCallback _shutdownCb;
-    CollabOrchestrator* _collabOrch = nullptr;
 
     std::mutex _uiMutex;
     std::atomic<bool> _running{false};
@@ -105,11 +97,6 @@ private:
 
     std::deque<OutputLine> _cmdHistory;
     int _scrollOffset = 0;
-
-    int _activeChatAgentId = 0;
-    std::string _activeChatSessionId;
-    std::string _activeChatClientName;
-    std::string _activeChatRemoteIp;
 
     NcursesStreamBuf _coutBuf;
     NcursesStreamBuf _cerrBuf;

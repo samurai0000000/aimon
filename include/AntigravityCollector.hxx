@@ -27,6 +27,7 @@ private:
     bool probePort(int port, const std::string& csrfToken);
 
     AntigravityConfig _config;
+    pid_t _cachedPid = 0;
     int _cachedPort = 0;
     std::string _cachedCsrf;
 };

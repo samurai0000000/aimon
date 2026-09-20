@@ -16,7 +16,6 @@ namespace aimon {
 
 class DynamicToolRegistry;
 class TcpGateway;
-class CollabOrchestrator;
 
 class McpServer {
 public:
@@ -25,31 +24,35 @@ public:
                        TcpGateway* tcpGateway = nullptr);
 
     void run();
-    nlohmann::json handleMessage(const nlohmann::json& request);
+    nlohmann::json handleMessage(const nlohmann::json& request, const std::string& profile = "");
 
     void setDynamicRegistry(DynamicToolRegistry* reg) { _dynamicRegistry = reg; }
     void setTcpGateway(TcpGateway* gw) { _tcpGateway = gw; }
     void setNotificationBroadcaster(std::function<void(const std::string&)> broadcaster) {
         _notificationBroadcaster = broadcaster;
     }
-    void setCollabOrchestrator(CollabOrchestrator* orch) { _collabOrch = orch; }
+    void setDefaultProfile(const std::string& profile) { _defaultProfile = profile; }
+    const std::string& getDefaultProfile() const { return _defaultProfile; }
     void notifyToolsListChanged();
+
+    static bool isToolAllowedInProfile(const std::string& toolName, const std::string& profile);
+    static std::string detectProfileFromWorkspace(const std::string& workspacePath);
 
 private:
     nlohmann::json handleInitialize(const nlohmann::json& id, const nlohmann::json& params);
-    nlohmann::json handleToolsList(const nlohmann::json& id);
-    nlohmann::json handleToolsCall(const nlohmann::json& id, const nlohmann::json& params);
+    nlohmann::json handleToolsList(const nlohmann::json& id, const std::string& profile);
+    nlohmann::json handleToolsCall(const nlohmann::json& id, const nlohmann::json& params, const std::string& profile);
 
     std::string formatAntigravityStatus(const AntigravityStatus& ag);
     std::string formatCursorStatus(const CursorStatus& cr);
     std::string formatCombinedStatus(const AggregateStatus& status);
-    std::string formatAgentTasks(const std::vector<AgentTask>& tasks);
 
     StateStore& _stateStore;
     DynamicToolRegistry* _dynamicRegistry = nullptr;
     TcpGateway* _tcpGateway = nullptr;
-    CollabOrchestrator* _collabOrch = nullptr;
     std::function<void(const std::string&)> _notificationBroadcaster;
+    std::string _defaultProfile = "all";
+    std::string _activeProfile;
 };
 
 } // namespace aimon
