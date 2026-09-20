@@ -18,6 +18,7 @@
 #include <functional>
 #include <nlohmann/json.hpp>
 #include "DynamicToolRegistry.hxx"
+#include "Models.hxx"
 
 namespace aimon {
 
@@ -26,7 +27,14 @@ struct ClientConnection {
     int socketFd = -1;
     std::string remoteAddress;
     std::string subsystem;
+    std::string displayName;
+    std::string shortName;
+    int priority = 100;
+    int webPort = 0;
+    std::string webPath = "/";
     std::atomic<bool> active{true};
+    std::atomic<bool> webReachable{false};
+    std::atomic<int64_t> lastSeenEpoch{0};
     std::unique_ptr<std::thread> readThread;
 };
 
@@ -55,9 +63,12 @@ public:
                   const nlohmann::json& arguments,
                   nlohmann::json& outResult,
                   std::string& outErrorMessage,
-                  int timeoutMs = 15000);
+                  int timeoutMs = 45000);
 
     void setToolsChangedCallback(ToolsChangedCallback cb);
+
+    std::vector<DiscoveredMonitor> getDiscoveredMonitors(int selfWebPort = 3883) const;
+    static bool checkTcpPortReachable(const std::string& host, int port, int timeoutMs = 800);
 
 private:
     void listenerLoop();
@@ -82,6 +93,9 @@ private:
     std::mutex _pendingMutex;
     std::map<std::string, std::shared_ptr<PendingCall>> _pendingCalls;
     std::atomic<uint64_t> _nextRequestId{1};
+
+    mutable std::mutex _retainedMutex;
+    std::map<std::string, DiscoveredMonitor> _retainedMonitors;
 };
 
 } // namespace aimon

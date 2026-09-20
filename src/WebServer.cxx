@@ -8,6 +8,7 @@
 #include "WebAssets.hxx"
 #include "McpServer.hxx"
 #include "TaskRegistry.hxx"
+#include "TcpGateway.hxx"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -36,12 +37,14 @@ static std::string generateSessionId() {
 
 WebServer::WebServer(StateStore& stateStore, HistoryStore& historyStore,
                      const WebConfig& config, RefreshCallback onRefresh,
-                     McpServer* mcpServer)
+                     McpServer* mcpServer,
+                     TcpGateway* tcpGateway)
     : _stateStore(stateStore),
       _historyStore(historyStore),
       _config(config),
       _onRefresh(onRefresh),
       _mcpServer(mcpServer),
+      _tcpGateway(tcpGateway),
       _endpointsEnabled(config.endpointsEnabled),
       _server(std::make_unique<httplib::Server>()) {
 }
@@ -134,6 +137,9 @@ void WebServer::setupRoutes() {
     // Gate REST API endpoints if disabled by configuration, unless request is from an authenticated Web UI session
     if (!_endpointsEnabled) {
         _server->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+            if (req.path == "/api/monitors") {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
             if (req.path == "/api" || req.path.rfind("/api/", 0) == 0) {
                 if (!isValidUiSession(req)) {
                     res.status = 403;
@@ -281,6 +287,36 @@ void WebServer::setupRoutes() {
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& s : sessions) {
             arr.push_back(s.toJson());
+        }
+        res.set_content(arr.dump(2), "application/json");
+    });
+
+    _server->Get("/api/monitors", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Expires", "0");
+        nlohmann::json arr = nlohmann::json::array();
+        if (_tcpGateway) {
+            auto monitors = _tcpGateway->getDiscoveredMonitors(_config.port);
+            for (const auto& m : monitors) {
+                arr.push_back(m.toJson());
+            }
+        } else {
+            DiscoveredMonitor selfMon;
+            selfMon.id = "aimon";
+            selfMon.name = "AI Quotas";
+            selfMon.shortName = "AI Quotas";
+            selfMon.subsystem = "aimon";
+            selfMon.host = "127.0.0.1";
+            selfMon.port = _config.port;
+            selfMon.path = "/";
+            selfMon.connected = true;
+            selfMon.reachable = true;
+            selfMon.isSelf = true;
+            selfMon.priority = 0;
+            selfMon.lastSeenEpoch = std::time(nullptr);
+            arr.push_back(selfMon.toJson());
         }
         res.set_content(arr.dump(2), "application/json");
     });

@@ -237,6 +237,39 @@ struct ClientSession {
     }
 };
 
+struct DiscoveredMonitor {
+    std::string id;
+    std::string name;
+    std::string shortName;
+    std::string subsystem;
+    std::string host;
+    int port = 0;
+    std::string path = "/";
+    bool connected = false;
+    bool reachable = false;
+    bool isSelf = false;
+    int priority = 100;
+    int64_t lastSeenEpoch = 0;
+
+    nlohmann::json toJson() const {
+        return {
+            {"id", id},
+            {"name", name},
+            {"short_name", shortName},
+            {"subsystem", subsystem},
+            {"host", host},
+            {"port", port},
+            {"path", path},
+            {"connected", connected},
+            {"reachable", reachable},
+            {"is_self", isSelf},
+            {"isSelf", isSelf},
+            {"priority", priority},
+            {"last_seen_epoch", lastSeenEpoch}
+        };
+    }
+};
+
 } // namespace aimon
 
 #endif // AIMON_MODELS_HXX

@@ -29,6 +29,7 @@ class Response;
 namespace aimon {
 
 class McpServer;
+class TcpGateway;
 
 struct SseSession {
     std::string id;
@@ -45,7 +46,8 @@ public:
 
     WebServer(StateStore& stateStore, HistoryStore& historyStore,
               const WebConfig& config, RefreshCallback onRefresh = nullptr,
-              McpServer* mcpServer = nullptr);
+              McpServer* mcpServer = nullptr,
+              TcpGateway* tcpGateway = nullptr);
     ~WebServer();
 
     bool start(bool async = false);
@@ -64,6 +66,7 @@ private:
     WebConfig _config;
     RefreshCallback _onRefresh;
     McpServer* _mcpServer = nullptr;
+    TcpGateway* _tcpGateway = nullptr;
 
     bool _endpointsEnabled = false;
     mutable std::mutex _sessionMutex;

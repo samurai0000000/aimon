@@ -284,7 +284,15 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         nlohmann::json gwResult;
         std::string gwError;
-        bool ok = _tcpGateway->callTool(toolName, args, gwResult, gwError);
+
+        int timeoutMs = 45000;
+        if (args.contains("timeout_sec") && args["timeout_sec"].is_number()) {
+            timeoutMs = (args["timeout_sec"].get<int>() + 10) * 1000;
+        } else if (toolName.find("flash") != std::string::npos) {
+            timeoutMs = 180000;
+        }
+
+        bool ok = _tcpGateway->callTool(toolName, args, gwResult, gwError, timeoutMs);
         if (!ok) {
             return {
                 {"jsonrpc", "2.0"},

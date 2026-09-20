@@ -7,6 +7,7 @@
 #include "TcpGateway.hxx"
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -17,6 +18,8 @@
 #include <iostream>
 #include <sstream>
 #include <chrono>
+#include <algorithm>
+#include <map>
 
 namespace aimon {
 
@@ -233,6 +236,23 @@ void TcpGateway::clientReadLoop(std::shared_ptr<ClientConnection> client) {
     std::cout << "[TcpGateway] Client disconnected: " << client->remoteAddress
               << " (" << client->subsystem << ", ID: " << client->clientId << ")" << std::endl;
 
+    std::string peerIp = client->remoteAddress;
+    size_t colon = peerIp.rfind(':');
+    if (colon != std::string::npos) {
+        peerIp = peerIp.substr(0, colon);
+    }
+    std::string retainedKey = client->subsystem + "@" + peerIp + ":" + std::to_string(client->webPort);
+
+    {
+        std::lock_guard<std::mutex> lock(_retainedMutex);
+        auto it = _retainedMonitors.find(retainedKey);
+        if (it != _retainedMonitors.end()) {
+            it->second.connected = false;
+            it->second.reachable = false;
+            it->second.lastSeenEpoch = std::time(nullptr);
+        }
+    }
+
     std::vector<std::string> removedTools;
     _registry.unregisterClient(client->clientId, removedTools);
 
@@ -257,9 +277,10 @@ void TcpGateway::clientReadLoop(std::shared_ptr<ClientConnection> client) {
     if (!removedTools.empty()) {
         std::cout << "[TcpGateway] Unregistered " << removedTools.size()
                   << " tools from " << client->subsystem << std::endl;
-        if (_onToolsChanged) {
-            _onToolsChanged();
-        }
+    }
+
+    if (_onToolsChanged) {
+        _onToolsChanged();
     }
 
     // Let thread detach itself
@@ -297,13 +318,85 @@ void TcpGateway::handleIncomingJson(std::shared_ptr<ClientConnection> client,
             std::string subsystem = params.value("subsystem", "unknown");
             client->subsystem = subsystem;
 
+            if (params.contains("display_name") && params["display_name"].is_string()) {
+                client->displayName = params["display_name"].get<std::string>();
+            } else if (params.contains("title") && params["title"].is_string()) {
+                client->displayName = params["title"].get<std::string>();
+            } else if (params.contains("name") && params["name"].is_string()) {
+                client->displayName = params["name"].get<std::string>();
+            } else {
+                client->displayName = subsystem;
+            }
+
+            if (params.contains("short_name") && params["short_name"].is_string()) {
+                client->shortName = params["short_name"].get<std::string>();
+            } else if (params.contains("shortName") && params["shortName"].is_string()) {
+                client->shortName = params["shortName"].get<std::string>();
+            } else {
+                client->shortName = client->displayName;
+            }
+
+            if (params.contains("priority") && params["priority"].is_number()) {
+                client->priority = params["priority"].get<int>();
+            } else {
+                if (subsystem == "aimon") client->priority = 0;
+                else if (subsystem == "netmon") client->priority = 10;
+                else if (subsystem == "meshmon") client->priority = 20;
+                else if (subsystem == "embdevenv") client->priority = 30;
+                else client->priority = 100;
+            }
+
+            if (params.contains("web_port") && params["web_port"].is_number()) {
+                client->webPort = params["web_port"].get<int>();
+            } else {
+                // Fallback default ports for known subsystems if not explicitly sent
+                if (subsystem == "netmon") client->webPort = 3884;
+                else if (subsystem == "meshmon") client->webPort = 16880;
+                else if (subsystem == "embdevenv") client->webPort = 3886;
+            }
+
+            if (params.contains("web_path") && params["web_path"].is_string()) {
+                client->webPath = params["web_path"].get<std::string>();
+            } else {
+                client->webPath = "/";
+            }
+
+            std::string peerIp = client->remoteAddress;
+            size_t colon = peerIp.rfind(':');
+            if (colon != std::string::npos) {
+                peerIp = peerIp.substr(0, colon);
+            }
+            std::string key = client->subsystem + "@" + peerIp + ":" + std::to_string(client->webPort);
+            bool reachable = (client->webPort > 0) ? checkTcpPortReachable(peerIp, client->webPort, 800) : false;
+            client->webReachable.store(reachable);
+            client->lastSeenEpoch.store(std::time(nullptr));
+
+            {
+                std::lock_guard<std::mutex> lock(_retainedMutex);
+                DiscoveredMonitor dm;
+                dm.id = client->subsystem;
+                dm.name = client->displayName;
+                dm.shortName = client->shortName;
+                dm.subsystem = client->subsystem;
+                dm.host = peerIp;
+                dm.port = client->webPort;
+                dm.path = client->webPath;
+                dm.connected = true;
+                dm.reachable = reachable;
+                dm.isSelf = false;
+                dm.priority = client->priority;
+                dm.lastSeenEpoch = std::time(nullptr);
+                _retainedMonitors[key] = dm;
+            }
+
             nlohmann::json toolsArray = params.value("tools", nlohmann::json::array());
             std::vector<std::string> addedNames;
             bool ok = _registry.registerTools(client->clientId, subsystem, toolsArray, addedNames);
 
             std::cout << "[TcpGateway] " << (method == "gateway/register" ? "Registered" : "Updated")
                       << " " << addedNames.size() << " tools from " << subsystem
-                      << " (client " << client->clientId << ")" << std::endl;
+                      << " (" << client->displayName << " [" << client->shortName << "], priority " << client->priority
+                      << ", client " << client->clientId << ", web_port: " << client->webPort << ")" << std::endl;
 
             nlohmann::json resp = {
                 {"jsonrpc", "2.0"},
@@ -315,7 +408,7 @@ void TcpGateway::handleIncomingJson(std::shared_ptr<ClientConnection> client,
             };
             sendLine(client->socketFd, resp.dump());
 
-            if (ok && _onToolsChanged) {
+            if (_onToolsChanged) {
                 _onToolsChanged();
             }
         } else if (method == "ping") {
@@ -439,6 +532,133 @@ bool TcpGateway::callTool(const std::string& toolName,
 
     outErrorMessage = "Malformed response from subsystem '" + client->subsystem + "'";
     return false;
+}
+
+bool TcpGateway::checkTcpPortReachable(const std::string& host, int port, int timeoutMs) {
+    if (host.empty() || port <= 0 || port > 65535) {
+        return false;
+    }
+
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return false;
+    }
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        ::close(sock);
+        return false;
+    }
+
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+        ::close(sock);
+        return false;
+    }
+
+    int res = ::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    if (res < 0) {
+        if (errno == EINPROGRESS) {
+            fd_set wset;
+            FD_ZERO(&wset);
+            FD_SET(sock, &wset);
+            struct timeval tv;
+            tv.tv_sec = timeoutMs / 1000;
+            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            int sel = ::select(sock + 1, nullptr, &wset, nullptr, &tv);
+            if (sel > 0) {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
+                    res = 0;
+                } else {
+                    res = -1;
+                }
+            } else {
+                res = -1;
+            }
+        } else {
+            res = -1;
+        }
+    }
+
+    ::close(sock);
+    return (res == 0);
+}
+
+std::vector<DiscoveredMonitor> TcpGateway::getDiscoveredMonitors(int selfWebPort) const {
+    std::vector<DiscoveredMonitor> list;
+
+    // Self: aimon
+    DiscoveredMonitor selfMon;
+    selfMon.id = "aimon";
+    selfMon.name = "AI Quotas";
+    selfMon.shortName = "AI Quotas";
+    selfMon.subsystem = "aimon";
+    selfMon.host = "127.0.0.1";
+    selfMon.port = selfWebPort;
+    selfMon.path = "/";
+    selfMon.connected = true;
+    selfMon.reachable = true;
+    selfMon.isSelf = true;
+    selfMon.priority = 0;
+    selfMon.lastSeenEpoch = std::time(nullptr);
+    list.push_back(selfMon);
+
+    std::lock_guard<std::mutex> lock(_retainedMutex);
+
+    // Count per subsystem for multi-host disambiguation
+    std::map<std::string, int> countPerSubsystem;
+    for (const auto& pair : _retainedMonitors) {
+        countPerSubsystem[pair.second.subsystem]++;
+    }
+
+    for (auto pair : _retainedMonitors) {
+        DiscoveredMonitor mon = pair.second;
+        if (mon.port <= 0) continue;
+
+        if (mon.connected) {
+            mon.reachable = checkTcpPortReachable(mon.host, mon.port, 200);
+        } else {
+            mon.reachable = false;
+        }
+
+        auto sanitizeHost = [](const std::string& h) -> std::string {
+            std::string s = h;
+            for (char& c : s) {
+                if (c == '.' || c == ':') c = '-';
+            }
+            return s;
+        };
+
+        mon.id = mon.subsystem + "-" + sanitizeHost(mon.host) + "-" + std::to_string(mon.port);
+
+        bool hasMultiple = (countPerSubsystem[mon.subsystem] > 1);
+        std::string baseName = !mon.name.empty() ? mon.name : mon.subsystem;
+        std::string baseShort = !mon.shortName.empty() ? mon.shortName : baseName;
+
+        if (hasMultiple) {
+            mon.name = baseName + " (" + mon.host + ")";
+            mon.shortName = baseShort + "@" + mon.host;
+        } else {
+            mon.name = baseName;
+            mon.shortName = baseShort;
+        }
+
+        list.push_back(mon);
+    }
+
+    std::sort(list.begin(), list.end(), [](const DiscoveredMonitor& a, const DiscoveredMonitor& b) {
+        if (a.priority != b.priority) return a.priority < b.priority;
+        if (a.subsystem != b.subsystem) return a.subsystem < b.subsystem;
+        if (a.host != b.host) return a.host < b.host;
+        return a.port < b.port;
+    });
+
+    return list;
 }
 
 } // namespace aimon

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.4 LANGUAGES CXX)
+project(aimon VERSION 1.0.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -98,3 +98,21 @@ target_link_libraries(aimon PRIVATE
 if(MOSQUITTO_LIBRARY_DIRS)
     target_link_directories(aimon PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
 endif()
+
+# Tests
+add_executable(test_gateway_timeout
+    test/TestGatewayTimeout.cxx
+    src/DynamicToolRegistry.cxx
+    src/TcpGateway.cxx
+)
+
+target_include_directories(test_gateway_timeout PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+)
+
+target_link_libraries(test_gateway_timeout PRIVATE
+    Threads::Threads
+)

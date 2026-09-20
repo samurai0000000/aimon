@@ -63,8 +63,11 @@ bool DynamicToolRegistry::unregisterClient(int clientId, std::vector<std::string
     }
 
     for (const auto& name : it->second) {
-        _tools.erase(name);
-        removedToolNames.push_back(name);
+        auto tit = _tools.find(name);
+        if (tit != _tools.end() && tit->second.clientId == clientId) {
+            _tools.erase(tit);
+            removedToolNames.push_back(name);
+        }
     }
     _clientTools.erase(it);
 

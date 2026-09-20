@@ -16,7 +16,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css?v=1.0.4">
+    <link rel="stylesheet" href="style.css?v=1.0.5">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -41,7 +41,15 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
             </div>
         </header>
 
-        <main class="dashboard-grid">
+        <nav class="monitor-nav" id="monitor-tabs" aria-label="System Monitors">
+            <button type="button" class="monitor-tab active" data-id="aimon">
+                <span class="tab-indicator tab-indicator-online"></span>
+                <span class="tab-title">AI Quotas</span>
+                <span class="tab-badge">Self</span>
+            </button>
+        </nav>
+
+        <main class="dashboard-grid view-panel active" id="view-aimon">
             <!-- Google Antigravity Section -->
             <section class="card glass-card antigravity-card">
                 <div class="card-header">
@@ -231,12 +239,15 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
             </section>
         </main>
 
+        <!-- Dynamic Discovered Monitor Embedded Panels -->
+        <div id="dynamic-panels"></div>
+
         <footer class="app-footer">
             <p>aimon daemon &bull; Pure C++17 AI Quota Monitor &bull; Local loopback on 127.0.0.1</p>
         </footer>
     </div>
 
-    <script src="app.js?v=1.0.4"></script>
+    <script src="app.js?v=1.0.5"></script>
 </body>
 </html>
 )raw_asset";
@@ -2041,6 +2052,288 @@ body {
     color: var(--text-muted);
     padding-top: 10px;
 }
+
+/* ==========================================================================
+   Multi-Monitor Navigation Tabs & Iframe Embed Container
+   ========================================================================== */
+
+.monitor-nav {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--bg-card);
+    backdrop-filter: blur(16px);
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+.monitor-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid transparent;
+    border-radius: 10px;
+    color: var(--text-secondary);
+    font-family: var(--font-sans);
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    white-space: nowrap;
+    user-select: none;
+}
+
+.monitor-tab:hover {
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--text-primary);
+    transform: translateY(-1px);
+}
+
+.monitor-tab.active {
+    background: rgba(0, 242, 254, 0.1);
+    border-color: rgba(0, 242, 254, 0.35);
+    color: #ffffff;
+    box-shadow: 0 0 16px rgba(0, 242, 254, 0.12);
+}
+
+.tab-indicator {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.tab-indicator-online {
+    background: var(--status-online);
+    box-shadow: 0 0 8px var(--status-online);
+}
+
+.tab-indicator-offline {
+    background: var(--status-offline);
+    box-shadow: 0 0 8px var(--status-offline);
+}
+
+.tab-title {
+    font-weight: 600;
+}
+
+.tab-badge {
+    font-size: 0.7rem;
+    font-weight: 500;
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+.monitor-tab.active .tab-badge {
+    background: rgba(0, 242, 254, 0.2);
+    color: var(--cyan-glow);
+}
+
+/* View panels */
+.view-panel {
+    width: 100%;
+    transition: opacity 0.2s ease;
+}
+
+.view-panel.hidden {
+    display: none !important;
+}
+
+/* Discovered Monitor Frame Container & Panels */
+.monitor-frame-container,
+.monitor-frame-panel {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-card);
+    backdrop-filter: blur(16px);
+    border: 1px solid var(--border-color);
+    border-radius: 16px;
+    overflow: hidden;
+    height: calc(100vh - 190px);
+    min-height: 680px;
+    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.35);
+}
+
+.frame-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 18px;
+    background: rgba(10, 14, 23, 0.75);
+    border-bottom: 1px solid var(--border-color);
+    gap: 16px;
+}
+
+.frame-info {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+.frame-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.frame-badge {
+    font-size: 0.72rem;
+    font-weight: 500;
+    padding: 2px 8px;
+    border-radius: 6px;
+    background: rgba(139, 92, 246, 0.15);
+    border: 1px solid rgba(139, 92, 246, 0.3);
+    color: var(--purple-glow);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.frame-url {
+    font-size: 0.78rem;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.frame-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+}
+
+.btn-frame-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    font-family: var(--font-sans);
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    cursor: pointer;
+    text-decoration: none;
+    transition: all 0.2s ease;
+}
+
+.btn-frame-action:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+.frame-content-wrapper {
+    position: relative;
+    flex: 1;
+    display: flex;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+}
+
+.monitor-iframe {
+    width: 100%;
+    height: 100%;
+    flex: 1;
+    border: none;
+    background: #0a0e17;
+    transition: filter 0.3s ease, opacity 0.3s ease;
+}
+
+.monitor-iframe.iframe-grayed-out {
+    filter: grayscale(0.85) blur(1.5px);
+    opacity: 0.45;
+    pointer-events: none;
+}
+
+.offline-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10, 14, 23, 0.75);
+    backdrop-filter: blur(8px);
+    z-index: 50;
+    animation: fadeIn 0.25s ease forwards;
+}
+
+.offline-overlay.hidden {
+    display: none !important;
+}
+
+.offline-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: 32px 40px;
+    max-width: 480px;
+    background: rgba(17, 24, 39, 0.92);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    box-shadow: 0 20px 45px rgba(0, 0, 0, 0.55), 0 0 30px rgba(239, 68, 68, 0.15);
+    border-radius: 16px;
+    gap: 12px;
+}
+
+.offline-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    color: #ef4444;
+    margin-bottom: 4px;
+}
+
+.offline-card h3 {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.offline-desc {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin: 0;
+}
+
+.offline-details {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 0.78rem;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    margin-top: 8px;
+    background: rgba(0, 0, 0, 0.35);
+    padding: 8px 16px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.offline-details code {
+    color: #f87171;
+}
 )raw_asset";
 
 inline const char* APP_JS = R"raw_asset(//
@@ -2639,6 +2932,7 @@ function setupSse() {
                 const data = JSON.parse(e.data);
                 if (data.event === 'tools_changed') {
                     fetchSessions();
+                    fetchMonitors();
                 }
             } catch (_) {}
         };
@@ -2650,15 +2944,317 @@ function setupSse() {
     }
 }
 
+// ==========================================================================
+// Multi-Monitor Navigation Tabs & Persistent Iframe Controller
+// ==========================================================================
+
+let discoveredMonitors = [];
+let activeMonitorId = 'aimon';
+
+function formatLastSeen(epoch) {
+    if (!epoch || epoch <= 0) return 'Just now';
+    const diffSec = Math.floor(Date.now() / 1000) - epoch;
+    if (diffSec < 10) return 'Just now';
+    if (diffSec < 60) return `${diffSec}s ago`;
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+    const d = new Date(epoch * 1000);
+    return d.toLocaleTimeString();
+}
+
+function getResolvedMonitorUrl(m) {
+    const protocol = window.location.protocol;
+    let host = m.host;
+    if (host === '127.0.0.1' || host === 'localhost') {
+        host = window.location.hostname;
+    }
+    const path = m.path ? (m.path.startsWith('/') ? m.path : ('/' + m.path)) : '/';
+    return `${protocol}//${host}:${m.port}${path}`;
+}
+
+async function fetchMonitors() {
+    try {
+        const res = await fetch('/api/monitors');
+        if (!res.ok) return;
+        discoveredMonitors = await res.json();
+        renderMonitorTabs(discoveredMonitors);
+    } catch (e) {
+        console.warn('Failed to fetch monitors:', e);
+    }
+}
+
+function renderMonitorTabs(monitors) {
+    const navEl = document.getElementById('monitor-tabs');
+    const dynamicPanelsEl = document.getElementById('dynamic-panels');
+    if (!navEl) return;
+
+    // Ensure aimon is present
+    let list = Array.isArray(monitors) ? [...monitors] : [];
+    if (!list.some(m => m.id === 'aimon')) {
+        list.unshift({
+            id: 'aimon',
+            name: 'AI Quotas',
+            short_name: 'AI Quotas',
+            subsystem: 'aimon',
+            host: '127.0.0.1',
+            port: window.location.port || 3883,
+            path: '/',
+            connected: true,
+            reachable: true,
+            is_self: true,
+            priority: 0
+        });
+    }
+
+    list.sort((a, b) => {
+        const pa = (a.priority !== undefined) ? a.priority : 100;
+        const pb = (b.priority !== undefined) ? b.priority : 100;
+        if (pa !== pb) return pa - pb;
+        const sa = a.subsystem || '';
+        const sb = b.subsystem || '';
+        if (sa !== sb) return sa.localeCompare(sb);
+        const ha = a.host || '';
+        const hb = b.host || '';
+        if (ha !== hb) return ha.localeCompare(hb);
+        return (a.port || 0) - (b.port || 0);
+    });
+
+    // Render navigation tabs
+    navEl.innerHTML = list.map(m => {
+        const isActive = (m.id === activeMonitorId);
+        const activeClass = isActive ? ' active' : '';
+        const isOnline = Boolean(m.connected && m.reachable);
+        const indClass = isOnline ? 'tab-indicator-online' : 'tab-indicator-offline';
+        const badgeText = (m.is_self || m.isSelf) ? 'Self' : (m.subsystem || `${m.port}`);
+        const displayLabel = m.short_name || m.name || m.subsystem || m.id;
+
+        return `
+            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(m.id)}" title="${escapeHtml(m.name || m.id)} (${m.host}:${m.port})">
+                <span class="tab-indicator ${indClass}"></span>
+                <span class="tab-title">${escapeHtml(displayLabel)}</span>
+                <span class="tab-badge">${escapeHtml(badgeText)}</span>
+            </button>
+        `;
+    }).join('');
+
+    // Attach tab click handlers
+    navEl.querySelectorAll('.monitor-tab').forEach(tabBtn => {
+        tabBtn.addEventListener('click', () => {
+            const id = tabBtn.getAttribute('data-id');
+            switchToMonitor(id);
+        });
+    });
+
+    // Synchronize persistent iframe panels in #dynamic-panels
+    if (dynamicPanelsEl) {
+        // Prune orphaned panels
+        const activePanelIds = new Set(list.filter(m => !m.is_self && !m.isSelf).map(m => `panel-${m.id}`));
+        dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(p => {
+            if (!activePanelIds.has(p.id)) {
+                p.remove();
+            }
+        });
+
+        list.forEach(m => {
+            if (m.is_self || m.isSelf) return;
+
+            let panel = document.getElementById(`panel-${m.id}`);
+            const targetUrl = getResolvedMonitorUrl(m);
+            const isOnline = Boolean(m.connected && m.reachable);
+
+            if (!panel) {
+                panel = document.createElement('div');
+                panel.id = `panel-${m.id}`;
+                panel.className = `monitor-frame-panel view-panel${m.id === activeMonitorId ? '' : ' hidden'}`;
+                panel.innerHTML = `
+                    <div class="frame-toolbar">
+                        <div class="frame-info">
+                            <span class="dot-status ${isOnline ? 'dot-online' : 'dot-offline'}" id="dot-${m.id}"></span>
+                            <span class="frame-title">${escapeHtml(m.name || m.id)}</span>
+                            <span class="frame-badge">${escapeHtml(m.subsystem || 'Satellite')}</span>
+                            <span class="frame-url">${escapeHtml(targetUrl)}</span>
+                        </div>
+                        <div class="frame-actions">
+                            <button type="button" class="btn-frame-action btn-panel-reload" data-id="${m.id}" title="Reload Tab">
+                                <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                                    <path d="M23 4v6h-6"></path>
+                                    <path d="M1 20v-6h6"></path>
+                                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                                </svg>
+                                Reload
+                            </button>
+                            <a href="${escapeHtml(targetUrl)}" target="_blank" rel="noopener noreferrer" class="btn-frame-action" title="Open in new window">
+                                <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                                    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                                    <polyline points="15 3 21 3 21 9"></polyline>
+                                    <line x1="10" y1="14" x2="21" y2="3"></line>
+                                </svg>
+                                Open in New Window
+                            </a>
+                        </div>
+                    </div>
+                    <div class="frame-content-wrapper">
+                        <iframe class="monitor-iframe ${isOnline ? '' : 'iframe-grayed-out'}" src="${escapeHtml(targetUrl)}" title="${escapeHtml(m.name)}"></iframe>
+                        <div class="offline-overlay ${isOnline ? 'hidden' : ''}" id="overlay-${m.id}">
+                            <div class="offline-card">
+                                <div class="offline-icon">
+                                    <svg viewBox="0 0 24 24" width="36" height="36" stroke="currentColor" stroke-width="2" fill="none">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <line x1="12" y1="8" x2="12" y2="12"></line>
+                                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                                    </svg>
+                                </div>
+                                <h3>${escapeHtml(m.name)} is Offline</h3>
+                                <p class="offline-desc">Subsystem connection to aimon has been disconnected.</p>
+                                <div class="offline-details">
+                                    <span>Host: <code>${escapeHtml(m.host)}:${m.port}</code></span>
+                                    <span class="offline-last-seen" id="last-seen-${m.id}">Last seen: ${formatLastSeen(m.last_seen_epoch)}</span>
+                                </div>
+                                <button type="button" class="btn-frame-action btn-overlay-reload" data-id="${m.id}" style="margin-top: 8px;">
+                                    <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                                        <path d="M23 4v6h-6"></path>
+                                        <path d="M1 20v-6h6"></path>
+                                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                                    </svg>
+                                    Reload Tab
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                dynamicPanelsEl.appendChild(panel);
+
+                const attachReload = (btn) => {
+                    if (!btn) return;
+                    btn.addEventListener('click', () => {
+                        const iframe = panel.querySelector('iframe');
+                        if (iframe) {
+                            try {
+                                iframe.contentWindow.location.reload();
+                            } catch (_) {
+                                const s = iframe.src;
+                                iframe.src = '';
+                                iframe.src = s;
+                            }
+                        }
+                    });
+                };
+                attachReload(panel.querySelector('.btn-panel-reload'));
+                attachReload(panel.querySelector('.btn-overlay-reload'));
+            } else {
+                // Update existing panel state
+                const dot = panel.querySelector(`#dot-${m.id}`);
+                if (dot) {
+                    dot.className = isOnline ? 'dot-status dot-online' : 'dot-status dot-offline';
+                }
+                const iframe = panel.querySelector('iframe');
+                if (iframe) {
+                    if (isOnline) {
+                        iframe.classList.remove('iframe-grayed-out');
+                    } else {
+                        iframe.classList.add('iframe-grayed-out');
+                    }
+                }
+                const overlay = panel.querySelector(`#overlay-${m.id}`);
+                if (overlay) {
+                    if (isOnline) {
+                        overlay.classList.add('hidden');
+                    } else {
+                        overlay.classList.remove('hidden');
+                    }
+                }
+                const lastSeenEl = panel.querySelector(`#last-seen-${m.id}`);
+                if (lastSeenEl && m.last_seen_epoch) {
+                    lastSeenEl.textContent = `Last seen: ${formatLastSeen(m.last_seen_epoch)}`;
+                }
+            }
+        });
+
+        if (window.location.hash) {
+            const hash = window.location.hash.replace(/^#/, '');
+            const target = monitors.find(m => m.id === hash || m.subsystem === hash);
+            if (target && activeMonitorId !== target.id) {
+                switchToMonitor(target.id);
+            }
+        }
+    }
+}
+
+function switchToMonitor(id) {
+    activeMonitorId = id;
+    if (window.location.hash !== '#' + id) {
+        try {
+            history.replaceState(null, '', '#' + id);
+        } catch (_) {}
+    }
+
+    // Update active tab styles
+    const navEl = document.getElementById('monitor-tabs');
+    if (navEl) {
+        navEl.querySelectorAll('.monitor-tab').forEach(tab => {
+            if (tab.getAttribute('data-id') === id) {
+                tab.classList.add('active');
+            } else {
+                tab.classList.remove('active');
+            }
+        });
+    }
+
+    const viewAimon = document.getElementById('view-aimon');
+    if (id === 'aimon') {
+        if (viewAimon) viewAimon.classList.remove('hidden');
+    } else {
+        if (viewAimon) viewAimon.classList.add('hidden');
+    }
+
+    // Toggle persistent panels
+    const dynamicPanelsEl = document.getElementById('dynamic-panels');
+    if (dynamicPanelsEl) {
+        dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(panel => {
+            if (panel.id === `panel-${id}`) {
+                panel.classList.remove('hidden');
+            } else {
+                panel.classList.add('hidden');
+            }
+        });
+    }
+}
+
+window.addEventListener('hashchange', () => {
+    const hash = window.location.hash.replace(/^#/, '');
+    if (hash) {
+        switchToMonitor(hash);
+    } else {
+        switchToMonitor('aimon');
+    }
+});
+
 document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
     fetchSessions();
+    fetchMonitors();
     setupSse();
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
         fetchStatus(true);
         fetchSessions();
+        fetchMonitors();
     });
+
+    const reloadBtn = document.getElementById('frame-reload-btn');
+    if (reloadBtn) {
+        reloadBtn.addEventListener('click', () => {
+            const iframe = document.getElementById('monitor-iframe');
+            if (iframe) {
+                try {
+                    iframe.contentWindow.location.reload();
+                } catch (_) {
+                    const src = iframe.src;
+                    iframe.src = '';
+                    iframe.src = src;
+                }
+            }
+        });
+    }
 
     const modelsToggleBtn = document.getElementById('ag-models-toggle');
     const modelsChevron = document.getElementById('ag-models-chevron');
@@ -2676,9 +3272,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Refresh data: status every 5s, sessions every 3s
+    // Refresh data: status every 5s, sessions every 3s, monitors every 8s
     setInterval(() => fetchStatus(false), 5000);
     setInterval(fetchSessions, 3000);
+    setInterval(fetchMonitors, 8000);
 
     // Update countdown timers and session uptime every second
     if (countdownInterval) clearInterval(countdownInterval);
@@ -2693,3 +3290,13 @@ document.addEventListener('DOMContentLoaded', () => {
 } // namespace aimon
 
 #endif // AIMON_WEB_ASSETS_HXX
+
+/*
+ * Local variables:
+ * mode: C++
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * tab-width: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

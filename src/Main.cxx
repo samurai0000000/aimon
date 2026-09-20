@@ -261,7 +261,7 @@ int main(int argc, char* argv[]) {
     }
     WebServer webServer(stateStore, historyStore, cfg.web, [&]() {
         pollOnce();
-    }, &mcpServer);
+    }, &mcpServer, &tcpGateway);
 
     mcpServer.setNotificationBroadcaster([&](const std::string& notif) {
         webServer.broadcastSseNotification(notif);

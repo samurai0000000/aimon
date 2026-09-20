@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css?v=1.0.4">
+    <link rel="stylesheet" href="style.css?v=1.0.5">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -29,7 +29,15 @@
             </div>
         </header>
 
-        <main class="dashboard-grid">
+        <nav class="monitor-nav" id="monitor-tabs" aria-label="System Monitors">
+            <button type="button" class="monitor-tab active" data-id="aimon">
+                <span class="tab-indicator tab-indicator-online"></span>
+                <span class="tab-title">AI Quotas</span>
+                <span class="tab-badge">Self</span>
+            </button>
+        </nav>
+
+        <main class="dashboard-grid view-panel active" id="view-aimon">
             <!-- Google Antigravity Section -->
             <section class="card glass-card antigravity-card">
                 <div class="card-header">
@@ -219,11 +227,14 @@
             </section>
         </main>
 
+        <!-- Dynamic Discovered Monitor Embedded Panels -->
+        <div id="dynamic-panels"></div>
+
         <footer class="app-footer">
             <p>aimon daemon &bull; Pure C++17 AI Quota Monitor &bull; Local loopback on 127.0.0.1</p>
         </footer>
     </div>
 
-    <script src="app.js?v=1.0.4"></script>
+    <script src="app.js?v=1.0.5"></script>
 </body>
 </html>
