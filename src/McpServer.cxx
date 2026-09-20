@@ -130,7 +130,7 @@ nlohmann::json McpServer::handleMessage(const nlohmann::json& request, const std
     std::string method = request["method"].get<std::string>();
     nlohmann::json id = request.value("id", nlohmann::json());
 
-    std::string effectiveProfile = !profile.empty() ? profile : (!this->_activeProfile.empty() ? this->_activeProfile : this->_defaultProfile);
+    std::string effectiveProfile = !profile.empty() ? profile : this->_defaultProfile;
 
     if (method == "initialize") {
         return handleInitialize(id, request.value("params", nlohmann::json::object()));
@@ -162,30 +162,7 @@ nlohmann::json McpServer::handleMessage(const nlohmann::json& request, const std
     return nullptr;
 }
 
-nlohmann::json McpServer::handleInitialize(const nlohmann::json& id, const nlohmann::json& params) {
-    // Attempt auto-scoping based on client workspace if active profile is not explicitly overridden
-    if (_activeProfile.empty() || _activeProfile == "all") {
-        std::string detected;
-        if (params.contains("rootUri") && params["rootUri"].is_string()) {
-            detected = detectProfileFromWorkspace(params["rootUri"].get<std::string>());
-        }
-        if (detected.empty() && params.contains("rootPath") && params["rootPath"].is_string()) {
-            detected = detectProfileFromWorkspace(params["rootPath"].get<std::string>());
-        }
-        if (detected.empty() && params.contains("workspaceFolders") && params["workspaceFolders"].is_array()) {
-            for (const auto& wf : params["workspaceFolders"]) {
-                if (wf.contains("uri") && wf["uri"].is_string()) {
-                    detected = detectProfileFromWorkspace(wf["uri"].get<std::string>());
-                    if (!detected.empty()) break;
-                }
-            }
-        }
-        if (!detected.empty()) {
-            _activeProfile = detected;
-            std::cerr << "[McpServer] Auto-scoped MCP tool profile to: " << _activeProfile << std::endl;
-        }
-    }
-
+nlohmann::json McpServer::handleInitialize(const nlohmann::json& id, const nlohmann::json& /* params */) {
     return {
         {"jsonrpc", "2.0"},
         {"id", id},

@@ -52,7 +52,6 @@ private:
     TcpGateway* _tcpGateway = nullptr;
     std::function<void(const std::string&)> _notificationBroadcaster;
     std::string _defaultProfile = "all";
-    std::string _activeProfile;
 };
 
 } // namespace aimon

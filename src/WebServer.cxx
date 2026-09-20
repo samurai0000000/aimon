@@ -484,6 +484,31 @@ void WebServer::setupRoutes() {
                     std::cout << "[WebServer] MCP client identified for session " << sessionId
                               << ": name='" << cName << "', version='" << cVer << "'" << std::endl;
                 }
+
+                // Auto-scope session profile from workspace if session has no explicit profile
+                if (session && session->profile.empty()) {
+                    std::string detected;
+                    if (p.contains("rootUri") && p["rootUri"].is_string()) {
+                        detected = McpServer::detectProfileFromWorkspace(p["rootUri"].get<std::string>());
+                    }
+                    if (detected.empty() && p.contains("rootPath") && p["rootPath"].is_string()) {
+                        detected = McpServer::detectProfileFromWorkspace(p["rootPath"].get<std::string>());
+                    }
+                    if (detected.empty() && p.contains("workspaceFolders") && p["workspaceFolders"].is_array()) {
+                        for (const auto& wf : p["workspaceFolders"]) {
+                            if (wf.contains("uri") && wf["uri"].is_string()) {
+                                detected = McpServer::detectProfileFromWorkspace(wf["uri"].get<std::string>());
+                                if (!detected.empty()) break;
+                            }
+                        }
+                    }
+                    if (!detected.empty()) {
+                        session->profile = detected;
+                        profile = detected;  // update for this request too
+                        std::cout << "[WebServer] Auto-scoped session " << sessionId
+                                  << " profile to: " << detected << std::endl;
+                    }
+                }
             }
         }
 
