@@ -22,9 +22,43 @@
 #endif
 #include <httplib.h>
 
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+
 namespace fs = std::filesystem;
 
 namespace aimon {
+
+static std::string getPrimaryLanIp() {
+    struct ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) == -1) {
+        return "";
+    }
+    std::string primaryIp;
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            if (!(ifa->ifa_flags & IFF_LOOPBACK) && (ifa->ifa_flags & IFF_UP)) {
+                char ipStr[INET_ADDRSTRLEN];
+                void* sin_addr = &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr;
+                if (inet_ntop(AF_INET, sin_addr, ipStr, sizeof(ipStr))) {
+                    std::string ip(ipStr);
+                    if (ip.rfind("192.168.", 0) == 0 || ip.rfind("10.", 0) == 0 || ip.rfind("172.", 0) == 0) {
+                        primaryIp = ip;
+                        break;
+                    }
+                    if (primaryIp.empty()) {
+                        primaryIp = ip;
+                    }
+                }
+            }
+        }
+    }
+    freeifaddrs(ifaddr);
+    return primaryIp;
+}
 
 static std::string generateSessionId() {
     static thread_local std::random_device rd;
@@ -193,7 +227,7 @@ void WebServer::setupRoutes() {
         res.set_header("Pragma", "no-cache");
         res.set_header("Expires", "0");
         if (fs::exists(diskPath)) {
-            std::ifstream f(diskPath);
+            std::ifstream f(diskPath, std::ios::binary);
             if (f.is_open()) {
                 std::string content((std::istreambuf_iterator<char>(f)),
                                     std::istreambuf_iterator<char>());
@@ -201,7 +235,12 @@ void WebServer::setupRoutes() {
                 return;
             }
         }
-        res.set_content(fallbackAsset, contentType.c_str());
+        if (fallbackAsset && fallbackAsset[0] != '\0') {
+            res.set_content(fallbackAsset, contentType.c_str());
+        } else {
+            res.status = 404;
+            res.set_content("File not found", "text/plain");
+        }
     };
 
     _server->Get("/", [this, serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
@@ -266,6 +305,7 @@ void WebServer::setupRoutes() {
     });
 
     _server->Get("/download/aimon-companion.apk", [serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Content-Disposition", "attachment; filename=\"aimon-companion.apk\"");
         serveFileOrFallback("mobile/android/app/build/outputs/apk/debug/app-debug.apk", "", "application/vnd.android.package-archive", res);
     });
 
@@ -452,6 +492,20 @@ void WebServer::setupRoutes() {
         res.set_content(data.dump(2), "application/json");
     });
 
+    _server->Get("/api/telemetry/activity_timeline", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string window = "24h";
+        int maxSessions = 50;
+        if (req.has_param("window")) {
+            window = req.get_param_value("window");
+        }
+        if (req.has_param("max_sessions")) {
+            try { maxSessions = std::stoi(req.get_param_value("max_sessions")); } catch (...) {}
+        }
+        auto data = AgentTelemetryDb::getInstance().queryActivityTimeline(window, maxSessions);
+        res.set_content(data.dump(2), "application/json");
+    });
+
     _server->Get("/api/telemetry/sessions", [](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         int limit = 50;
@@ -548,9 +602,14 @@ void WebServer::setupRoutes() {
     _server->Get("/api/mobile/qr", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string secret = MobileGateway::getInstance().createPairingSecret(300);
+        std::string lanIp = getPrimaryLanIp();
+
         nlohmann::json resp;
         resp["secret"] = secret;
         resp["expires_in"] = 300;
+        if (!lanIp.empty()) {
+            resp["lan_ip"] = lanIp;
+        }
         res.set_content(resp.dump(2), "application/json");
     });
 

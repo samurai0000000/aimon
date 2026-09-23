@@ -3353,10 +3353,12 @@ inline const char* APP_JS = R"raw_asset(//
 
 let currentStatus = null;
 let countdownInterval = null;
+let statusFetchedAt = Date.now();
+let serverTimeOffset = 0;
 
-function formatDuration(ms) {
+function formatCountdown(ms) {
     if (ms <= 0) return 'Ready';
-    const totalSeconds = Math.floor(ms / 1000);
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
     const days = Math.floor(totalSeconds / 86400);
     const hours = Math.floor((totalSeconds % 86400) / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
@@ -3377,7 +3379,8 @@ function updateCountdowns() {
         return;
     }
 
-    const now = Date.now();
+    const elapsedSinceFetch = Date.now() - statusFetchedAt;
+    const serverNow = Date.now() + serverTimeOffset;
 
     // 1. Quota group buckets
     if (currentStatus.antigravity.quota_groups) {
@@ -3386,12 +3389,36 @@ function updateCountdowns() {
             group.buckets.forEach((bucket, bIdx) => {
                 const timerEl = document.getElementById(`timer-bucket-${gIdx}-${bIdx}`);
                 if (!timerEl) return;
-                if (!bucket.reset_time_iso) {
+
+                const frac = bucket.remaining_fraction !== undefined ? bucket.remaining_fraction : 1.0;
+                if (frac >= 0.999 && (!bucket.reset_time_remaining_seconds || bucket.reset_time_remaining_seconds <= 0)) {
                     timerEl.textContent = 'Active';
                     return;
                 }
-                const diff = new Date(bucket.reset_time_iso).getTime() - now;
-                timerEl.textContent = diff > 0 ? `Resets in ${formatDuration(diff)}` : 'Ready to reset';
+
+                let diff = 0;
+                if (bucket.reset_time_remaining_seconds !== undefined && bucket.reset_time_remaining_seconds > 0) {
+                    diff = Math.max(0, (bucket.reset_time_remaining_seconds * 1000) - elapsedSinceFetch);
+                } else if (bucket.reset_time_iso) {
+                    const resetTime = new Date(bucket.reset_time_iso).getTime();
+                    diff = resetTime - serverNow;
+                }
+
+                // Sanity check: Antigravity quota window is at most weekly (7 days = 604,800,000 ms)
+                // If diff is greater than 8 days or negative due to clock skew, fallback immediately to description
+                if (diff > 8 * 86400 * 1000 || diff < 0) {
+                    if (bucket.description && bucket.description.includes('refresh in ')) {
+                        const parsed = bucket.description.split('refresh in ')[1].replace(/\.$/, '');
+                        timerEl.textContent = `Resets in ${parsed}`;
+                        return;
+                    }
+                }
+
+                if (diff > 0) {
+                    timerEl.textContent = `Resets in ${formatCountdown(diff)}`;
+                } else {
+                    timerEl.textContent = frac >= 0.999 ? 'Active' : 'Ready to reset';
+                }
             });
         });
     }
@@ -3402,14 +3429,30 @@ function updateCountdowns() {
             const timerEl = document.getElementById(`timer-model-${idx}`);
             if (!timerEl) return;
 
-            if (!m.reset_time_iso) {
+            const frac = m.remaining_fraction !== undefined ? m.remaining_fraction : 1.0;
+            if (frac >= 0.999 && (!m.reset_time_remaining_seconds || m.reset_time_remaining_seconds <= 0)) {
                 timerEl.textContent = 'Active';
                 return;
             }
 
-            const resetTime = new Date(m.reset_time_iso).getTime();
-            const diff = resetTime - now;
-            timerEl.textContent = diff > 0 ? `Resets in ${formatDuration(diff)}` : 'Ready to reset';
+            let diff = 0;
+            if (m.reset_time_remaining_seconds !== undefined && m.reset_time_remaining_seconds > 0) {
+                diff = Math.max(0, (m.reset_time_remaining_seconds * 1000) - elapsedSinceFetch);
+            } else if (m.reset_time_iso) {
+                const resetTime = new Date(m.reset_time_iso).getTime();
+                diff = resetTime - serverNow;
+            }
+
+            if (diff > 8 * 86400 * 1000 || diff < 0) {
+                timerEl.textContent = frac >= 0.999 ? 'Active' : 'Ready to reset';
+                return;
+            }
+
+            if (diff > 0) {
+                timerEl.textContent = `Resets in ${formatCountdown(diff)}`;
+            } else {
+                timerEl.textContent = frac >= 0.999 ? 'Active' : 'Ready to reset';
+            }
         });
     }
 }
@@ -3833,8 +3876,13 @@ async function fetchStatus(isManual = false) {
         if (res.ok) {
             const data = await res.json();
             currentStatus = data;
+            statusFetchedAt = Date.now();
+            if (data.server_timestamp_ms) {
+                serverTimeOffset = data.server_timestamp_ms - statusFetchedAt;
+            }
             renderAntigravity(data.antigravity);
             renderCursor(data.cursor);
+            updateCountdowns();
 
             const updatedEl = document.getElementById('last-updated');
             const nowTime = new Date().toLocaleTimeString();

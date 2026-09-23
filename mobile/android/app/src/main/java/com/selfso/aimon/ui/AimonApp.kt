@@ -16,6 +16,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.dp
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -146,13 +147,17 @@ fun AimonApp(
             composable(Screen.Pairing.route) {
                 PairingScreen(
                     config = config,
-                    onPair = { host, port, secret ->
+                    onPair = { host, port, secret, onComplete ->
                         scope.launch {
                             val res = repository.pairWithDaemon(host, port, secret)
                             if (res.isSuccess) {
+                                onComplete(true, null)
                                 navController.navigate(Screen.Quotas.route) {
                                     popUpTo(0)
                                 }
+                            } else {
+                                val msg = res.exceptionOrNull()?.localizedMessage ?: "Pairing failed"
+                                onComplete(false, msg)
                             }
                         }
                     },

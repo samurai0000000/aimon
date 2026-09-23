@@ -149,11 +149,6 @@ async function run() {
     console.log('Models grid expanded status:', modelsExpanded);
     await takeScreenshot('e2e_widget_02_ai_quotas_models_expanded.png');
 
-    // Click #refresh-btn to verify header refresh
-    console.log('Clicking Header Force Refresh button (#refresh-btn)...');
-    await evalJs(`document.getElementById('refresh-btn').click()`);
-    await sleep(1500);
-
     // -------------------------------------------------------------
     // SECTION 2: Agent Telemetry & Analytics Subpanel (#subpanel-telemetry)
     // -------------------------------------------------------------

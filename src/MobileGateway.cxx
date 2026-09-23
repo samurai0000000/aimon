@@ -21,8 +21,8 @@ MobileGateway &MobileGateway::getInstance() {
 }
 
 MobileGateway::MobileGateway()
-    : _pairingSecret("")
-    , _pairingExpires(0)
+    : _lastGeneratedSecret("")
+    , _lastGeneratedExpires(0)
     , _broadcastCb(nullptr) {
 }
 
@@ -46,6 +46,7 @@ void MobileGateway::shutdown() {
         }
     }
     _pendingApprovals.clear();
+    _pairingSecrets.clear();
     _sessions.clear();
 }
 
@@ -63,9 +64,33 @@ std::string MobileGateway::generateRandomHex(size_t byteCount) {
 
 std::string MobileGateway::createPairingSecret(int validitySeconds) {
     std::lock_guard<std::mutex> lock(_mutex);
-    _pairingSecret = generateRandomHex(16); // 128-bit secret
-    _pairingExpires = time(nullptr) + (validitySeconds > 0 ? validitySeconds : 300);
-    return _pairingSecret;
+    time_t now = time(nullptr);
+
+    // Purge expired secrets
+    for (auto it = _pairingSecrets.begin(); it != _pairingSecrets.end();) {
+        if (now > it->second) {
+            it = _pairingSecrets.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // If the last generated secret is still valid with at least 30s remaining, reuse it
+    if (!_lastGeneratedSecret.empty() && now + 30 <= _lastGeneratedExpires) {
+        auto it = _pairingSecrets.find(_lastGeneratedSecret);
+        if (it != _pairingSecrets.end() && now <= it->second) {
+            return _lastGeneratedSecret;
+        }
+    }
+
+    int duration = (validitySeconds > 0 ? validitySeconds : 300);
+    std::string secret = generateRandomHex(16); // 128-bit secret
+    time_t expires = now + duration;
+    _pairingSecrets[secret] = expires;
+    _lastGeneratedSecret = secret;
+    _lastGeneratedExpires = expires;
+
+    return secret;
 }
 
 bool MobileGateway::pairDevice(const std::string &pairingSecret,
@@ -75,7 +100,17 @@ bool MobileGateway::pairDevice(const std::string &pairingSecret,
     std::lock_guard<std::mutex> lock(_mutex);
     time_t now = time(nullptr);
 
-    if (_pairingSecret.empty() || now > _pairingExpires || pairingSecret != _pairingSecret) {
+    // Purge expired secrets
+    for (auto it = _pairingSecrets.begin(); it != _pairingSecrets.end();) {
+        if (now > it->second) {
+            it = _pairingSecrets.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    auto secIt = _pairingSecrets.find(pairingSecret);
+    if (secIt == _pairingSecrets.end() || now > secIt->second) {
         return false;
     }
 
@@ -92,8 +127,11 @@ bool MobileGateway::pairDevice(const std::string &pairingSecret,
     _sessions[outToken] = session;
 
     // Single-use pairing secret consumption
-    _pairingSecret.clear();
-    _pairingExpires = 0;
+    _pairingSecrets.erase(secIt);
+    if (_lastGeneratedSecret == pairingSecret) {
+        _lastGeneratedSecret.clear();
+        _lastGeneratedExpires = 0;
+    }
 
     return true;
 }

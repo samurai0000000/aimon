@@ -89,8 +89,9 @@ private:
     std::string generateRandomHex(size_t byteCount);
 
     std::mutex _mutex;
-    std::string _pairingSecret;
-    time_t _pairingExpires = 0;
+    std::string _lastGeneratedSecret;
+    time_t _lastGeneratedExpires = 0;
+    std::map<std::string, time_t> _pairingSecrets;
     std::map<std::string, MobileSession> _sessions;
     std::map<std::string, std::shared_ptr<ApprovalRequest>> _pendingApprovals;
     BroadcastCallback _broadcastCb;

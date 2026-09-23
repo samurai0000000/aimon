@@ -95,6 +95,7 @@ public:
     // High-Performance Queries
     nlohmann::json queryOverview(int windowHours = 24);
     nlohmann::json queryTimeseries(const std::string &window = "24h", int maxPoints = 300);
+    nlohmann::json queryActivityTimeline(const std::string &window = "24h", int maxSessions = 50);
     nlohmann::json querySessions(int limit = 50, const std::string &status = "");
     nlohmann::json querySessionEvents(const std::string &sessionId);
     nlohmann::json queryToolStats(int windowHours = 24);

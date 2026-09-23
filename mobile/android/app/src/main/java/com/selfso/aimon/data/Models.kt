@@ -77,9 +77,15 @@ data class ConnectionConfig(
     val token: String = "",
     val isPaired: Boolean = false
 ) {
+    val cleanHost: String
+        get() = host.trim()
+            .removePrefix("http://")
+            .removePrefix("https://")
+            .removeSuffix("/")
+
     val httpBaseUrl: String
-        get() = "http://$host:$port"
+        get() = "http://$cleanHost:$port"
 
     val wsUrl: String
-        get() = "ws://$host:$port/ws/mobile"
+        get() = "ws://$cleanHost:$port/ws/mobile"
 }
