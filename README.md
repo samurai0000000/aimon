@@ -185,9 +185,6 @@ aimon/
 │   ├── TcpGateway.hxx             # TCP port 3885 satellite multiplexer
 │   ├── WebAssets.hxx              # Embedded fallback dashboard assets
 │   └── WebServer.hxx              # Embedded HTTP dashboard server & SSE endpoint
-├── scripts/
-│   ├── mobile_permission_relay.py # Dual-IDE hook normalizer for Antigravity & Cursor
-│   └── test_web_dashboard.py      # Headless Chromium visual validation harness
 ├── src/
 │   ├── AgentTelemetryDb.cxx       # Agent telemetry time-series & downsampling engine
 │   ├── AntigravityCollector.cxx   # Antigravity collector implementation
