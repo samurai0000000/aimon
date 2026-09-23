@@ -9,6 +9,7 @@ build/
 *.tmp
 config.json
 .DS_Store
-plan/
+plan/*
+!plan/done/
 __pycache__/
 *.pyc
