@@ -22,11 +22,17 @@ struct ModelQuota {
     std::chrono::system_clock::time_point resetTimestamp;
 
     nlohmann::json toJson() const {
+        int64_t remainingSec = 0;
+        auto now = std::chrono::system_clock::now();
+        if (resetTimestamp > now) {
+            remainingSec = std::chrono::duration_cast<std::chrono::seconds>(resetTimestamp - now).count();
+        }
         return {
             {"model_name", modelName},
             {"model_id", modelId},
             {"remaining_fraction", remainingFraction},
-            {"reset_time_iso", resetTimeIso}
+            {"reset_time_iso", resetTimeIso},
+            {"reset_time_remaining_seconds", remainingSec}
         };
     }
 };
@@ -38,15 +44,22 @@ struct QuotaBucket {
     std::string description;
     double remainingFraction = 1.0;
     std::string resetTimeIso;
+    std::chrono::system_clock::time_point resetTimestamp;
 
     nlohmann::json toJson() const {
+        int64_t remainingSec = 0;
+        auto now = std::chrono::system_clock::now();
+        if (resetTimestamp > now) {
+            remainingSec = std::chrono::duration_cast<std::chrono::seconds>(resetTimestamp - now).count();
+        }
         return {
             {"bucket_id", bucketId},
             {"display_name", displayName},
             {"window", window},
             {"description", description},
             {"remaining_fraction", remainingFraction},
-            {"reset_time_iso", resetTimeIso}
+            {"reset_time_iso", resetTimeIso},
+            {"reset_time_remaining_seconds", remainingSec}
         };
     }
 };
@@ -204,8 +217,11 @@ struct AggregateStatus {
     nlohmann::json toJson() const {
         auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
             lastUpdated.time_since_epoch()).count();
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
         return {
+            {"server_timestamp_ms", nowMs},
             {"last_updated_epoch", epoch},
             {"antigravity", antigravity.toJson()},
             {"cursor", cursor.toJson()}

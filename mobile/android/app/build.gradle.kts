@@ -77,4 +77,6 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
 
     debugImplementation(libs.androidx.ui.tooling)
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20231013")
 }

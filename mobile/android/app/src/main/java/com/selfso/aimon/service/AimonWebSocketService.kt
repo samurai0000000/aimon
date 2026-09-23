@@ -47,13 +47,13 @@ class AimonWebSocketService : Service() {
 
         if (!isRunning) {
             isRunning = true
-            connectWebSocket()
+            connectEventStream()
         }
 
         return START_STICKY
     }
 
-    private fun connectWebSocket() {
+    private fun connectEventStream() {
         serviceScope.launch {
             val repository = AimonApplication.instance.repository
             val pairingManager = AimonApplication.instance.pairingManager
@@ -66,44 +66,47 @@ class AimonWebSocketService : Service() {
                     continue
                 }
 
+                val cleanHost = config.host.trim().removePrefix("http://").removePrefix("https://").removeSuffix("/")
+                val sseUrl = "http://$cleanHost:${config.port}/sse?profile=mobile"
                 val request = Request.Builder()
-                    .url(config.wsUrl)
+                    .url(sseUrl)
+                    .addHeader("Accept", "text/event-stream")
                     .addHeader("Authorization", "Bearer ${config.token}")
                     .build()
 
-                val latch = CompletableDeferred<Unit>()
+                try {
+                    val sseClient = httpClient.newBuilder()
+                        .readTimeout(0, TimeUnit.MILLISECONDS)
+                        .build()
 
-                webSocket = httpClient.newWebSocket(request, object : WebSocketListener() {
-                    override fun onOpen(ws: WebSocket, response: Response) {
+                    val response = sseClient.newCall(request).execute()
+                    if (response.isSuccessful) {
                         repository.setConnected(true)
                         serviceScope.launch {
                             repository.refreshQuotas()
                             repository.refreshApprovals()
                             repository.refreshTelemetry()
                         }
-                    }
 
-                    override fun onMessage(ws: WebSocket, text: String) {
-                        handleMessage(text)
+                        val source = response.body?.source()
+                        if (source != null) {
+                            while (isRunning && !source.exhausted()) {
+                                val line = source.readUtf8Line() ?: break
+                                if (line.startsWith("data: ")) {
+                                    val data = line.removePrefix("data: ").trim()
+                                    if (data.startsWith("{")) {
+                                        handleMessage(data)
+                                    }
+                                }
+                            }
+                        }
                     }
+                } catch (_: Exception) {
+                } finally {
+                    repository.setConnected(false)
+                }
 
-                    override fun onClosing(ws: WebSocket, code: Int, reason: String) {
-                        repository.setConnected(false)
-                    }
-
-                    override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                        repository.setConnected(false)
-                        latch.complete(Unit)
-                    }
-
-                    override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                        repository.setConnected(false)
-                        latch.complete(Unit)
-                    }
-                })
-
-                latch.await()
-                delay(3000) // Auto-reconnect delay
+                delay(3000)
             }
         }
     }
@@ -117,16 +120,24 @@ class AimonWebSocketService : Service() {
             when (type) {
                 "approval_request" -> {
                     val reqJson = json.optJSONObject("payload") ?: return
+                    val argsMap = mutableMapOf<String, Any?>()
+                    reqJson.optJSONObject("tool_args")?.let { argsObj ->
+                        val keys = argsObj.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            argsMap[k] = argsObj.opt(k)
+                        }
+                    }
                     val approval = ApprovalRequest(
                         approvalId = reqJson.optString("approval_id"),
                         agentType = reqJson.optString("agent_type", "antigravity"),
                         toolName = reqJson.optString("tool_name", ""),
                         workspace = reqJson.optString("workspace", ""),
-                        toolArgs = emptyMap(),
+                        toolArgs = argsMap,
                         reason = reqJson.optString("reason", ""),
                         requestedAt = reqJson.optLong("requested_at", System.currentTimeMillis() / 1000),
                         timeoutSeconds = reqJson.optInt("timeout_seconds", 120),
-                        remainingSeconds = reqJson.optInt("timeout_seconds", 120)
+                        remainingSeconds = reqJson.optInt("remaining_seconds", reqJson.optInt("timeout_seconds", 120))
                     )
                     repository.handleIncomingApproval(approval)
                     notificationManager.showApprovalNotification(approval)

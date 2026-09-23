@@ -13,3 +13,13 @@ plan/*
 !plan/done/
 __pycache__/
 *.pyc
+
+# Android
+.gradle/
+build/
+local.properties
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+

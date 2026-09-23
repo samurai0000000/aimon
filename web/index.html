@@ -11,49 +11,31 @@
 </head>
 <body>
     <div class="app-container">
-        <header class="navbar">
-            <div class="brand">
-                <div class="logo-pulse"></div>
-                <h1>aimon <span class="badge-sub">Unified AI Quotas</span></h1>
-            </div>
-            <div class="actions">
-                <span id="last-updated" class="last-updated">Updated: Just now</span>
-                <button id="refresh-btn" class="btn-refresh" title="Force Refresh">
-                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
-                        <path d="M23 4v6h-6"></path>
-                        <path d="M1 20v-6h6"></path>
-                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
-                    </svg>
-                    Refresh
-                </button>
-            </div>
-        </header>
-
         <nav class="monitor-nav" id="monitor-tabs" aria-label="System Monitors">
             <button type="button" class="monitor-tab active" data-id="aimon">
                 <span class="tab-indicator tab-indicator-online"></span>
                 <span class="tab-title">aimon</span>
-                <span class="tab-badge">Hub</span>
             </button>
+            <div id="satellite-tabs" class="satellite-tabs-row"></div>
         </nav>
 
-        <main class="view-panel active" id="view-aimon">
+        <div class="main-viewport" id="main-viewport">
+            <!-- Native Aimon Monitor Panel -->
+            <main class="view-panel active" id="view-aimon">
             <!-- Aimon Sub-Navigation Tab Bar -->
             <div class="aimon-subnav-bar" id="aimon-subnav" aria-label="aimon Subpanels">
                 <button type="button" class="aimon-subnav-tab active" data-subpanel="quotas">
                     <span class="subnav-indicator"></span>
-                    <span class="subnav-title">AI Quotas</span>
-                    <span class="tab-badge">Quota</span>
+                    <span class="subnav-title">ai quotas</span>
                 </button>
                 <button type="button" class="aimon-subnav-tab" data-subpanel="telemetry">
                     <span class="subnav-indicator"></span>
-                    <span class="subnav-title">Agent Telemetry</span>
-                    <span class="tab-badge badge-cyan">Analytics</span>
+                    <span class="subnav-title">agent telemetry</span>
                 </button>
                 <button type="button" class="aimon-subnav-tab" data-subpanel="approvals">
                     <span class="subnav-indicator"></span>
-                    <span class="subnav-title">Action Approvals</span>
-                    <span class="tab-badge badge-amber" id="approvals-badge">0 Pending</span>
+                    <span class="subnav-title">action approvals</span>
+                    <span class="tab-badge badge-amber hidden" id="approvals-badge">0</span>
                 </button>
             </div>
 
@@ -285,19 +267,19 @@
                     </div>
                 </div>
 
-                <!-- Telemetry Charts Grid -->
+                <!-- Telemetry Charts Grid (2x2 Layout) -->
                 <div class="telemetry-charts-grid">
                     <!-- Chart 1: Tool Invocations & Active Workload Velocity -->
                     <div class="glass-card chart-card">
                         <div class="chart-header">
                             <div class="chart-title">Tool Invocations & Workload Velocity</div>
                             <div class="chart-legend">
-                                <span class="legend-item"><i class="dot dot-cyan"></i> Tool Invocations (calls/s)</span>
+                                <span class="legend-item"><i class="dot dot-cyan"></i> Tool Calls/s</span>
                                 <span class="legend-item"><i class="dot dot-magenta"></i> Active Sessions</span>
                             </div>
                         </div>
                         <div class="svg-chart-container" id="token-velocity-chart">
-                            <svg class="metric-svg" id="token-svg" viewBox="0 0 800 240"></svg>
+                            <svg class="metric-svg" id="token-svg" viewBox="0 0 800 220"></svg>
                         </div>
                     </div>
 
@@ -306,7 +288,7 @@
                         <div class="chart-header">
                             <div>
                                 <div class="chart-title">Step Duration & Latency Envelope</div>
-                                <p class="chart-subtitle">P95 envelope tracks 95th percentile upper variance. Latency health: &lt; 3s Normal, 3–8s Moderate, &gt; 8s Degraded.</p>
+                                <p class="chart-subtitle">P95 variance (&lt;3s Normal, 3-8s Moderate, &gt;8s Degraded)</p>
                             </div>
                             <div class="chart-legend">
                                 <span class="legend-item"><i class="dot dot-blue"></i> Avg Duration</span>
@@ -314,7 +296,42 @@
                             </div>
                         </div>
                         <div class="svg-chart-container" id="latency-chart">
-                            <svg class="metric-svg" id="latency-svg" viewBox="0 0 800 240"></svg>
+                            <svg class="metric-svg" id="latency-svg" viewBox="0 0 800 220"></svg>
+                        </div>
+                    </div>
+
+                    <!-- Chart 3: Agent Activity & Task Execution Timeline (Gantt Swimlanes) -->
+                    <div class="glass-card chart-card">
+                        <div class="chart-header">
+                            <div>
+                                <div class="chart-title">Agent Activity & Task Execution Timeline</div>
+                                <p class="chart-subtitle">Session run intervals, active execution times & status</p>
+                            </div>
+                            <div class="chart-legend">
+                                <span class="legend-item"><i class="dot dot-emerald"></i> Active</span>
+                                <span class="legend-item"><i class="dot dot-cyan"></i> Done</span>
+                                <span class="legend-item"><i class="dot dot-coral"></i> Error</span>
+                            </div>
+                        </div>
+                        <div class="svg-chart-container" id="activity-gantt-chart">
+                            <svg class="metric-svg" id="activity-gantt-svg" viewBox="0 0 800 220"></svg>
+                        </div>
+                    </div>
+
+                    <!-- Chart 4: Agent Busyness & Concurrency Stack -->
+                    <div class="glass-card chart-card">
+                        <div class="chart-header">
+                            <div>
+                                <div class="chart-title">Agent Busyness & Concurrency Stack</div>
+                                <p class="chart-subtitle">Concurrent active agents and active workload duty cycle</p>
+                            </div>
+                            <div class="chart-legend">
+                                <span class="legend-item"><i class="dot dot-cyan"></i> Antigravity</span>
+                                <span class="legend-item"><i class="dot dot-purple"></i> Cursor</span>
+                            </div>
+                        </div>
+                        <div class="svg-chart-container" id="busyness-stack-chart">
+                            <svg class="metric-svg" id="busyness-stack-svg" viewBox="0 0 800 220"></svg>
                         </div>
                     </div>
                 </div>
@@ -385,7 +402,17 @@
                                     <li>Tap <strong>Scan QR / Enter Secret</strong> and point your camera at the QR code above.</li>
                                     <li>Approvals for sensitive tools (<code>run_command</code>, <code>write_to_file</code>) will vibrate directly on your lock screen with <code>[Approve]</code> and <code>[Deny]</code> action buttons.</li>
                                 </ol>
-                                <button type="button" class="btn-refresh" id="btn-new-qr">Regenerate Secret</button>
+                                <div class="pairing-action-row">
+                                    <button type="button" class="btn-refresh" id="btn-new-qr">Regenerate Secret</button>
+                                    <a href="/download/aimon-companion.apk" class="btn-download-apk" download title="Download compiled Android companion app">
+                                        <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+                                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                            <polyline points="7 10 12 15 17 10"></polyline>
+                                            <line x1="12" y1="15" x2="12" y2="3"></line>
+                                        </svg>
+                                        Download Android APK
+                                    </a>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -403,9 +430,9 @@
             </div>
         </main>
 
-
-        <!-- Dynamic Discovered Monitor Embedded Panels -->
+        <!-- Dynamic Discovered Satellite Panels -->
         <div id="dynamic-panels"></div>
+    </div>
 
         <footer class="app-footer">
             <p>aimon daemon &bull; Pure C++17 AI Quota Monitor &bull; Local loopback on 127.0.0.1</p>
@@ -413,6 +440,6 @@
     </div>
 
     <script src="qrcode.js"></script>
-    <script src="app.js?v=1.0.7"></script>
+    <script src="app.js?v=1.0.8"></script>
 </body>
 </html>

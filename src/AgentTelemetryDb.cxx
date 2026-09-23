@@ -578,6 +578,166 @@ json AgentTelemetryDb::queryTimeseries(const std::string &window, int maxPoints)
     return result;
 }
 
+json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxSessions) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    json result = json::object();
+    result["window"] = window;
+    json sessionsArray = json::array();
+    json bucketsArray = json::array();
+    json summary = json::object();
+
+    if (!_db) {
+        result["sessions"] = sessionsArray;
+        result["buckets"] = bucketsArray;
+        result["summary"] = summary;
+        return result;
+    }
+
+    int64_t now = static_cast<int64_t>(time(nullptr));
+    int64_t durationSec = 86400; // default 24h
+
+    if (window == "1h") durationSec = 3600;
+    else if (window == "24h") durationSec = 86400;
+    else if (window == "7d") durationSec = 7 * 86400;
+    else if (window == "30d") durationSec = 30 * 86400;
+    else if (window == "1y") durationSec = 365 * 86400;
+
+    int64_t startEpoch = now - durationSec;
+    result["start_time"] = startEpoch;
+    result["end_time"] = now;
+
+    // 1. Fetch sessions overlapping the window
+    std::string sqlSessions =
+        "SELECT session_id, conversation_id, agent_type, workspace_path, model_name,"
+        "       start_timestamp, end_timestamp, status, total_turns, total_tool_calls, total_errors "
+        "FROM agent_sessions "
+        "WHERE start_timestamp <= ? AND (end_timestamp >= ? OR end_timestamp == 0) "
+        "ORDER BY start_timestamp DESC LIMIT ?;";
+
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sqlSessions.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, now);
+        sqlite3_bind_int64(stmt, 2, startEpoch);
+        sqlite3_bind_int(stmt, 3, maxSessions > 0 ? maxSessions : 50);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            json s = json::object();
+            s["session_id"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            s["conversation_id"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            s["agent_type"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            s["workspace_path"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            s["model_name"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+            int64_t startTs = sqlite3_column_int64(stmt, 5);
+            int64_t endTs = sqlite3_column_int64(stmt, 6);
+            s["start_timestamp"] = startTs;
+            s["end_timestamp"] = endTs;
+            s["status"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            s["total_turns"] = sqlite3_column_int(stmt, 8);
+            s["total_tool_calls"] = sqlite3_column_int(stmt, 9);
+            s["total_errors"] = sqlite3_column_int(stmt, 10);
+
+            int64_t effEnd = (endTs > 0) ? endTs : now;
+            s["duration_s"] = std::max<int64_t>(0, effEnd - startTs);
+            sessionsArray.push_back(s);
+        }
+        sqlite3_finalize(stmt);
+    }
+    result["sessions"] = sessionsArray;
+
+    // 2. Compute time buckets for busyness / concurrency
+    int bucketCount = 24;
+    if (window == "1h") bucketCount = 12;
+    else if (window == "24h") bucketCount = 24;
+    else if (window == "7d") bucketCount = 28;
+    else if (window == "30d") bucketCount = 30;
+    else bucketCount = 24;
+
+    int64_t bucketWidth = std::max<int64_t>(10, durationSec / bucketCount);
+    int64_t alignedStart = (startEpoch / bucketWidth) * bucketWidth;
+
+    std::map<int64_t, json> bucketMap;
+    for (int i = 0; i < bucketCount; ++i) {
+        int64_t bTs = alignedStart + (i * bucketWidth);
+        json b = json::object();
+        b["timestamp"] = bTs;
+        b["antigravity_active"] = 0;
+        b["cursor_active"] = 0;
+        b["active_agents"] = 0;
+        b["tool_calls"] = 0;
+        bucketMap[bTs] = b;
+    }
+
+    // Overlay session concurrency across active bucket intervals
+    for (const auto &s : sessionsArray) {
+        int64_t sStart = s.value("start_timestamp", 0LL);
+        int64_t sEnd = s.value("end_timestamp", 0LL);
+        if (sEnd <= 0) sEnd = now;
+        std::string aType = s.value("agent_type", "antigravity");
+        std::transform(aType.begin(), aType.end(), aType.begin(), ::tolower);
+        bool isCursor = (aType.find("cursor") != std::string::npos);
+
+        for (auto &pair : bucketMap) {
+            int64_t bStart = pair.first;
+            int64_t bEnd = bStart + bucketWidth;
+            if (sStart < bEnd && sEnd >= bStart) {
+                if (isCursor) {
+                    pair.second["cursor_active"] = pair.second["cursor_active"].get<int>() + 1;
+                } else {
+                    pair.second["antigravity_active"] = pair.second["antigravity_active"].get<int>() + 1;
+                }
+            }
+        }
+    }
+
+    // Query granular tool call events from agent_lifecycle_events
+    std::string sqlEvents =
+        "SELECT "
+        "  (timestamp / " + std::to_string(bucketWidth) + ") * " + std::to_string(bucketWidth) + " AS b_ts,"
+        "  SUM(CASE WHEN event_type = 'TOOL_CALL' THEN 1 ELSE 0 END) AS tools "
+        "FROM agent_lifecycle_events "
+        "WHERE timestamp >= ? AND timestamp <= ? "
+        "GROUP BY b_ts ORDER BY b_ts ASC;";
+
+    int totalToolCalls = 0;
+    if (sqlite3_prepare_v2(_db, sqlEvents.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, alignedStart);
+        sqlite3_bind_int64(stmt, 2, now + bucketWidth);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t bTs = sqlite3_column_int64(stmt, 0);
+            int tools = sqlite3_column_int(stmt, 1);
+            totalToolCalls += tools;
+
+            if (bucketMap.find(bTs) != bucketMap.end()) {
+                bucketMap[bTs]["tool_calls"] = tools;
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    int peakConcurrency = 0;
+    int64_t totalActiveSec = 0;
+
+    for (auto &pair : bucketMap) {
+        int agy = pair.second["antigravity_active"].get<int>();
+        int cur = pair.second["cursor_active"].get<int>();
+        int active = agy + cur;
+        pair.second["active_agents"] = active;
+        if (active > peakConcurrency) peakConcurrency = active;
+        if (active > 0) totalActiveSec += bucketWidth;
+        bucketsArray.push_back(pair.second);
+    }
+    result["buckets"] = bucketsArray;
+
+    summary["peak_concurrency"] = peakConcurrency;
+    summary["total_active_seconds"] = totalActiveSec;
+    summary["total_tool_calls"] = totalToolCalls;
+    summary["total_sessions"] = static_cast<int>(sessionsArray.size());
+    result["summary"] = summary;
+
+    return result;
+}
+
 json AgentTelemetryDb::querySessions(int limit, const std::string &status) {
     std::lock_guard<std::mutex> lock(_mutex);
     json sessions = json::array();

@@ -55,7 +55,10 @@ class ChromeClient:
         self.sock.sendall(header + mask + masked)
 
     def recv_frame(self):
-        header = self._recv_exact(2)
+        try:
+            header = self._recv_exact(2)
+        except Exception:
+            return None
         b1, b2 = header[0], header[1]
         opcode = b1 & 0x0F
         has_mask = (b2 & 0x80) != 0
@@ -73,7 +76,10 @@ class ChromeClient:
         if opcode == 0x8: # close
             return None
         if opcode == 0x1: # text
-            return json.loads(data.decode('utf-8'))
+            try:
+                return json.loads(data.decode('utf-8'))
+            except:
+                return None
         return None
 
     def call(self, method, params=None):
@@ -83,12 +89,15 @@ class ChromeClient:
         if params:
             payload["params"] = params
         self.send(payload)
-        while True:
+        start_t = time.time()
+        while time.time() - start_t < 10:
             frame = self.recv_frame()
-            if frame and frame.get("id") == curr_id:
-                if "error" in frame:
-                    raise RuntimeError(f"CDP error: {frame['error']}")
-                return frame.get("result", {})
+            if frame and isinstance(frame, dict):
+                if frame.get("id") == curr_id:
+                    if "error" in frame:
+                        raise RuntimeError(f"CDP error: {frame['error']}")
+                    return frame.get("result", {})
+        raise TimeoutError(f"CDP method {method} timed out")
 
     def close(self):
         try:
@@ -124,7 +133,7 @@ def main():
         print("[3/5] Navigating to http://127.0.0.1:3883/ ...")
         client.call("Page.enable")
         client.call("Page.navigate", {"url": "http://127.0.0.1:3883/"})
-        time.sleep(1.5)
+        time.sleep(2.0)
 
         # Tab 1: AI Quotas
         print("  - Capturing Tab 1 (AI Quotas front page)...")
@@ -134,22 +143,22 @@ def main():
         print("    -> Saved /tmp/aimon_web_tab_aimon.png")
 
         # Tab 2: Telemetry
-        print("  - Switching to Tab 2 (Agent Telemetry & Analytics)...")
+        print("  - Switching to Subpanel (Agent Telemetry & Analytics)...")
         client.call("Runtime.evaluate", {
-            "expression": "document.querySelector('[data-id=\"telemetry\"]').click()"
+            "expression": "document.querySelector('[data-subpanel=\"telemetry\"]').click()"
         })
-        time.sleep(1.2)
+        time.sleep(1.5)
         res2 = client.call("Page.captureScreenshot", {"format": "png"})
         with open("/tmp/aimon_web_tab_telemetry.png", "wb") as f:
             f.write(base64.b64decode(res2["data"]))
         print("    -> Saved /tmp/aimon_web_tab_telemetry.png")
 
         # Tab 3: Action Approvals
-        print("  - Switching to Tab 3 (Action Approvals & Mobile Companion)...")
+        print("  - Switching to Subpanel (Action Approvals & Mobile Companion)...")
         client.call("Runtime.evaluate", {
-            "expression": "document.querySelector('[data-id=\"approvals\"]').click()"
+            "expression": "document.querySelector('[data-subpanel=\"approvals\"]').click()"
         })
-        time.sleep(1.2)
+        time.sleep(1.5)
         res3 = client.call("Page.captureScreenshot", {"format": "png"})
         with open("/tmp/aimon_web_tab_approvals.png", "wb") as f:
             f.write(base64.b64decode(res3["data"]))

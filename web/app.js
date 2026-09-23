@@ -4,10 +4,12 @@
 
 let currentStatus = null;
 let countdownInterval = null;
+let statusFetchedAt = Date.now();
+let serverTimeOffset = 0;
 
-function formatDuration(ms) {
+function formatCountdown(ms) {
     if (ms <= 0) return 'Ready';
-    const totalSeconds = Math.floor(ms / 1000);
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
     const days = Math.floor(totalSeconds / 86400);
     const hours = Math.floor((totalSeconds % 86400) / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
@@ -28,7 +30,8 @@ function updateCountdowns() {
         return;
     }
 
-    const now = Date.now();
+    const elapsedSinceFetch = Date.now() - statusFetchedAt;
+    const serverNow = Date.now() + serverTimeOffset;
 
     // 1. Quota group buckets
     if (currentStatus.antigravity.quota_groups) {
@@ -37,12 +40,36 @@ function updateCountdowns() {
             group.buckets.forEach((bucket, bIdx) => {
                 const timerEl = document.getElementById(`timer-bucket-${gIdx}-${bIdx}`);
                 if (!timerEl) return;
-                if (!bucket.reset_time_iso) {
+
+                const frac = bucket.remaining_fraction !== undefined ? bucket.remaining_fraction : 1.0;
+                if (frac >= 0.999 && (!bucket.reset_time_remaining_seconds || bucket.reset_time_remaining_seconds <= 0)) {
                     timerEl.textContent = 'Active';
                     return;
                 }
-                const diff = new Date(bucket.reset_time_iso).getTime() - now;
-                timerEl.textContent = diff > 0 ? `Resets in ${formatDuration(diff)}` : 'Ready to reset';
+
+                let diff = 0;
+                if (bucket.reset_time_remaining_seconds !== undefined && bucket.reset_time_remaining_seconds > 0) {
+                    diff = Math.max(0, (bucket.reset_time_remaining_seconds * 1000) - elapsedSinceFetch);
+                } else if (bucket.reset_time_iso) {
+                    const resetTime = new Date(bucket.reset_time_iso).getTime();
+                    diff = resetTime - serverNow;
+                }
+
+                // Sanity check: Antigravity quota window is at most weekly (7 days = 604,800,000 ms)
+                // If diff is greater than 8 days or negative due to clock skew, fallback immediately to description
+                if (diff > 8 * 86400 * 1000 || diff < 0) {
+                    if (bucket.description && bucket.description.includes('refresh in ')) {
+                        const parsed = bucket.description.split('refresh in ')[1].replace(/\.$/, '');
+                        timerEl.textContent = `Resets in ${parsed}`;
+                        return;
+                    }
+                }
+
+                if (diff > 0) {
+                    timerEl.textContent = `Resets in ${formatCountdown(diff)}`;
+                } else {
+                    timerEl.textContent = frac >= 0.999 ? 'Active' : 'Ready to reset';
+                }
             });
         });
     }
@@ -53,14 +80,30 @@ function updateCountdowns() {
             const timerEl = document.getElementById(`timer-model-${idx}`);
             if (!timerEl) return;
 
-            if (!m.reset_time_iso) {
+            const frac = m.remaining_fraction !== undefined ? m.remaining_fraction : 1.0;
+            if (frac >= 0.999 && (!m.reset_time_remaining_seconds || m.reset_time_remaining_seconds <= 0)) {
                 timerEl.textContent = 'Active';
                 return;
             }
 
-            const resetTime = new Date(m.reset_time_iso).getTime();
-            const diff = resetTime - now;
-            timerEl.textContent = diff > 0 ? `Resets in ${formatDuration(diff)}` : 'Ready to reset';
+            let diff = 0;
+            if (m.reset_time_remaining_seconds !== undefined && m.reset_time_remaining_seconds > 0) {
+                diff = Math.max(0, (m.reset_time_remaining_seconds * 1000) - elapsedSinceFetch);
+            } else if (m.reset_time_iso) {
+                const resetTime = new Date(m.reset_time_iso).getTime();
+                diff = resetTime - serverNow;
+            }
+
+            if (diff > 8 * 86400 * 1000 || diff < 0) {
+                timerEl.textContent = frac >= 0.999 ? 'Active' : 'Ready to reset';
+                return;
+            }
+
+            if (diff > 0) {
+                timerEl.textContent = `Resets in ${formatCountdown(diff)}`;
+            } else {
+                timerEl.textContent = frac >= 0.999 ? 'Active' : 'Ready to reset';
+            }
         });
     }
 }
@@ -473,7 +516,7 @@ function renderCursorSpend(cr) {
 
 async function fetchStatus(isManual = false) {
     const refreshBtn = document.getElementById('refresh-btn');
-    if (isManual) {
+    if (isManual && refreshBtn) {
         refreshBtn.classList.add('spinning');
     }
 
@@ -484,17 +527,24 @@ async function fetchStatus(isManual = false) {
         if (res.ok) {
             const data = await res.json();
             currentStatus = data;
+            statusFetchedAt = Date.now();
+            if (data.server_timestamp_ms) {
+                serverTimeOffset = data.server_timestamp_ms - statusFetchedAt;
+            }
             renderAntigravity(data.antigravity);
             renderCursor(data.cursor);
+            updateCountdowns();
 
             const updatedEl = document.getElementById('last-updated');
-            const nowTime = new Date().toLocaleTimeString();
-            updatedEl.textContent = `Updated: ${nowTime}`;
+            if (updatedEl) {
+                const nowTime = new Date().toLocaleTimeString();
+                updatedEl.textContent = `Updated: ${nowTime}`;
+            }
         }
     } catch (e) {
         console.error('Failed to fetch status:', e);
     } finally {
-        if (isManual) {
+        if (isManual && refreshBtn) {
             setTimeout(() => refreshBtn.classList.remove('spinning'), 500);
         }
     }
@@ -629,14 +679,36 @@ function setupSse() {
 let discoveredMonitors = [];
 let activeMonitorId = 'aimon';
 
+function formatFullDateTime(epochSec) {
+    if (!epochSec || epochSec <= 0) return 'N/A';
+    const d = new Date(epochSec * 1000);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const hours = String(d.getHours()).padStart(2, '0');
+    const minutes = String(d.getMinutes()).padStart(2, '0');
+    const seconds = String(d.getSeconds()).padStart(2, '0');
+    return `${year}/${month}/${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function formatDurationSeconds(sec) {
+    if (!sec || sec <= 0) return '0s';
+    if (sec < 60) return `${Math.round(sec)}s`;
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    if (m < 60) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+    const h = Math.floor(m / 60);
+    const remM = m % 60;
+    return `${h}h ${remM}m`;
+}
+
 function formatLastSeen(epoch) {
     if (!epoch || epoch <= 0) return 'Just now';
     const diffSec = Math.floor(Date.now() / 1000) - epoch;
     if (diffSec < 10) return 'Just now';
     if (diffSec < 60) return `${diffSec}s ago`;
     if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
-    const d = new Date(epoch * 1000);
-    return d.toLocaleTimeString();
+    return formatFullDateTime(epoch);
 }
 
 function getResolvedMonitorUrl(m) {
@@ -660,73 +732,15 @@ async function fetchMonitors() {
     }
 }
 
-let activeAimonSubpanel = 'quotas';
-
-function switchToAimonSubpanel(subpanelId) {
-    if (!subpanelId) subpanelId = 'quotas';
-    activeAimonSubpanel = subpanelId;
-
-    // Update aimon subnav tabs
-    const subnavEl = document.getElementById('aimon-subnav');
-    if (subnavEl) {
-        subnavEl.querySelectorAll('.aimon-subnav-tab').forEach(tab => {
-            const id = tab.getAttribute('data-subpanel');
-            if (id === subpanelId) {
-                tab.classList.add('active');
-            } else {
-                tab.classList.remove('active');
-            }
-        });
-    }
-
-    // Toggle subpanels
-    document.querySelectorAll('.aimon-subpanel').forEach(panel => {
-        if (panel.id === `subpanel-${subpanelId}`) {
-            panel.classList.add('active');
-            panel.classList.remove('hidden');
-        } else {
-            panel.classList.remove('active');
-            panel.classList.add('hidden');
-        }
-    });
-
-    if (subpanelId === 'telemetry') {
-        fetchTelemetryOverview();
-        fetchTelemetryTimeseries();
-        fetchTelemetryTools();
-        fetchTelemetrySessions();
-    } else if (subpanelId === 'approvals') {
-        fetchPendingApprovals();
-        fetchMobileQr();
-        fetchMobileDevices();
-    }
-}
+let activeSubpanelId = 'quotas';
 
 function renderMonitorTabs(monitors) {
-    const navEl = document.getElementById('monitor-tabs');
+    const satelliteNavEl = document.getElementById('satellite-tabs');
     const dynamicPanelsEl = document.getElementById('dynamic-panels');
-    if (!navEl) return;
+    const dividerEl = document.getElementById('nav-divider');
+    if (!satelliteNavEl) return;
 
-    // Top-level peer monitors: aimon (Hub / Self) + external satellite monitors
-    const nativeTabs = [
-        {
-            id: 'aimon',
-            name: 'aimon',
-            short_name: 'aimon',
-            subsystem: 'aimon',
-            host: '127.0.0.1',
-            port: window.location.port || 3883,
-            path: '/',
-            connected: true,
-            reachable: true,
-            is_self: true,
-            badge: 'Hub',
-            badgeClass: '',
-            priority: 0
-        }
-    ];
-
-    let externalMonitors = Array.isArray(monitors) ? monitors.filter(m => m.id !== 'aimon' && m.id !== 'telemetry' && m.id !== 'approvals') : [];
+    let externalMonitors = Array.isArray(monitors) ? monitors.filter(m => m.id !== 'aimon' && m.id !== 'telemetry' && m.id !== 'approvals' && m.id !== 'quotas') : [];
     externalMonitors.sort((a, b) => {
         const pa = (a.priority !== undefined) ? a.priority : 100;
         const pb = (b.priority !== undefined) ? b.priority : 100;
@@ -740,29 +754,29 @@ function renderMonitorTabs(monitors) {
         return (a.port || 0) - (b.port || 0);
     });
 
-    const allTabs = [...nativeTabs, ...externalMonitors];
+    if (dividerEl) {
+        dividerEl.style.display = externalMonitors.length > 0 ? 'block' : 'none';
+    }
 
-    // Render navigation tabs
-    navEl.innerHTML = allTabs.map(m => {
-        const isActive = (m.id === activeMonitorId);
+    // Render satellite tabs strictly in lowercase
+    satelliteNavEl.innerHTML = externalMonitors.map(m => {
+        const sub = (m.subsystem || m.short_name || m.name || m.id || '').toLowerCase();
+        const fullId = m.id;
+        const isActive = (activeMonitorId === fullId || activeMonitorId === sub);
         const activeClass = isActive ? ' active' : '';
         const isOnline = Boolean(m.connected && m.reachable);
         const indClass = isOnline ? 'tab-indicator-online' : 'tab-indicator-offline';
-        const badgeText = m.badge || ((m.is_self || m.isSelf) ? 'Hub' : (m.subsystem || `${m.port}`));
-        const badgeClass = m.badgeClass ? ` ${m.badgeClass}` : '';
-        const displayLabel = m.short_name || m.name || m.subsystem || m.id;
 
         return `
-            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(m.id)}" title="${escapeHtml(m.name || m.id)}">
+            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(sub)}" data-full-id="${escapeHtml(fullId)}" title="${escapeHtml(m.name || m.id)}">
                 <span class="tab-indicator ${indClass}"></span>
-                <span class="tab-title">${escapeHtml(displayLabel)}</span>
-                <span class="tab-badge${badgeClass}">${escapeHtml(badgeText)}</span>
+                <span class="tab-title">${escapeHtml(sub)}</span>
             </button>
         `;
     }).join('');
 
     // Attach tab click handlers
-    navEl.querySelectorAll('.monitor-tab').forEach(tabBtn => {
+    satelliteNavEl.querySelectorAll('.monitor-tab').forEach(tabBtn => {
         tabBtn.addEventListener('click', () => {
             const id = tabBtn.getAttribute('data-id');
             switchToMonitor(id);
@@ -1161,6 +1175,279 @@ async function fetchTelemetryTimeseries() {
     } catch (_) {}
 }
 
+async function fetchActivityTimeline() {
+    try {
+        const res = await fetch(`/api/telemetry/activity_timeline?window=${activeTelemetryWindow}&max_sessions=40`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data) return;
+
+        renderAgentActivityGantt('activity-gantt-svg', data);
+        renderAgentBusynessStack('busyness-stack-svg', data);
+    } catch (_) {}
+}
+
+function renderAgentActivityGantt(svgId, data) {
+    const svg = document.getElementById(svgId);
+    if (!svg) return;
+
+    const width = 800;
+    const height = 220;
+    const padL = 75;
+    const padR = 25;
+    const padT = 18;
+    const padB = 30;
+    const plotW = width - padL - padR;
+    const plotH = height - padT - padB;
+
+    const startTime = data.start_time || (Math.floor(Date.now() / 1000) - 86400);
+    const endTime = data.end_time || Math.floor(Date.now() / 1000);
+    const totalDuration = Math.max(1, endTime - startTime);
+
+    const rawSessions = data.sessions || [];
+    const sessions = rawSessions.slice(0, 6);
+
+    if (sessions.length === 0) {
+        svg.innerHTML = `<text x="${width / 2}" y="${height / 2}" fill="#6b7280" font-size="12" text-anchor="middle" font-family="sans-serif">No agent task activity recorded in this timeframe</text>`;
+        return;
+    }
+
+    // Time Axis Ticks & Grid
+    const tickCount = 6;
+    let xTicksSvg = '';
+    let gridSvg = '';
+    for (let i = 0; i <= tickCount; i++) {
+        const x = padL + (i / tickCount) * plotW;
+        const tickEpoch = startTime + (i / tickCount) * totalDuration;
+        const d = new Date(tickEpoch * 1000);
+        const label = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+        xTicksSvg += `<text x="${x}" y="${height - 10}" fill="#9ca3af" font-size="9.5" text-anchor="middle" font-family="monospace">${label}</text>`;
+        gridSvg += `<line x1="${x}" y1="${padT}" x2="${x}" y2="${padT + plotH}" stroke="rgba(255,255,255,0.06)" stroke-width="1" />`;
+    }
+
+    const rowHeight = plotH / sessions.length;
+    let barsSvg = '';
+    let tooltipsData = [];
+
+    sessions.forEach((s, idx) => {
+        const y = padT + idx * rowHeight + 3;
+        const barH = Math.max(16, rowHeight - 6);
+
+        const sStart = Math.max(startTime, s.start_timestamp);
+        const sEnd = (s.end_timestamp && s.end_timestamp > 0) ? Math.min(endTime, s.end_timestamp) : endTime;
+        const barX = padL + ((sStart - startTime) / totalDuration) * plotW;
+        const barW = Math.max(8, ((sEnd - sStart) / totalDuration) * plotW);
+
+        const isRunning = (!s.end_timestamp || s.end_timestamp === 0 || s.status === 'RUNNING' || s.status === 'active');
+        const isError = (s.status === 'ERROR' || s.total_errors > 0);
+        let barColor = isRunning ? '#10b981' : (isError ? '#f43f5e' : '#38bdf8');
+        let bgOpacity = isRunning ? '0.85' : '0.65';
+
+        const agentName = (s.agent_type || 'agent').toLowerCase();
+        let shortId = s.session_id || 'sess';
+        if (shortId.startsWith('sess-')) shortId = shortId.substring(5);
+        if (shortId.length > 8) shortId = shortId.substring(0, 8);
+
+        barsSvg += `<text x="${padL - 8}" y="${y + barH / 2 + 3.5}" fill="#cbd5e1" font-size="9" text-anchor="end" font-family="monospace">${escapeHtml(shortId)}</text>`;
+
+        barsSvg += `
+            <g class="gantt-bar-group" data-idx="${idx}" style="cursor: pointer;">
+                <rect x="${barX}" y="${y}" width="${barW}" height="${barH}" rx="4" fill="${barColor}" fill-opacity="${bgOpacity}" stroke="${barColor}" stroke-width="1.2" />
+                <text x="${barX + 6}" y="${y + barH / 2 + 3}" fill="#ffffff" font-size="8.5" font-family="sans-serif" font-weight="500">${escapeHtml(s.model_name || agentName)} (${s.total_tool_calls || 0} tools)</text>
+            </g>
+        `;
+
+        tooltipsData.push({
+            barX, y,
+            session_id: s.session_id,
+            model_name: s.model_name || agentName,
+            status: isRunning ? 'Active (Running)' : (s.status || 'Done'),
+            tools: s.total_tool_calls || 0,
+            turns: s.total_turns || 0,
+            duration: formatDurationSeconds(s.duration_s || 0),
+            startTimeStr: formatFullDateTime(s.start_timestamp)
+        });
+    });
+
+    svg.innerHTML = `
+        ${gridSvg}
+        ${xTicksSvg}
+        ${barsSvg}
+        <g id="gantt-tip-${svgId}" style="display: none; pointer-events: none;">
+            <rect id="gantt-tip-bg-${svgId}" width="190" height="58" rx="6" fill="rgba(10, 14, 23, 0.95)" stroke="rgba(56, 189, 248, 0.5)" stroke-width="1" />
+            <text id="gantt-tip-title-${svgId}" x="0" y="0" fill="#38bdf8" font-size="9.5" font-weight="bold" font-family="monospace"></text>
+            <text id="gantt-tip-line1-${svgId}" x="0" y="0" fill="#e2e8f0" font-size="9" font-family="sans-serif"></text>
+            <text id="gantt-tip-line2-${svgId}" x="0" y="0" fill="#94a3b8" font-size="8.5" font-family="monospace"></text>
+        </g>
+    `;
+
+    const tipG = svg.querySelector(`#gantt-tip-${svgId}`);
+    const tipBg = svg.querySelector(`#gantt-tip-bg-${svgId}`);
+    const tipTitle = svg.querySelector(`#gantt-tip-title-${svgId}`);
+    const tipL1 = svg.querySelector(`#gantt-tip-line1-${svgId}`);
+    const tipL2 = svg.querySelector(`#gantt-tip-line2-${svgId}`);
+
+    svg.querySelectorAll('.gantt-bar-group').forEach(el => {
+        el.addEventListener('mouseenter', () => {
+            const idx = parseInt(el.getAttribute('data-idx'), 10);
+            const item = tooltipsData[idx];
+            if (!item || !tipG) return;
+
+            tipTitle.textContent = `${item.session_id} [${item.status}]`;
+            tipL1.textContent = `${item.model_name} • ${item.turns}t / ${item.tools} tools (${item.duration})`;
+            tipL2.textContent = `Started: ${item.startTimeStr}`;
+
+            let tipX = item.barX + 10;
+            if (tipX + 195 > width - padR) tipX = item.barX - 200;
+            const tipY = Math.max(padT, item.y - 10);
+
+            tipBg.setAttribute('x', tipX);
+            tipBg.setAttribute('y', tipY);
+            tipTitle.setAttribute('x', tipX + 8);
+            tipTitle.setAttribute('y', tipY + 16);
+            tipL1.setAttribute('x', tipX + 8);
+            tipL1.setAttribute('y', tipY + 32);
+            tipL2.setAttribute('x', tipX + 8);
+            tipL2.setAttribute('y', tipY + 48);
+
+            tipG.style.display = 'block';
+        });
+
+        el.addEventListener('mouseleave', () => {
+            if (tipG) tipG.style.display = 'none';
+        });
+    });
+}
+
+function renderAgentBusynessStack(svgId, data) {
+    const svg = document.getElementById(svgId);
+    if (!svg) return;
+
+    const width = 800;
+    const height = 220;
+    const padL = 45;
+    const padR = 25;
+    const padT = 18;
+    const padB = 30;
+    const plotW = width - padL - padR;
+    const plotH = height - padT - padB;
+
+    const buckets = data.buckets || [];
+    if (buckets.length === 0) {
+        svg.innerHTML = `<text x="${width / 2}" y="${height / 2}" fill="#6b7280" font-size="12" text-anchor="middle" font-family="sans-serif">No concurrency telemetry available</text>`;
+        return;
+    }
+
+    let maxAgents = 1;
+    buckets.forEach(b => {
+        const total = (b.antigravity_active || 0) + (b.cursor_active || 0);
+        if (total > maxAgents) maxAgents = total;
+    });
+    maxAgents = Math.max(2, maxAgents);
+
+    // Y Axis Grid
+    let yGridSvg = '';
+    for (let yVal = 0; yVal <= maxAgents; yVal++) {
+        const y = padT + plotH - (yVal / maxAgents) * plotH;
+        yGridSvg += `
+            <line x1="${padL}" y1="${y}" x2="${padL + plotW}" y2="${y}" stroke="rgba(255,255,255,0.06)" stroke-width="1" />
+            <text x="${padL - 8}" y="${y + 3.5}" fill="#9ca3af" font-size="9" text-anchor="end" font-family="monospace">${yVal}</text>
+        `;
+    }
+
+    const barSlotW = plotW / buckets.length;
+    const barW = Math.max(4, barSlotW * 0.75);
+    let barsSvg = '';
+    let xTicksSvg = '';
+    let tooltipBuckets = [];
+
+    buckets.forEach((b, idx) => {
+        const x = padL + idx * barSlotW + (barSlotW - barW) / 2;
+        const agy = b.antigravity_active || 0;
+        const cur = b.cursor_active || 0;
+        const tools = b.tool_calls || 0;
+
+        const hAgy = (agy / maxAgents) * plotH;
+        const hCur = (cur / maxAgents) * plotH;
+
+        const yAgy = padT + plotH - hAgy;
+        const yCur = yAgy - hCur;
+
+        if (hAgy > 0) {
+            barsSvg += `<rect x="${x}" y="${yAgy}" width="${barW}" height="${hAgy}" rx="2" fill="#38bdf8" fill-opacity="0.8" />`;
+        }
+        if (hCur > 0) {
+            barsSvg += `<rect x="${x}" y="${yCur}" width="${barW}" height="${hCur}" rx="2" fill="#a855f7" fill-opacity="0.8" />`;
+        }
+
+        if (idx % Math.max(1, Math.floor(buckets.length / 6)) === 0) {
+            const d = new Date(b.timestamp * 1000);
+            const label = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+            xTicksSvg += `<text x="${x + barW / 2}" y="${height - 10}" fill="#9ca3af" font-size="9.5" text-anchor="middle" font-family="monospace">${label}</text>`;
+        }
+
+        barsSvg += `<rect class="busyness-bar-hitbox" data-idx="${idx}" x="${padL + idx * barSlotW}" y="${padT}" width="${barSlotW}" height="${plotH}" fill="transparent" style="cursor: crosshair;" />`;
+
+        tooltipBuckets.push({
+            x: x + barW / 2,
+            timestamp: b.timestamp,
+            antigravity: agy,
+            cursor: cur,
+            total: agy + cur,
+            tools: tools
+        });
+    });
+
+    svg.innerHTML = `
+        ${yGridSvg}
+        ${xTicksSvg}
+        ${barsSvg}
+        <g id="busy-tip-${svgId}" style="display: none; pointer-events: none;">
+            <rect id="busy-tip-bg-${svgId}" width="165" height="50" rx="6" fill="rgba(10, 14, 23, 0.95)" stroke="rgba(255, 255, 255, 0.2)" stroke-width="1" />
+            <text id="busy-tip-time-${svgId}" x="0" y="0" fill="#9ca3af" font-size="9" font-family="monospace"></text>
+            <text id="busy-tip-val1-${svgId}" x="0" y="0" fill="#38bdf8" font-size="9.5" font-family="monospace" font-weight="bold"></text>
+            <text id="busy-tip-val2-${svgId}" x="0" y="0" fill="#a855f7" font-size="9.5" font-family="monospace" font-weight="bold"></text>
+        </g>
+    `;
+
+    const tipG = svg.querySelector(`#busy-tip-${svgId}`);
+    const tipBg = svg.querySelector(`#busy-tip-bg-${svgId}`);
+    const tipTime = svg.querySelector(`#busy-tip-time-${svgId}`);
+    const tipVal1 = svg.querySelector(`#busy-tip-val1-${svgId}`);
+    const tipVal2 = svg.querySelector(`#busy-tip-val2-${svgId}`);
+
+    svg.querySelectorAll('.busyness-bar-hitbox').forEach(el => {
+        el.addEventListener('mousemove', () => {
+            const idx = parseInt(el.getAttribute('data-idx'), 10);
+            const item = tooltipBuckets[idx];
+            if (!item || !tipG) return;
+
+            tipTime.textContent = `Time: ${formatFullDateTime(item.timestamp)}`;
+            tipVal1.textContent = `Antigravity: ${item.antigravity} active (${item.tools} tools)`;
+            tipVal2.textContent = `Cursor: ${item.cursor} active`;
+
+            let tipX = item.x + 10;
+            if (tipX + 170 > width - padR) tipX = item.x - 175;
+            const tipY = padT + 10;
+
+            tipBg.setAttribute('x', tipX);
+            tipBg.setAttribute('y', tipY);
+            tipTime.setAttribute('x', tipX + 8);
+            tipTime.setAttribute('y', tipY + 14);
+            tipVal1.setAttribute('x', tipX + 8);
+            tipVal1.setAttribute('y', tipY + 28);
+            tipVal2.setAttribute('x', tipX + 8);
+            tipVal2.setAttribute('y', tipY + 42);
+
+            tipG.style.display = 'block';
+        });
+
+        el.addEventListener('mouseleave', () => {
+            if (tipG) tipG.style.display = 'none';
+        });
+    });
+}
+
 async function fetchTelemetryTools() {
     try {
         const res = await fetch('/api/telemetry/tools');
@@ -1221,12 +1508,16 @@ async function fetchTelemetrySessions() {
             return;
         }
 
+        // Sort latest on top
+        sessions.sort((a, b) => (b.start_timestamp || 0) - (a.start_timestamp || 0));
+
         const chosenSessionId = currentVal || sessions[0].session_id;
         select.innerHTML = sessions.map(s => {
-            const tsStr = new Date(s.start_timestamp * 1000).toLocaleTimeString();
+            const dtStr = formatFullDateTime(s.start_timestamp);
             const turns = s.total_turns || 0;
             const tools = s.total_tool_calls || 0;
-            return `<option value="${s.session_id}" ${s.session_id === chosenSessionId ? 'selected' : ''}>[${s.agent_type.toUpperCase()}] ${s.session_id} - ${s.model_name} (${turns} turns, ${tools} tools &bull; ${tsStr})</option>`;
+            const agentLabel = (s.agent_type || 'agent').toLowerCase();
+            return `<option value="${s.session_id}" ${s.session_id === chosenSessionId ? 'selected' : ''}>[${agentLabel}] ${s.session_id} - ${s.model_name} (${turns} turns, ${tools} tools &bull; ${dtStr})</option>`;
         }).join('');
 
         select.value = chosenSessionId;
@@ -1350,7 +1641,10 @@ async function fetchMobileQr() {
         if (countEl) countEl.textContent = `Valid for ${data.expires_in || 300}s`;
 
         if (qrContainer && secret && typeof window.generateQrSvg === 'function') {
-            const host = window.location.hostname || '127.0.0.1';
+            let host = window.location.hostname || '127.0.0.1';
+            if ((host === '127.0.0.1' || host === 'localhost' || host === '0.0.0.0') && data.lan_ip) {
+                host = data.lan_ip;
+            }
             const port = window.location.port || 3883;
             const pairingUri = `aimon://pair?host=${host}&port=${port}&secret=${secret}`;
             qrContainer.innerHTML = window.generateQrSvg(pairingUri, {
@@ -1401,81 +1695,144 @@ async function revokeDevice(deviceId) {
     } catch (_) {}
 }
 
-function switchToMonitor(id) {
-    activeMonitorId = id;
-    if (window.location.hash !== '#' + id) {
-        try {
-            history.replaceState(null, '', '#' + id);
-        } catch (_) {}
+function switchToSubpanel(subpanelId) {
+    if (!subpanelId) subpanelId = 'quotas';
+    activeSubpanelId = subpanelId;
+    activeMonitorId = 'aimon';
+
+    try {
+        history.replaceState(null, '', '#' + subpanelId);
+    } catch (_) {}
+
+    // 1. Activate aimon top tab, deactivate satellite tabs
+    const navEl = document.getElementById('monitor-tabs');
+    if (navEl) {
+        navEl.querySelectorAll('.monitor-tab').forEach(tab => {
+            const isAimon = (tab.getAttribute('data-id') === 'aimon');
+            tab.classList.toggle('active', isAimon);
+        });
     }
 
-    // If switching to an aimon subpanel directly (e.g. #telemetry or #approvals or #quotas)
-    if (id === 'quotas' || id === 'telemetry' || id === 'approvals') {
-        switchToMonitor('aimon');
-        switchToAimonSubpanel(id);
+    // 2. Show aimon view panel, hide dynamic satellite panels
+    const viewAimon = document.getElementById('view-aimon');
+    if (viewAimon) {
+        viewAimon.classList.add('active');
+        viewAimon.classList.remove('hidden');
+    }
+    const dynamicPanelsEl = document.getElementById('dynamic-panels');
+    if (dynamicPanelsEl) {
+        dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(p => {
+            p.classList.remove('active');
+            p.classList.add('hidden');
+        });
+    }
+
+    // 3. Update aimon subnav tabs
+    const subnavEl = document.getElementById('aimon-subnav');
+    if (subnavEl) {
+        subnavEl.querySelectorAll('.aimon-subnav-tab').forEach(tab => {
+            const isMatch = (tab.getAttribute('data-subpanel') === subpanelId);
+            tab.classList.toggle('active', isMatch);
+        });
+    }
+
+    // 4. Show active subpanel, hide other subpanels
+    const subpanels = {
+        'quotas': document.getElementById('subpanel-quotas'),
+        'telemetry': document.getElementById('subpanel-telemetry'),
+        'approvals': document.getElementById('subpanel-approvals')
+    };
+    Object.keys(subpanels).forEach(key => {
+        const el = subpanels[key];
+        if (el) {
+            const isMatch = (key === subpanelId);
+            el.classList.toggle('active', isMatch);
+            el.classList.toggle('hidden', !isMatch);
+        }
+    });
+
+    // 5. Fetch subpanel data
+    if (subpanelId === 'quotas') {
+        fetchStatus();
+        fetchSessions();
+    } else if (subpanelId === 'telemetry') {
+        fetchTelemetryOverview();
+        fetchTelemetryTimeseries();
+        fetchActivityTimeline();
+        fetchTelemetryTools();
+        fetchTelemetrySessions();
+    } else if (subpanelId === 'approvals') {
+        fetchPendingApprovals();
+        fetchMobileQr();
+        fetchMobileDevices();
+    }
+}
+
+function switchToMonitor(monitorId) {
+    if (!monitorId || monitorId === 'aimon') {
+        switchToSubpanel(activeSubpanelId || 'quotas');
         return;
     }
 
-    activeMonitorId = id;
+    activeMonitorId = monitorId;
 
-    // Update active tab button styles in top nav
+    try {
+        history.replaceState(null, '', '#' + monitorId);
+    } catch (_) {}
+
+    // 1. Update top monitor tab active states
     const navEl = document.getElementById('monitor-tabs');
     if (navEl) {
         navEl.querySelectorAll('.monitor-tab').forEach(tab => {
             const tabId = tab.getAttribute('data-id');
-            const isMatch = (tabId === id || tabId.startsWith(id + '-'));
-            if (isMatch) {
-                tab.classList.add('active');
-            } else {
-                tab.classList.remove('active');
-            }
+            const fullId = tab.getAttribute('data-full-id');
+            const isMatch = (tabId === monitorId || fullId === monitorId || (fullId && fullId.startsWith(monitorId + '-')));
+            tab.classList.toggle('active', isMatch);
         });
     }
 
+    // 2. Hide aimon view panel
     const viewAimon = document.getElementById('view-aimon');
-    const isAimon = (id === 'aimon');
-
     if (viewAimon) {
-        viewAimon.classList.toggle('active', isAimon);
-        viewAimon.classList.toggle('hidden', !isAimon);
-        if (isAimon) {
-            switchToAimonSubpanel(activeAimonSubpanel);
-        }
+        viewAimon.classList.remove('active');
+        viewAimon.classList.add('hidden');
     }
 
-    // Toggle persistent satellite monitor panels
+    // 3. Show matching satellite frame panel
     const dynamicPanelsEl = document.getElementById('dynamic-panels');
     if (dynamicPanelsEl) {
         dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(panel => {
             const panelId = panel.id;
             const subsystem = panel.getAttribute('data-subsystem');
-            const isMatch = !isAimon && (panelId === `panel-${id}` || panelId.startsWith(`panel-${id}-`) || (subsystem && (subsystem === id || id.startsWith(subsystem))));
-            if (isMatch) {
-                panel.classList.add('active');
-                panel.classList.remove('hidden');
-            } else {
-                panel.classList.remove('active');
-                panel.classList.add('hidden');
-            }
+            const isMatch = (panelId === `panel-${monitorId}` || panelId.startsWith(`panel-${monitorId}-`) || (subsystem && (subsystem === monitorId || monitorId.startsWith(subsystem))));
+            panel.classList.toggle('active', isMatch);
+            panel.classList.toggle('hidden', !isMatch);
         });
+    }
+}
+
+function switchToTab(id) {
+    if (!id || id === 'aimon') {
+        switchToSubpanel(activeSubpanelId || 'quotas');
+    } else if (id === 'quotas' || id === 'telemetry' || id === 'approvals') {
+        switchToSubpanel(id);
+    } else {
+        switchToMonitor(id);
     }
 }
 
 window.addEventListener('hashchange', () => {
     const hash = window.location.hash.replace(/^#/, '');
     if (hash) {
-        if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
-            switchToMonitor('aimon');
-            switchToAimonSubpanel(hash);
-        } else if (hash.startsWith('aimon/')) {
-            const sub = hash.split('/')[1];
-            switchToMonitor('aimon');
-            switchToAimonSubpanel(sub);
+        if (hash.startsWith('aimon/')) {
+            switchToSubpanel(hash.split('/')[1]);
+        } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+            switchToSubpanel(hash);
         } else {
             switchToMonitor(hash);
         }
     } else {
-        switchToMonitor('aimon');
+        switchToSubpanel('quotas');
     }
 });
 
@@ -1489,37 +1846,37 @@ document.addEventListener('DOMContentLoaded', () => {
     if (window.location.hash) {
         const hash = window.location.hash.replace(/^#/, '');
         if (hash) {
-            if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
-                switchToMonitor('aimon');
-                switchToAimonSubpanel(hash);
-            } else if (hash.startsWith('aimon/')) {
-                const sub = hash.split('/')[1];
-                switchToMonitor('aimon');
-                switchToAimonSubpanel(sub);
+            if (hash.startsWith('aimon/')) {
+                switchToSubpanel(hash.split('/')[1]);
+            } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+                switchToSubpanel(hash);
             } else {
                 switchToMonitor(hash);
             }
         }
+    } else {
+        switchToSubpanel('quotas');
     }
 
-    // Top-level tab button click listeners
+    // Top-level monitor tabs listener
     const monitorTabsEl = document.getElementById('monitor-tabs');
     if (monitorTabsEl) {
         monitorTabsEl.addEventListener('click', (e) => {
             const btn = e.target.closest('.monitor-tab');
-            if (btn && btn.dataset.id) {
-                switchToMonitor(btn.dataset.id);
+            if (btn) {
+                const monitorId = btn.getAttribute('data-id');
+                switchToMonitor(monitorId);
             }
         });
     }
 
-    // Aimon Sub-Navigation button click listeners
+    // Aimon sub-navigation tabs listener
     const aimonSubnavEl = document.getElementById('aimon-subnav');
     if (aimonSubnavEl) {
         aimonSubnavEl.addEventListener('click', (e) => {
             const btn = e.target.closest('.aimon-subnav-tab');
             if (btn && btn.dataset.subpanel) {
-                switchToAimonSubpanel(btn.dataset.subpanel);
+                switchToSubpanel(btn.dataset.subpanel);
             }
         });
     }
@@ -1534,6 +1891,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 btn.classList.add('active');
                 activeTelemetryWindow = btn.dataset.window;
                 fetchTelemetryTimeseries();
+                fetchActivityTimeline();
             }
         });
     }
@@ -1551,23 +1909,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btnQr) {
         btnQr.addEventListener('click', fetchMobileQr);
     }
-
-    document.getElementById('refresh-btn').addEventListener('click', () => {
-        fetchStatus(true);
-        fetchSessions();
-        fetchMonitors();
-        if (activeMonitorId === 'aimon') {
-            if (activeAimonSubpanel === 'telemetry') {
-                fetchTelemetryOverview();
-                fetchTelemetryTimeseries();
-                fetchTelemetryTools();
-                fetchTelemetrySessions();
-            } else if (activeAimonSubpanel === 'approvals') {
-                fetchPendingApprovals();
-                fetchMobileDevices();
-            }
-        }
-    });
 
     const modelsToggleBtn = document.getElementById('ag-models-toggle');
     const modelsChevron = document.getElementById('ag-models-chevron');
@@ -1592,11 +1933,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Refresh telemetry & approvals periodically when respective tab is active
     setInterval(() => {
-        if (activeMonitorId === 'telemetry') {
+        if (activeTabId === 'telemetry') {
             fetchTelemetryOverview();
             fetchTelemetryTimeseries();
+            fetchActivityTimeline();
             fetchTelemetryTools();
-        } else if (activeMonitorId === 'approvals') {
+        } else if (activeTabId === 'approvals') {
             fetchPendingApprovals();
         }
     }, 8000);

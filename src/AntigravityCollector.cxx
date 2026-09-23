@@ -412,6 +412,7 @@ AntigravityStatus AntigravityCollector::fetchStatus() {
                                 }
                                 if (b.contains("resetTime") && b["resetTime"].is_string()) {
                                     qb.resetTimeIso = b["resetTime"].get<std::string>();
+                                    qb.resetTimestamp = parseIsoTimestamp(qb.resetTimeIso);
                                 }
                                 qg.buckets.push_back(qb);
                             }

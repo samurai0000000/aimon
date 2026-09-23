@@ -35,19 +35,24 @@ body {
         radial-gradient(circle at 85% 30%, rgba(139, 92, 246, 0.06) 0%, transparent 45%);
     color: var(--text-primary);
     font-family: var(--font-sans);
-    min-height: 100vh;
+    height: 100vh;
+    margin: 0;
+    padding: 0;
     display: flex;
     justify-content: center;
     -webkit-font-smoothing: antialiased;
+    overflow: hidden;
 }
 
 .app-container {
     width: 100%;
-    max-width: 1540px;
-    padding: 20px 24px 36px;
+    max-width: 1600px;
+    height: 100vh;
+    padding: 12px 20px 6px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    box-sizing: border-box;
+    overflow: hidden;
 }
 
 /* Header */
@@ -1791,19 +1796,12 @@ body {
     z-index: 10;
 }
 
-/* Footer */
-.app-footer {
-    text-align: center;
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    padding-top: 10px;
-}
-
 /* ==========================================================================
-   Multi-Monitor Navigation Tabs & Iframe Embed Container
+   Top Navigation Bar & Multi-Monitor Switching
    ========================================================================== */
 
 .monitor-nav {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -1812,18 +1810,22 @@ body {
     backdrop-filter: blur(16px);
     border: 1px solid var(--border-color);
     border-radius: 14px;
+    margin-bottom: 14px;
     overflow-x: auto;
     white-space: nowrap;
     -webkit-overflow-scrolling: touch;
-    scrollbar-width: thin;
-    flex-wrap: nowrap;
+    scrollbar-width: none;
+}
+
+.monitor-nav::-webkit-scrollbar {
+    display: none;
 }
 
 .monitor-tab {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    padding: 8px 16px;
+    padding: 7px 16px;
     background: rgba(255, 255, 255, 0.03);
     border: 1px solid transparent;
     border-radius: 10px;
@@ -1836,6 +1838,7 @@ body {
     white-space: nowrap;
     user-select: none;
     flex-shrink: 0;
+    text-transform: lowercase;
 }
 
 .monitor-tab:hover {
@@ -1845,10 +1848,10 @@ body {
 }
 
 .monitor-tab.active {
-    background: rgba(0, 242, 254, 0.1);
+    background: rgba(0, 242, 254, 0.12);
     border-color: rgba(0, 242, 254, 0.35);
     color: #ffffff;
-    box-shadow: 0 0 16px rgba(0, 242, 254, 0.12);
+    box-shadow: 0 0 14px rgba(0, 242, 254, 0.12);
 }
 
 .tab-indicator {
@@ -1870,16 +1873,18 @@ body {
 
 .tab-title {
     font-weight: 600;
+    text-transform: lowercase;
 }
 
 .tab-badge {
-    font-size: 0.7rem;
-    font-weight: 500;
-    padding: 2px 6px;
-    border-radius: 6px;
-    background: rgba(255, 255, 255, 0.06);
+    font-size: 0.68rem;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.08);
     color: var(--text-muted);
     font-family: var(--font-mono);
+    text-transform: lowercase;
 }
 
 .monitor-tab.active .tab-badge {
@@ -1921,6 +1926,7 @@ body {
     white-space: nowrap;
     user-select: none;
     flex-shrink: 0;
+    text-transform: lowercase;
 }
 
 .aimon-subnav-tab:hover {
@@ -1965,7 +1971,6 @@ body {
 .aimon-subpanel {
     display: none;
     width: 100%;
-    animation: fadeInSubpanel 0.2s ease;
 }
 
 .aimon-subpanel.active {
@@ -1981,42 +1986,65 @@ body {
     display: none !important;
 }
 
-@keyframes fadeInSubpanel {
-    from { opacity: 0; transform: translateY(4px); }
-    to { opacity: 1; transform: translateY(0); }
+/* ==========================================================================
+   Main Viewport & View Panels Architecture
+   ========================================================================== */
+
+.main-viewport {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+    overflow: hidden;
+    width: 100%;
 }
 
-/* View panels */
 .view-panel {
     display: none;
     width: 100%;
-    transition: opacity 0.2s ease;
+    height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-right: 4px;
+    scrollbar-width: thin;
 }
 
 .view-panel.active {
     display: block;
 }
 
-.dashboard-grid.view-panel.active {
-    display: grid;
-}
-
 .view-panel.hidden {
     display: none !important;
 }
 
-/* Discovered Monitor Frame Container & Panels */
-.monitor-frame-container,
+.view-panel::-webkit-scrollbar {
+    width: 6px;
+}
+
+.view-panel::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+}
+
+.view-panel::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#dynamic-panels {
+    width: 100%;
+    height: 100%;
+}
+
+/* Discovered Monitor Frame Container & Panels (Zero Parent Scrollbars) */
 .monitor-frame-panel {
     display: none;
     flex-direction: column;
+    width: 100%;
+    height: 100%;
     background: var(--bg-card);
     backdrop-filter: blur(16px);
     border: 1px solid var(--border-color);
-    border-radius: 16px;
+    border-radius: 14px;
     overflow: hidden;
-    height: calc(100vh - 210px);
-    min-height: 520px;
     box-shadow: 0 16px 36px rgba(0, 0, 0, 0.35);
 }
 
@@ -2030,42 +2058,46 @@ body {
 }
 
 .frame-toolbar {
+    flex-shrink: 0;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 12px 18px;
+    padding: 8px 14px;
     background: rgba(10, 14, 23, 0.75);
     border-bottom: 1px solid var(--border-color);
-    gap: 16px;
+    gap: 12px;
+    height: 38px;
+    box-sizing: border-box;
 }
 
 .frame-info {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     min-width: 0;
 }
 
 .frame-title {
-    font-size: 0.95rem;
+    font-size: 0.88rem;
     font-weight: 600;
     color: var(--text-primary);
+    text-transform: lowercase;
 }
 
 .frame-badge {
-    font-size: 0.72rem;
+    font-size: 0.68rem;
     font-weight: 500;
-    padding: 2px 8px;
-    border-radius: 6px;
+    padding: 1px 6px;
+    border-radius: 4px;
     background: rgba(139, 92, 246, 0.15);
     border: 1px solid rgba(139, 92, 246, 0.3);
     color: var(--purple-glow);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
+    text-transform: lowercase;
+    letter-spacing: 0.02em;
 }
 
 .frame-url {
-    font-size: 0.78rem;
+    font-size: 0.74rem;
     font-family: var(--font-mono);
     color: var(--text-muted);
     overflow: hidden;
@@ -2076,17 +2108,17 @@ body {
 .frame-actions {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     flex-shrink: 0;
 }
 
 .btn-frame-action {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 12px;
-    border-radius: 8px;
-    font-size: 0.8rem;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 0.76rem;
     font-weight: 500;
     font-family: var(--font-sans);
     background: rgba(255, 255, 255, 0.05);
@@ -2106,6 +2138,7 @@ body {
 .frame-content-wrapper {
     position: relative;
     flex: 1;
+    min-height: 0;
     display: flex;
     width: 100%;
     height: 100%;
@@ -2119,12 +2152,22 @@ body {
     border: none;
     background: #0a0e17;
     transition: filter 0.3s ease, opacity 0.3s ease;
+    display: block;
 }
 
 .monitor-iframe.iframe-grayed-out {
     filter: grayscale(0.85) blur(1.5px);
     opacity: 0.45;
     pointer-events: none;
+}
+
+/* Footer */
+.app-footer {
+    flex-shrink: 0;
+    text-align: center;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    padding: 4px 0 2px;
 }
 
 .offline-overlay {
@@ -2308,16 +2351,22 @@ body {
     color: var(--text-muted);
 }
 
-/* Charts Grid */
+/* Charts Grid (2x2 Layout) */
 .telemetry-charts-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
-    gap: 20px;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
     margin-bottom: 20px;
 }
 
+@media (max-width: 1024px) {
+    .telemetry-charts-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
 .chart-card {
-    padding: 20px;
+    padding: 18px 20px;
     background: rgba(15, 23, 42, 0.6);
     backdrop-filter: blur(12px);
     border: 1px solid rgba(255, 255, 255, 0.07);
@@ -2356,10 +2405,52 @@ body {
     gap: 6px;
 }
 
-.dot-cyan { background: #38bdf8; }
-.dot-blue { background: #3b82f6; }
-.dot-amber { background: #f59e0b; }
-.dot-magenta { background: #e879f9; }
+.dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.dot-cyan { background: #38bdf8; box-shadow: 0 0 8px rgba(56, 189, 248, 0.7); }
+.dot-blue { background: #3b82f6; box-shadow: 0 0 8px rgba(59, 130, 246, 0.7); }
+.dot-amber { background: #f59e0b; box-shadow: 0 0 8px rgba(245, 158, 11, 0.7); }
+.dot-magenta { background: #e879f9; box-shadow: 0 0 8px rgba(232, 121, 249, 0.7); }
+.dot-emerald { background: #10b981; box-shadow: 0 0 8px rgba(16, 185, 129, 0.7); }
+.dot-purple { background: #a855f7; box-shadow: 0 0 8px rgba(168, 85, 247, 0.7); }
+.dot-coral { background: #f43f5e; box-shadow: 0 0 8px rgba(244, 63, 94, 0.7); }
+
+.pairing-action-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+}
+
+.btn-download-apk {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(139, 92, 246, 0.18));
+    border: 1px solid rgba(56, 189, 248, 0.4);
+    border-radius: 8px;
+    color: #38bdf8;
+    font-size: 0.85rem;
+    font-weight: 500;
+    text-decoration: none;
+    transition: all 0.2s ease;
+}
+
+.btn-download-apk:hover {
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.3), rgba(139, 92, 246, 0.3));
+    border-color: #38bdf8;
+    box-shadow: 0 0 14px rgba(56, 189, 248, 0.35);
+    transform: translateY(-1px);
+    color: #fff;
+}
 
 .svg-chart-container {
     width: 100%;
