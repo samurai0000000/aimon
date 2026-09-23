@@ -21,6 +21,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include "AgentTelemetryDb.hxx"
+#include "PathUtils.hxx"
 
 namespace fs = std::filesystem;
 
@@ -606,7 +607,7 @@ void AntigravityCollector::syncTranscriptTelemetry() {
                 std::string sessionStatus = (now - sessionEnd < 300) ? "RUNNING" : "COMPLETED";
 
                 AgentTelemetryDb::getInstance().recordSessionStart(
-                    sessionId, convId, "antigravity", "/home/samurai/work", "Antigravity", sessionStart);
+                    sessionId, convId, "antigravity", PathUtils::expandHome("~/work"), "Antigravity", sessionStart);
                 AgentTelemetryDb::getInstance().updateSessionStats(
                     sessionId, sessionStatus, totalTurns, 0, 0, totalTools, totalErrors, avgTurnMs, sessionStart, sessionEnd);
             }

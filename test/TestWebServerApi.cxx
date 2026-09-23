@@ -55,7 +55,7 @@ int main() {
         {"event_type", "SESSION_START"},
         {"session_id", "test-web-sess-1"},
         {"agent_type", "antigravity"},
-        {"workspace", "/home/samurai/work/aimon"},
+        {"workspace", "/workspace/aimon"},
         {"model", "Antigravity"},
         {"timestamp", static_cast<int64_t>(time(nullptr))}
     };
@@ -153,7 +153,7 @@ int main() {
     json reqBody = {
         {"agent_type", "antigravity"},
         {"tool_name", "run_command"},
-        {"workspace", "/home/samurai/work/aimon"},
+        {"workspace", "/workspace/aimon"},
         {"tool_args", {{"CommandLine", "make"}}},
         {"reason", "Test compilation approval"},
         {"timeout_seconds", 5}

@@ -65,7 +65,7 @@ static void testApprovalLatching() {
     nlohmann::json toolArgs;
     toolArgs["CommandLine"] = "make -j8";
 
-    std::string approvalId = gw.submitApprovalRequest("antigravity", "run_command", "/home/samurai/work/aimon", toolArgs, "Build target", 5);
+    std::string approvalId = gw.submitApprovalRequest("antigravity", "run_command", "/workspace/aimon", toolArgs, "Build target", 5);
     assert(!approvalId.empty());
 
     // Check pending list
@@ -99,7 +99,7 @@ static void testApprovalTimeout() {
     nlohmann::json toolArgs;
     toolArgs["TargetFile"] = "/tmp/sensitive.conf";
 
-    std::string approvalId = gw.submitApprovalRequest("cursor", "write_to_file", "/home/samurai/work/aimon", toolArgs, "Write config", 1);
+    std::string approvalId = gw.submitApprovalRequest("cursor", "write_to_file", "/workspace/aimon", toolArgs, "Write config", 1);
     assert(!approvalId.empty());
 
     // Wait with 1-second timeout (no one resolves)

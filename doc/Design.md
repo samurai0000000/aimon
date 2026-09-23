@@ -400,7 +400,7 @@ When the web frontend or mobile app queries timeseries data over wide windows (`
 Autonomous agent tasks frequently stall when sensitive tools (`run_command`, `write_to_file`, `multi_replace_file_content`, `embdevenv_mcu_power`) request human confirmation. `aimon` provides an asynchronous action approval latching engine that delivers real-time confirmation requests directly to the developer's mobile device lock screen.
 
 ### 9.1 Latching Protocol & Concurrency Architecture
-1. **Hook Interception**: When Antigravity or Cursor triggers a sensitive tool, `scripts/mobile_permission_relay.py` intercepts the JSON invocation and executes a synchronous `POST /api/approvals/request` to `aimon`.
+1. **Hook Interception**: When Antigravity or Cursor triggers a sensitive tool, the configured IDE hook interceptor intercepts the JSON invocation and executes a synchronous `POST /api/approvals/request` to `aimon`.
 2. **Promise Latch Creation**: `MobileGateway::requestApproval()` registers a pending action record with a unique UUID and initializes a `std::promise<ApprovalVerdict>`. The calling HTTP worker thread blocks synchronously on `std::future<ApprovalVerdict>::get()`.
 3. **Multicast Notification**: `MobileGateway` broadcasts an SSE / WebSocket approval notification to paired Android devices.
 4. **Lock-Screen Verdict**: The operator taps `[Approve]` or `[Deny]` directly from the Android heads-up notification. The mobile app posts the verdict back to `/api/approvals/decision`.
@@ -425,11 +425,12 @@ The `aimon` dashboard (`web/index.html`, `web/app.js`, `web/style.css`, `include
 
 ---
 
-## 11. Dual-IDE Universal Hook Relays
+## 11. Dual-IDE Hook Protocol
 
-`scripts/mobile_permission_relay.py` standardizes tool interception across both IDEs:
+IDE tool approval hooks standardize tool interception across both IDEs:
 - **Google Antigravity**: Configured via `.agents/hooks.json` (`PreToolUse`, `PostToolUse`).
 - **Cursor IDE**: Configured via `.cursor/hooks.json` (`preTool`, `postTool`).
+
 
 ---
 

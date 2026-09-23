@@ -29,7 +29,7 @@ static void testBasicOperations() {
     int64_t now = static_cast<int64_t>(time(nullptr));
 
     // 1. Session start
-    assert(db.recordSessionStart("sess-001", "conv-100", "antigravity", "/home/samurai/work/aimon", "Antigravity", now - 60));
+    assert(db.recordSessionStart("sess-001", "conv-100", "antigravity", "/workspace/aimon", "Antigravity", now - 60));
 
     // 2. Insert lifecycle events
     AgentLifecycleEvent ev1;
