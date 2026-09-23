@@ -16,7 +16,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css?v=1.0.6">
+    <link rel="stylesheet" href="style.css?v=1.0.7">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -44,200 +44,377 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
         <nav class="monitor-nav" id="monitor-tabs" aria-label="System Monitors">
             <button type="button" class="monitor-tab active" data-id="aimon">
                 <span class="tab-indicator tab-indicator-online"></span>
-                <span class="tab-title">AI Quotas</span>
-                <span class="tab-badge">Self</span>
+                <span class="tab-title">aimon</span>
+                <span class="tab-badge">Hub</span>
             </button>
         </nav>
 
-        <main class="dashboard-grid view-panel active" id="view-aimon">
-            <!-- Google Antigravity Section -->
-            <section class="card glass-card antigravity-card">
-                <div class="card-header">
-                    <div class="provider-title">
-                        <span class="dot-status dot-online" id="ag-status-dot"></span>
-                        <h2>Google Antigravity</h2>
-                    </div>
-                    <span id="ag-plan-badge" class="badge badge-cyan">Google AI Ultra</span>
-                </div>
+        <main class="view-panel active" id="view-aimon">
+            <!-- Aimon Sub-Navigation Tab Bar -->
+            <div class="aimon-subnav-bar" id="aimon-subnav" aria-label="aimon Subpanels">
+                <button type="button" class="aimon-subnav-tab active" data-subpanel="quotas">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">AI Quotas</span>
+                    <span class="tab-badge">Quota</span>
+                </button>
+                <button type="button" class="aimon-subnav-tab" data-subpanel="telemetry">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">Agent Telemetry</span>
+                    <span class="tab-badge badge-cyan">Analytics</span>
+                </button>
+                <button type="button" class="aimon-subnav-tab" data-subpanel="approvals">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">Action Approvals</span>
+                    <span class="tab-badge badge-amber" id="approvals-badge">0 Pending</span>
+                </button>
+            </div>
 
-                <!-- Credits & Allowances Strip -->
-                <div class="credits-strip" id="ag-credits-strip">
-                    <div class="credit-pill">
-                        <div class="credit-top-row">
-                            <span class="credit-label">Google One AI Credits</span>
-                            <span class="badge-sub" id="ag-credit-min">Min 50 / req</span>
+            <!-- Subpanel 1: AI Quotas (Antigravity, Cursor, MCP Clients) -->
+            <div class="aimon-subpanel dashboard-grid active" id="subpanel-quotas">
+                <!-- Google Antigravity Section -->
+                <section class="card glass-card antigravity-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-online" id="ag-status-dot"></span>
+                            <h2>Google Antigravity</h2>
                         </div>
-                        <span id="ag-available-credits" class="credit-val highlight-cyan">--</span>
+                        <span id="ag-plan-badge" class="badge badge-cyan">Google AI Ultra</span>
                     </div>
-                    <div class="credit-pill">
-                        <div class="credit-top-row">
-                            <span class="credit-label">Prompt & Flow Balance</span>
-                            <span class="badge-sub" id="ag-credit-tier">Monthly</span>
+
+                    <!-- Credits & Allowances Strip -->
+                    <div class="credits-strip" id="ag-credits-strip">
+                        <div class="credit-pill">
+                            <div class="credit-top-row">
+                                <span class="credit-label">Google One AI Credits</span>
+                                <span class="badge-sub" id="ag-credit-min">Min 50 / req</span>
+                            </div>
+                            <span id="ag-available-credits" class="credit-val highlight-cyan">--</span>
                         </div>
-                        <span id="ag-prompt-flow" class="credit-val">--</span>
-                    </div>
-                </div>
-
-                <!-- Quota Groups (Gemini Models, Claude & GPT models) -->
-                <div class="quota-groups-section">
-                    <div class="section-title-row">
-                        <h3>Model Quota Limits</h3>
-                    </div>
-                    <div id="ag-quota-groups" class="quota-groups-list">
-                        <div class="gauge-loading">Scanning quota groups...</div>
-                    </div>
-                </div>
-
-                <!-- Collapsible Individual Models -->
-                <div class="models-collapsible-section">
-                    <button type="button" id="ag-models-toggle" class="btn-toggle-models">
-                        <span id="ag-models-toggle-text">Individual Model Capacities</span>
-                        <svg class="toggle-icon" id="ag-models-chevron" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
-                            <path d="M6 9l6 6 6-6"></path>
-                        </svg>
-                    </button>
-                    <div id="ag-models-grid" class="gauges-grid hidden">
-                        <!-- Dynamically populated model gauges -->
-                    </div>
-                </div>
-
-                <div id="ag-error" class="error-banner hidden"></div>
-            </section>
-
-            <!-- Cursor Section -->
-            <section class="card glass-card cursor-card">
-                <div class="card-header">
-                    <div class="provider-title">
-                        <span class="dot-status dot-online" id="cursor-status-dot"></span>
-                        <h2>Cursor</h2>
-                    </div>
-                    <span id="cursor-plan-badge" class="badge badge-magenta">Pro</span>
-                </div>
-
-                <div class="cursor-metrics">
-                    <div class="cursor-top-row">
-                        <div class="usage-stat-box">
-                            <div class="stat-top">
-                                <span class="stat-label">Fast Requests Pool</span>
-                                <span id="cursor-fast-ratio" class="stat-ratio">-- / --</span>
+                        <div class="credit-pill">
+                            <div class="credit-top-row">
+                                <span class="credit-label">Prompt & Flow Balance</span>
+                                <span class="badge-sub" id="ag-credit-tier">Monthly</span>
                             </div>
-                            <div class="progress-track">
-                                <div id="cursor-progress-bar" class="progress-fill" style="width: 0%;"></div>
-                            </div>
-                            <div class="stat-bottom">
-                                <span id="cursor-remaining-txt" class="stat-sub">Calculating...</span>
-                                <span id="cursor-percent-txt" class="stat-pct">0%</span>
-                            </div>
-                        </div>
-
-                        <div class="details-box">
-                            <div class="detail-row">
-                                <span class="detail-label">Billing Cycle Reset</span>
-                                <span id="cursor-reset-date" class="detail-value">--</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">Days Remaining</span>
-                                <span id="cursor-days-remaining" class="detail-value">--</span>
-                            </div>
+                            <span id="ag-prompt-flow" class="credit-val">--</span>
                         </div>
                     </div>
 
-                    <!-- Personal Usage & Cumulative Spend Card -->
-                    <div class="spend-section" id="cursor-spend-section">
-                        <div class="spend-header">
-                            <div>
-                                <span class="spend-subtitle">Personal Usage</span>
-                                <h3 class="spend-title">Cumulative Spend</h3>
-                                <p class="spend-desc">Track your spend against last month.</p>
-                            </div>
-                            <div class="spend-totals">
-                                <span id="cursor-total-spend" class="spend-amount">$0.00</span>
-                                <span id="cursor-prev-spend-pill" class="spend-prev-pill hidden">vs $0.00 last month</span>
-                            </div>
+                    <!-- Quota Groups (Gemini Models, Claude & GPT models) -->
+                    <div class="quota-groups-section">
+                        <div class="section-title-row">
+                            <h3>Model Quota Limits</h3>
                         </div>
-
-                        <div class="spend-content-grid">
-                            <!-- Chart Container -->
-                            <div class="spend-chart-container">
-                                <svg id="cursor-spend-chart" class="spend-chart-svg" viewBox="0 0 420 160">
-                                    <defs>
-                                        <linearGradient id="spendGrad" x1="0" y1="0" x2="0" y2="1">
-                                            <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.45"/>
-                                            <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.0"/>
-                                        </linearGradient>
-                                    </defs>
-                                    <!-- Grid Lines & Axis -->
-                                    <line x1="50" y1="20" x2="410" y2="20" class="chart-grid-line" />
-                                    <text x="42" y="24" class="chart-axis-lbl" id="chart-lbl-max">$400</text>
-
-                                    <line x1="50" y1="58" x2="410" y2="58" class="chart-grid-line" />
-                                    <text x="42" y="62" class="chart-axis-lbl" id="chart-lbl-mid2">$300</text>
-
-                                    <line x1="50" y1="96" x2="410" y2="96" class="chart-grid-line" />
-                                    <text x="42" y="100" class="chart-axis-lbl" id="chart-lbl-mid1">$200</text>
-
-                                    <line x1="50" y1="135" x2="410" y2="135" class="chart-grid-line" />
-                                    <text x="42" y="139" class="chart-axis-lbl">$0</text>
-
-                                    <!-- Gradient Area -->
-                                    <path id="spend-chart-area" d="" fill="url(#spendGrad)"></path>
-                                    <!-- Trend Line -->
-                                    <path id="spend-chart-line" d="" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
-                                    <!-- Interactive Dots -->
-                                    <g id="spend-chart-dots"></g>
-                                </svg>
-                                <div id="chart-dates-axis" class="chart-dates-row">
-                                    <!-- Day labels populated dynamically -->
-                                </div>
-                            </div>
-
-                            <!-- Spend by Model Breakdown -->
-                            <div class="categories-breakdown" id="cursor-categories-breakdown">
-                                <div class="breakdown-header">Spend by Model</div>
-                                <div id="cursor-categories-list" class="categories-list scrollable-categories">
-                                    <!-- Dynamically populated category bars -->
-                                </div>
-                            </div>
+                        <div id="ag-quota-groups" class="quota-groups-list">
+                            <div class="gauge-loading">Scanning quota groups...</div>
                         </div>
                     </div>
-                </div>
 
-                <div id="cursor-error" class="error-banner hidden"></div>
-            </section>
-
-            <!-- Connected MCP Clients Section -->
-            <section class="card glass-card agents-fleet-card">
-                <div class="card-header">
-                    <div class="provider-title">
-                        <span class="dot-status dot-online" id="agents-status-dot"></span>
-                        <h2>Connected MCP Clients</h2>
-                    </div>
-                    <div class="agents-header-actions">
-                        <span id="agents-count-badge" class="badge badge-cyan">0 Sessions</span>
-                    </div>
-                </div>
-
-                <!-- Live Connected MCP Clients Bar -->
-                <div class="mcp-clients-bar" id="mcp-clients-bar">
-                    <div class="mcp-clients-left">
-                        <span class="mcp-clients-title">
-                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
-                                <circle cx="12" cy="12" r="10"></circle>
-                                <line x1="2" y1="12" x2="22" y2="12"></line>
-                                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                    <!-- Collapsible Individual Models -->
+                    <div class="models-collapsible-section">
+                        <button type="button" id="ag-models-toggle" class="btn-toggle-models">
+                            <span id="ag-models-toggle-text">Individual Model Capacities</span>
+                            <svg class="toggle-icon" id="ag-models-chevron" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                                <path d="M6 9l6 6 6-6"></path>
                             </svg>
-                            Active Sessions:
-                        </span>
+                        </button>
+                        <div id="ag-models-grid" class="gauges-grid hidden">
+                            <!-- Dynamically populated model gauges -->
+                        </div>
                     </div>
-                    <div class="mcp-clients-list" id="mcp-clients-list">
-                        <span class="client-badge client-badge-empty">
-                            <span class="dot-status dot-offline"></span>
-                            No active MCP connections
-                        </span>
+
+                    <div id="ag-error" class="error-banner hidden"></div>
+                </section>
+
+                <!-- Cursor Section -->
+                <section class="card glass-card cursor-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-online" id="cursor-status-dot"></span>
+                            <h2>Cursor</h2>
+                        </div>
+                        <span id="cursor-plan-badge" class="badge badge-magenta">Pro</span>
+                    </div>
+
+                    <div class="cursor-metrics">
+                        <div class="cursor-top-row">
+                            <div class="usage-stat-box">
+                                <div class="stat-top">
+                                    <span class="stat-label">Fast Requests Pool</span>
+                                    <span id="cursor-fast-ratio" class="stat-ratio">-- / --</span>
+                                </div>
+                                <div class="progress-track">
+                                    <div id="cursor-progress-bar" class="progress-fill" style="width: 0%;"></div>
+                                </div>
+                                <div class="stat-bottom">
+                                    <span id="cursor-remaining-txt" class="stat-sub">Calculating...</span>
+                                    <span id="cursor-percent-txt" class="stat-pct">0%</span>
+                                </div>
+                            </div>
+
+                            <div class="details-box">
+                                <div class="detail-row">
+                                    <span class="detail-label">Billing Cycle Reset</span>
+                                    <span id="cursor-reset-date" class="detail-value">--</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="detail-label">Days Remaining</span>
+                                    <span id="cursor-days-remaining" class="detail-value">--</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Personal Usage & Cumulative Spend Card -->
+                        <div class="spend-section" id="cursor-spend-section">
+                            <div class="spend-header">
+                                <div>
+                                    <span class="spend-subtitle">Personal Usage</span>
+                                    <h3 class="spend-title">Cumulative Spend</h3>
+                                    <p class="spend-desc">Track your spend against last month.</p>
+                                </div>
+                                <div class="spend-totals">
+                                    <span id="cursor-total-spend" class="spend-amount">$0.00</span>
+                                    <span id="cursor-prev-spend-pill" class="spend-prev-pill hidden">vs $0.00 last month</span>
+                                </div>
+                            </div>
+
+                            <div class="spend-content-grid">
+                                <!-- Chart Container -->
+                                <div class="spend-chart-container">
+                                    <svg id="cursor-spend-chart" class="spend-chart-svg" viewBox="0 0 420 160">
+                                        <defs>
+                                            <linearGradient id="spendGrad" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.45"/>
+                                                <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.0"/>
+                                            </linearGradient>
+                                        </defs>
+                                        <!-- Grid Lines & Axis -->
+                                        <line x1="50" y1="20" x2="410" y2="20" class="chart-grid-line" />
+                                        <text x="42" y="24" class="chart-axis-lbl" id="chart-lbl-max">$400</text>
+
+                                        <line x1="50" y1="58" x2="410" y2="58" class="chart-grid-line" />
+                                        <text x="42" y="62" class="chart-axis-lbl" id="chart-lbl-mid2">$300</text>
+
+                                        <line x1="50" y1="96" x2="410" y2="96" class="chart-grid-line" />
+                                        <text x="42" y="100" class="chart-axis-lbl" id="chart-lbl-mid1">$200</text>
+
+                                        <line x1="50" y1="135" x2="410" y2="135" class="chart-grid-line" />
+                                        <text x="42" y="139" class="chart-axis-lbl">$0</text>
+
+                                        <!-- Gradient Area -->
+                                        <path id="spend-chart-area" d="" fill="url(#spendGrad)"></path>
+                                        <!-- Trend Line -->
+                                        <path id="spend-chart-line" d="" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                                        <!-- Interactive Dots -->
+                                        <g id="spend-chart-dots"></g>
+                                    </svg>
+                                    <div id="chart-dates-axis" class="chart-dates-row">
+                                        <!-- Day labels populated dynamically -->
+                                    </div>
+                                </div>
+
+                                <!-- Spend by Model Breakdown -->
+                                <div class="categories-breakdown" id="cursor-categories-breakdown">
+                                    <div class="breakdown-header">Spend by Model</div>
+                                    <div id="cursor-categories-list" class="categories-list scrollable-categories">
+                                        <!-- Dynamically populated category bars -->
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="cursor-error" class="error-banner hidden"></div>
+                </section>
+
+                <!-- Connected MCP Clients Section -->
+                <section class="card glass-card agents-fleet-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-online" id="agents-status-dot"></span>
+                            <h2>Connected MCP Clients</h2>
+                        </div>
+                        <div class="agents-header-actions">
+                            <span id="agents-count-badge" class="badge badge-cyan">0 Sessions</span>
+                        </div>
+                    </div>
+
+                    <!-- Live Connected MCP Clients Bar -->
+                    <div class="mcp-clients-bar" id="mcp-clients-bar">
+                        <div class="mcp-clients-left">
+                            <span class="mcp-clients-title">
+                                <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <line x1="2" y1="12" x2="22" y2="12"></line>
+                                    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                                </svg>
+                                Active Sessions:
+                            </span>
+                        </div>
+                        <div class="mcp-clients-list" id="mcp-clients-list">
+                            <span class="client-badge client-badge-empty">
+                                <span class="dot-status dot-offline"></span>
+                                No active MCP connections
+                            </span>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Subpanel 2: Agent Telemetry & Analytics -->
+            <div class="aimon-subpanel hidden" id="subpanel-telemetry">
+                <!-- Telemetry Header & Timeframe Bar -->
+                <div class="telemetry-header-bar glass-card">
+                    <div class="telemetry-title-group">
+                        <h2>Agent Execution Telemetry & Historical Analytics</h2>
+                        <span class="badge badge-cyan" id="telem-db-badge">SQLite WAL (Rolling)</span>
+                    </div>
+                    <div class="timeframe-selector" id="telem-timeframe-selector">
+                        <button type="button" class="time-btn" data-window="1h">1H</button>
+                        <button type="button" class="time-btn active" data-window="24h">24H</button>
+                        <button type="button" class="time-btn" data-window="7d">7D</button>
+                        <button type="button" class="time-btn" data-window="30d">30D</button>
+                        <button type="button" class="time-btn" data-window="1y">1Y</button>
                     </div>
                 </div>
-            </section>
+
+                <!-- KPI Summary Cards -->
+                <div class="telemetry-kpi-grid">
+                    <div class="glass-card kpi-card">
+                        <div class="kpi-label">Active Agent Sessions</div>
+                        <div class="kpi-val" id="kpi-active-sessions">0 <span class="kpi-sub">running</span></div>
+                    </div>
+                    <div class="glass-card kpi-card">
+                        <div class="kpi-label">Total Tool Calls</div>
+                        <div class="kpi-val highlight-cyan" id="kpi-total-tools">0 <span class="kpi-sub">calls</span></div>
+                    </div>
+                    <div class="glass-card kpi-card">
+                        <div class="kpi-label">Avg Step Duration</div>
+                        <div class="kpi-val" id="kpi-avg-latency">0.00 <span class="kpi-sub">sec</span></div>
+                    </div>
+                    <div class="glass-card kpi-card">
+                        <div class="kpi-label">Tool Error Rate</div>
+                        <div class="kpi-val highlight-amber" id="kpi-error-rate">0.0 <span class="kpi-sub">%</span></div>
+                    </div>
+                </div>
+
+                <!-- Telemetry Charts Grid -->
+                <div class="telemetry-charts-grid">
+                    <!-- Chart 1: Tool Invocations & Active Workload Velocity -->
+                    <div class="glass-card chart-card">
+                        <div class="chart-header">
+                            <div class="chart-title">Tool Invocations & Workload Velocity</div>
+                            <div class="chart-legend">
+                                <span class="legend-item"><i class="dot dot-cyan"></i> Tool Invocations (calls/s)</span>
+                                <span class="legend-item"><i class="dot dot-magenta"></i> Active Sessions</span>
+                            </div>
+                        </div>
+                        <div class="svg-chart-container" id="token-velocity-chart">
+                            <svg class="metric-svg" id="token-svg" viewBox="0 0 800 240"></svg>
+                        </div>
+                    </div>
+
+                    <!-- Chart 2: Step Duration & Peak Envelope -->
+                    <div class="glass-card chart-card">
+                        <div class="chart-header">
+                            <div>
+                                <div class="chart-title">Step Duration & Latency Envelope</div>
+                                <p class="chart-subtitle">P95 envelope tracks 95th percentile upper variance. Latency health: &lt; 3s Normal, 3–8s Moderate, &gt; 8s Degraded.</p>
+                            </div>
+                            <div class="chart-legend">
+                                <span class="legend-item"><i class="dot dot-blue"></i> Avg Duration</span>
+                                <span class="legend-item"><i class="dot dot-amber"></i> P95 Envelope</span>
+                            </div>
+                        </div>
+                        <div class="svg-chart-container" id="latency-chart">
+                            <svg class="metric-svg" id="latency-svg" viewBox="0 0 800 240"></svg>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tool Invocation Matrix Card -->
+                <div class="glass-card tool-matrix-card">
+                    <div class="card-header">
+                        <h2>Tool Invocations by Category</h2>
+                        <span class="badge badge-cyan" id="tools-total-badge">0 Calls</span>
+                    </div>
+                    <div class="tool-matrix-body" id="tool-matrix-container">
+                        <div class="loading-placeholder">Loading tool execution metrics...</div>
+                    </div>
+                </div>
+
+                <!-- Live Agent Lifecycle Waterfall -->
+                <div class="glass-card waterfall-card">
+                    <div class="card-header">
+                        <h2>Live Agent Lifecycle Waterfall & Turns</h2>
+                        <div class="waterfall-controls">
+                            <select id="waterfall-session-select" class="session-dropdown">
+                                <option value="">Select an Agent Session...</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="waterfall-timeline-container" id="waterfall-container">
+                        <div class="waterfall-empty-hint">Select a session above to inspect turn breakdown, tool executions, and approval wait times.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Subpanel 3: Action Approvals & Mobile Companion -->
+            <div class="aimon-subpanel hidden" id="subpanel-approvals">
+                <div class="approvals-grid">
+                    <!-- Pending Approvals Card -->
+                    <div class="glass-card pending-approvals-card">
+                        <div class="card-header">
+                            <h2>Pending Action Approvals</h2>
+                            <span class="badge badge-amber" id="pending-approvals-count">0 Pending</span>
+                        </div>
+                        <div class="pending-list" id="pending-approvals-list">
+                            <div class="no-pending-hint">
+                                <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="1.8" fill="none">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <polyline points="12 6 12 12 14 14"></polyline>
+                                </svg>
+                                <p>No actions currently waiting for approval.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Mobile Companion Pairing Card -->
+                    <div class="glass-card mobile-pairing-card">
+                        <div class="card-header">
+                            <h2>Mobile Companion Pairing</h2>
+                            <span class="badge badge-cyan">WireGuard / Tailscale / LAN</span>
+                        </div>
+                        <div class="pairing-content">
+                            <div class="qr-placeholder-box" id="qr-container-box">
+                                <div class="qr-code-canvas-box" id="pairing-qr-svg"></div>
+                                <div class="secret-code-display" id="pairing-secret-display">Generating...</div>
+                                <div class="pairing-countdown" id="pairing-countdown">Valid for 300s</div>
+                            </div>
+                            <div class="pairing-instructions">
+                                <h3>How to Pair Your Android Phone:</h3>
+                                <ol>
+                                    <li>Launch <strong>aimon Companion</strong> on your Android device.</li>
+                                    <li>Tap <strong>Scan QR / Enter Secret</strong> and point your camera at the QR code above.</li>
+                                    <li>Approvals for sensitive tools (<code>run_command</code>, <code>write_to_file</code>) will vibrate directly on your lock screen with <code>[Approve]</code> and <code>[Deny]</code> action buttons.</li>
+                                </ol>
+                                <button type="button" class="btn-refresh" id="btn-new-qr">Regenerate Secret</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Connected Devices Card -->
+                    <div class="glass-card devices-card">
+                        <div class="card-header">
+                            <h2>Paired Mobile Devices</h2>
+                        </div>
+                        <div class="devices-list" id="paired-devices-list">
+                            <div class="loading-placeholder">Loading paired devices...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </main>
+
 
         <!-- Dynamic Discovered Monitor Embedded Panels -->
         <div id="dynamic-panels"></div>
@@ -247,7 +424,8 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
         </footer>
     </div>
 
-    <script src="app.js?v=1.0.6"></script>
+    <script src="qrcode.js"></script>
+    <script src="app.js?v=1.0.7"></script>
 </body>
 </html>
 )raw_asset";
@@ -2067,7 +2245,10 @@ body {
     border: 1px solid var(--border-color);
     border-radius: 14px;
     overflow-x: auto;
+    white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
     scrollbar-width: thin;
+    flex-wrap: nowrap;
 }
 
 .monitor-tab {
@@ -2086,6 +2267,7 @@ body {
     transition: all 0.2s ease;
     white-space: nowrap;
     user-select: none;
+    flex-shrink: 0;
 }
 
 .monitor-tab:hover {
@@ -2137,10 +2319,118 @@ body {
     color: var(--cyan-glow);
 }
 
+/* Aimon Sub-Navigation Tab Bar & Subpanels */
+.aimon-subnav-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: rgba(13, 19, 33, 0.65);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    margin-bottom: 18px;
+    overflow-x: auto;
+    white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+    flex-wrap: nowrap;
+}
+
+.aimon-subnav-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 14px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-family: var(--font-sans);
+    font-size: 0.82rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    white-space: nowrap;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.aimon-subnav-tab:hover {
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--text-primary);
+    transform: translateY(-1px);
+}
+
+.aimon-subnav-tab.active {
+    background: rgba(0, 242, 254, 0.12);
+    border-color: rgba(0, 242, 254, 0.35);
+    color: #ffffff;
+    box-shadow: 0 0 14px rgba(0, 242, 254, 0.12);
+}
+
+.aimon-subnav-tab .subnav-indicator {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.25);
+    transition: all 0.2s ease;
+}
+
+.aimon-subnav-tab.active .subnav-indicator {
+    background: var(--cyan-glow);
+    box-shadow: 0 0 8px var(--cyan-glow);
+}
+
+.aimon-subnav-tab .tab-badge {
+    font-size: 0.68rem;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+}
+
+.aimon-subnav-tab.active .tab-badge {
+    background: rgba(0, 242, 254, 0.2);
+    color: var(--cyan-glow);
+}
+
+.aimon-subpanel {
+    display: none;
+    width: 100%;
+    animation: fadeInSubpanel 0.2s ease;
+}
+
+.aimon-subpanel.active {
+    display: block;
+}
+
+.aimon-subpanel.dashboard-grid.active {
+    display: grid;
+}
+
+.aimon-subpanel.hidden,
+.aimon-subpanel:not(.active) {
+    display: none !important;
+}
+
+@keyframes fadeInSubpanel {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
 /* View panels */
 .view-panel {
+    display: none;
     width: 100%;
     transition: opacity 0.2s ease;
+}
+
+.view-panel.active {
+    display: block;
+}
+
+.dashboard-grid.view-panel.active {
+    display: grid;
 }
 
 .view-panel.hidden {
@@ -2150,16 +2440,25 @@ body {
 /* Discovered Monitor Frame Container & Panels */
 .monitor-frame-container,
 .monitor-frame-panel {
-    display: flex;
+    display: none;
     flex-direction: column;
     background: var(--bg-card);
     backdrop-filter: blur(16px);
     border: 1px solid var(--border-color);
     border-radius: 16px;
     overflow: hidden;
-    height: calc(100vh - 190px);
-    min-height: 680px;
+    height: calc(100vh - 210px);
+    min-height: 520px;
     box-shadow: 0 16px 36px rgba(0, 0, 0, 0.35);
+}
+
+.monitor-frame-panel.active {
+    display: flex !important;
+}
+
+.monitor-frame-panel.hidden,
+.monitor-frame-panel:not(.active) {
+    display: none !important;
 }
 
 .frame-toolbar {
@@ -2334,6 +2633,718 @@ body {
 .offline-details code {
     color: #f87171;
 }
+
+/* ==========================================================================
+   Agent Telemetry & Historical Analytics Styles
+   ========================================================================== */
+
+.telemetry-header-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    margin-bottom: 20px;
+    background: rgba(15, 23, 42, 0.65);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+}
+
+.telemetry-title-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.telemetry-title-group h2 {
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.timeframe-selector {
+    display: flex;
+    gap: 4px;
+    background: rgba(0, 0, 0, 0.35);
+    padding: 4px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.time-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.time-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.time-btn.active {
+    background: rgba(6, 182, 212, 0.25);
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.4);
+    box-shadow: 0 0 12px rgba(6, 182, 212, 0.2);
+}
+
+/* KPI Summary Cards */
+.telemetry-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 20px;
+}
+
+.kpi-card {
+    padding: 18px 20px;
+    background: rgba(15, 23, 42, 0.6);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.kpi-label {
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.kpi-val {
+    font-size: 1.65rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+.kpi-sub {
+    font-size: 0.85rem;
+    font-weight: 400;
+    color: var(--text-muted);
+}
+
+/* Charts Grid */
+.telemetry-charts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+    gap: 20px;
+    margin-bottom: 20px;
+}
+
+.chart-card {
+    padding: 20px;
+    background: rgba(15, 23, 42, 0.6);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+}
+
+.chart-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+}
+
+.chart-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.chart-subtitle {
+    font-size: 0.74rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+.chart-legend {
+    display: flex;
+    gap: 14px;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.dot-cyan { background: #38bdf8; }
+.dot-blue { background: #3b82f6; }
+.dot-amber { background: #f59e0b; }
+.dot-magenta { background: #e879f9; }
+
+.svg-chart-container {
+    width: 100%;
+    height: 220px;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    overflow: hidden;
+    position: relative;
+}
+
+.metric-svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+/* Tool Invocations Matrix */
+.tool-matrix-card {
+    padding: 20px;
+    margin-bottom: 20px;
+    background: rgba(15, 23, 42, 0.6);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+}
+
+.tool-matrix-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 14px;
+}
+
+.tool-row {
+    display: grid;
+    grid-template-columns: 180px 1fr 100px 80px;
+    align-items: center;
+    gap: 14px;
+    font-size: 0.84rem;
+}
+
+.tool-name-col {
+    font-family: var(--font-mono);
+    color: #38bdf8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tool-bar-track {
+    height: 8px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.tool-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: linear-gradient(90deg, #06b6d4, #3b82f6);
+    transition: width 0.4s ease;
+}
+
+.tool-bar-fill.error-fill {
+    background: linear-gradient(90deg, #f59e0b, #ef4444);
+}
+
+.tool-count-col {
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+    text-align: right;
+}
+
+.tool-duration-col {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    color: var(--text-muted);
+    text-align: right;
+}
+
+/* Live Agent Lifecycle Waterfall */
+.waterfall-card {
+    padding: 20px;
+    background: rgba(15, 23, 42, 0.6);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+    margin-bottom: 20px;
+}
+
+.waterfall-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.session-dropdown {
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--text-primary);
+    font-size: 0.84rem;
+    padding: 6px 14px;
+    border-radius: 8px;
+    outline: none;
+    cursor: pointer;
+}
+
+.waterfall-timeline-container {
+    margin-top: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.waterfall-turn-row {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: rgba(0, 0, 0, 0.25);
+    padding: 12px 16px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.turn-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.82rem;
+    font-weight: 600;
+}
+
+.turn-timeline-track {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+    max-height: 240px;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.turn-timeline-track::-webkit-scrollbar {
+    width: 6px;
+}
+
+.turn-timeline-track::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+}
+
+.wf-block {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.78rem;
+    font-family: var(--font-mono);
+    border: 1px solid transparent;
+}
+
+.wf-block-prompt {
+    background: rgba(168, 85, 247, 0.15);
+    border-color: rgba(168, 85, 247, 0.35);
+    color: #c084fc;
+}
+
+.wf-block-think {
+    background: rgba(6, 182, 212, 0.15);
+    border-color: rgba(6, 182, 212, 0.35);
+    color: #38bdf8;
+}
+
+.wf-block-tool {
+    background: rgba(34, 197, 94, 0.15);
+    border-color: rgba(34, 197, 94, 0.35);
+    color: #4ade80;
+}
+
+.wf-block-approval {
+    background: rgba(245, 158, 11, 0.15);
+    border-color: rgba(245, 158, 11, 0.45);
+    color: #fbbf24;
+    animation: pulseGlow 2s infinite ease-in-out;
+}
+
+.wf-block-error {
+    background: rgba(239, 68, 68, 0.15);
+    border-color: rgba(239, 68, 68, 0.35);
+    color: #f87171;
+}
+
+@keyframes pulseGlow {
+    0%, 100% { box-shadow: 0 0 6px rgba(245, 158, 11, 0.2); }
+    50% { box-shadow: 0 0 16px rgba(245, 158, 11, 0.5); }
+}
+
+/* ==========================================================================
+   Action Approvals & Mobile Companion Styles
+   ========================================================================== */
+
+.approvals-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+    gap: 20px;
+    margin-bottom: 20px;
+}
+
+.pending-approvals-card,
+.mobile-pairing-card,
+.devices-card {
+    padding: 20px;
+    background: rgba(15, 23, 42, 0.6);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+}
+
+.pending-list {
+    margin-top: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.no-pending-hint {
+    text-align: center;
+    padding: 36px 16px;
+    color: var(--text-muted);
+}
+
+.no-pending-hint svg {
+    opacity: 0.6;
+    margin-bottom: 8px;
+}
+
+.approval-item-card {
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.approval-item-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.approval-tool-badge {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: #fbbf24;
+}
+
+.approval-item-body {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    background: rgba(0, 0, 0, 0.4);
+    padding: 10px 14px;
+    border-radius: 6px;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.approval-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.btn-approve {
+    background: rgba(34, 197, 94, 0.25);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.45);
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-approve:hover {
+    background: rgba(34, 197, 94, 0.4);
+    box-shadow: 0 0 14px rgba(34, 197, 94, 0.35);
+}
+
+.btn-deny {
+    background: rgba(239, 68, 68, 0.2);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-deny:hover {
+    background: rgba(239, 68, 68, 0.35);
+}
+
+/* Pairing Card */
+.pairing-content {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px;
+    margin-top: 14px;
+    align-items: center;
+}
+
+.qr-placeholder-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-width: 190px;
+    background: rgba(0, 0, 0, 0.5);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    border-radius: 14px;
+    padding: 16px;
+    text-align: center;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35), inset 0 0 16px rgba(56, 189, 248, 0.04);
+}
+
+.qr-code-canvas-box {
+    width: 160px;
+    height: 160px;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.qr-code-canvas-box svg {
+    width: 100%;
+    height: 100%;
+    border-radius: 8px;
+}
+
+.secret-code-display {
+    font-family: var(--font-mono);
+    font-size: 0.92rem;
+    font-weight: 700;
+    color: #38bdf8;
+    word-break: break-all;
+    letter-spacing: 0.05em;
+}
+
+.pairing-countdown {
+    font-size: 0.74rem;
+    color: var(--text-muted);
+    margin-top: 8px;
+}
+
+.pairing-instructions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 0.84rem;
+    color: var(--text-secondary);
+}
+
+.pairing-instructions h3 {
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.pairing-instructions ol {
+    margin: 0;
+    padding-left: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.devices-list {
+    margin-top: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.device-item-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(0, 0, 0, 0.3);
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.device-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.device-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 0.86rem;
+}
+
+.device-meta {
+    font-size: 0.74rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+.btn-revoke {
+    background: transparent;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #f87171;
+    font-size: 0.76rem;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-revoke:hover {
+    background: rgba(239, 68, 68, 0.2);
+}
+
+/* ==========================================================================
+   Responsive Viewport & Mobile Breakpoints (< 600px & < 900px)
+   ========================================================================== */
+
+@media (max-width: 600px) {
+    .app-container {
+        padding: 12px 10px 24px;
+        gap: 14px;
+    }
+
+    .navbar {
+        padding: 12px 14px;
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+
+    .brand h1 {
+        font-size: 1.05rem;
+    }
+
+    .badge-sub {
+        display: none;
+    }
+
+    .actions {
+        gap: 8px;
+    }
+
+    .last-updated {
+        font-size: 0.74rem;
+        white-space: nowrap;
+    }
+
+    .btn-refresh {
+        padding: 6px 10px;
+        font-size: 0.76rem;
+    }
+
+    .telemetry-header-bar {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+    }
+
+    .timeframe-selector {
+        width: 100%;
+        overflow-x: auto;
+        justify-content: space-between;
+    }
+
+    .time-btn {
+        flex: 1;
+        padding: 4px 8px;
+        font-size: 0.74rem;
+        text-align: center;
+    }
+
+    .telemetry-kpi-grid {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 10px;
+    }
+
+    .chart-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+    }
+
+    .chart-legend {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .tool-row {
+        grid-template-columns: 110px 1fr 65px;
+        gap: 8px;
+    }
+
+    .tool-duration-col {
+        display: none;
+    }
+
+    .tool-bar-track {
+        min-width: 50px;
+        flex: 1 1 auto;
+    }
+
+    .waterfall-turn-row .turn-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+    }
+
+    .waterfall-turn-row .badge {
+        max-width: 100%;
+        text-overflow: ellipsis;
+        overflow: hidden;
+        white-space: nowrap;
+        font-size: 0.7rem;
+    }
+
+    .details-box {
+        min-width: 120px;
+    }
+
+    .details-box .detail-value {
+        white-space: nowrap;
+    }
+
+    .spend-content-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .approvals-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+
 )raw_asset";
 
 inline const char* APP_JS = R"raw_asset(//
@@ -2590,49 +3601,57 @@ function renderCursor(cr) {
     const errorBanner = document.getElementById('cursor-error');
 
     if (!cr || !cr.is_authenticated) {
-        statusDot.className = 'dot-status dot-offline';
-        planBadge.textContent = cr ? (cr.plan_tier || 'Free') : 'Unauthenticated';
-        planBadge.className = 'badge';
-        ratioEl.textContent = '-- / --';
-        progressBar.style.width = '0%';
-        remainingTxt.textContent = 'Unauthenticated';
-        percentTxt.textContent = '0%';
-        resetDateEl.textContent = '--';
-        daysRemainingEl.textContent = '--';
+        if (statusDot) statusDot.className = 'dot-status dot-offline';
+        if (planBadge) {
+            planBadge.textContent = cr ? (cr.plan_tier || 'Free') : 'Unauthenticated';
+            planBadge.className = 'badge';
+        }
+        if (ratioEl) ratioEl.textContent = '-- / --';
+        if (progressBar) progressBar.style.width = '0%';
+        if (remainingTxt) remainingTxt.textContent = 'Unauthenticated';
+        if (percentTxt) percentTxt.textContent = '0%';
+        if (resetDateEl) resetDateEl.textContent = '--';
+        if (daysRemainingEl) daysRemainingEl.textContent = '--';
 
         if (cr && cr.error_message) {
-            errorBanner.textContent = cr.error_message;
-            errorBanner.classList.remove('hidden');
+            if (errorBanner) {
+                errorBanner.textContent = cr.error_message;
+                errorBanner.classList.remove('hidden');
+            }
         }
         return;
     }
 
-    statusDot.className = 'dot-status dot-online';
-    planBadge.textContent = cr.plan_tier || 'Pro';
-    planBadge.className = 'badge badge-magenta';
-    errorBanner.classList.add('hidden');
+    if (statusDot) statusDot.className = 'dot-status dot-online';
+    if (planBadge) {
+        planBadge.textContent = cr.plan_tier || 'Pro';
+        planBadge.className = 'badge badge-magenta';
+    }
+    if (errorBanner) errorBanner.classList.add('hidden');
 
     const used = cr.fast_requests_used || 0;
     const limit = cr.fast_requests_limit || 0;
-    ratioEl.textContent = `${used.toLocaleString()} / ${limit.toLocaleString()}`;
+    if (ratioEl) ratioEl.textContent = `${used.toLocaleString()} / ${limit.toLocaleString()}`;
 
     const frac = limit > 0 ? Math.min(1, used / limit) : 0;
     const pct = Math.round(frac * 100);
-    progressBar.style.width = `${pct}%`;
-    percentTxt.textContent = `${pct}% used`;
+    if (progressBar) progressBar.style.width = `${pct}%`;
+    if (percentTxt) percentTxt.textContent = `${pct}% used`;
 
     const remaining = Math.max(0, limit - used);
-    remainingTxt.textContent = `${remaining.toLocaleString()} fast requests remaining`;
+    if (remainingTxt) remainingTxt.textContent = `${remaining.toLocaleString()} fast requests remaining`;
 
-    if (cr.cycle_reset_iso) {
-        const resetDate = new Date(cr.cycle_reset_iso);
-        resetDateEl.textContent = resetDate.toLocaleDateString();
+    if (resetDateEl && daysRemainingEl) {
+        if (cr.cycle_reset_iso) {
+            const resetDate = new Date(cr.cycle_reset_iso);
+            resetDateEl.textContent = resetDate.toLocaleDateString();
 
-        const diffDays = Math.ceil((resetDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
-        daysRemainingEl.textContent = diffDays > 0 ? `${diffDays} days left` : 'Reset pending';
-    } else {
-        resetDateEl.textContent = 'N/A';
-        daysRemainingEl.textContent = '--';
+            const diffDays = Math.ceil((resetDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+            daysRemainingEl.textContent = diffDays > 0 ? `${diffDays} days left` : 'Reset pending';
+        } else {
+            resetDateEl.textContent = 'N/A';
+            daysRemainingEl.textContent = '--';
+        }
     }
 
     renderCursorSpend(cr);
@@ -2692,19 +3711,19 @@ function renderCursorSpend(cr) {
     if (lblMid2) lblMid2.textContent = `$${Math.round(yMax * 0.75)}`;
     if (lblMid1) lblMid1.textContent = `$${Math.round(yMax * 0.5)}`;
 
-    // Chart bounds (viewBox 0 0 420 170)
-    const chartLeft = 55;
-    const chartRight = 405;
-    const chartBottom = 145;
-    const chartTop = 25;
+    // Chart bounds (viewBox 0 0 420 160)
+    const chartLeft = 50;
+    const chartRight = 410;
+    const chartBottom = 135;
+    const chartTop = 20;
     const width = chartRight - chartLeft;
     const height = chartBottom - chartTop;
 
     const n = history.length;
     let pathD = '';
     let areaD = '';
-    dotsGroup.innerHTML = '';
-    datesAxis.innerHTML = '';
+    if (dotsGroup) dotsGroup.innerHTML = '';
+    if (datesAxis) datesAxis.innerHTML = '';
 
     const points = history.map((pt, i) => {
         const x = n === 1 ? chartLeft + width / 2 : chartLeft + (i / (n - 1)) * width;
@@ -2724,42 +3743,47 @@ function renderCursorSpend(cr) {
             }
 
             // Dot element
-            const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-            circle.setAttribute('cx', p.x.toFixed(1));
-            circle.setAttribute('cy', p.y.toFixed(1));
-            circle.setAttribute('r', '4');
-            circle.setAttribute('class', 'chart-dot');
+            if (dotsGroup) {
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', p.x.toFixed(1));
+                circle.setAttribute('cy', p.y.toFixed(1));
+                circle.setAttribute('r', '4');
+                circle.setAttribute('class', 'chart-dot');
 
-            const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-            const dayLabel = p.pt.day_str || '';
-            title.textContent = `${dayLabel}\nDaily: $${(p.pt.spend_usd || 0).toFixed(2)}\nCumulative: $${(p.pt.cumulative_usd || 0).toFixed(2)}`;
-            circle.appendChild(title);
-            dotsGroup.appendChild(circle);
+                const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+                const dayLabel = p.pt.day_str || '';
+                title.textContent = `${dayLabel}\nDaily: $${(p.pt.spend_usd || 0).toFixed(2)}\nCumulative: $${(p.pt.cumulative_usd || 0).toFixed(2)}`;
+                circle.appendChild(title);
+                dotsGroup.appendChild(circle);
+            }
 
             // Date label on X axis
-            const shouldShowLabel = (n <= 7) || (idx === 0) || (idx === n - 1) || (idx % Math.ceil(n / 5) === 0);
-            if (shouldShowLabel) {
-                const dateLbl = document.createElement('span');
-                dateLbl.className = 'chart-date-item';
-                if (dayLabel) {
-                    const parts = dayLabel.split('-');
-                    if (parts.length === 3) {
-                        const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-                        const mIdx = parseInt(parts[1], 10) - 1;
-                        const dayNum = parseInt(parts[2], 10);
-                        dateLbl.textContent = `${monthNames[mIdx]} ${dayNum}`;
-                    } else {
-                        dateLbl.textContent = dayLabel;
+            if (datesAxis) {
+                const shouldShowLabel = (n <= 7) || (idx === 0) || (idx === n - 1) || (idx % Math.ceil(n / 5) === 0);
+                if (shouldShowLabel) {
+                    const dateLbl = document.createElement('span');
+                    dateLbl.className = 'chart-date-item';
+                    const dayLabel = p.pt.day_str || '';
+                    if (dayLabel) {
+                        const parts = dayLabel.split('-');
+                        if (parts.length === 3) {
+                            const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                            const mIdx = parseInt(parts[1], 10) - 1;
+                            const dayNum = parseInt(parts[2], 10);
+                            dateLbl.textContent = `${monthNames[mIdx]} ${dayNum}`;
+                        } else {
+                            dateLbl.textContent = dayLabel;
+                        }
                     }
+                    datesAxis.appendChild(dateLbl);
                 }
-                datesAxis.appendChild(dateLbl);
             }
         });
 
         areaD += ` L ${points[points.length - 1].x.toFixed(1)} ${chartBottom} Z`;
 
-        linePath.setAttribute('d', pathD);
-        areaPath.setAttribute('d', areaD);
+        if (linePath) linePath.setAttribute('d', pathD);
+        if (areaPath) areaPath.setAttribute('d', areaD);
     }
 
     // Categories Breakdown
@@ -2925,6 +3949,9 @@ async function fetchSessions() {
 }
 
 function setupSse() {
+    if (window.location.search.includes('no_sse')) {
+        return;
+    }
     try {
         const source = new EventSource('/sse');
         source.onmessage = (e) => {
@@ -2982,18 +4009,59 @@ async function fetchMonitors() {
     }
 }
 
+let activeAimonSubpanel = 'quotas';
+
+function switchToAimonSubpanel(subpanelId) {
+    if (!subpanelId) subpanelId = 'quotas';
+    activeAimonSubpanel = subpanelId;
+
+    // Update aimon subnav tabs
+    const subnavEl = document.getElementById('aimon-subnav');
+    if (subnavEl) {
+        subnavEl.querySelectorAll('.aimon-subnav-tab').forEach(tab => {
+            const id = tab.getAttribute('data-subpanel');
+            if (id === subpanelId) {
+                tab.classList.add('active');
+            } else {
+                tab.classList.remove('active');
+            }
+        });
+    }
+
+    // Toggle subpanels
+    document.querySelectorAll('.aimon-subpanel').forEach(panel => {
+        if (panel.id === `subpanel-${subpanelId}`) {
+            panel.classList.add('active');
+            panel.classList.remove('hidden');
+        } else {
+            panel.classList.remove('active');
+            panel.classList.add('hidden');
+        }
+    });
+
+    if (subpanelId === 'telemetry') {
+        fetchTelemetryOverview();
+        fetchTelemetryTimeseries();
+        fetchTelemetryTools();
+        fetchTelemetrySessions();
+    } else if (subpanelId === 'approvals') {
+        fetchPendingApprovals();
+        fetchMobileQr();
+        fetchMobileDevices();
+    }
+}
+
 function renderMonitorTabs(monitors) {
     const navEl = document.getElementById('monitor-tabs');
     const dynamicPanelsEl = document.getElementById('dynamic-panels');
     if (!navEl) return;
 
-    // Ensure aimon is present
-    let list = Array.isArray(monitors) ? [...monitors] : [];
-    if (!list.some(m => m.id === 'aimon')) {
-        list.unshift({
+    // Top-level peer monitors: aimon (Hub / Self) + external satellite monitors
+    const nativeTabs = [
+        {
             id: 'aimon',
-            name: 'AI Quotas',
-            short_name: 'AI Quotas',
+            name: 'aimon',
+            short_name: 'aimon',
             subsystem: 'aimon',
             host: '127.0.0.1',
             port: window.location.port || 3883,
@@ -3001,11 +4069,14 @@ function renderMonitorTabs(monitors) {
             connected: true,
             reachable: true,
             is_self: true,
+            badge: 'Hub',
+            badgeClass: '',
             priority: 0
-        });
-    }
+        }
+    ];
 
-    list.sort((a, b) => {
+    let externalMonitors = Array.isArray(monitors) ? monitors.filter(m => m.id !== 'aimon' && m.id !== 'telemetry' && m.id !== 'approvals') : [];
+    externalMonitors.sort((a, b) => {
         const pa = (a.priority !== undefined) ? a.priority : 100;
         const pb = (b.priority !== undefined) ? b.priority : 100;
         if (pa !== pb) return pa - pb;
@@ -3018,20 +4089,23 @@ function renderMonitorTabs(monitors) {
         return (a.port || 0) - (b.port || 0);
     });
 
+    const allTabs = [...nativeTabs, ...externalMonitors];
+
     // Render navigation tabs
-    navEl.innerHTML = list.map(m => {
+    navEl.innerHTML = allTabs.map(m => {
         const isActive = (m.id === activeMonitorId);
         const activeClass = isActive ? ' active' : '';
         const isOnline = Boolean(m.connected && m.reachable);
         const indClass = isOnline ? 'tab-indicator-online' : 'tab-indicator-offline';
-        const badgeText = (m.is_self || m.isSelf) ? 'Self' : (m.subsystem || `${m.port}`);
+        const badgeText = m.badge || ((m.is_self || m.isSelf) ? 'Hub' : (m.subsystem || `${m.port}`));
+        const badgeClass = m.badgeClass ? ` ${m.badgeClass}` : '';
         const displayLabel = m.short_name || m.name || m.subsystem || m.id;
 
         return `
-            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(m.id)}" title="${escapeHtml(m.name || m.id)} (${m.host}:${m.port})">
+            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(m.id)}" title="${escapeHtml(m.name || m.id)}">
                 <span class="tab-indicator ${indClass}"></span>
                 <span class="tab-title">${escapeHtml(displayLabel)}</span>
-                <span class="tab-badge">${escapeHtml(badgeText)}</span>
+                <span class="tab-badge${badgeClass}">${escapeHtml(badgeText)}</span>
             </button>
         `;
     }).join('');
@@ -3047,14 +4121,14 @@ function renderMonitorTabs(monitors) {
     // Synchronize persistent iframe panels in #dynamic-panels
     if (dynamicPanelsEl) {
         // Prune orphaned panels
-        const activePanelIds = new Set(list.filter(m => !m.is_self && !m.isSelf).map(m => `panel-${m.id}`));
+        const activePanelIds = new Set(externalMonitors.map(m => `panel-${m.id}`));
         dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(p => {
             if (!activePanelIds.has(p.id)) {
                 p.remove();
             }
         });
 
-        list.forEach(m => {
+        externalMonitors.forEach(m => {
             if (m.is_self || m.isSelf) return;
 
             let panel = document.getElementById(`panel-${m.id}`);
@@ -3064,7 +4138,9 @@ function renderMonitorTabs(monitors) {
             if (!panel) {
                 panel = document.createElement('div');
                 panel.id = `panel-${m.id}`;
-                panel.className = `monitor-frame-panel view-panel${m.id === activeMonitorId ? '' : ' hidden'}`;
+                panel.setAttribute('data-subsystem', m.subsystem || m.id);
+                const isSelected = (m.id === activeMonitorId || (m.subsystem && m.subsystem === activeMonitorId));
+                panel.className = `monitor-frame-panel view-panel${isSelected ? ' active' : ' hidden'}`;
                 panel.innerHTML = `
                     <div class="frame-toolbar">
                         <div class="frame-info">
@@ -3171,12 +4247,507 @@ function renderMonitorTabs(monitors) {
 
         if (window.location.hash) {
             const hash = window.location.hash.replace(/^#/, '');
-            const target = monitors.find(m => m.id === hash || m.subsystem === hash);
+            const target = allTabs.find(m => m.id === hash || m.subsystem === hash);
             if (target && activeMonitorId !== target.id) {
                 switchToMonitor(target.id);
             }
         }
     }
+}
+
+// ==========================================================================
+// Agent Telemetry, Historical Analytics & Approvals Frontend Engine
+// ==========================================================================
+
+let activeTelemetryWindow = '24h';
+let telemetryTimer = null;
+let approvalsTimer = null;
+
+async function fetchTelemetryOverview() {
+    try {
+        const res = await fetch('/api/telemetry/overview');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        const activeSessionsEl = document.getElementById('kpi-active-sessions');
+        const totalToolsEl = document.getElementById('kpi-total-tools');
+        const avgLatencyEl = document.getElementById('kpi-avg-latency');
+        const errorRateEl = document.getElementById('kpi-error-rate');
+
+        if (activeSessionsEl) activeSessionsEl.innerHTML = `${data.active_sessions || 0} <span class="kpi-sub">running</span>`;
+        if (totalToolsEl) {
+            totalToolsEl.innerHTML = `${(data.total_tool_calls || 0).toLocaleString()} <span class="kpi-sub">calls</span>`;
+        }
+        if (avgLatencyEl) {
+            const avgSec = ((data.avg_turn_latency_ms || 0) / 1000.0).toFixed(2);
+            avgLatencyEl.innerHTML = `${avgSec} <span class="kpi-sub">sec</span>`;
+        }
+        if (errorRateEl) {
+            const errPct = (data.error_rate_pct || 0).toFixed(1);
+            errorRateEl.innerHTML = `${errPct} <span class="kpi-sub">%</span>`;
+        }
+    } catch (_) {}
+}
+
+function formatChartValue(val, isLatency) {
+    if (isLatency) {
+        if (val < 1000) return `${Math.round(val)}ms`;
+        if (val < 60000) return `${(val / 1000).toFixed(1)}s`;
+        return `${(val / 60000).toFixed(1)}m`;
+    }
+    if (val >= 1000) return `${(val / 1000).toFixed(1)}k`;
+    if (val === Math.round(val)) return `${val}`;
+    return val.toFixed(1);
+}
+
+function renderSvgLineChart(svgId, timestamps, series1, series2, color1, color2, isDualAxis = false) {
+    const svg = document.getElementById(svgId);
+    if (!svg) return;
+
+    if (!timestamps || timestamps.length < 2) {
+        svg.innerHTML = '<text x="400" y="120" fill="rgba(255,255,255,0.3)" font-size="12" text-anchor="middle" font-family="sans-serif">Accumulating telemetry data points...</text>';
+        return;
+    }
+
+    const width = 800;
+    const height = 240;
+    const padL = 65;
+    const padR = isDualAxis ? 50 : 25;
+    const padT = 20;
+    const padB = 35;
+
+    const plotW = width - padL - padR;
+    const plotH = height - padT - padB;
+    const pointsCount = timestamps.length;
+    const isLatency = (svgId === 'latency-svg');
+
+    let maxVal1 = Math.max(...series1, 0);
+    if (maxVal1 <= 0) maxVal1 = 1;
+    maxVal1 = maxVal1 * 1.15;
+
+    let maxVal2 = Math.max(...series2, 0);
+    if (maxVal2 <= 0) maxVal2 = 1;
+    maxVal2 = maxVal2 * 1.15;
+
+    if (!isDualAxis) {
+        const combinedMax = Math.max(maxVal1, maxVal2);
+        maxVal1 = combinedMax;
+        maxVal2 = combinedMax;
+    }
+
+    const getX = (idx) => padL + (idx / (pointsCount - 1)) * plotW;
+    const getY1 = (val) => padT + plotH - (Math.max(0, val) / maxVal1) * plotH;
+    const getY2 = (val) => padT + plotH - (Math.max(0, val) / maxVal2) * plotH;
+
+    let path1 = '';
+    let path2 = '';
+    let area1 = `M ${getX(0)} ${padT + plotH} `;
+    let area2 = `M ${getX(0)} ${padT + plotH} `;
+
+    for (let i = 0; i < pointsCount; ++i) {
+        const x = getX(i);
+        const y1 = getY1(series1[i] || 0);
+        const y2 = getY2(series2[i] || 0);
+
+        if (i === 0) {
+            path1 += `M ${x} ${y1} `;
+            path2 += `M ${x} ${y2} `;
+        } else {
+            path1 += `L ${x} ${y1} `;
+            path2 += `L ${x} ${y2} `;
+        }
+        area1 += `L ${x} ${y1} `;
+        area2 += `L ${x} ${y2} `;
+    }
+
+    area1 += `L ${getX(pointsCount - 1)} ${padT + plotH} Z`;
+    area2 += `L ${getX(pointsCount - 1)} ${padT + plotH} Z`;
+
+    // Grid lines & Y-axis labels
+    let gridSvg = '';
+    const gridLines = 4;
+    for (let g = 0; g <= gridLines; ++g) {
+        const gy = padT + (g / gridLines) * plotH;
+        const gVal1 = ((gridLines - g) / gridLines) * maxVal1;
+        const gValStr1 = formatChartValue(gVal1, isLatency);
+
+        gridSvg += `<line x1="${padL}" y1="${gy}" x2="${width - padR}" y2="${gy}" stroke="rgba(255,255,255,0.06)" stroke-width="1" />`;
+        gridSvg += `<text x="${padL - 8}" y="${gy + 4}" fill="${color1}" fill-opacity="0.65" font-size="10" font-family="monospace" text-anchor="end">${gValStr1}</text>`;
+
+        if (isDualAxis) {
+            const gVal2 = Math.round(((gridLines - g) / gridLines) * maxVal2);
+            gridSvg += `<text x="${width - padR + 8}" y="${gy + 4}" fill="${color2}" fill-opacity="0.65" font-size="10" font-family="monospace" text-anchor="start">${gVal2}</text>`;
+        }
+    }
+
+    // X-Axis Timestamp Ticks (4-5 evenly spaced intervals)
+    let xTicksSvg = '';
+    const numXTicks = Math.min(5, pointsCount);
+    for (let t = 0; t < numXTicks; ++t) {
+        const idx = Math.floor(t * (pointsCount - 1) / (numXTicks - 1));
+        const tx = getX(idx);
+        const epoch = timestamps[idx];
+        const dateObj = new Date(epoch * 1000);
+        let timeStr = dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+        if (activeTelemetryWindow === '7d' || activeTelemetryWindow === '30d' || activeTelemetryWindow === '1y') {
+            timeStr = `${dateObj.getMonth() + 1}/${dateObj.getDate()} ${timeStr}`;
+        }
+        xTicksSvg += `<line x1="${tx}" y1="${padT + plotH}" x2="${tx}" y2="${padT + plotH + 5}" stroke="rgba(255,255,255,0.15)" stroke-width="1" />`;
+        xTicksSvg += `<text x="${tx}" y="${padT + plotH + 18}" fill="rgba(255,255,255,0.4)" font-size="10" font-family="monospace" text-anchor="middle">${timeStr}</text>`;
+    }
+
+    svg.innerHTML = `
+        <defs>
+            <linearGradient id="grad-${svgId}-1" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="${color1}" stop-opacity="0.25"/>
+                <stop offset="100%" stop-color="${color1}" stop-opacity="0.0"/>
+            </linearGradient>
+            <linearGradient id="grad-${svgId}-2" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="${color2}" stop-opacity="0.2"/>
+                <stop offset="100%" stop-color="${color2}" stop-opacity="0.0"/>
+            </linearGradient>
+        </defs>
+        ${gridSvg}
+        ${xTicksSvg}
+        <path d="${area2}" fill="url(#grad-${svgId}-2)" />
+        <path d="${area1}" fill="url(#grad-${svgId}-1)" />
+        <path d="${path2}" fill="none" stroke="${color2}" stroke-width="2" stroke-linecap="round" />
+        <path d="${path1}" fill="none" stroke="${color1}" stroke-width="2.2" stroke-linecap="round" />
+        <g id="tooltip-${svgId}" class="chart-tooltip-group" style="display: none;">
+            <line id="crosshair-${svgId}" x1="0" y1="${padT}" x2="0" y2="${padT + plotH}" stroke="rgba(255,255,255,0.35)" stroke-dasharray="3,3" stroke-width="1" />
+            <circle id="dot1-${svgId}" r="4" fill="${color1}" stroke="#ffffff" stroke-width="1.5" />
+            <circle id="dot2-${svgId}" r="4" fill="${color2}" stroke="#ffffff" stroke-width="1.5" />
+            <rect id="tip-bg-${svgId}" width="155" height="52" rx="6" fill="rgba(10, 14, 23, 0.92)" stroke="rgba(255,255,255,0.18)" stroke-width="1" />
+            <text id="tip-t-${svgId}" x="0" y="0" fill="#9ca3af" font-size="9" font-family="monospace"></text>
+            <text id="tip-v1-${svgId}" x="0" y="0" fill="${color1}" font-size="10" font-family="monospace" font-weight="bold"></text>
+            <text id="tip-v2-${svgId}" x="0" y="0" fill="${color2}" font-size="10" font-family="monospace" font-weight="bold"></text>
+        </g>
+        <rect class="svg-overlay-catcher" x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" fill="transparent" style="cursor: crosshair;" />
+    `;
+
+    // Interactive crosshair & tooltip
+    const catcher = svg.querySelector('.svg-overlay-catcher');
+    const tipGroup = svg.querySelector(`#tooltip-${svgId}`);
+    const crosshair = svg.querySelector(`#crosshair-${svgId}`);
+    const dot1 = svg.querySelector(`#dot1-${svgId}`);
+    const dot2 = svg.querySelector(`#dot2-${svgId}`);
+    const tipBg = svg.querySelector(`#tip-bg-${svgId}`);
+    const tipT = svg.querySelector(`#tip-t-${svgId}`);
+    const tipV1 = svg.querySelector(`#tip-v1-${svgId}`);
+    const tipV2 = svg.querySelector(`#tip-v2-${svgId}`);
+
+    if (catcher && tipGroup) {
+        catcher.addEventListener('mousemove', (e) => {
+            const rect = svg.getBoundingClientRect();
+            const mouseSvgX = ((e.clientX - rect.left) / rect.width) * width;
+            const normX = Math.max(0, Math.min(1, (mouseSvgX - padL) / plotW));
+            const idx = Math.round(normX * (pointsCount - 1));
+
+            const curX = getX(idx);
+            const val1 = series1[idx] || 0;
+            const val2 = series2[idx] || 0;
+            const curY1 = getY1(val1);
+            const curY2 = getY2(val2);
+
+            crosshair.setAttribute('x1', curX);
+            crosshair.setAttribute('x2', curX);
+            dot1.setAttribute('cx', curX);
+            dot1.setAttribute('cy', curY1);
+            dot2.setAttribute('cx', curX);
+            dot2.setAttribute('cy', curY2);
+
+            const epoch = timestamps[idx];
+            const tsStr = new Date(epoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+            tipT.textContent = `Time: ${tsStr}`;
+
+            if (isLatency) {
+                tipV1.textContent = `Avg: ${formatChartValue(val1, true)}`;
+                tipV2.textContent = `P95: ${formatChartValue(val2, true)}`;
+            } else {
+                tipV1.textContent = `Rate: ${val1.toFixed(1)} calls/s`;
+                tipV2.textContent = `Sessions: ${Math.round(val2)}`;
+            }
+
+            let boxX = curX + 10;
+            if (boxX + 160 > width - padR) {
+                boxX = curX - 165;
+            }
+            const boxY = padT + 8;
+            tipBg.setAttribute('x', boxX);
+            tipBg.setAttribute('y', boxY);
+            tipT.setAttribute('x', boxX + 8);
+            tipT.setAttribute('y', boxY + 14);
+            tipV1.setAttribute('x', boxX + 8);
+            tipV1.setAttribute('y', boxY + 29);
+            tipV2.setAttribute('x', boxX + 8);
+            tipV2.setAttribute('y', boxY + 44);
+
+            tipGroup.style.display = 'block';
+        });
+
+        catcher.addEventListener('mouseleave', () => {
+            tipGroup.style.display = 'none';
+        });
+    }
+}
+
+async function fetchTelemetryTimeseries() {
+    try {
+        const res = await fetch(`/api/telemetry/timeseries?window=${activeTelemetryWindow}&max_points=100`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data || !data.series) return;
+
+        const s = data.series;
+        const ts = s.timestamps || [];
+        const toolCalls = s.tool_calls_sec || [];
+        const activeAgents = s.active_agents || [];
+        const avgLat = s.avg_turn_latency_ms || [];
+        const p95Lat = s.p95_turn_latency_ms || [];
+
+        renderSvgLineChart('token-svg', ts, toolCalls, activeAgents, '#38bdf8', '#e879f9', true);
+        renderSvgLineChart('latency-svg', ts, avgLat, p95Lat, '#3b82f6', '#f59e0b', false);
+    } catch (_) {}
+}
+
+async function fetchTelemetryTools() {
+    try {
+        const res = await fetch('/api/telemetry/tools');
+        if (!res.ok) return;
+        const tools = await res.json();
+        const container = document.getElementById('tool-matrix-container');
+        const badge = document.getElementById('tools-total-badge');
+        if (!container) return;
+
+        if (!tools || tools.length === 0) {
+            container.innerHTML = '<div class="loading-placeholder">No tool execution telemetry recorded yet.</div>';
+            if (badge) badge.textContent = '0 Calls';
+            return;
+        }
+
+        let totalInvocations = 0;
+        let maxInvocations = 1;
+        tools.forEach(t => {
+            totalInvocations += (t.invocations || 0);
+            if ((t.invocations || 0) > maxInvocations) {
+                maxInvocations = t.invocations;
+            }
+        });
+        if (badge) badge.textContent = `${totalInvocations} Calls`;
+
+        container.innerHTML = tools.map(t => {
+            const inv = t.invocations || 0;
+            const pct = Math.round((inv / maxInvocations) * 100);
+            const errRate = (t.error_rate_pct || 0).toFixed(1);
+            const avgMs = Math.round(t.avg_duration_ms || 0);
+            const isError = t.error_count > 0;
+
+            return `
+                <div class="tool-row">
+                    <span class="tool-name-col" title="${escapeHtml(t.tool_name)}">${escapeHtml(t.tool_name)}</span>
+                    <div class="tool-bar-track">
+                        <div class="tool-bar-fill ${isError ? 'error-fill' : ''}" style="width: ${pct}%;"></div>
+                    </div>
+                    <span class="tool-count-col">${inv} calls ${errRate > 0 ? `<span class="text-amber">(${errRate}% err)</span>` : ''}</span>
+                    <span class="tool-duration-col">${avgMs} ms</span>
+                </div>
+            `;
+        }).join('');
+    } catch (_) {}
+}
+
+async function fetchTelemetrySessions() {
+    try {
+        const res = await fetch('/api/telemetry/sessions');
+        if (!res.ok) return;
+        const sessions = await res.json();
+        const select = document.getElementById('waterfall-session-select');
+        if (!select) return;
+
+        const currentVal = select.value;
+        if (!sessions || sessions.length === 0) {
+            select.innerHTML = '<option value="">No Active or Recent Sessions</option>';
+            return;
+        }
+
+        const chosenSessionId = currentVal || sessions[0].session_id;
+        select.innerHTML = sessions.map(s => {
+            const tsStr = new Date(s.start_timestamp * 1000).toLocaleTimeString();
+            const turns = s.total_turns || 0;
+            const tools = s.total_tool_calls || 0;
+            return `<option value="${s.session_id}" ${s.session_id === chosenSessionId ? 'selected' : ''}>[${s.agent_type.toUpperCase()}] ${s.session_id} - ${s.model_name} (${turns} turns, ${tools} tools &bull; ${tsStr})</option>`;
+        }).join('');
+
+        select.value = chosenSessionId;
+        fetchSessionWaterfall(chosenSessionId);
+    } catch (_) {}
+}
+
+async function fetchSessionWaterfall(sessionId) {
+    if (!sessionId) return;
+    const container = document.getElementById('waterfall-container');
+    if (!container) return;
+
+    try {
+        const res = await fetch(`/api/telemetry/session_events?sessionId=${sessionId}`);
+        if (!res.ok) return;
+        const events = await res.json();
+
+        if (!events || events.length === 0) {
+            container.innerHTML = `<div class="waterfall-empty-hint">Session <code>${escapeHtml(sessionId)}</code> is active, but 0 lifecycle events recorded yet.</div>`;
+            return;
+        }
+
+        const maxDisplay = 100;
+        const displayEvents = events.length > maxDisplay ? events.slice(-maxDisplay) : events;
+        const badgeLabel = events.length > maxDisplay ? `Recent ${maxDisplay} / ${events.length} Events` : `${events.length} Events`;
+
+        container.innerHTML = `
+            <div class="waterfall-turn-row">
+                <div class="turn-header">
+                    <span>Session Lifecycle Timeline (Chronological Execution Flow)</span>
+                    <span class="badge badge-cyan">${badgeLabel}</span>
+                </div>
+                <div class="turn-timeline-track">
+                    ${displayEvents.map(ev => {
+                        let blockClass = 'wf-block-tool';
+                        if (ev.event_type === 'SESSION_START' || ev.event_type === 'TURN_START' || ev.event_type === 'USER_TURN') blockClass = 'wf-block-prompt';
+                        else if (ev.event_type === 'THINKING') blockClass = 'wf-block-think';
+                        else if (ev.event_type === 'APPROVAL_WAIT') blockClass = 'wf-block-approval';
+                        else if (ev.status === 'ERROR') blockClass = 'wf-block-error';
+
+                        const durationStr = ev.duration_ms > 0 ? ` (${Math.round(ev.duration_ms)}ms)` : '';
+                        const label = ev.tool_name ? `${ev.event_type}: ${ev.tool_name}` : ev.event_type;
+
+                        return `<div class="wf-block ${blockClass}">${label}${durationStr}</div>`;
+                    }).join('')}
+                </div>
+            </div>
+        `;
+    } catch (_) {}
+}
+
+// --- Action Approvals & Mobile Companion Client ---
+
+async function fetchPendingApprovals() {
+    try {
+        const res = await fetch('/api/approvals/pending');
+        if (!res.ok) return;
+        const list = await res.json();
+
+        const badge = document.getElementById('pending-approvals-count');
+        const navBadge = document.getElementById('approvals-badge');
+        const container = document.getElementById('pending-approvals-list');
+
+        if (badge) badge.textContent = `${list.length} Pending`;
+        if (navBadge) navBadge.textContent = list.length > 0 ? `${list.length} Action` : 'Mobile';
+
+        if (!container) return;
+        if (!list || list.length === 0) {
+            container.innerHTML = `
+                <div class="no-pending-hint">
+                    <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="1.8" fill="none">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <polyline points="12 6 12 14 14 14"></polyline>
+                    </svg>
+                    <p>No actions currently waiting for approval.</p>
+                </div>
+            `;
+            return;
+        }
+
+        container.innerHTML = list.map(item => `
+            <div class="approval-item-card" id="approval-card-${item.approval_id}">
+                <div class="approval-item-header">
+                    <span class="approval-tool-badge">[${item.agent_type.toUpperCase()}] ${item.tool_name}</span>
+                    <span class="badge badge-amber">⏱️ ${item.remaining_seconds}s left</span>
+                </div>
+                <div class="approval-item-body">${item.reason || ''}\nWorkspace: ${item.workspace}\nArgs: ${JSON.stringify(item.tool_args, null, 2)}</div>
+                <div class="approval-actions">
+                    <button class="btn-deny" onclick="submitApprovalDecision('${item.approval_id}', 'deny')">Deny</button>
+                    <button class="btn-approve" onclick="submitApprovalDecision('${item.approval_id}', 'allow')">Approve Action</button>
+                </div>
+            </div>
+        `).join('');
+    } catch (_) {}
+}
+
+async function submitApprovalDecision(approvalId, decision) {
+    try {
+        const res = await fetch('/api/approvals/decision', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ approval_id: approvalId, decision: decision })
+        });
+        if (res.ok) {
+            fetchPendingApprovals();
+        }
+    } catch (_) {}
+}
+
+async function fetchMobileQr() {
+    try {
+        const res = await fetch('/api/mobile/qr');
+        if (!res.ok) return;
+        const data = await res.json();
+        const secretEl = document.getElementById('pairing-secret-display');
+        const countEl = document.getElementById('pairing-countdown');
+        const qrContainer = document.getElementById('pairing-qr-svg');
+
+        const secret = data.secret || '';
+        if (secretEl) secretEl.textContent = secret || 'ERR_SECRET';
+        if (countEl) countEl.textContent = `Valid for ${data.expires_in || 300}s`;
+
+        if (qrContainer && secret && typeof window.generateQrSvg === 'function') {
+            const host = window.location.hostname || '127.0.0.1';
+            const port = window.location.port || 3883;
+            const pairingUri = `aimon://pair?host=${host}&port=${port}&secret=${secret}`;
+            qrContainer.innerHTML = window.generateQrSvg(pairingUri, {
+                fg: '#38bdf8',
+                bg: '#0f172a',
+                margin: 2
+            });
+        }
+    } catch (_) {}
+}
+
+async function fetchMobileDevices() {
+    try {
+        const res = await fetch('/api/mobile/devices');
+        if (!res.ok) return;
+        const list = await res.json();
+        const container = document.getElementById('paired-devices-list');
+        if (!container) return;
+
+        if (!list || list.length === 0) {
+            container.innerHTML = '<div class="loading-placeholder">No mobile devices paired yet. Scan the code above to link your phone.</div>';
+            return;
+        }
+
+        container.innerHTML = list.map(d => `
+            <div class="device-item-row">
+                <div class="device-info">
+                    <span class="device-name">${d.device_name || 'Android Device'}</span>
+                    <span class="device-meta">ID: ${d.device_id} &bull; Paired: ${new Date(d.paired_at * 1000).toLocaleDateString()}</span>
+                </div>
+                <button class="btn-revoke" onclick="revokeDevice('${d.device_id}')">Revoke</button>
+            </div>
+        `).join('');
+    } catch (_) {}
+}
+
+async function revokeDevice(deviceId) {
+    if (!confirm('Revoke access for this device?')) return;
+    try {
+        const res = await fetch('/api/mobile/revoke', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_id: deviceId })
+        });
+        if (res.ok) {
+            fetchMobileDevices();
+        }
+    } catch (_) {}
 }
 
 function switchToMonitor(id) {
@@ -3187,11 +4758,22 @@ function switchToMonitor(id) {
         } catch (_) {}
     }
 
-    // Update active tab styles
+    // If switching to an aimon subpanel directly (e.g. #telemetry or #approvals or #quotas)
+    if (id === 'quotas' || id === 'telemetry' || id === 'approvals') {
+        switchToMonitor('aimon');
+        switchToAimonSubpanel(id);
+        return;
+    }
+
+    activeMonitorId = id;
+
+    // Update active tab button styles in top nav
     const navEl = document.getElementById('monitor-tabs');
     if (navEl) {
         navEl.querySelectorAll('.monitor-tab').forEach(tab => {
-            if (tab.getAttribute('data-id') === id) {
+            const tabId = tab.getAttribute('data-id');
+            const isMatch = (tabId === id || tabId.startsWith(id + '-'));
+            if (isMatch) {
                 tab.classList.add('active');
             } else {
                 tab.classList.remove('active');
@@ -3200,19 +4782,28 @@ function switchToMonitor(id) {
     }
 
     const viewAimon = document.getElementById('view-aimon');
-    if (id === 'aimon') {
-        if (viewAimon) viewAimon.classList.remove('hidden');
-    } else {
-        if (viewAimon) viewAimon.classList.add('hidden');
+    const isAimon = (id === 'aimon');
+
+    if (viewAimon) {
+        viewAimon.classList.toggle('active', isAimon);
+        viewAimon.classList.toggle('hidden', !isAimon);
+        if (isAimon) {
+            switchToAimonSubpanel(activeAimonSubpanel);
+        }
     }
 
-    // Toggle persistent panels
+    // Toggle persistent satellite monitor panels
     const dynamicPanelsEl = document.getElementById('dynamic-panels');
     if (dynamicPanelsEl) {
         dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(panel => {
-            if (panel.id === `panel-${id}`) {
+            const panelId = panel.id;
+            const subsystem = panel.getAttribute('data-subsystem');
+            const isMatch = !isAimon && (panelId === `panel-${id}` || panelId.startsWith(`panel-${id}-`) || (subsystem && (subsystem === id || id.startsWith(subsystem))));
+            if (isMatch) {
+                panel.classList.add('active');
                 panel.classList.remove('hidden');
             } else {
+                panel.classList.remove('active');
                 panel.classList.add('hidden');
             }
         });
@@ -3222,7 +4813,16 @@ function switchToMonitor(id) {
 window.addEventListener('hashchange', () => {
     const hash = window.location.hash.replace(/^#/, '');
     if (hash) {
-        switchToMonitor(hash);
+        if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+            switchToMonitor('aimon');
+            switchToAimonSubpanel(hash);
+        } else if (hash.startsWith('aimon/')) {
+            const sub = hash.split('/')[1];
+            switchToMonitor('aimon');
+            switchToAimonSubpanel(sub);
+        } else {
+            switchToMonitor(hash);
+        }
     } else {
         switchToMonitor('aimon');
     }
@@ -3232,29 +4832,91 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
     fetchSessions();
     fetchMonitors();
+    fetchMobileQr();
     setupSse();
+
+    if (window.location.hash) {
+        const hash = window.location.hash.replace(/^#/, '');
+        if (hash) {
+            if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+                switchToMonitor('aimon');
+                switchToAimonSubpanel(hash);
+            } else if (hash.startsWith('aimon/')) {
+                const sub = hash.split('/')[1];
+                switchToMonitor('aimon');
+                switchToAimonSubpanel(sub);
+            } else {
+                switchToMonitor(hash);
+            }
+        }
+    }
+
+    // Top-level tab button click listeners
+    const monitorTabsEl = document.getElementById('monitor-tabs');
+    if (monitorTabsEl) {
+        monitorTabsEl.addEventListener('click', (e) => {
+            const btn = e.target.closest('.monitor-tab');
+            if (btn && btn.dataset.id) {
+                switchToMonitor(btn.dataset.id);
+            }
+        });
+    }
+
+    // Aimon Sub-Navigation button click listeners
+    const aimonSubnavEl = document.getElementById('aimon-subnav');
+    if (aimonSubnavEl) {
+        aimonSubnavEl.addEventListener('click', (e) => {
+            const btn = e.target.closest('.aimon-subnav-tab');
+            if (btn && btn.dataset.subpanel) {
+                switchToAimonSubpanel(btn.dataset.subpanel);
+            }
+        });
+    }
+
+    // Timeframe selector listeners
+    const tfSelector = document.getElementById('telem-timeframe-selector');
+    if (tfSelector) {
+        tfSelector.addEventListener('click', (e) => {
+            const btn = e.target.closest('.time-btn');
+            if (btn && btn.dataset.window) {
+                tfSelector.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                activeTelemetryWindow = btn.dataset.window;
+                fetchTelemetryTimeseries();
+            }
+        });
+    }
+
+    // Session dropdown listener
+    const sessionSelect = document.getElementById('waterfall-session-select');
+    if (sessionSelect) {
+        sessionSelect.addEventListener('change', (e) => {
+            fetchSessionWaterfall(e.target.value);
+        });
+    }
+
+    // Regenerate QR button
+    const btnQr = document.getElementById('btn-new-qr');
+    if (btnQr) {
+        btnQr.addEventListener('click', fetchMobileQr);
+    }
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
         fetchStatus(true);
         fetchSessions();
         fetchMonitors();
-    });
-
-    const reloadBtn = document.getElementById('frame-reload-btn');
-    if (reloadBtn) {
-        reloadBtn.addEventListener('click', () => {
-            const iframe = document.getElementById('monitor-iframe');
-            if (iframe) {
-                try {
-                    iframe.contentWindow.location.reload();
-                } catch (_) {
-                    const src = iframe.src;
-                    iframe.src = '';
-                    iframe.src = src;
-                }
+        if (activeMonitorId === 'aimon') {
+            if (activeAimonSubpanel === 'telemetry') {
+                fetchTelemetryOverview();
+                fetchTelemetryTimeseries();
+                fetchTelemetryTools();
+                fetchTelemetrySessions();
+            } else if (activeAimonSubpanel === 'approvals') {
+                fetchPendingApprovals();
+                fetchMobileDevices();
             }
-        });
-    }
+        }
+    });
 
     const modelsToggleBtn = document.getElementById('ag-models-toggle');
     const modelsChevron = document.getElementById('ag-models-chevron');
@@ -3272,10 +4934,21 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Refresh data: status every 5s, sessions every 3s, monitors every 8s
-    setInterval(() => fetchStatus(false), 5000);
-    setInterval(fetchSessions, 3000);
-    setInterval(fetchMonitors, 8000);
+    // Periodic refresh timers (backed by reactive SSE streams)
+    setInterval(() => fetchStatus(false), 12000);
+    setInterval(fetchSessions, 10000);
+    setInterval(fetchMonitors, 15000);
+
+    // Refresh telemetry & approvals periodically when respective tab is active
+    setInterval(() => {
+        if (activeMonitorId === 'telemetry') {
+            fetchTelemetryOverview();
+            fetchTelemetryTimeseries();
+            fetchTelemetryTools();
+        } else if (activeMonitorId === 'approvals') {
+            fetchPendingApprovals();
+        }
+    }, 8000);
 
     // Update countdown timers and session uptime every second
     if (countdownInterval) clearInterval(countdownInterval);
@@ -3284,19 +4957,334 @@ document.addEventListener('DOMContentLoaded', () => {
         updateSessionUptimes();
     }, 1000);
 });
+
+)raw_asset";
+
+inline const char* QRCODE_JS = R"raw_asset(/*
+ * qrcode.js - Pure Vanilla JavaScript QR Code SVG Generator
+ *
+ * Copyright (C) 2026, Charles Chiou
+ */
+
+(function(global) {
+    'use strict';
+
+    // GF(256) Math
+    var EXP_TABLE = new Array(256);
+    var LOG_TABLE = new Array(256);
+
+    (function initGF() {
+        var x = 1;
+        for (var i = 0; i < 255; i++) {
+            EXP_TABLE[i] = x;
+            LOG_TABLE[x] = i;
+            x <<= 1;
+            if (x & 256) x ^= 0x11d;
+        }
+        EXP_TABLE[255] = EXP_TABLE[0];
+    })();
+
+    function glog(n) {
+        if (n < 1) throw new Error("glog(" + n + ")");
+        return LOG_TABLE[n];
+    }
+
+    function gexp(n) {
+        while (n < 0) n += 255;
+        while (n >= 256) n -= 255;
+        return EXP_TABLE[n];
+    }
+
+    function polyMultiply(p1, p2) {
+        var res = new Array(p1.length + p2.length - 1);
+        for (var i = 0; i < res.length; i++) res[i] = 0;
+        for (var i = 0; i < p1.length; i++) {
+            for (var j = 0; j < p2.length; j++) {
+                res[i + j] ^= gexp(glog(p1[i]) + glog(p2[j]));
+            }
+        }
+        return res;
+    }
+
+    function getRsGeneratorPoly(ecLen) {
+        var poly = [1];
+        for (var i = 0; i < ecLen; i++) {
+            poly = polyMultiply(poly, [1, gexp(i)]);
+        }
+        return poly;
+    }
+
+    function calcErrorCorrection(data, ecLen) {
+        var gen = getRsGeneratorPoly(ecLen);
+        var msg = data.slice();
+        for (var i = 0; i < ecLen; i++) msg.push(0);
+
+        for (var i = 0; i < data.length; i++) {
+            var lead = msg[i];
+            if (lead !== 0) {
+                var leadLog = glog(lead);
+                for (var j = 0; j < gen.length; j++) {
+                    msg[i + j] ^= gexp(leadLog + glog(gen[j]));
+                }
+            }
+        }
+        return msg.slice(data.length);
+    }
+
+    // Version parameters for Byte mode + Error Correction Level M
+    var VERSION_PARAMS = [
+        null,
+        { version: 1, totalBytes: 26, dataBytes: 16, ecBytes: 10, alignPos: [] },
+        { version: 2, totalBytes: 44, dataBytes: 28, ecBytes: 16, alignPos: [6, 18] },
+        { version: 3, totalBytes: 70, dataBytes: 44, ecBytes: 26, alignPos: [6, 22] },
+        { version: 4, totalBytes: 100, dataBytes: 64, ecBytes: 36, alignPos: [6, 26] },
+        { version: 5, totalBytes: 134, dataBytes: 86, ecBytes: 48, alignPos: [6, 30] },
+        { version: 6, totalBytes: 172, dataBytes: 108, ecBytes: 64, alignPos: [6, 34] }
+    ];
+
+    function createBitBuffer() {
+        var buffer = [];
+        var length = 0;
+        return {
+            put: function(num, len) {
+                for (var i = 0; i < len; i++) {
+                    buffer.push((num >>> (len - i - 1)) & 1);
+                    length++;
+                }
+            },
+            getBuffer: function() { return buffer; },
+            getLength: function() { return length; }
+        };
+    }
+
+    function QRCode(text, options) {
+        options = options || {};
+        var utf8Bytes = [];
+        for (var i = 0; i < text.length; i++) {
+            var code = text.charCodeAt(i);
+            if (code < 0x80) {
+                utf8Bytes.push(code);
+            } else if (code < 0x800) {
+                utf8Bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+            } else {
+                utf8Bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+            }
+        }
+
+        var textLen = utf8Bytes.length;
+        var ver = 1;
+        while (ver < VERSION_PARAMS.length && VERSION_PARAMS[ver].dataBytes < textLen + 3) {
+            ver++;
+        }
+        if (ver >= VERSION_PARAMS.length) {
+            ver = VERSION_PARAMS.length - 1;
+        }
+
+        var p = VERSION_PARAMS[ver];
+        var bb = createBitBuffer();
+        bb.put(4, 4); // Byte Mode
+        bb.put(textLen, 8); // Length
+        for (var i = 0; i < textLen; i++) {
+            bb.put(utf8Bytes[i], 8);
+        }
+
+        // Terminator
+        var totalDataBits = p.dataBytes * 8;
+        if (bb.getLength() + 4 <= totalDataBits) {
+            bb.put(0, 4);
+        } else {
+            bb.put(0, totalDataBits - bb.getLength());
+        }
+
+        // Pad to byte
+        while (bb.getLength() % 8 !== 0) {
+            bb.put(0, 1);
+        }
+
+        // Pad bytes
+        var bits = bb.getBuffer();
+        var data = [];
+        for (var i = 0; i < bits.length; i += 8) {
+            var b = 0;
+            for (var j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+            data.push(b);
+        }
+
+        var padByte = 0xEC;
+        while (data.length < p.dataBytes) {
+            data.push(padByte);
+            padByte = (padByte === 0xEC) ? 0x11 : 0xEC;
+        }
+
+        var ec = calcErrorCorrection(data, p.ecBytes);
+        var finalCodewords = data.concat(ec);
+
+        // Matrix construction
+        var size = ver * 4 + 17;
+        var matrix = [];
+        var reserved = [];
+        for (var r = 0; r < size; r++) {
+            matrix[r] = new Array(size);
+            reserved[r] = new Array(size);
+            for (var c = 0; c < size; c++) {
+                matrix[r][c] = false;
+                reserved[r][c] = false;
+            }
+        }
+
+        function setFinder(startR, startC) {
+            for (var r = -1; r <= 7; r++) {
+                for (var c = -1; c <= 7; c++) {
+                    var mr = startR + r, mc = startC + c;
+                    if (mr >= 0 && mr < size && mc >= 0 && mc < size) {
+                        reserved[mr][mc] = true;
+                        if ((r >= 0 && r <= 6 && (c === 0 || c === 6)) ||
+                            (c >= 0 && c <= 6 && (r === 0 || r === 6)) ||
+                            (r >= 2 && r <= 4 && c >= 2 && c <= 4)) {
+                            matrix[mr][mc] = true;
+                        } else {
+                            matrix[mr][mc] = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        setFinder(0, 0);
+        setFinder(0, size - 7);
+        setFinder(size - 7, 0);
+
+        // Alignment patterns
+        if (p.alignPos && p.alignPos.length > 0) {
+            for (var i = 0; i < p.alignPos.length; i++) {
+                for (var j = 0; j < p.alignPos.length; j++) {
+                    var ar = p.alignPos[i], ac = p.alignPos[j];
+                    if (reserved[ar][ac]) continue;
+                    for (var r = -2; r <= 2; r++) {
+                        for (var c = -2; c <= 2; c++) {
+                            reserved[ar + r][ac + c] = true;
+                            if (Math.abs(r) === 2 || Math.abs(c) === 2 || (r === 0 && c === 0)) {
+                                matrix[ar + r][ac + c] = true;
+                            } else {
+                                matrix[ar + r][ac + c] = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Timing patterns
+        for (var i = 8; i < size - 8; i++) {
+            if (!reserved[6][i]) {
+                reserved[6][i] = true;
+                matrix[6][i] = (i % 2 === 0);
+            }
+            if (!reserved[i][6]) {
+                reserved[i][6] = true;
+                matrix[i][6] = (i % 2 === 0);
+            }
+        }
+
+        // Dark module
+        reserved[4 * ver + 9][8] = true;
+        matrix[4 * ver + 9][8] = true;
+
+        // Reserved format bits
+        for (var i = 0; i < 9; i++) {
+            reserved[8][i] = true;
+            reserved[i][8] = true;
+        }
+        for (var i = size - 8; i < size; i++) {
+            reserved[8][i] = true;
+            reserved[i][8] = true;
+        }
+
+        // Place data bits
+        var allBits = [];
+        for (var i = 0; i < finalCodewords.length; i++) {
+            for (var b = 7; b >= 0; b--) {
+                allBits.push((finalCodewords[i] >>> b) & 1);
+            }
+        }
+
+        var bitIdx = 0;
+        var dir = -1;
+        var row = size - 1;
+        var col = size - 1;
+
+        while (col > 0) {
+            if (col === 6) col--;
+            for (var count = 0; count < size; count++) {
+                for (var c = 0; c < 2; c++) {
+                    var currC = col - c;
+                    if (!reserved[row][currC]) {
+                        var bit = (bitIdx < allBits.length) ? allBits[bitIdx++] : 0;
+                        // Mask 0: (row + col) % 2 == 0
+                        var mask = ((row + currC) % 2 === 0);
+                        matrix[row][currC] = (bit === 1) ? !mask : mask;
+                    }
+                }
+                row += dir;
+            }
+            dir = -dir;
+            row += dir;
+            col -= 2;
+        }
+
+        // Format info for EC Level M (00), Mask 0 (000) -> Format bits: 101010000010010 (XOR with 101010000010010)
+        // Standard Format Info: Level M (0), Mask 0 (0) with mask 0x5412 is 0x504B (101000001001011)
+        var formatBits = [1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1];
+        for (var i = 0; i < 6; i++) matrix[8][i] = (formatBits[i] === 1);
+        matrix[8][7] = (formatBits[6] === 1);
+        matrix[8][8] = (formatBits[7] === 1);
+        matrix[7][8] = (formatBits[8] === 1);
+        for (var i = 9; i < 15; i++) matrix[14 - i][8] = (formatBits[i] === 1);
+
+        for (var i = 0; i < 8; i++) matrix[size - 1 - i][8] = (formatBits[i] === 1);
+        for (var i = 8; i < 15; i++) matrix[8][size - 15 + i] = (formatBits[i] === 1);
+
+        return {
+            size: size,
+            isDark: function(r, c) { return matrix[r][c]; },
+            toSvg: function(opt) {
+                opt = opt || {};
+                var margin = opt.margin !== undefined ? opt.margin : 2;
+                var fg = opt.fg || '#38bdf8';
+                var bg = opt.bg || '#0b1120';
+                var total = size + margin * 2;
+
+                var path = '';
+                for (var r = 0; r < size; r++) {
+                    for (var c = 0; c < size; c++) {
+                        if (matrix[r][c]) {
+                            path += 'M' + (c + margin) + ',' + (r + margin) + 'h1v1h-1z ';
+                        }
+                    }
+                }
+
+                return '<svg viewBox="0 0 ' + total + ' ' + total + '" class="qr-svg-matrix" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:100%;border-radius:12px;border:1px solid rgba(56,189,248,0.25);">' +
+                    '<rect width="' + total + '" height="' + total + '" fill="' + bg + '"/>' +
+                    '<path d="' + path + '" fill="' + fg + '"/>' +
+                    '</svg>';
+            }
+        };
+    }
+
+    global.generateQrSvg = function(text, options) {
+        try {
+            var qr = QRCode(text, options);
+            return qr.toSvg(options);
+        } catch (e) {
+            console.error('QR code generation error:', e);
+            return '<div class="qr-error">QR Generation Error</div>';
+        }
+    };
+
+})(typeof window !== 'undefined' ? window : this);
 )raw_asset";
 
 } // namespace assets
 } // namespace aimon
 
 #endif // AIMON_WEB_ASSETS_HXX
-
-/*
- * Local variables:
- * mode: C++
- * c-file-style: "BSD"
- * c-basic-offset: 4
- * tab-width: 4
- * indent-tabs-mode: nil
- * End:
- */

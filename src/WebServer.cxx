@@ -9,6 +9,8 @@
 #include "McpServer.hxx"
 #include "TaskRegistry.hxx"
 #include "TcpGateway.hxx"
+#include "AgentTelemetryDb.hxx"
+#include "MobileGateway.hxx"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -78,23 +80,36 @@ std::string WebServer::createUiSession() {
 }
 
 bool WebServer::isValidUiSession(const httplib::Request& req) const {
-    // 1. Block command-line agents and automated scripts
+    // 1. Allow internal hooks and mobile companion clients
     if (req.has_header("User-Agent")) {
         std::string ua = req.get_header_value("User-Agent");
-        for (char &c : ua) c = tolower(c);
-        if (ua.find("curl/") != std::string::npos ||
-            ua.find("python") != std::string::npos ||
-            ua.find("wget/") != std::string::npos ||
-            ua.find("httpie") != std::string::npos ||
-            ua.find("aiohttp") != std::string::npos ||
-            ua.find("go-http-client") != std::string::npos) {
+        if (ua.find("aimon-hook") != std::string::npos ||
+            ua.find("aimon-mobile") != std::string::npos) {
+            return true;
+        }
+        std::string lowerUa = ua;
+        for (char &c : lowerUa) c = tolower(c);
+        if (lowerUa.find("curl/") != std::string::npos ||
+            lowerUa.find("python") != std::string::npos ||
+            lowerUa.find("wget/") != std::string::npos ||
+            lowerUa.find("httpie") != std::string::npos ||
+            lowerUa.find("aiohttp") != std::string::npos ||
+            lowerUa.find("go-http-client") != std::string::npos) {
             return false;
         }
     } else {
         return false;
     }
 
-    // 2. Extract session token
+    // 2. Allow requests with valid mobile authentication tokens
+    if (req.has_header("X-Mobile-Token")) {
+        std::string outDev;
+        if (MobileGateway::getInstance().authenticate(req.get_header_value("X-Mobile-Token"), outDev)) {
+            return true;
+        }
+    }
+
+    // 3. Extract session token
     std::string token;
     if (req.has_header("X-UI-Session")) {
         token = req.get_header_value("X-UI-Session");
@@ -112,7 +127,7 @@ bool WebServer::isValidUiSession(const httplib::Request& req) const {
         return false;
     }
 
-    // 3. Verify token exists and is fresh
+    // 4. Verify token exists and is fresh
     std::lock_guard<std::mutex> lock(_sessionMutex);
     auto it = _uiSessions.find(token);
     if (it != _uiSessions.end()) {
@@ -134,10 +149,22 @@ std::string WebServer::getMcpHintForPath(const std::string& path, const std::str
 }
 
 void WebServer::setupRoutes() {
+    // Connect MobileGateway broadcast callback to broadcast SSE events
+    MobileGateway::getInstance().setBroadcastCallback([this](const std::string& type, const nlohmann::json& payload) {
+        nlohmann::json evt;
+        evt["type"] = type;
+        evt["payload"] = payload;
+        broadcastSseNotification(evt.dump());
+    });
+
     // Gate REST API endpoints if disabled by configuration, unless request is from an authenticated Web UI session
     if (!_endpointsEnabled) {
         _server->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-            if (req.path == "/api/monitors") {
+            if (req.path == "/api/monitors" ||
+                req.path == "/api/status" ||
+                req.path.rfind("/api/approvals", 0) == 0 ||
+                req.path.rfind("/api/telemetry", 0) == 0 ||
+                req.path.rfind("/api/mobile", 0) == 0) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
             if (req.path == "/api" || req.path.rfind("/api/", 0) == 0) {
@@ -156,6 +183,7 @@ void WebServer::setupRoutes() {
             return httplib::Server::HandlerResponse::Unhandled;
         });
     }
+
 
     auto serveFileOrFallback = [](const std::string& diskPath,
                                   const char* fallbackAsset,
@@ -231,6 +259,25 @@ void WebServer::setupRoutes() {
 
     _server->Get("/app.js", [serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
         serveFileOrFallback("web/app.js", assets::APP_JS, "application/javascript", res);
+    });
+
+    _server->Get("/qrcode.js", [serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
+        serveFileOrFallback("web/qrcode.js", assets::QRCODE_JS, "application/javascript", res);
+    });
+
+    _server->Get("/download/aimon-companion.apk", [serveFileOrFallback](const httplib::Request&, httplib::Response& res) {
+        serveFileOrFallback("mobile/android/app/build/outputs/apk/debug/app-debug.apk", "", "application/vnd.android.package-archive", res);
+    });
+
+    _server->Get("/favicon.ico", [](const httplib::Request&, httplib::Response& res) {
+        static const std::string faviconSvg =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\">"
+            "<circle cx=\"16\" cy=\"16\" r=\"14\" fill=\"#0a0e17\" stroke=\"#00f2fe\" stroke-width=\"2\"/>"
+            "<circle cx=\"16\" cy=\"16\" r=\"6\" fill=\"#00f2fe\"/>"
+            "<circle cx=\"16\" cy=\"16\" r=\"10\" fill=\"none\" stroke=\"#8b5cf6\" stroke-width=\"1\" stroke-dasharray=\"2,2\"/>"
+            "</svg>";
+        res.set_header("Cache-Control", "public, max-age=86400");
+        res.set_content(faviconSvg, "image/svg+xml");
     });
 
     _server->Get("/api/status", [this](const httplib::Request&, httplib::Response& res) {
@@ -320,6 +367,246 @@ void WebServer::setupRoutes() {
         }
         res.set_content(arr.dump(2), "application/json");
     });
+
+    // --- Telemetry Endpoints ---
+
+    _server->Post("/api/telemetry/event", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            nlohmann::json body = nlohmann::json::parse(req.body);
+            std::string eventType = body.value("event_type", "");
+            std::string sessionId = body.value("session_id", "default");
+            std::string agentType = body.value("agent_type", "antigravity");
+            int64_t ts = body.value("timestamp", static_cast<int64_t>(time(nullptr)));
+
+            if (eventType == "SESSION_START") {
+                std::string convId = body.value("conversation_id", sessionId);
+                std::string workspace = body.value("workspace", "");
+                std::string model = body.value("model", "default");
+                AgentTelemetryDb::getInstance().recordSessionStart(sessionId, convId, agentType, workspace, model, ts);
+            } else if (eventType == "SESSION_END") {
+                std::string status = body.value("status", "COMPLETED");
+                int turns = body.value("total_turns", 0);
+                int promptTokens = body.value("prompt_tokens", 0);
+                int compTokens = body.value("comp_tokens", 0);
+                int toolCalls = body.value("tool_calls", 0);
+                int errors = body.value("errors", 0);
+                double avgTurnMs = body.value("avg_turn_ms", 0.0);
+                AgentTelemetryDb::getInstance().recordSessionEnd(sessionId, status, turns, promptTokens, compTokens, toolCalls, errors, avgTurnMs, ts);
+            } else if (eventType == "sample" || eventType == "SAMPLE" || eventType == "TELEMETRY_SAMPLE") {
+                AgentTelemetrySample sample;
+                sample.timestamp = ts;
+                sample.activeAgents = body.value("active_sessions", body.value("active_agents", 0));
+                sample.promptTokensSec = body.value("prompt_tokens_per_sec", body.value("prompt_tokens_sec", 0.0));
+                sample.compTokensSec = body.value("completion_tokens_per_sec", body.value("comp_tokens_sec", 0.0));
+                sample.toolCallsSec = body.value("tool_calls_per_sec", body.value("tool_calls_sec", 0.0));
+                sample.errorRatePct = body.value("tool_error_rate_pct", body.value("error_rate_pct", 0.0));
+                sample.avgTurnLatencyMs = body.value("turn_latency_ms", body.value("avg_turn_latency_ms", 0.0));
+                sample.p95TurnLatencyMs = body.value("turn_latency_p95_ms", body.value("p95_turn_latency_ms", 0.0));
+                sample.approvalWaitMs = body.value("approval_wait_latency_ms", body.value("approval_wait_ms", 0.0));
+                AgentTelemetryDb::getInstance().insertSample(sample);
+            } else {
+                AgentLifecycleEvent ev;
+                ev.timestamp = ts;
+                ev.sessionId = sessionId;
+                ev.agentType = agentType;
+                ev.eventType = eventType;
+                ev.stepIndex = body.value("step_index", 0);
+                ev.toolName = body.value("tool_name", "");
+                ev.durationMs = body.value("duration_ms", 0.0);
+                ev.status = body.value("status", "OK");
+                if (body.contains("details")) {
+                    ev.detailsJson = body["details"];
+                }
+                AgentTelemetryDb::getInstance().insertEvent(ev);
+            }
+
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
+    _server->Get("/api/telemetry/overview", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        int hours = 24;
+        if (req.has_param("hours")) {
+            try { hours = std::stoi(req.get_param_value("hours")); } catch (...) {}
+        }
+        auto data = AgentTelemetryDb::getInstance().queryOverview(hours);
+        res.set_content(data.dump(2), "application/json");
+    });
+
+    _server->Get("/api/telemetry/timeseries", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string window = "24h";
+        int maxPoints = 300;
+        if (req.has_param("window")) {
+            window = req.get_param_value("window");
+        }
+        if (req.has_param("max_points")) {
+            try { maxPoints = std::stoi(req.get_param_value("max_points")); } catch (...) {}
+        }
+        auto data = AgentTelemetryDb::getInstance().queryTimeseries(window, maxPoints);
+        res.set_content(data.dump(2), "application/json");
+    });
+
+    _server->Get("/api/telemetry/sessions", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        int limit = 50;
+        std::string status = "";
+        if (req.has_param("limit")) {
+            try { limit = std::stoi(req.get_param_value("limit")); } catch (...) {}
+        }
+        if (req.has_param("status")) {
+            status = req.get_param_value("status");
+        }
+        auto data = AgentTelemetryDb::getInstance().querySessions(limit, status);
+        res.set_content(data.dump(2), "application/json");
+    });
+
+    _server->Get("/api/telemetry/session_events", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string sessionId = req.has_param("sessionId") ? req.get_param_value("sessionId") :
+                               (req.has_param("session_id") ? req.get_param_value("session_id") : "");
+        auto data = AgentTelemetryDb::getInstance().querySessionEvents(sessionId);
+        res.set_content(data.dump(2), "application/json");
+    });
+
+    _server->Get("/api/telemetry/tools", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        int hours = 24;
+        if (req.has_param("hours")) {
+            try { hours = std::stoi(req.get_param_value("hours")); } catch (...) {}
+        }
+        auto data = AgentTelemetryDb::getInstance().queryToolStats(hours);
+        res.set_content(data.dump(2), "application/json");
+    });
+
+    // --- Action Approval Endpoints ---
+
+    _server->Post("/api/approvals/request", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            nlohmann::json body = nlohmann::json::parse(req.body);
+            std::string agentType = body.value("agent_type", "antigravity");
+            std::string toolName = body.value("tool_name", "run_command");
+            std::string workspace = body.value("workspace", "");
+            nlohmann::json toolArgs = body.value("tool_args", nlohmann::json::object());
+            std::string reason = body.value("reason", "");
+            int timeoutSec = body.value("timeout_seconds", 120);
+
+            std::string approvalId = MobileGateway::getInstance().submitApprovalRequest(
+                agentType, toolName, workspace, toolArgs, reason, timeoutSec);
+
+            // Block and wait for mobile / UI approval
+            ApprovalVerdict verdict = MobileGateway::getInstance().waitForApproval(approvalId, timeoutSec);
+            std::string verdictStr = (verdict == ApprovalVerdict::APPROVED) ? "APPROVED" :
+                                     (verdict == ApprovalVerdict::DENIED) ? "DENIED" : "TIMED_OUT";
+
+            nlohmann::json resp;
+            resp["approval_id"] = approvalId;
+            resp["verdict"] = verdictStr;
+            res.set_content(resp.dump(2), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
+    _server->Post("/api/approvals/decision", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            nlohmann::json body = nlohmann::json::parse(req.body);
+            std::string approvalId = body.value("approval_id", "");
+            std::string decision = body.value("decision", "deny");
+
+            ApprovalVerdict verdict = (decision == "allow" || decision == "approve" || decision == "APPROVED")
+                ? ApprovalVerdict::APPROVED : ApprovalVerdict::DENIED;
+
+            bool resolved = MobileGateway::getInstance().resolveApproval(approvalId, verdict);
+            nlohmann::json resp;
+            resp["approval_id"] = approvalId;
+            resp["resolved"] = resolved;
+            res.set_content(resp.dump(2), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
+    _server->Get("/api/approvals/pending", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        auto pending = MobileGateway::getInstance().listPendingApprovals();
+        nlohmann::json arr = pending;
+        res.set_content(arr.dump(2), "application/json");
+    });
+
+    // --- Mobile Gateway & Pairing Endpoints ---
+
+    _server->Get("/api/mobile/qr", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string secret = MobileGateway::getInstance().createPairingSecret(300);
+        nlohmann::json resp;
+        resp["secret"] = secret;
+        resp["expires_in"] = 300;
+        res.set_content(resp.dump(2), "application/json");
+    });
+
+    _server->Post("/api/mobile/pair", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            nlohmann::json body = nlohmann::json::parse(req.body);
+            std::string secret = body.value("secret", "");
+            std::string deviceId = body.value("device_id", "");
+            std::string deviceName = body.value("device_name", "");
+
+            std::string token;
+            if (MobileGateway::getInstance().pairDevice(secret, deviceId, deviceName, token)) {
+                nlohmann::json resp;
+                resp["token"] = token;
+                resp["device_id"] = deviceId;
+                resp["status"] = "paired";
+                res.set_content(resp.dump(2), "application/json");
+            } else {
+                res.status = 401;
+                res.set_content("{\"error\":\"Invalid or expired pairing secret\"}", "application/json");
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
+    _server->Get("/api/mobile/devices", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        auto devs = MobileGateway::getInstance().listDevices();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& d : devs) {
+            arr.push_back({
+                {"device_id", d.deviceId},
+                {"device_name", d.deviceName},
+                {"paired_at", d.pairedAt},
+                {"last_seen_at", d.lastSeenAt}
+            });
+        }
+        res.set_content(arr.dump(2), "application/json");
+    });
+
+    _server->Post("/api/mobile/revoke", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            nlohmann::json body = nlohmann::json::parse(req.body);
+            std::string deviceId = body.value("device_id", "");
+            MobileGateway::getInstance().revokeDevice(deviceId);
+            res.set_content("{\"status\":\"revoked\"}", "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
 
     _server->Get("/sse", [this](const httplib::Request& req, httplib::Response& res) {
         if (!_mcpServer) {

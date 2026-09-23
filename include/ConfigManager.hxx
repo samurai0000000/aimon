@@ -44,6 +44,7 @@ struct AntigravityConfig {
     bool autoDiscover = true;
     int port = 0;
     std::string csrfToken;
+    std::string defaultModel = "Antigravity";
 };
 
 struct CursorConfig {

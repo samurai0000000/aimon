@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css?v=1.0.6">
+    <link rel="stylesheet" href="style.css?v=1.0.7">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -32,200 +32,377 @@
         <nav class="monitor-nav" id="monitor-tabs" aria-label="System Monitors">
             <button type="button" class="monitor-tab active" data-id="aimon">
                 <span class="tab-indicator tab-indicator-online"></span>
-                <span class="tab-title">AI Quotas</span>
-                <span class="tab-badge">Self</span>
+                <span class="tab-title">aimon</span>
+                <span class="tab-badge">Hub</span>
             </button>
         </nav>
 
-        <main class="dashboard-grid view-panel active" id="view-aimon">
-            <!-- Google Antigravity Section -->
-            <section class="card glass-card antigravity-card">
-                <div class="card-header">
-                    <div class="provider-title">
-                        <span class="dot-status dot-online" id="ag-status-dot"></span>
-                        <h2>Google Antigravity</h2>
-                    </div>
-                    <span id="ag-plan-badge" class="badge badge-cyan">Google AI Ultra</span>
-                </div>
+        <main class="view-panel active" id="view-aimon">
+            <!-- Aimon Sub-Navigation Tab Bar -->
+            <div class="aimon-subnav-bar" id="aimon-subnav" aria-label="aimon Subpanels">
+                <button type="button" class="aimon-subnav-tab active" data-subpanel="quotas">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">AI Quotas</span>
+                    <span class="tab-badge">Quota</span>
+                </button>
+                <button type="button" class="aimon-subnav-tab" data-subpanel="telemetry">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">Agent Telemetry</span>
+                    <span class="tab-badge badge-cyan">Analytics</span>
+                </button>
+                <button type="button" class="aimon-subnav-tab" data-subpanel="approvals">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">Action Approvals</span>
+                    <span class="tab-badge badge-amber" id="approvals-badge">0 Pending</span>
+                </button>
+            </div>
 
-                <!-- Credits & Allowances Strip -->
-                <div class="credits-strip" id="ag-credits-strip">
-                    <div class="credit-pill">
-                        <div class="credit-top-row">
-                            <span class="credit-label">Google One AI Credits</span>
-                            <span class="badge-sub" id="ag-credit-min">Min 50 / req</span>
+            <!-- Subpanel 1: AI Quotas (Antigravity, Cursor, MCP Clients) -->
+            <div class="aimon-subpanel dashboard-grid active" id="subpanel-quotas">
+                <!-- Google Antigravity Section -->
+                <section class="card glass-card antigravity-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-online" id="ag-status-dot"></span>
+                            <h2>Google Antigravity</h2>
                         </div>
-                        <span id="ag-available-credits" class="credit-val highlight-cyan">--</span>
+                        <span id="ag-plan-badge" class="badge badge-cyan">Google AI Ultra</span>
                     </div>
-                    <div class="credit-pill">
-                        <div class="credit-top-row">
-                            <span class="credit-label">Prompt & Flow Balance</span>
-                            <span class="badge-sub" id="ag-credit-tier">Monthly</span>
+
+                    <!-- Credits & Allowances Strip -->
+                    <div class="credits-strip" id="ag-credits-strip">
+                        <div class="credit-pill">
+                            <div class="credit-top-row">
+                                <span class="credit-label">Google One AI Credits</span>
+                                <span class="badge-sub" id="ag-credit-min">Min 50 / req</span>
+                            </div>
+                            <span id="ag-available-credits" class="credit-val highlight-cyan">--</span>
                         </div>
-                        <span id="ag-prompt-flow" class="credit-val">--</span>
-                    </div>
-                </div>
-
-                <!-- Quota Groups (Gemini Models, Claude & GPT models) -->
-                <div class="quota-groups-section">
-                    <div class="section-title-row">
-                        <h3>Model Quota Limits</h3>
-                    </div>
-                    <div id="ag-quota-groups" class="quota-groups-list">
-                        <div class="gauge-loading">Scanning quota groups...</div>
-                    </div>
-                </div>
-
-                <!-- Collapsible Individual Models -->
-                <div class="models-collapsible-section">
-                    <button type="button" id="ag-models-toggle" class="btn-toggle-models">
-                        <span id="ag-models-toggle-text">Individual Model Capacities</span>
-                        <svg class="toggle-icon" id="ag-models-chevron" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
-                            <path d="M6 9l6 6 6-6"></path>
-                        </svg>
-                    </button>
-                    <div id="ag-models-grid" class="gauges-grid hidden">
-                        <!-- Dynamically populated model gauges -->
-                    </div>
-                </div>
-
-                <div id="ag-error" class="error-banner hidden"></div>
-            </section>
-
-            <!-- Cursor Section -->
-            <section class="card glass-card cursor-card">
-                <div class="card-header">
-                    <div class="provider-title">
-                        <span class="dot-status dot-online" id="cursor-status-dot"></span>
-                        <h2>Cursor</h2>
-                    </div>
-                    <span id="cursor-plan-badge" class="badge badge-magenta">Pro</span>
-                </div>
-
-                <div class="cursor-metrics">
-                    <div class="cursor-top-row">
-                        <div class="usage-stat-box">
-                            <div class="stat-top">
-                                <span class="stat-label">Fast Requests Pool</span>
-                                <span id="cursor-fast-ratio" class="stat-ratio">-- / --</span>
+                        <div class="credit-pill">
+                            <div class="credit-top-row">
+                                <span class="credit-label">Prompt & Flow Balance</span>
+                                <span class="badge-sub" id="ag-credit-tier">Monthly</span>
                             </div>
-                            <div class="progress-track">
-                                <div id="cursor-progress-bar" class="progress-fill" style="width: 0%;"></div>
-                            </div>
-                            <div class="stat-bottom">
-                                <span id="cursor-remaining-txt" class="stat-sub">Calculating...</span>
-                                <span id="cursor-percent-txt" class="stat-pct">0%</span>
-                            </div>
-                        </div>
-
-                        <div class="details-box">
-                            <div class="detail-row">
-                                <span class="detail-label">Billing Cycle Reset</span>
-                                <span id="cursor-reset-date" class="detail-value">--</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">Days Remaining</span>
-                                <span id="cursor-days-remaining" class="detail-value">--</span>
-                            </div>
+                            <span id="ag-prompt-flow" class="credit-val">--</span>
                         </div>
                     </div>
 
-                    <!-- Personal Usage & Cumulative Spend Card -->
-                    <div class="spend-section" id="cursor-spend-section">
-                        <div class="spend-header">
-                            <div>
-                                <span class="spend-subtitle">Personal Usage</span>
-                                <h3 class="spend-title">Cumulative Spend</h3>
-                                <p class="spend-desc">Track your spend against last month.</p>
-                            </div>
-                            <div class="spend-totals">
-                                <span id="cursor-total-spend" class="spend-amount">$0.00</span>
-                                <span id="cursor-prev-spend-pill" class="spend-prev-pill hidden">vs $0.00 last month</span>
-                            </div>
+                    <!-- Quota Groups (Gemini Models, Claude & GPT models) -->
+                    <div class="quota-groups-section">
+                        <div class="section-title-row">
+                            <h3>Model Quota Limits</h3>
                         </div>
-
-                        <div class="spend-content-grid">
-                            <!-- Chart Container -->
-                            <div class="spend-chart-container">
-                                <svg id="cursor-spend-chart" class="spend-chart-svg" viewBox="0 0 420 160">
-                                    <defs>
-                                        <linearGradient id="spendGrad" x1="0" y1="0" x2="0" y2="1">
-                                            <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.45"/>
-                                            <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.0"/>
-                                        </linearGradient>
-                                    </defs>
-                                    <!-- Grid Lines & Axis -->
-                                    <line x1="50" y1="20" x2="410" y2="20" class="chart-grid-line" />
-                                    <text x="42" y="24" class="chart-axis-lbl" id="chart-lbl-max">$400</text>
-
-                                    <line x1="50" y1="58" x2="410" y2="58" class="chart-grid-line" />
-                                    <text x="42" y="62" class="chart-axis-lbl" id="chart-lbl-mid2">$300</text>
-
-                                    <line x1="50" y1="96" x2="410" y2="96" class="chart-grid-line" />
-                                    <text x="42" y="100" class="chart-axis-lbl" id="chart-lbl-mid1">$200</text>
-
-                                    <line x1="50" y1="135" x2="410" y2="135" class="chart-grid-line" />
-                                    <text x="42" y="139" class="chart-axis-lbl">$0</text>
-
-                                    <!-- Gradient Area -->
-                                    <path id="spend-chart-area" d="" fill="url(#spendGrad)"></path>
-                                    <!-- Trend Line -->
-                                    <path id="spend-chart-line" d="" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
-                                    <!-- Interactive Dots -->
-                                    <g id="spend-chart-dots"></g>
-                                </svg>
-                                <div id="chart-dates-axis" class="chart-dates-row">
-                                    <!-- Day labels populated dynamically -->
-                                </div>
-                            </div>
-
-                            <!-- Spend by Model Breakdown -->
-                            <div class="categories-breakdown" id="cursor-categories-breakdown">
-                                <div class="breakdown-header">Spend by Model</div>
-                                <div id="cursor-categories-list" class="categories-list scrollable-categories">
-                                    <!-- Dynamically populated category bars -->
-                                </div>
-                            </div>
+                        <div id="ag-quota-groups" class="quota-groups-list">
+                            <div class="gauge-loading">Scanning quota groups...</div>
                         </div>
                     </div>
-                </div>
 
-                <div id="cursor-error" class="error-banner hidden"></div>
-            </section>
-
-            <!-- Connected MCP Clients Section -->
-            <section class="card glass-card agents-fleet-card">
-                <div class="card-header">
-                    <div class="provider-title">
-                        <span class="dot-status dot-online" id="agents-status-dot"></span>
-                        <h2>Connected MCP Clients</h2>
-                    </div>
-                    <div class="agents-header-actions">
-                        <span id="agents-count-badge" class="badge badge-cyan">0 Sessions</span>
-                    </div>
-                </div>
-
-                <!-- Live Connected MCP Clients Bar -->
-                <div class="mcp-clients-bar" id="mcp-clients-bar">
-                    <div class="mcp-clients-left">
-                        <span class="mcp-clients-title">
-                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
-                                <circle cx="12" cy="12" r="10"></circle>
-                                <line x1="2" y1="12" x2="22" y2="12"></line>
-                                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                    <!-- Collapsible Individual Models -->
+                    <div class="models-collapsible-section">
+                        <button type="button" id="ag-models-toggle" class="btn-toggle-models">
+                            <span id="ag-models-toggle-text">Individual Model Capacities</span>
+                            <svg class="toggle-icon" id="ag-models-chevron" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                                <path d="M6 9l6 6 6-6"></path>
                             </svg>
-                            Active Sessions:
-                        </span>
+                        </button>
+                        <div id="ag-models-grid" class="gauges-grid hidden">
+                            <!-- Dynamically populated model gauges -->
+                        </div>
                     </div>
-                    <div class="mcp-clients-list" id="mcp-clients-list">
-                        <span class="client-badge client-badge-empty">
-                            <span class="dot-status dot-offline"></span>
-                            No active MCP connections
-                        </span>
+
+                    <div id="ag-error" class="error-banner hidden"></div>
+                </section>
+
+                <!-- Cursor Section -->
+                <section class="card glass-card cursor-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-online" id="cursor-status-dot"></span>
+                            <h2>Cursor</h2>
+                        </div>
+                        <span id="cursor-plan-badge" class="badge badge-magenta">Pro</span>
+                    </div>
+
+                    <div class="cursor-metrics">
+                        <div class="cursor-top-row">
+                            <div class="usage-stat-box">
+                                <div class="stat-top">
+                                    <span class="stat-label">Fast Requests Pool</span>
+                                    <span id="cursor-fast-ratio" class="stat-ratio">-- / --</span>
+                                </div>
+                                <div class="progress-track">
+                                    <div id="cursor-progress-bar" class="progress-fill" style="width: 0%;"></div>
+                                </div>
+                                <div class="stat-bottom">
+                                    <span id="cursor-remaining-txt" class="stat-sub">Calculating...</span>
+                                    <span id="cursor-percent-txt" class="stat-pct">0%</span>
+                                </div>
+                            </div>
+
+                            <div class="details-box">
+                                <div class="detail-row">
+                                    <span class="detail-label">Billing Cycle Reset</span>
+                                    <span id="cursor-reset-date" class="detail-value">--</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="detail-label">Days Remaining</span>
+                                    <span id="cursor-days-remaining" class="detail-value">--</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Personal Usage & Cumulative Spend Card -->
+                        <div class="spend-section" id="cursor-spend-section">
+                            <div class="spend-header">
+                                <div>
+                                    <span class="spend-subtitle">Personal Usage</span>
+                                    <h3 class="spend-title">Cumulative Spend</h3>
+                                    <p class="spend-desc">Track your spend against last month.</p>
+                                </div>
+                                <div class="spend-totals">
+                                    <span id="cursor-total-spend" class="spend-amount">$0.00</span>
+                                    <span id="cursor-prev-spend-pill" class="spend-prev-pill hidden">vs $0.00 last month</span>
+                                </div>
+                            </div>
+
+                            <div class="spend-content-grid">
+                                <!-- Chart Container -->
+                                <div class="spend-chart-container">
+                                    <svg id="cursor-spend-chart" class="spend-chart-svg" viewBox="0 0 420 160">
+                                        <defs>
+                                            <linearGradient id="spendGrad" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.45"/>
+                                                <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.0"/>
+                                            </linearGradient>
+                                        </defs>
+                                        <!-- Grid Lines & Axis -->
+                                        <line x1="50" y1="20" x2="410" y2="20" class="chart-grid-line" />
+                                        <text x="42" y="24" class="chart-axis-lbl" id="chart-lbl-max">$400</text>
+
+                                        <line x1="50" y1="58" x2="410" y2="58" class="chart-grid-line" />
+                                        <text x="42" y="62" class="chart-axis-lbl" id="chart-lbl-mid2">$300</text>
+
+                                        <line x1="50" y1="96" x2="410" y2="96" class="chart-grid-line" />
+                                        <text x="42" y="100" class="chart-axis-lbl" id="chart-lbl-mid1">$200</text>
+
+                                        <line x1="50" y1="135" x2="410" y2="135" class="chart-grid-line" />
+                                        <text x="42" y="139" class="chart-axis-lbl">$0</text>
+
+                                        <!-- Gradient Area -->
+                                        <path id="spend-chart-area" d="" fill="url(#spendGrad)"></path>
+                                        <!-- Trend Line -->
+                                        <path id="spend-chart-line" d="" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                                        <!-- Interactive Dots -->
+                                        <g id="spend-chart-dots"></g>
+                                    </svg>
+                                    <div id="chart-dates-axis" class="chart-dates-row">
+                                        <!-- Day labels populated dynamically -->
+                                    </div>
+                                </div>
+
+                                <!-- Spend by Model Breakdown -->
+                                <div class="categories-breakdown" id="cursor-categories-breakdown">
+                                    <div class="breakdown-header">Spend by Model</div>
+                                    <div id="cursor-categories-list" class="categories-list scrollable-categories">
+                                        <!-- Dynamically populated category bars -->
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="cursor-error" class="error-banner hidden"></div>
+                </section>
+
+                <!-- Connected MCP Clients Section -->
+                <section class="card glass-card agents-fleet-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-online" id="agents-status-dot"></span>
+                            <h2>Connected MCP Clients</h2>
+                        </div>
+                        <div class="agents-header-actions">
+                            <span id="agents-count-badge" class="badge badge-cyan">0 Sessions</span>
+                        </div>
+                    </div>
+
+                    <!-- Live Connected MCP Clients Bar -->
+                    <div class="mcp-clients-bar" id="mcp-clients-bar">
+                        <div class="mcp-clients-left">
+                            <span class="mcp-clients-title">
+                                <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <line x1="2" y1="12" x2="22" y2="12"></line>
+                                    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                                </svg>
+                                Active Sessions:
+                            </span>
+                        </div>
+                        <div class="mcp-clients-list" id="mcp-clients-list">
+                            <span class="client-badge client-badge-empty">
+                                <span class="dot-status dot-offline"></span>
+                                No active MCP connections
+                            </span>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Subpanel 2: Agent Telemetry & Analytics -->
+            <div class="aimon-subpanel hidden" id="subpanel-telemetry">
+                <!-- Telemetry Header & Timeframe Bar -->
+                <div class="telemetry-header-bar glass-card">
+                    <div class="telemetry-title-group">
+                        <h2>Agent Execution Telemetry & Historical Analytics</h2>
+                        <span class="badge badge-cyan" id="telem-db-badge">SQLite WAL (Rolling)</span>
+                    </div>
+                    <div class="timeframe-selector" id="telem-timeframe-selector">
+                        <button type="button" class="time-btn" data-window="1h">1H</button>
+                        <button type="button" class="time-btn active" data-window="24h">24H</button>
+                        <button type="button" class="time-btn" data-window="7d">7D</button>
+                        <button type="button" class="time-btn" data-window="30d">30D</button>
+                        <button type="button" class="time-btn" data-window="1y">1Y</button>
                     </div>
                 </div>
-            </section>
+
+                <!-- KPI Summary Cards -->
+                <div class="telemetry-kpi-grid">
+                    <div class="glass-card kpi-card">
+                        <div class="kpi-label">Active Agent Sessions</div>
+                        <div class="kpi-val" id="kpi-active-sessions">0 <span class="kpi-sub">running</span></div>
+                    </div>
+                    <div class="glass-card kpi-card">
+                        <div class="kpi-label">Total Tool Calls</div>
+                        <div class="kpi-val highlight-cyan" id="kpi-total-tools">0 <span class="kpi-sub">calls</span></div>
+                    </div>
+                    <div class="glass-card kpi-card">
+                        <div class="kpi-label">Avg Step Duration</div>
+                        <div class="kpi-val" id="kpi-avg-latency">0.00 <span class="kpi-sub">sec</span></div>
+                    </div>
+                    <div class="glass-card kpi-card">
+                        <div class="kpi-label">Tool Error Rate</div>
+                        <div class="kpi-val highlight-amber" id="kpi-error-rate">0.0 <span class="kpi-sub">%</span></div>
+                    </div>
+                </div>
+
+                <!-- Telemetry Charts Grid -->
+                <div class="telemetry-charts-grid">
+                    <!-- Chart 1: Tool Invocations & Active Workload Velocity -->
+                    <div class="glass-card chart-card">
+                        <div class="chart-header">
+                            <div class="chart-title">Tool Invocations & Workload Velocity</div>
+                            <div class="chart-legend">
+                                <span class="legend-item"><i class="dot dot-cyan"></i> Tool Invocations (calls/s)</span>
+                                <span class="legend-item"><i class="dot dot-magenta"></i> Active Sessions</span>
+                            </div>
+                        </div>
+                        <div class="svg-chart-container" id="token-velocity-chart">
+                            <svg class="metric-svg" id="token-svg" viewBox="0 0 800 240"></svg>
+                        </div>
+                    </div>
+
+                    <!-- Chart 2: Step Duration & Peak Envelope -->
+                    <div class="glass-card chart-card">
+                        <div class="chart-header">
+                            <div>
+                                <div class="chart-title">Step Duration & Latency Envelope</div>
+                                <p class="chart-subtitle">P95 envelope tracks 95th percentile upper variance. Latency health: &lt; 3s Normal, 3–8s Moderate, &gt; 8s Degraded.</p>
+                            </div>
+                            <div class="chart-legend">
+                                <span class="legend-item"><i class="dot dot-blue"></i> Avg Duration</span>
+                                <span class="legend-item"><i class="dot dot-amber"></i> P95 Envelope</span>
+                            </div>
+                        </div>
+                        <div class="svg-chart-container" id="latency-chart">
+                            <svg class="metric-svg" id="latency-svg" viewBox="0 0 800 240"></svg>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tool Invocation Matrix Card -->
+                <div class="glass-card tool-matrix-card">
+                    <div class="card-header">
+                        <h2>Tool Invocations by Category</h2>
+                        <span class="badge badge-cyan" id="tools-total-badge">0 Calls</span>
+                    </div>
+                    <div class="tool-matrix-body" id="tool-matrix-container">
+                        <div class="loading-placeholder">Loading tool execution metrics...</div>
+                    </div>
+                </div>
+
+                <!-- Live Agent Lifecycle Waterfall -->
+                <div class="glass-card waterfall-card">
+                    <div class="card-header">
+                        <h2>Live Agent Lifecycle Waterfall & Turns</h2>
+                        <div class="waterfall-controls">
+                            <select id="waterfall-session-select" class="session-dropdown">
+                                <option value="">Select an Agent Session...</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="waterfall-timeline-container" id="waterfall-container">
+                        <div class="waterfall-empty-hint">Select a session above to inspect turn breakdown, tool executions, and approval wait times.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Subpanel 3: Action Approvals & Mobile Companion -->
+            <div class="aimon-subpanel hidden" id="subpanel-approvals">
+                <div class="approvals-grid">
+                    <!-- Pending Approvals Card -->
+                    <div class="glass-card pending-approvals-card">
+                        <div class="card-header">
+                            <h2>Pending Action Approvals</h2>
+                            <span class="badge badge-amber" id="pending-approvals-count">0 Pending</span>
+                        </div>
+                        <div class="pending-list" id="pending-approvals-list">
+                            <div class="no-pending-hint">
+                                <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="1.8" fill="none">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <polyline points="12 6 12 12 14 14"></polyline>
+                                </svg>
+                                <p>No actions currently waiting for approval.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Mobile Companion Pairing Card -->
+                    <div class="glass-card mobile-pairing-card">
+                        <div class="card-header">
+                            <h2>Mobile Companion Pairing</h2>
+                            <span class="badge badge-cyan">WireGuard / Tailscale / LAN</span>
+                        </div>
+                        <div class="pairing-content">
+                            <div class="qr-placeholder-box" id="qr-container-box">
+                                <div class="qr-code-canvas-box" id="pairing-qr-svg"></div>
+                                <div class="secret-code-display" id="pairing-secret-display">Generating...</div>
+                                <div class="pairing-countdown" id="pairing-countdown">Valid for 300s</div>
+                            </div>
+                            <div class="pairing-instructions">
+                                <h3>How to Pair Your Android Phone:</h3>
+                                <ol>
+                                    <li>Launch <strong>aimon Companion</strong> on your Android device.</li>
+                                    <li>Tap <strong>Scan QR / Enter Secret</strong> and point your camera at the QR code above.</li>
+                                    <li>Approvals for sensitive tools (<code>run_command</code>, <code>write_to_file</code>) will vibrate directly on your lock screen with <code>[Approve]</code> and <code>[Deny]</code> action buttons.</li>
+                                </ol>
+                                <button type="button" class="btn-refresh" id="btn-new-qr">Regenerate Secret</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Connected Devices Card -->
+                    <div class="glass-card devices-card">
+                        <div class="card-header">
+                            <h2>Paired Mobile Devices</h2>
+                        </div>
+                        <div class="devices-list" id="paired-devices-list">
+                            <div class="loading-placeholder">Loading paired devices...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </main>
+
 
         <!-- Dynamic Discovered Monitor Embedded Panels -->
         <div id="dynamic-panels"></div>
@@ -235,6 +412,7 @@
         </footer>
     </div>
 
-    <script src="app.js?v=1.0.6"></script>
+    <script src="qrcode.js"></script>
+    <script src="app.js?v=1.0.7"></script>
 </body>
 </html>

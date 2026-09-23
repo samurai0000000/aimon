@@ -20,6 +20,17 @@ all:
 
 test: all
 	@./$(BUILD_DIR)/test_gateway_timeout
+	@./$(BUILD_DIR)/test_agent_telemetry_db
+	@./$(BUILD_DIR)/test_mobile_gateway
+	@./$(BUILD_DIR)/test_web_server_api
+
+mobile:
+	@if [ -d mobile/android ] && command -v ./mobile/android/gradlew >/dev/null 2>&1; then \
+		cd mobile/android && ./gradlew assembleDebug; \
+	fi
+
+
+
 
 clean:
 	@if [ -d $(BUILD_DIR) ] && [ -f $(BUILD_DIR)/Makefile ]; then \

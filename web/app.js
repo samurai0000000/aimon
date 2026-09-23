@@ -252,49 +252,57 @@ function renderCursor(cr) {
     const errorBanner = document.getElementById('cursor-error');
 
     if (!cr || !cr.is_authenticated) {
-        statusDot.className = 'dot-status dot-offline';
-        planBadge.textContent = cr ? (cr.plan_tier || 'Free') : 'Unauthenticated';
-        planBadge.className = 'badge';
-        ratioEl.textContent = '-- / --';
-        progressBar.style.width = '0%';
-        remainingTxt.textContent = 'Unauthenticated';
-        percentTxt.textContent = '0%';
-        resetDateEl.textContent = '--';
-        daysRemainingEl.textContent = '--';
+        if (statusDot) statusDot.className = 'dot-status dot-offline';
+        if (planBadge) {
+            planBadge.textContent = cr ? (cr.plan_tier || 'Free') : 'Unauthenticated';
+            planBadge.className = 'badge';
+        }
+        if (ratioEl) ratioEl.textContent = '-- / --';
+        if (progressBar) progressBar.style.width = '0%';
+        if (remainingTxt) remainingTxt.textContent = 'Unauthenticated';
+        if (percentTxt) percentTxt.textContent = '0%';
+        if (resetDateEl) resetDateEl.textContent = '--';
+        if (daysRemainingEl) daysRemainingEl.textContent = '--';
 
         if (cr && cr.error_message) {
-            errorBanner.textContent = cr.error_message;
-            errorBanner.classList.remove('hidden');
+            if (errorBanner) {
+                errorBanner.textContent = cr.error_message;
+                errorBanner.classList.remove('hidden');
+            }
         }
         return;
     }
 
-    statusDot.className = 'dot-status dot-online';
-    planBadge.textContent = cr.plan_tier || 'Pro';
-    planBadge.className = 'badge badge-magenta';
-    errorBanner.classList.add('hidden');
+    if (statusDot) statusDot.className = 'dot-status dot-online';
+    if (planBadge) {
+        planBadge.textContent = cr.plan_tier || 'Pro';
+        planBadge.className = 'badge badge-magenta';
+    }
+    if (errorBanner) errorBanner.classList.add('hidden');
 
     const used = cr.fast_requests_used || 0;
     const limit = cr.fast_requests_limit || 0;
-    ratioEl.textContent = `${used.toLocaleString()} / ${limit.toLocaleString()}`;
+    if (ratioEl) ratioEl.textContent = `${used.toLocaleString()} / ${limit.toLocaleString()}`;
 
     const frac = limit > 0 ? Math.min(1, used / limit) : 0;
     const pct = Math.round(frac * 100);
-    progressBar.style.width = `${pct}%`;
-    percentTxt.textContent = `${pct}% used`;
+    if (progressBar) progressBar.style.width = `${pct}%`;
+    if (percentTxt) percentTxt.textContent = `${pct}% used`;
 
     const remaining = Math.max(0, limit - used);
-    remainingTxt.textContent = `${remaining.toLocaleString()} fast requests remaining`;
+    if (remainingTxt) remainingTxt.textContent = `${remaining.toLocaleString()} fast requests remaining`;
 
-    if (cr.cycle_reset_iso) {
-        const resetDate = new Date(cr.cycle_reset_iso);
-        resetDateEl.textContent = resetDate.toLocaleDateString();
+    if (resetDateEl && daysRemainingEl) {
+        if (cr.cycle_reset_iso) {
+            const resetDate = new Date(cr.cycle_reset_iso);
+            resetDateEl.textContent = resetDate.toLocaleDateString();
 
-        const diffDays = Math.ceil((resetDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
-        daysRemainingEl.textContent = diffDays > 0 ? `${diffDays} days left` : 'Reset pending';
-    } else {
-        resetDateEl.textContent = 'N/A';
-        daysRemainingEl.textContent = '--';
+            const diffDays = Math.ceil((resetDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+            daysRemainingEl.textContent = diffDays > 0 ? `${diffDays} days left` : 'Reset pending';
+        } else {
+            resetDateEl.textContent = 'N/A';
+            daysRemainingEl.textContent = '--';
+        }
     }
 
     renderCursorSpend(cr);
@@ -354,19 +362,19 @@ function renderCursorSpend(cr) {
     if (lblMid2) lblMid2.textContent = `$${Math.round(yMax * 0.75)}`;
     if (lblMid1) lblMid1.textContent = `$${Math.round(yMax * 0.5)}`;
 
-    // Chart bounds (viewBox 0 0 420 170)
-    const chartLeft = 55;
-    const chartRight = 405;
-    const chartBottom = 145;
-    const chartTop = 25;
+    // Chart bounds (viewBox 0 0 420 160)
+    const chartLeft = 50;
+    const chartRight = 410;
+    const chartBottom = 135;
+    const chartTop = 20;
     const width = chartRight - chartLeft;
     const height = chartBottom - chartTop;
 
     const n = history.length;
     let pathD = '';
     let areaD = '';
-    dotsGroup.innerHTML = '';
-    datesAxis.innerHTML = '';
+    if (dotsGroup) dotsGroup.innerHTML = '';
+    if (datesAxis) datesAxis.innerHTML = '';
 
     const points = history.map((pt, i) => {
         const x = n === 1 ? chartLeft + width / 2 : chartLeft + (i / (n - 1)) * width;
@@ -386,42 +394,47 @@ function renderCursorSpend(cr) {
             }
 
             // Dot element
-            const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-            circle.setAttribute('cx', p.x.toFixed(1));
-            circle.setAttribute('cy', p.y.toFixed(1));
-            circle.setAttribute('r', '4');
-            circle.setAttribute('class', 'chart-dot');
+            if (dotsGroup) {
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', p.x.toFixed(1));
+                circle.setAttribute('cy', p.y.toFixed(1));
+                circle.setAttribute('r', '4');
+                circle.setAttribute('class', 'chart-dot');
 
-            const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-            const dayLabel = p.pt.day_str || '';
-            title.textContent = `${dayLabel}\nDaily: $${(p.pt.spend_usd || 0).toFixed(2)}\nCumulative: $${(p.pt.cumulative_usd || 0).toFixed(2)}`;
-            circle.appendChild(title);
-            dotsGroup.appendChild(circle);
+                const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+                const dayLabel = p.pt.day_str || '';
+                title.textContent = `${dayLabel}\nDaily: $${(p.pt.spend_usd || 0).toFixed(2)}\nCumulative: $${(p.pt.cumulative_usd || 0).toFixed(2)}`;
+                circle.appendChild(title);
+                dotsGroup.appendChild(circle);
+            }
 
             // Date label on X axis
-            const shouldShowLabel = (n <= 7) || (idx === 0) || (idx === n - 1) || (idx % Math.ceil(n / 5) === 0);
-            if (shouldShowLabel) {
-                const dateLbl = document.createElement('span');
-                dateLbl.className = 'chart-date-item';
-                if (dayLabel) {
-                    const parts = dayLabel.split('-');
-                    if (parts.length === 3) {
-                        const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-                        const mIdx = parseInt(parts[1], 10) - 1;
-                        const dayNum = parseInt(parts[2], 10);
-                        dateLbl.textContent = `${monthNames[mIdx]} ${dayNum}`;
-                    } else {
-                        dateLbl.textContent = dayLabel;
+            if (datesAxis) {
+                const shouldShowLabel = (n <= 7) || (idx === 0) || (idx === n - 1) || (idx % Math.ceil(n / 5) === 0);
+                if (shouldShowLabel) {
+                    const dateLbl = document.createElement('span');
+                    dateLbl.className = 'chart-date-item';
+                    const dayLabel = p.pt.day_str || '';
+                    if (dayLabel) {
+                        const parts = dayLabel.split('-');
+                        if (parts.length === 3) {
+                            const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                            const mIdx = parseInt(parts[1], 10) - 1;
+                            const dayNum = parseInt(parts[2], 10);
+                            dateLbl.textContent = `${monthNames[mIdx]} ${dayNum}`;
+                        } else {
+                            dateLbl.textContent = dayLabel;
+                        }
                     }
+                    datesAxis.appendChild(dateLbl);
                 }
-                datesAxis.appendChild(dateLbl);
             }
         });
 
         areaD += ` L ${points[points.length - 1].x.toFixed(1)} ${chartBottom} Z`;
 
-        linePath.setAttribute('d', pathD);
-        areaPath.setAttribute('d', areaD);
+        if (linePath) linePath.setAttribute('d', pathD);
+        if (areaPath) areaPath.setAttribute('d', areaD);
     }
 
     // Categories Breakdown
@@ -587,6 +600,9 @@ async function fetchSessions() {
 }
 
 function setupSse() {
+    if (window.location.search.includes('no_sse')) {
+        return;
+    }
     try {
         const source = new EventSource('/sse');
         source.onmessage = (e) => {
@@ -644,18 +660,59 @@ async function fetchMonitors() {
     }
 }
 
+let activeAimonSubpanel = 'quotas';
+
+function switchToAimonSubpanel(subpanelId) {
+    if (!subpanelId) subpanelId = 'quotas';
+    activeAimonSubpanel = subpanelId;
+
+    // Update aimon subnav tabs
+    const subnavEl = document.getElementById('aimon-subnav');
+    if (subnavEl) {
+        subnavEl.querySelectorAll('.aimon-subnav-tab').forEach(tab => {
+            const id = tab.getAttribute('data-subpanel');
+            if (id === subpanelId) {
+                tab.classList.add('active');
+            } else {
+                tab.classList.remove('active');
+            }
+        });
+    }
+
+    // Toggle subpanels
+    document.querySelectorAll('.aimon-subpanel').forEach(panel => {
+        if (panel.id === `subpanel-${subpanelId}`) {
+            panel.classList.add('active');
+            panel.classList.remove('hidden');
+        } else {
+            panel.classList.remove('active');
+            panel.classList.add('hidden');
+        }
+    });
+
+    if (subpanelId === 'telemetry') {
+        fetchTelemetryOverview();
+        fetchTelemetryTimeseries();
+        fetchTelemetryTools();
+        fetchTelemetrySessions();
+    } else if (subpanelId === 'approvals') {
+        fetchPendingApprovals();
+        fetchMobileQr();
+        fetchMobileDevices();
+    }
+}
+
 function renderMonitorTabs(monitors) {
     const navEl = document.getElementById('monitor-tabs');
     const dynamicPanelsEl = document.getElementById('dynamic-panels');
     if (!navEl) return;
 
-    // Ensure aimon is present
-    let list = Array.isArray(monitors) ? [...monitors] : [];
-    if (!list.some(m => m.id === 'aimon')) {
-        list.unshift({
+    // Top-level peer monitors: aimon (Hub / Self) + external satellite monitors
+    const nativeTabs = [
+        {
             id: 'aimon',
-            name: 'AI Quotas',
-            short_name: 'AI Quotas',
+            name: 'aimon',
+            short_name: 'aimon',
             subsystem: 'aimon',
             host: '127.0.0.1',
             port: window.location.port || 3883,
@@ -663,11 +720,14 @@ function renderMonitorTabs(monitors) {
             connected: true,
             reachable: true,
             is_self: true,
+            badge: 'Hub',
+            badgeClass: '',
             priority: 0
-        });
-    }
+        }
+    ];
 
-    list.sort((a, b) => {
+    let externalMonitors = Array.isArray(monitors) ? monitors.filter(m => m.id !== 'aimon' && m.id !== 'telemetry' && m.id !== 'approvals') : [];
+    externalMonitors.sort((a, b) => {
         const pa = (a.priority !== undefined) ? a.priority : 100;
         const pb = (b.priority !== undefined) ? b.priority : 100;
         if (pa !== pb) return pa - pb;
@@ -680,20 +740,23 @@ function renderMonitorTabs(monitors) {
         return (a.port || 0) - (b.port || 0);
     });
 
+    const allTabs = [...nativeTabs, ...externalMonitors];
+
     // Render navigation tabs
-    navEl.innerHTML = list.map(m => {
+    navEl.innerHTML = allTabs.map(m => {
         const isActive = (m.id === activeMonitorId);
         const activeClass = isActive ? ' active' : '';
         const isOnline = Boolean(m.connected && m.reachable);
         const indClass = isOnline ? 'tab-indicator-online' : 'tab-indicator-offline';
-        const badgeText = (m.is_self || m.isSelf) ? 'Self' : (m.subsystem || `${m.port}`);
+        const badgeText = m.badge || ((m.is_self || m.isSelf) ? 'Hub' : (m.subsystem || `${m.port}`));
+        const badgeClass = m.badgeClass ? ` ${m.badgeClass}` : '';
         const displayLabel = m.short_name || m.name || m.subsystem || m.id;
 
         return `
-            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(m.id)}" title="${escapeHtml(m.name || m.id)} (${m.host}:${m.port})">
+            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(m.id)}" title="${escapeHtml(m.name || m.id)}">
                 <span class="tab-indicator ${indClass}"></span>
                 <span class="tab-title">${escapeHtml(displayLabel)}</span>
-                <span class="tab-badge">${escapeHtml(badgeText)}</span>
+                <span class="tab-badge${badgeClass}">${escapeHtml(badgeText)}</span>
             </button>
         `;
     }).join('');
@@ -709,14 +772,14 @@ function renderMonitorTabs(monitors) {
     // Synchronize persistent iframe panels in #dynamic-panels
     if (dynamicPanelsEl) {
         // Prune orphaned panels
-        const activePanelIds = new Set(list.filter(m => !m.is_self && !m.isSelf).map(m => `panel-${m.id}`));
+        const activePanelIds = new Set(externalMonitors.map(m => `panel-${m.id}`));
         dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(p => {
             if (!activePanelIds.has(p.id)) {
                 p.remove();
             }
         });
 
-        list.forEach(m => {
+        externalMonitors.forEach(m => {
             if (m.is_self || m.isSelf) return;
 
             let panel = document.getElementById(`panel-${m.id}`);
@@ -726,7 +789,9 @@ function renderMonitorTabs(monitors) {
             if (!panel) {
                 panel = document.createElement('div');
                 panel.id = `panel-${m.id}`;
-                panel.className = `monitor-frame-panel view-panel${m.id === activeMonitorId ? '' : ' hidden'}`;
+                panel.setAttribute('data-subsystem', m.subsystem || m.id);
+                const isSelected = (m.id === activeMonitorId || (m.subsystem && m.subsystem === activeMonitorId));
+                panel.className = `monitor-frame-panel view-panel${isSelected ? ' active' : ' hidden'}`;
                 panel.innerHTML = `
                     <div class="frame-toolbar">
                         <div class="frame-info">
@@ -833,12 +898,507 @@ function renderMonitorTabs(monitors) {
 
         if (window.location.hash) {
             const hash = window.location.hash.replace(/^#/, '');
-            const target = monitors.find(m => m.id === hash || m.subsystem === hash);
+            const target = allTabs.find(m => m.id === hash || m.subsystem === hash);
             if (target && activeMonitorId !== target.id) {
                 switchToMonitor(target.id);
             }
         }
     }
+}
+
+// ==========================================================================
+// Agent Telemetry, Historical Analytics & Approvals Frontend Engine
+// ==========================================================================
+
+let activeTelemetryWindow = '24h';
+let telemetryTimer = null;
+let approvalsTimer = null;
+
+async function fetchTelemetryOverview() {
+    try {
+        const res = await fetch('/api/telemetry/overview');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        const activeSessionsEl = document.getElementById('kpi-active-sessions');
+        const totalToolsEl = document.getElementById('kpi-total-tools');
+        const avgLatencyEl = document.getElementById('kpi-avg-latency');
+        const errorRateEl = document.getElementById('kpi-error-rate');
+
+        if (activeSessionsEl) activeSessionsEl.innerHTML = `${data.active_sessions || 0} <span class="kpi-sub">running</span>`;
+        if (totalToolsEl) {
+            totalToolsEl.innerHTML = `${(data.total_tool_calls || 0).toLocaleString()} <span class="kpi-sub">calls</span>`;
+        }
+        if (avgLatencyEl) {
+            const avgSec = ((data.avg_turn_latency_ms || 0) / 1000.0).toFixed(2);
+            avgLatencyEl.innerHTML = `${avgSec} <span class="kpi-sub">sec</span>`;
+        }
+        if (errorRateEl) {
+            const errPct = (data.error_rate_pct || 0).toFixed(1);
+            errorRateEl.innerHTML = `${errPct} <span class="kpi-sub">%</span>`;
+        }
+    } catch (_) {}
+}
+
+function formatChartValue(val, isLatency) {
+    if (isLatency) {
+        if (val < 1000) return `${Math.round(val)}ms`;
+        if (val < 60000) return `${(val / 1000).toFixed(1)}s`;
+        return `${(val / 60000).toFixed(1)}m`;
+    }
+    if (val >= 1000) return `${(val / 1000).toFixed(1)}k`;
+    if (val === Math.round(val)) return `${val}`;
+    return val.toFixed(1);
+}
+
+function renderSvgLineChart(svgId, timestamps, series1, series2, color1, color2, isDualAxis = false) {
+    const svg = document.getElementById(svgId);
+    if (!svg) return;
+
+    if (!timestamps || timestamps.length < 2) {
+        svg.innerHTML = '<text x="400" y="120" fill="rgba(255,255,255,0.3)" font-size="12" text-anchor="middle" font-family="sans-serif">Accumulating telemetry data points...</text>';
+        return;
+    }
+
+    const width = 800;
+    const height = 240;
+    const padL = 65;
+    const padR = isDualAxis ? 50 : 25;
+    const padT = 20;
+    const padB = 35;
+
+    const plotW = width - padL - padR;
+    const plotH = height - padT - padB;
+    const pointsCount = timestamps.length;
+    const isLatency = (svgId === 'latency-svg');
+
+    let maxVal1 = Math.max(...series1, 0);
+    if (maxVal1 <= 0) maxVal1 = 1;
+    maxVal1 = maxVal1 * 1.15;
+
+    let maxVal2 = Math.max(...series2, 0);
+    if (maxVal2 <= 0) maxVal2 = 1;
+    maxVal2 = maxVal2 * 1.15;
+
+    if (!isDualAxis) {
+        const combinedMax = Math.max(maxVal1, maxVal2);
+        maxVal1 = combinedMax;
+        maxVal2 = combinedMax;
+    }
+
+    const getX = (idx) => padL + (idx / (pointsCount - 1)) * plotW;
+    const getY1 = (val) => padT + plotH - (Math.max(0, val) / maxVal1) * plotH;
+    const getY2 = (val) => padT + plotH - (Math.max(0, val) / maxVal2) * plotH;
+
+    let path1 = '';
+    let path2 = '';
+    let area1 = `M ${getX(0)} ${padT + plotH} `;
+    let area2 = `M ${getX(0)} ${padT + plotH} `;
+
+    for (let i = 0; i < pointsCount; ++i) {
+        const x = getX(i);
+        const y1 = getY1(series1[i] || 0);
+        const y2 = getY2(series2[i] || 0);
+
+        if (i === 0) {
+            path1 += `M ${x} ${y1} `;
+            path2 += `M ${x} ${y2} `;
+        } else {
+            path1 += `L ${x} ${y1} `;
+            path2 += `L ${x} ${y2} `;
+        }
+        area1 += `L ${x} ${y1} `;
+        area2 += `L ${x} ${y2} `;
+    }
+
+    area1 += `L ${getX(pointsCount - 1)} ${padT + plotH} Z`;
+    area2 += `L ${getX(pointsCount - 1)} ${padT + plotH} Z`;
+
+    // Grid lines & Y-axis labels
+    let gridSvg = '';
+    const gridLines = 4;
+    for (let g = 0; g <= gridLines; ++g) {
+        const gy = padT + (g / gridLines) * plotH;
+        const gVal1 = ((gridLines - g) / gridLines) * maxVal1;
+        const gValStr1 = formatChartValue(gVal1, isLatency);
+
+        gridSvg += `<line x1="${padL}" y1="${gy}" x2="${width - padR}" y2="${gy}" stroke="rgba(255,255,255,0.06)" stroke-width="1" />`;
+        gridSvg += `<text x="${padL - 8}" y="${gy + 4}" fill="${color1}" fill-opacity="0.65" font-size="10" font-family="monospace" text-anchor="end">${gValStr1}</text>`;
+
+        if (isDualAxis) {
+            const gVal2 = Math.round(((gridLines - g) / gridLines) * maxVal2);
+            gridSvg += `<text x="${width - padR + 8}" y="${gy + 4}" fill="${color2}" fill-opacity="0.65" font-size="10" font-family="monospace" text-anchor="start">${gVal2}</text>`;
+        }
+    }
+
+    // X-Axis Timestamp Ticks (4-5 evenly spaced intervals)
+    let xTicksSvg = '';
+    const numXTicks = Math.min(5, pointsCount);
+    for (let t = 0; t < numXTicks; ++t) {
+        const idx = Math.floor(t * (pointsCount - 1) / (numXTicks - 1));
+        const tx = getX(idx);
+        const epoch = timestamps[idx];
+        const dateObj = new Date(epoch * 1000);
+        let timeStr = dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+        if (activeTelemetryWindow === '7d' || activeTelemetryWindow === '30d' || activeTelemetryWindow === '1y') {
+            timeStr = `${dateObj.getMonth() + 1}/${dateObj.getDate()} ${timeStr}`;
+        }
+        xTicksSvg += `<line x1="${tx}" y1="${padT + plotH}" x2="${tx}" y2="${padT + plotH + 5}" stroke="rgba(255,255,255,0.15)" stroke-width="1" />`;
+        xTicksSvg += `<text x="${tx}" y="${padT + plotH + 18}" fill="rgba(255,255,255,0.4)" font-size="10" font-family="monospace" text-anchor="middle">${timeStr}</text>`;
+    }
+
+    svg.innerHTML = `
+        <defs>
+            <linearGradient id="grad-${svgId}-1" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="${color1}" stop-opacity="0.25"/>
+                <stop offset="100%" stop-color="${color1}" stop-opacity="0.0"/>
+            </linearGradient>
+            <linearGradient id="grad-${svgId}-2" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="${color2}" stop-opacity="0.2"/>
+                <stop offset="100%" stop-color="${color2}" stop-opacity="0.0"/>
+            </linearGradient>
+        </defs>
+        ${gridSvg}
+        ${xTicksSvg}
+        <path d="${area2}" fill="url(#grad-${svgId}-2)" />
+        <path d="${area1}" fill="url(#grad-${svgId}-1)" />
+        <path d="${path2}" fill="none" stroke="${color2}" stroke-width="2" stroke-linecap="round" />
+        <path d="${path1}" fill="none" stroke="${color1}" stroke-width="2.2" stroke-linecap="round" />
+        <g id="tooltip-${svgId}" class="chart-tooltip-group" style="display: none;">
+            <line id="crosshair-${svgId}" x1="0" y1="${padT}" x2="0" y2="${padT + plotH}" stroke="rgba(255,255,255,0.35)" stroke-dasharray="3,3" stroke-width="1" />
+            <circle id="dot1-${svgId}" r="4" fill="${color1}" stroke="#ffffff" stroke-width="1.5" />
+            <circle id="dot2-${svgId}" r="4" fill="${color2}" stroke="#ffffff" stroke-width="1.5" />
+            <rect id="tip-bg-${svgId}" width="155" height="52" rx="6" fill="rgba(10, 14, 23, 0.92)" stroke="rgba(255,255,255,0.18)" stroke-width="1" />
+            <text id="tip-t-${svgId}" x="0" y="0" fill="#9ca3af" font-size="9" font-family="monospace"></text>
+            <text id="tip-v1-${svgId}" x="0" y="0" fill="${color1}" font-size="10" font-family="monospace" font-weight="bold"></text>
+            <text id="tip-v2-${svgId}" x="0" y="0" fill="${color2}" font-size="10" font-family="monospace" font-weight="bold"></text>
+        </g>
+        <rect class="svg-overlay-catcher" x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" fill="transparent" style="cursor: crosshair;" />
+    `;
+
+    // Interactive crosshair & tooltip
+    const catcher = svg.querySelector('.svg-overlay-catcher');
+    const tipGroup = svg.querySelector(`#tooltip-${svgId}`);
+    const crosshair = svg.querySelector(`#crosshair-${svgId}`);
+    const dot1 = svg.querySelector(`#dot1-${svgId}`);
+    const dot2 = svg.querySelector(`#dot2-${svgId}`);
+    const tipBg = svg.querySelector(`#tip-bg-${svgId}`);
+    const tipT = svg.querySelector(`#tip-t-${svgId}`);
+    const tipV1 = svg.querySelector(`#tip-v1-${svgId}`);
+    const tipV2 = svg.querySelector(`#tip-v2-${svgId}`);
+
+    if (catcher && tipGroup) {
+        catcher.addEventListener('mousemove', (e) => {
+            const rect = svg.getBoundingClientRect();
+            const mouseSvgX = ((e.clientX - rect.left) / rect.width) * width;
+            const normX = Math.max(0, Math.min(1, (mouseSvgX - padL) / plotW));
+            const idx = Math.round(normX * (pointsCount - 1));
+
+            const curX = getX(idx);
+            const val1 = series1[idx] || 0;
+            const val2 = series2[idx] || 0;
+            const curY1 = getY1(val1);
+            const curY2 = getY2(val2);
+
+            crosshair.setAttribute('x1', curX);
+            crosshair.setAttribute('x2', curX);
+            dot1.setAttribute('cx', curX);
+            dot1.setAttribute('cy', curY1);
+            dot2.setAttribute('cx', curX);
+            dot2.setAttribute('cy', curY2);
+
+            const epoch = timestamps[idx];
+            const tsStr = new Date(epoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+            tipT.textContent = `Time: ${tsStr}`;
+
+            if (isLatency) {
+                tipV1.textContent = `Avg: ${formatChartValue(val1, true)}`;
+                tipV2.textContent = `P95: ${formatChartValue(val2, true)}`;
+            } else {
+                tipV1.textContent = `Rate: ${val1.toFixed(1)} calls/s`;
+                tipV2.textContent = `Sessions: ${Math.round(val2)}`;
+            }
+
+            let boxX = curX + 10;
+            if (boxX + 160 > width - padR) {
+                boxX = curX - 165;
+            }
+            const boxY = padT + 8;
+            tipBg.setAttribute('x', boxX);
+            tipBg.setAttribute('y', boxY);
+            tipT.setAttribute('x', boxX + 8);
+            tipT.setAttribute('y', boxY + 14);
+            tipV1.setAttribute('x', boxX + 8);
+            tipV1.setAttribute('y', boxY + 29);
+            tipV2.setAttribute('x', boxX + 8);
+            tipV2.setAttribute('y', boxY + 44);
+
+            tipGroup.style.display = 'block';
+        });
+
+        catcher.addEventListener('mouseleave', () => {
+            tipGroup.style.display = 'none';
+        });
+    }
+}
+
+async function fetchTelemetryTimeseries() {
+    try {
+        const res = await fetch(`/api/telemetry/timeseries?window=${activeTelemetryWindow}&max_points=100`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data || !data.series) return;
+
+        const s = data.series;
+        const ts = s.timestamps || [];
+        const toolCalls = s.tool_calls_sec || [];
+        const activeAgents = s.active_agents || [];
+        const avgLat = s.avg_turn_latency_ms || [];
+        const p95Lat = s.p95_turn_latency_ms || [];
+
+        renderSvgLineChart('token-svg', ts, toolCalls, activeAgents, '#38bdf8', '#e879f9', true);
+        renderSvgLineChart('latency-svg', ts, avgLat, p95Lat, '#3b82f6', '#f59e0b', false);
+    } catch (_) {}
+}
+
+async function fetchTelemetryTools() {
+    try {
+        const res = await fetch('/api/telemetry/tools');
+        if (!res.ok) return;
+        const tools = await res.json();
+        const container = document.getElementById('tool-matrix-container');
+        const badge = document.getElementById('tools-total-badge');
+        if (!container) return;
+
+        if (!tools || tools.length === 0) {
+            container.innerHTML = '<div class="loading-placeholder">No tool execution telemetry recorded yet.</div>';
+            if (badge) badge.textContent = '0 Calls';
+            return;
+        }
+
+        let totalInvocations = 0;
+        let maxInvocations = 1;
+        tools.forEach(t => {
+            totalInvocations += (t.invocations || 0);
+            if ((t.invocations || 0) > maxInvocations) {
+                maxInvocations = t.invocations;
+            }
+        });
+        if (badge) badge.textContent = `${totalInvocations} Calls`;
+
+        container.innerHTML = tools.map(t => {
+            const inv = t.invocations || 0;
+            const pct = Math.round((inv / maxInvocations) * 100);
+            const errRate = (t.error_rate_pct || 0).toFixed(1);
+            const avgMs = Math.round(t.avg_duration_ms || 0);
+            const isError = t.error_count > 0;
+
+            return `
+                <div class="tool-row">
+                    <span class="tool-name-col" title="${escapeHtml(t.tool_name)}">${escapeHtml(t.tool_name)}</span>
+                    <div class="tool-bar-track">
+                        <div class="tool-bar-fill ${isError ? 'error-fill' : ''}" style="width: ${pct}%;"></div>
+                    </div>
+                    <span class="tool-count-col">${inv} calls ${errRate > 0 ? `<span class="text-amber">(${errRate}% err)</span>` : ''}</span>
+                    <span class="tool-duration-col">${avgMs} ms</span>
+                </div>
+            `;
+        }).join('');
+    } catch (_) {}
+}
+
+async function fetchTelemetrySessions() {
+    try {
+        const res = await fetch('/api/telemetry/sessions');
+        if (!res.ok) return;
+        const sessions = await res.json();
+        const select = document.getElementById('waterfall-session-select');
+        if (!select) return;
+
+        const currentVal = select.value;
+        if (!sessions || sessions.length === 0) {
+            select.innerHTML = '<option value="">No Active or Recent Sessions</option>';
+            return;
+        }
+
+        const chosenSessionId = currentVal || sessions[0].session_id;
+        select.innerHTML = sessions.map(s => {
+            const tsStr = new Date(s.start_timestamp * 1000).toLocaleTimeString();
+            const turns = s.total_turns || 0;
+            const tools = s.total_tool_calls || 0;
+            return `<option value="${s.session_id}" ${s.session_id === chosenSessionId ? 'selected' : ''}>[${s.agent_type.toUpperCase()}] ${s.session_id} - ${s.model_name} (${turns} turns, ${tools} tools &bull; ${tsStr})</option>`;
+        }).join('');
+
+        select.value = chosenSessionId;
+        fetchSessionWaterfall(chosenSessionId);
+    } catch (_) {}
+}
+
+async function fetchSessionWaterfall(sessionId) {
+    if (!sessionId) return;
+    const container = document.getElementById('waterfall-container');
+    if (!container) return;
+
+    try {
+        const res = await fetch(`/api/telemetry/session_events?sessionId=${sessionId}`);
+        if (!res.ok) return;
+        const events = await res.json();
+
+        if (!events || events.length === 0) {
+            container.innerHTML = `<div class="waterfall-empty-hint">Session <code>${escapeHtml(sessionId)}</code> is active, but 0 lifecycle events recorded yet.</div>`;
+            return;
+        }
+
+        const maxDisplay = 100;
+        const displayEvents = events.length > maxDisplay ? events.slice(-maxDisplay) : events;
+        const badgeLabel = events.length > maxDisplay ? `Recent ${maxDisplay} / ${events.length} Events` : `${events.length} Events`;
+
+        container.innerHTML = `
+            <div class="waterfall-turn-row">
+                <div class="turn-header">
+                    <span>Session Lifecycle Timeline (Chronological Execution Flow)</span>
+                    <span class="badge badge-cyan">${badgeLabel}</span>
+                </div>
+                <div class="turn-timeline-track">
+                    ${displayEvents.map(ev => {
+                        let blockClass = 'wf-block-tool';
+                        if (ev.event_type === 'SESSION_START' || ev.event_type === 'TURN_START' || ev.event_type === 'USER_TURN') blockClass = 'wf-block-prompt';
+                        else if (ev.event_type === 'THINKING') blockClass = 'wf-block-think';
+                        else if (ev.event_type === 'APPROVAL_WAIT') blockClass = 'wf-block-approval';
+                        else if (ev.status === 'ERROR') blockClass = 'wf-block-error';
+
+                        const durationStr = ev.duration_ms > 0 ? ` (${Math.round(ev.duration_ms)}ms)` : '';
+                        const label = ev.tool_name ? `${ev.event_type}: ${ev.tool_name}` : ev.event_type;
+
+                        return `<div class="wf-block ${blockClass}">${label}${durationStr}</div>`;
+                    }).join('')}
+                </div>
+            </div>
+        `;
+    } catch (_) {}
+}
+
+// --- Action Approvals & Mobile Companion Client ---
+
+async function fetchPendingApprovals() {
+    try {
+        const res = await fetch('/api/approvals/pending');
+        if (!res.ok) return;
+        const list = await res.json();
+
+        const badge = document.getElementById('pending-approvals-count');
+        const navBadge = document.getElementById('approvals-badge');
+        const container = document.getElementById('pending-approvals-list');
+
+        if (badge) badge.textContent = `${list.length} Pending`;
+        if (navBadge) navBadge.textContent = list.length > 0 ? `${list.length} Action` : 'Mobile';
+
+        if (!container) return;
+        if (!list || list.length === 0) {
+            container.innerHTML = `
+                <div class="no-pending-hint">
+                    <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="1.8" fill="none">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <polyline points="12 6 12 14 14 14"></polyline>
+                    </svg>
+                    <p>No actions currently waiting for approval.</p>
+                </div>
+            `;
+            return;
+        }
+
+        container.innerHTML = list.map(item => `
+            <div class="approval-item-card" id="approval-card-${item.approval_id}">
+                <div class="approval-item-header">
+                    <span class="approval-tool-badge">[${item.agent_type.toUpperCase()}] ${item.tool_name}</span>
+                    <span class="badge badge-amber">⏱️ ${item.remaining_seconds}s left</span>
+                </div>
+                <div class="approval-item-body">${item.reason || ''}\nWorkspace: ${item.workspace}\nArgs: ${JSON.stringify(item.tool_args, null, 2)}</div>
+                <div class="approval-actions">
+                    <button class="btn-deny" onclick="submitApprovalDecision('${item.approval_id}', 'deny')">Deny</button>
+                    <button class="btn-approve" onclick="submitApprovalDecision('${item.approval_id}', 'allow')">Approve Action</button>
+                </div>
+            </div>
+        `).join('');
+    } catch (_) {}
+}
+
+async function submitApprovalDecision(approvalId, decision) {
+    try {
+        const res = await fetch('/api/approvals/decision', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ approval_id: approvalId, decision: decision })
+        });
+        if (res.ok) {
+            fetchPendingApprovals();
+        }
+    } catch (_) {}
+}
+
+async function fetchMobileQr() {
+    try {
+        const res = await fetch('/api/mobile/qr');
+        if (!res.ok) return;
+        const data = await res.json();
+        const secretEl = document.getElementById('pairing-secret-display');
+        const countEl = document.getElementById('pairing-countdown');
+        const qrContainer = document.getElementById('pairing-qr-svg');
+
+        const secret = data.secret || '';
+        if (secretEl) secretEl.textContent = secret || 'ERR_SECRET';
+        if (countEl) countEl.textContent = `Valid for ${data.expires_in || 300}s`;
+
+        if (qrContainer && secret && typeof window.generateQrSvg === 'function') {
+            const host = window.location.hostname || '127.0.0.1';
+            const port = window.location.port || 3883;
+            const pairingUri = `aimon://pair?host=${host}&port=${port}&secret=${secret}`;
+            qrContainer.innerHTML = window.generateQrSvg(pairingUri, {
+                fg: '#38bdf8',
+                bg: '#0f172a',
+                margin: 2
+            });
+        }
+    } catch (_) {}
+}
+
+async function fetchMobileDevices() {
+    try {
+        const res = await fetch('/api/mobile/devices');
+        if (!res.ok) return;
+        const list = await res.json();
+        const container = document.getElementById('paired-devices-list');
+        if (!container) return;
+
+        if (!list || list.length === 0) {
+            container.innerHTML = '<div class="loading-placeholder">No mobile devices paired yet. Scan the code above to link your phone.</div>';
+            return;
+        }
+
+        container.innerHTML = list.map(d => `
+            <div class="device-item-row">
+                <div class="device-info">
+                    <span class="device-name">${d.device_name || 'Android Device'}</span>
+                    <span class="device-meta">ID: ${d.device_id} &bull; Paired: ${new Date(d.paired_at * 1000).toLocaleDateString()}</span>
+                </div>
+                <button class="btn-revoke" onclick="revokeDevice('${d.device_id}')">Revoke</button>
+            </div>
+        `).join('');
+    } catch (_) {}
+}
+
+async function revokeDevice(deviceId) {
+    if (!confirm('Revoke access for this device?')) return;
+    try {
+        const res = await fetch('/api/mobile/revoke', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_id: deviceId })
+        });
+        if (res.ok) {
+            fetchMobileDevices();
+        }
+    } catch (_) {}
 }
 
 function switchToMonitor(id) {
@@ -849,11 +1409,22 @@ function switchToMonitor(id) {
         } catch (_) {}
     }
 
-    // Update active tab styles
+    // If switching to an aimon subpanel directly (e.g. #telemetry or #approvals or #quotas)
+    if (id === 'quotas' || id === 'telemetry' || id === 'approvals') {
+        switchToMonitor('aimon');
+        switchToAimonSubpanel(id);
+        return;
+    }
+
+    activeMonitorId = id;
+
+    // Update active tab button styles in top nav
     const navEl = document.getElementById('monitor-tabs');
     if (navEl) {
         navEl.querySelectorAll('.monitor-tab').forEach(tab => {
-            if (tab.getAttribute('data-id') === id) {
+            const tabId = tab.getAttribute('data-id');
+            const isMatch = (tabId === id || tabId.startsWith(id + '-'));
+            if (isMatch) {
                 tab.classList.add('active');
             } else {
                 tab.classList.remove('active');
@@ -862,19 +1433,28 @@ function switchToMonitor(id) {
     }
 
     const viewAimon = document.getElementById('view-aimon');
-    if (id === 'aimon') {
-        if (viewAimon) viewAimon.classList.remove('hidden');
-    } else {
-        if (viewAimon) viewAimon.classList.add('hidden');
+    const isAimon = (id === 'aimon');
+
+    if (viewAimon) {
+        viewAimon.classList.toggle('active', isAimon);
+        viewAimon.classList.toggle('hidden', !isAimon);
+        if (isAimon) {
+            switchToAimonSubpanel(activeAimonSubpanel);
+        }
     }
 
-    // Toggle persistent panels
+    // Toggle persistent satellite monitor panels
     const dynamicPanelsEl = document.getElementById('dynamic-panels');
     if (dynamicPanelsEl) {
         dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(panel => {
-            if (panel.id === `panel-${id}`) {
+            const panelId = panel.id;
+            const subsystem = panel.getAttribute('data-subsystem');
+            const isMatch = !isAimon && (panelId === `panel-${id}` || panelId.startsWith(`panel-${id}-`) || (subsystem && (subsystem === id || id.startsWith(subsystem))));
+            if (isMatch) {
+                panel.classList.add('active');
                 panel.classList.remove('hidden');
             } else {
+                panel.classList.remove('active');
                 panel.classList.add('hidden');
             }
         });
@@ -884,7 +1464,16 @@ function switchToMonitor(id) {
 window.addEventListener('hashchange', () => {
     const hash = window.location.hash.replace(/^#/, '');
     if (hash) {
-        switchToMonitor(hash);
+        if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+            switchToMonitor('aimon');
+            switchToAimonSubpanel(hash);
+        } else if (hash.startsWith('aimon/')) {
+            const sub = hash.split('/')[1];
+            switchToMonitor('aimon');
+            switchToAimonSubpanel(sub);
+        } else {
+            switchToMonitor(hash);
+        }
     } else {
         switchToMonitor('aimon');
     }
@@ -894,29 +1483,91 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
     fetchSessions();
     fetchMonitors();
+    fetchMobileQr();
     setupSse();
+
+    if (window.location.hash) {
+        const hash = window.location.hash.replace(/^#/, '');
+        if (hash) {
+            if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+                switchToMonitor('aimon');
+                switchToAimonSubpanel(hash);
+            } else if (hash.startsWith('aimon/')) {
+                const sub = hash.split('/')[1];
+                switchToMonitor('aimon');
+                switchToAimonSubpanel(sub);
+            } else {
+                switchToMonitor(hash);
+            }
+        }
+    }
+
+    // Top-level tab button click listeners
+    const monitorTabsEl = document.getElementById('monitor-tabs');
+    if (monitorTabsEl) {
+        monitorTabsEl.addEventListener('click', (e) => {
+            const btn = e.target.closest('.monitor-tab');
+            if (btn && btn.dataset.id) {
+                switchToMonitor(btn.dataset.id);
+            }
+        });
+    }
+
+    // Aimon Sub-Navigation button click listeners
+    const aimonSubnavEl = document.getElementById('aimon-subnav');
+    if (aimonSubnavEl) {
+        aimonSubnavEl.addEventListener('click', (e) => {
+            const btn = e.target.closest('.aimon-subnav-tab');
+            if (btn && btn.dataset.subpanel) {
+                switchToAimonSubpanel(btn.dataset.subpanel);
+            }
+        });
+    }
+
+    // Timeframe selector listeners
+    const tfSelector = document.getElementById('telem-timeframe-selector');
+    if (tfSelector) {
+        tfSelector.addEventListener('click', (e) => {
+            const btn = e.target.closest('.time-btn');
+            if (btn && btn.dataset.window) {
+                tfSelector.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                activeTelemetryWindow = btn.dataset.window;
+                fetchTelemetryTimeseries();
+            }
+        });
+    }
+
+    // Session dropdown listener
+    const sessionSelect = document.getElementById('waterfall-session-select');
+    if (sessionSelect) {
+        sessionSelect.addEventListener('change', (e) => {
+            fetchSessionWaterfall(e.target.value);
+        });
+    }
+
+    // Regenerate QR button
+    const btnQr = document.getElementById('btn-new-qr');
+    if (btnQr) {
+        btnQr.addEventListener('click', fetchMobileQr);
+    }
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
         fetchStatus(true);
         fetchSessions();
         fetchMonitors();
-    });
-
-    const reloadBtn = document.getElementById('frame-reload-btn');
-    if (reloadBtn) {
-        reloadBtn.addEventListener('click', () => {
-            const iframe = document.getElementById('monitor-iframe');
-            if (iframe) {
-                try {
-                    iframe.contentWindow.location.reload();
-                } catch (_) {
-                    const src = iframe.src;
-                    iframe.src = '';
-                    iframe.src = src;
-                }
+        if (activeMonitorId === 'aimon') {
+            if (activeAimonSubpanel === 'telemetry') {
+                fetchTelemetryOverview();
+                fetchTelemetryTimeseries();
+                fetchTelemetryTools();
+                fetchTelemetrySessions();
+            } else if (activeAimonSubpanel === 'approvals') {
+                fetchPendingApprovals();
+                fetchMobileDevices();
             }
-        });
-    }
+        }
+    });
 
     const modelsToggleBtn = document.getElementById('ag-models-toggle');
     const modelsChevron = document.getElementById('ag-models-chevron');
@@ -934,10 +1585,21 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Refresh data: status every 5s, sessions every 3s, monitors every 8s
-    setInterval(() => fetchStatus(false), 5000);
-    setInterval(fetchSessions, 3000);
-    setInterval(fetchMonitors, 8000);
+    // Periodic refresh timers (backed by reactive SSE streams)
+    setInterval(() => fetchStatus(false), 12000);
+    setInterval(fetchSessions, 10000);
+    setInterval(fetchMonitors, 15000);
+
+    // Refresh telemetry & approvals periodically when respective tab is active
+    setInterval(() => {
+        if (activeMonitorId === 'telemetry') {
+            fetchTelemetryOverview();
+            fetchTelemetryTimeseries();
+            fetchTelemetryTools();
+        } else if (activeMonitorId === 'approvals') {
+            fetchPendingApprovals();
+        }
+    }, 8000);
 
     // Update countdown timers and session uptime every second
     if (countdownInterval) clearInterval(countdownInterval);
@@ -946,3 +1608,4 @@ document.addEventListener('DOMContentLoaded', () => {
         updateSessionUptimes();
     }, 1000);
 });
+

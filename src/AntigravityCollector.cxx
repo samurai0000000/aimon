@@ -20,6 +20,7 @@
 #endif
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include "AgentTelemetryDb.hxx"
 
 namespace fs = std::filesystem;
 
@@ -178,11 +179,16 @@ bool AntigravityCollector::discoverProcess(int& outPort, std::string& outCsrf) {
 
     for (pid_t pid : candidatePids) {
         std::string cmdlinePath = "/proc/" + std::to_string(pid) + "/cmdline";
-        std::ifstream cmdlineFile(cmdlinePath);
-        if (!cmdlineFile.is_open()) continue;
+        std::string content;
+        try {
+            std::ifstream cmdlineFile(cmdlinePath);
+            if (!cmdlineFile.is_open()) continue;
 
-        std::string content((std::istreambuf_iterator<char>(cmdlineFile)),
-                             std::istreambuf_iterator<char>());
+            content.assign((std::istreambuf_iterator<char>(cmdlineFile)),
+                           std::istreambuf_iterator<char>());
+        } catch (...) {
+            continue;
+        }
         if (content.find("language_server") == std::string::npos) {
             continue;
         }
@@ -422,6 +428,189 @@ AntigravityStatus AntigravityCollector::fetchStatus() {
     }
 
     return status;
+}
+
+void AntigravityCollector::syncTranscriptTelemetry() {
+    time_t now = time(nullptr);
+    if (_lastTranscriptScan != 0 && (now - _lastTranscriptScan < 5)) {
+        return; // Throttle scan to every 5s
+    }
+    _lastTranscriptScan = now;
+
+    const char *home = getenv("HOME");
+    if (!home) return;
+
+    fs::path brainDir = fs::path(home) / ".gemini" / "antigravity-ide" / "brain";
+    if (!fs::exists(brainDir) || !fs::is_directory(brainDir)) {
+        return;
+    }
+
+    try {
+        for (const auto& entry : fs::directory_iterator(brainDir)) {
+            if (!entry.is_directory()) continue;
+            std::string convId = entry.path().filename().string();
+            fs::path transcriptPath = entry.path() / ".system_generated" / "logs" / "transcript.jsonl";
+            if (!fs::exists(transcriptPath)) continue;
+
+            auto ftime = fs::last_write_time(transcriptPath);
+            auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+            std::time_t mtime = std::chrono::system_clock::to_time_t(sctp);
+            if (now - mtime > 60 * 86400) continue; // Skip stale files older than 60d
+
+            int64_t lastOffset = 0;
+            auto it = _transcriptOffsets.find(transcriptPath.string());
+            if (it != _transcriptOffsets.end()) {
+                lastOffset = it->second;
+            }
+
+            uintmax_t curSize = fs::file_size(transcriptPath);
+            if (curSize <= static_cast<uintmax_t>(lastOffset)) {
+                continue; // No new data
+            }
+
+            std::ifstream ifs(transcriptPath);
+            if (!ifs.is_open()) continue;
+
+            if (lastOffset > 0) {
+                ifs.seekg(lastOffset);
+            }
+
+            std::string line;
+            std::string sessionId = "sess-" + (convId.length() >= 8 ? convId.substr(0, 8) : convId);
+            std::vector<nlohmann::json> parsedSteps;
+
+            while (std::getline(ifs, line)) {
+                if (line.empty()) continue;
+                try {
+                    auto j = nlohmann::json::parse(line, nullptr, false);
+                    if (!j.is_discarded() && j.is_object()) {
+                        parsedSteps.push_back(std::move(j));
+                    }
+                } catch (...) {}
+            }
+
+            _transcriptOffsets[transcriptPath.string()] = curSize;
+            if (parsedSteps.empty()) continue;
+
+            std::vector<AgentLifecycleEvent> eventsBatch;
+            int totalTurns = 0;
+            int totalTools = 0;
+            int totalErrors = 0;
+            double sumDuration = 0.0;
+            int durationCount = 0;
+            int64_t firstTs = 0;
+            int64_t lastTs = 0;
+
+            for (size_t i = 0; i < parsedSteps.size(); ++i) {
+                const auto& j = parsedSteps[i];
+                std::string stype = j.value("type", "");
+                std::string status = j.value("status", "DONE");
+                std::string iso = j.value("created_at", "");
+                int stepIdx = j.value("step_index", static_cast<int>(i));
+
+                int64_t stepTs = mtime;
+                if (!iso.empty()) {
+                    stepTs = std::chrono::system_clock::to_time_t(parseIsoTimestamp(iso));
+                }
+                if (firstTs == 0) firstTs = stepTs;
+                lastTs = stepTs;
+
+                double stepDurationMs = 0.0;
+                if (i + 1 < parsedSteps.size()) {
+                    std::string nextIso = parsedSteps[i + 1].value("created_at", "");
+                    if (!iso.empty() && !nextIso.empty()) {
+                        auto tp1 = parseIsoTimestamp(iso);
+                        auto tp2 = parseIsoTimestamp(nextIso);
+                        double dms = std::chrono::duration<double, std::milli>(tp2 - tp1).count();
+                        if (dms >= 0.0 && dms <= 300000.0) {
+                            stepDurationMs = dms;
+                        }
+                    }
+                }
+
+                if (status == "ERROR") {
+                    totalErrors++;
+                }
+
+                if (stype == "USER_INPUT") {
+                    totalTurns++;
+                    AgentLifecycleEvent ev;
+                    ev.timestamp = stepTs;
+                    ev.sessionId = sessionId;
+                    ev.agentType = "antigravity";
+                    ev.eventType = "USER_TURN";
+                    ev.stepIndex = stepIdx;
+                    ev.durationMs = 0.0;
+                    ev.status = (status == "ERROR" ? "ERROR" : "OK");
+                    eventsBatch.push_back(ev);
+                } else if (stype == "PLANNER_RESPONSE") {
+                    if (stepDurationMs > 0.0) {
+                        sumDuration += stepDurationMs;
+                        durationCount++;
+                    }
+                    AgentLifecycleEvent ev;
+                    ev.timestamp = stepTs;
+                    ev.sessionId = sessionId;
+                    ev.agentType = "antigravity";
+                    ev.eventType = "THINKING";
+                    ev.stepIndex = stepIdx;
+                    ev.durationMs = stepDurationMs;
+                    ev.status = (status == "ERROR" ? "ERROR" : "OK");
+                    eventsBatch.push_back(ev);
+                }
+
+                if (j.contains("tool_calls") && j["tool_calls"].is_array()) {
+                    for (const auto& tc : j["tool_calls"]) {
+                        if (tc.is_object() && tc.contains("name")) {
+                            totalTools++;
+                            AgentLifecycleEvent ev;
+                            ev.timestamp = stepTs;
+                            ev.sessionId = sessionId;
+                            ev.agentType = "antigravity";
+                            ev.eventType = "TOOL_CALL";
+                            ev.stepIndex = stepIdx;
+                            ev.toolName = tc["name"].get<std::string>();
+                            ev.durationMs = stepDurationMs;
+                            ev.status = (status == "ERROR" ? "ERROR" : "OK");
+                            eventsBatch.push_back(ev);
+                        }
+                    }
+                }
+
+                if (stype == "RUN_COMMAND" || stype == "VIEW_FILE" || stype == "WRITE_TO_FILE" ||
+                    stype == "REPLACE_FILE_CONTENT" || stype == "MULTI_REPLACE_FILE_CONTENT" ||
+                    stype == "GREP_SEARCH" || stype == "LIST_DIRECTORY") {
+                    totalTools++;
+                    std::string tname = stype;
+                    std::transform(tname.begin(), tname.end(), tname.begin(), ::tolower);
+                    AgentLifecycleEvent ev;
+                    ev.timestamp = stepTs;
+                    ev.sessionId = sessionId;
+                    ev.agentType = "antigravity";
+                    ev.eventType = "TOOL_CALL";
+                    ev.stepIndex = stepIdx;
+                    ev.toolName = tname;
+                    ev.durationMs = stepDurationMs;
+                    ev.status = (status == "ERROR" ? "ERROR" : "OK");
+                    eventsBatch.push_back(ev);
+                }
+            }
+
+            if (!eventsBatch.empty()) {
+                AgentTelemetryDb::getInstance().insertEventsBatch(eventsBatch);
+                double avgTurnMs = durationCount > 0 ? (sumDuration / durationCount) : 0.0;
+                int64_t sessionStart = firstTs > 0 ? firstTs : mtime;
+                int64_t sessionEnd = lastTs > 0 ? lastTs : mtime;
+                std::string sessionStatus = (now - sessionEnd < 300) ? "RUNNING" : "COMPLETED";
+
+                AgentTelemetryDb::getInstance().recordSessionStart(
+                    sessionId, convId, "antigravity", "/home/samurai/work", "Antigravity", sessionStart);
+                AgentTelemetryDb::getInstance().updateSessionStats(
+                    sessionId, sessionStatus, totalTurns, 0, 0, totalTools, totalErrors, avgTurnMs, sessionStart, sessionEnd);
+            }
+        }
+    } catch (...) {}
 }
 
 } // namespace aimon

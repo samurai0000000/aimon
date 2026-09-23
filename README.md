@@ -168,12 +168,14 @@ aimon/
 ├── ha/
 │   └── lovelace_cards.yaml        # Ready-to-import Home Assistant Lovelace cards
 ├── include/
+│   ├── AgentTelemetryDb.hxx       # Rolling SQLite WAL agent telemetry & time-series DB
 │   ├── AntigravityCollector.hxx   # Antigravity local process probe & Connect-RPC client
 │   ├── ConfigManager.hxx          # Configuration manager (~/.config/aimon/config.json)
 │   ├── CursorCollector.hxx        # Cursor SQLite & API client
 │   ├── DynamicToolRegistry.hxx    # Thread-safe satellite tool registry & routing
 │   ├── HistoryStore.hxx           # SQLite3 time-series diff store (~/.config/aimon/history.db)
 │   ├── McpServer.hxx              # JSON-RPC 2.0 stdio & SSE engine with scoped profiling
+│   ├── MobileGateway.hxx          # Action approval latching & mobile pairing engine
 │   ├── Models.hxx                 # Core data structures and metrics
 │   ├── MqttPublisher.hxx          # Home Assistant MQTT auto-discovery publisher
 │   ├── NcursesConsole.hxx         # Interactive split-screen terminal monitor
@@ -183,7 +185,11 @@ aimon/
 │   ├── TcpGateway.hxx             # TCP port 3885 satellite multiplexer
 │   ├── WebAssets.hxx              # Embedded fallback dashboard assets
 │   └── WebServer.hxx              # Embedded HTTP dashboard server & SSE endpoint
+├── scripts/
+│   ├── mobile_permission_relay.py # Dual-IDE hook normalizer for Antigravity & Cursor
+│   └── test_web_dashboard.py      # Headless Chromium visual validation harness
 ├── src/
+│   ├── AgentTelemetryDb.cxx       # Agent telemetry time-series & downsampling engine
 │   ├── AntigravityCollector.cxx   # Antigravity collector implementation
 │   ├── ConfigManager.cxx          # Config manager implementation
 │   ├── CursorCollector.cxx        # Cursor collector implementation
@@ -191,21 +197,26 @@ aimon/
 │   ├── HistoryStore.cxx           # History & usage diff store implementation
 │   ├── Main.cxx                   # Application entrypoint & subcommand dispatch
 │   ├── McpServer.cxx              # MCP tool registration, profiling, and handlers
+│   ├── MobileGateway.cxx          # 128-bit mobile pairing, promise latches, & reaper
 │   ├── MqttPublisher.cxx          # MQTT auto-discovery and state publisher
 │   ├── NcursesConsole.cxx         # Split-screen ncurses console implementation
 │   ├── PathUtils.cxx              # Path resolution utilities
 │   ├── StateStore.cxx             # State store cache implementation
 │   ├── TaskRegistry.cxx           # Session registry implementation
 │   ├── TcpGateway.cxx             # TCP satellite gateway multiplexer implementation
-│   └── WebServer.cxx              # Dashboard handler, SSE, and REST endpoints
+│   └── WebServer.cxx              # Dashboard handler, SSE, REST, & telemetry routes
+├── test/
+│   ├── TestAgentTelemetryDb.cxx   # Unit tests for SQLite WAL rolling timeseries DB
+│   ├── TestGatewayTimeout.cxx     # Unit tests for TcpGateway timeout execution
+│   ├── TestMobileGateway.cxx      # Unit tests for mobile action approval latching
+│   └── TestWebServerApi.cxx       # Integration tests for WebServer REST & WS routes
 ├── third_party/
 │   ├── cpp-httplib/               # Git submodule (https://github.com/yhirose/cpp-httplib)
 │   └── json/                      # Git submodule (https://github.com/nlohmann/json)
 └── web/
-    ├── app.js                     # Dashboard dynamics and countdown timers
-    ├── index.html                 # Dashboard markup
-    └── style.css                  # Dark-mode styling and gauges
-```
+    ├── app.js                     # Dashboard dynamics, SVG charts, and tab switching
+    ├── index.html                 # Multi-tab dashboard markup (Quotas, Telemetry, Approvals)
+    └── style.css                  # Dark-mode glassmorphic styling and charts
 
 ---
 

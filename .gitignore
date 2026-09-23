@@ -10,3 +10,5 @@ build/
 config.json
 .DS_Store
 plan/
+__pycache__/
+*.pyc

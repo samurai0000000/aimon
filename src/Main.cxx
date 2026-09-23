@@ -27,7 +27,10 @@
 #include "TcpGateway.hxx"
 #include "NcursesConsole.hxx"
 #include "Version.hxx"
+#include "AgentTelemetryDb.hxx"
+#include "MobileGateway.hxx"
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #endif
 #include <httplib.h>
@@ -178,6 +181,10 @@ int main(int argc, char* argv[]) {
         historyStore.open(cfg.history.dbPath);
     }
 
+    AgentTelemetryDb::getInstance().open();
+    MobileGateway::getInstance().init();
+
+
     AntigravityCollector agCollector(cfg.antigravity);
     CursorCollector crCollector(cfg.cursor);
     std::unique_ptr<MqttPublisher> mqttPublisher;
@@ -197,6 +204,7 @@ int main(int argc, char* argv[]) {
         status.lastUpdated = std::chrono::system_clock::now();
 
         stateStore.update(status);
+        agCollector.syncTranscriptTelemetry();
 
         if (cfg.history.enabled) {
             historyStore.recordSnapshot(status);

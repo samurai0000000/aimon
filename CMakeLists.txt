@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.6 LANGUAGES CXX)
+project(aimon VERSION 1.0.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,12 +54,13 @@ find_package(Curses REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 
-# Source files
-set(SOURCES
-    src/Main.cxx
+# Library and Server Sources
+set(LIB_SOURCES
     src/PathUtils.cxx
     src/ConfigManager.cxx
     src/HistoryStore.cxx
+    src/AgentTelemetryDb.cxx
+    src/MobileGateway.cxx
     src/StateStore.cxx
     src/AntigravityCollector.cxx
     src/CursorCollector.cxx
@@ -72,7 +73,7 @@ set(SOURCES
     src/NcursesConsole.cxx
 )
 
-add_executable(aimon ${SOURCES})
+add_executable(aimon src/Main.cxx ${LIB_SOURCES})
 
 target_compile_definitions(aimon PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 
@@ -116,3 +117,70 @@ target_include_directories(test_gateway_timeout PRIVATE
 target_link_libraries(test_gateway_timeout PRIVATE
     Threads::Threads
 )
+
+add_executable(test_agent_telemetry_db
+    test/TestAgentTelemetryDb.cxx
+    src/AgentTelemetryDb.cxx
+    src/PathUtils.cxx
+)
+
+target_include_directories(test_agent_telemetry_db PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+)
+
+target_link_libraries(test_agent_telemetry_db PRIVATE
+    SQLite::SQLite3
+    Threads::Threads
+)
+
+add_executable(test_mobile_gateway
+    test/TestMobileGateway.cxx
+    src/MobileGateway.cxx
+    src/AgentTelemetryDb.cxx
+    src/PathUtils.cxx
+)
+
+target_include_directories(test_mobile_gateway PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+)
+
+target_link_libraries(test_mobile_gateway PRIVATE
+    SQLite::SQLite3
+    Threads::Threads
+)
+
+add_executable(test_web_server_api
+    test/TestWebServerApi.cxx
+    ${LIB_SOURCES}
+)
+
+target_compile_definitions(test_web_server_api PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+
+target_include_directories(test_web_server_api PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+    ${MOSQUITTO_INCLUDE_DIRS}
+    ${CURSES_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_web_server_api PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    SQLite::SQLite3
+    Threads::Threads
+    ${MOSQUITTO_LIBRARIES}
+    ${CURSES_LIBRARIES}
+)
+
+
+
+

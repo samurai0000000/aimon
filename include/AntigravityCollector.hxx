@@ -9,6 +9,7 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include "Models.hxx"
 #include "ConfigManager.hxx"
 
@@ -21,6 +22,7 @@ public:
     AntigravityStatus fetchStatus();
 
     bool discoverProcess(int& outPort, std::string& outCsrf);
+    void syncTranscriptTelemetry();
 
 private:
     std::vector<int> findCandidateListeningPorts(pid_t pid);
@@ -30,6 +32,8 @@ private:
     pid_t _cachedPid = 0;
     int _cachedPort = 0;
     std::string _cachedCsrf;
+    std::map<std::string, int64_t> _transcriptOffsets;
+    time_t _lastTranscriptScan = 0;
 };
 
 } // namespace aimon

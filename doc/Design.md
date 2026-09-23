@@ -320,3 +320,128 @@ All AI agents in the ecosystem must interact with `aimon` exclusively through th
 - Direct REST/HTTP endpoint queries (`/api/*`) are restricted and return HTTP `403 Forbidden` for non-dashboard clients.
 - Autonomous scripts or agents must never bypass MCP by calling raw socket, Telnet, or REST interfaces.
 - When an MCP tool call fails or times out, agents must adhere to the **Strict Stop-and-Report** protocol without attempting side-channel workarounds.
+
+---
+
+## 8. Rolling Agent Telemetry Database Subsystem (`AgentTelemetryDb`)
+
+To provide deep observability into agent cognitive cycles, execution durations, and resource consumption without relying on third-party cloud analytics, `aimon` includes an integrated, local-first rolling time-series engine modeled after the proven `SnmpDatabase` architecture in `netmon`.
+
+### 8.1 SQLite WAL Schema & Storage Engine
+`AgentTelemetryDb` stores data in SQLite with Write-Ahead Logging (`WAL`) enabled, dynamic downsampling, and automated retention pruning:
+
+```sql
+-- Active and historical agent execution sessions
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    session_id          TEXT PRIMARY KEY,
+    conversation_id     TEXT,
+    agent_type          TEXT NOT NULL,
+    workspace           TEXT,
+    model               TEXT,
+    start_timestamp     INTEGER NOT NULL,
+    end_timestamp       INTEGER,
+    status              TEXT DEFAULT 'RUNNING',
+    total_turns         INTEGER DEFAULT 0,
+    prompt_tokens       INTEGER DEFAULT 0,
+    comp_tokens         INTEGER DEFAULT 0,
+    tool_calls          INTEGER DEFAULT 0,
+    errors              INTEGER DEFAULT 0,
+    avg_turn_ms         REAL DEFAULT 0.0
+);
+
+-- Granular per-step lifecycle and tool invocation events
+CREATE TABLE IF NOT EXISTS agent_lifecycle_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp           INTEGER NOT NULL,
+    session_id          TEXT NOT NULL,
+    agent_type          TEXT NOT NULL,
+    event_type          TEXT NOT NULL,
+    step_index          INTEGER DEFAULT 0,
+    tool_name           TEXT,
+    duration_ms         REAL DEFAULT 0.0,
+    status              TEXT DEFAULT 'OK',
+    details_json        TEXT,
+    FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
+);
+
+-- High-frequency telemetry samples (14-day retention)
+CREATE TABLE IF NOT EXISTS agent_telemetry_samples (
+    timestamp           INTEGER PRIMARY KEY,
+    active_agents       INTEGER DEFAULT 0,
+    prompt_tokens_sec   REAL DEFAULT 0.0,
+    comp_tokens_sec     REAL DEFAULT 0.0,
+    tool_calls_sec      REAL DEFAULT 0.0,
+    error_rate_pct      REAL DEFAULT 0.0,
+    avg_turn_latency_ms REAL DEFAULT 0.0,
+    p95_turn_latency_ms REAL DEFAULT 0.0,
+    approval_wait_ms    REAL DEFAULT 0.0
+);
+
+-- Aggregated hourly rollups (365-day retention)
+CREATE TABLE IF NOT EXISTS agent_hourly_rollups (
+    hour_bucket         INTEGER PRIMARY KEY,
+    total_prompt_tokens INTEGER DEFAULT 0,
+    total_comp_tokens   INTEGER DEFAULT 0,
+    total_tool_calls    INTEGER DEFAULT 0,
+    total_errors        INTEGER DEFAULT 0,
+    avg_turn_latency_ms REAL DEFAULT 0.0,
+    p95_turn_latency_ms REAL DEFAULT 0.0,
+    avg_approval_wait_ms REAL DEFAULT 0.0
+);
+```
+
+### 8.2 Dynamic Downsampling Engine
+When the web frontend or mobile app queries timeseries data over wide windows (`7d`, `30d`, `1y`), `AgentTelemetryDb::queryTimeseries(window, maxPoints)` dynamically downsamples the dataset into evenly spaced buckets to guarantee sub-millisecond query execution and bounded payload sizes.
+
+---
+
+## 9. Mobile Companion Action Approval Latching Subsystem (`MobileGateway`)
+
+Autonomous agent tasks frequently stall when sensitive tools (`run_command`, `write_to_file`, `multi_replace_file_content`, `embdevenv_mcu_power`) request human confirmation. `aimon` provides an asynchronous action approval latching engine that delivers real-time confirmation requests directly to the developer's mobile device lock screen.
+
+### 9.1 Latching Protocol & Concurrency Architecture
+1. **Hook Interception**: When Antigravity or Cursor triggers a sensitive tool, `scripts/mobile_permission_relay.py` intercepts the JSON invocation and executes a synchronous `POST /api/approvals/request` to `aimon`.
+2. **Promise Latch Creation**: `MobileGateway::requestApproval()` registers a pending action record with a unique UUID and initializes a `std::promise<ApprovalVerdict>`. The calling HTTP worker thread blocks synchronously on `std::future<ApprovalVerdict>::get()`.
+3. **Multicast Notification**: `MobileGateway` broadcasts an SSE / WebSocket approval notification to paired Android devices.
+4. **Lock-Screen Verdict**: The operator taps `[Approve]` or `[Deny]` directly from the Android heads-up notification. The mobile app posts the verdict back to `/api/approvals/decision`.
+5. **Latch Resolution**: The promise resolves instantly in C++, unblocking the HTTP worker thread and returning the approval decision to the IDE hook.
+6. **Reaper Fallback**: If no mobile response is received within 120 seconds, a background timeout reaper thread automatically expires the request and fails safely.
+
+### 9.2 Cryptographic Authentication & Replay Defense
+- **128-bit Pairing Secrets**: Pairing generates a high-entropy 128-bit cryptographic secret formatted for QR code scanning or manual entry.
+- **Single-Use Action Tokens**: Each notification payload includes a single-use action token. Once a decision is submitted, the token is permanently invalidated to prevent replay attacks.
+- **Instant Revocation**: Devices can be audited and revoked individually from the web dashboard or CLI.
+
+---
+
+## 10. Web Analytics & Multi-Surface Approvals Dashboard
+
+The `aimon` dashboard (`web/index.html`, `web/app.js`, `web/style.css`, `include/WebAssets.hxx`) provides a multi-tab single-page interface:
+
+1. **AI Quotas (`#view-aimon`)**: Untouched front page displaying Google Antigravity quotas, credit allowances, and Cursor Fast Request usage.
+2. **Agent Telemetry & Analytics (`#view-telemetry`)**: Interactive SVG/Canvas charts for Token Velocity, Turn Latency & P95 Distribution, Tool Invocation Matrices, and Session Waterfalls with timeframe selectors (`1H`, `24H`, `7D`, `30D`, `1Y`).
+3. **Action Approvals (`#view-approvals`)**: Live pending approval actions, 128-bit mobile pairing QR interface, and paired device management.
+4. **Dynamic Satellite Panels (`#panel-<id>`)**: Seamless embedded iframe monitors for connected subsystems (`netmon`, `meshmon`, `embdevenv`).
+
+---
+
+## 11. Dual-IDE Universal Hook Relays
+
+`scripts/mobile_permission_relay.py` standardizes tool interception across both IDEs:
+- **Google Antigravity**: Configured via `.agents/hooks.json` (`PreToolUse`, `PostToolUse`).
+- **Cursor IDE**: Configured via `.cursor/hooks.json` (`preTool`, `postTool`).
+
+---
+
+## 12. Android Companion Application Architecture
+
+The Android companion application (`com.selfso.aimon`) is built using Kotlin and Jetpack Compose:
+- **`AimonWebSocketClient`**: OkHttp client with automatic exponential backoff reconnection and 15s heartbeats.
+- **`AimonNotificationManager`**: Native Android `NotificationCompat` builder creating high-priority heads-up notifications with embedded `[Approve]` and `[Deny]` action buttons.
+- **Glance AppWidget**: Android home-screen widget displaying real-time AI quota balances and active agent session counts.
+
+---
+
+## License & Copyright
+
+Copyright (C) 2026, Charles Chiou. All rights reserved.
