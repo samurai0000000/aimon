@@ -16,56 +16,38 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css?v=1.0.7">
+    <link rel="stylesheet" href="style.css?v=1.0.8">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
     <div class="app-container">
-        <header class="navbar">
-            <div class="brand">
-                <div class="logo-pulse"></div>
-                <h1>aimon <span class="badge-sub">Unified AI Quotas</span></h1>
-            </div>
-            <div class="actions">
-                <span id="last-updated" class="last-updated">Updated: Just now</span>
-                <button id="refresh-btn" class="btn-refresh" title="Force Refresh">
-                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
-                        <path d="M23 4v6h-6"></path>
-                        <path d="M1 20v-6h6"></path>
-                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
-                    </svg>
-                    Refresh
-                </button>
-            </div>
-        </header>
-
         <nav class="monitor-nav" id="monitor-tabs" aria-label="System Monitors">
             <button type="button" class="monitor-tab active" data-id="aimon">
                 <span class="tab-indicator tab-indicator-online"></span>
                 <span class="tab-title">aimon</span>
-                <span class="tab-badge">Hub</span>
             </button>
+            <div id="satellite-tabs" class="satellite-tabs-row"></div>
         </nav>
 
-        <main class="view-panel active" id="view-aimon">
+        <div class="main-viewport" id="main-viewport">
+            <!-- Native Aimon Monitor Panel -->
+            <main class="view-panel active" id="view-aimon">
             <!-- Aimon Sub-Navigation Tab Bar -->
             <div class="aimon-subnav-bar" id="aimon-subnav" aria-label="aimon Subpanels">
                 <button type="button" class="aimon-subnav-tab active" data-subpanel="quotas">
                     <span class="subnav-indicator"></span>
-                    <span class="subnav-title">AI Quotas</span>
-                    <span class="tab-badge">Quota</span>
+                    <span class="subnav-title">ai quotas</span>
                 </button>
                 <button type="button" class="aimon-subnav-tab" data-subpanel="telemetry">
                     <span class="subnav-indicator"></span>
-                    <span class="subnav-title">Agent Telemetry</span>
-                    <span class="tab-badge badge-cyan">Analytics</span>
+                    <span class="subnav-title">agent telemetry</span>
                 </button>
                 <button type="button" class="aimon-subnav-tab" data-subpanel="approvals">
                     <span class="subnav-indicator"></span>
-                    <span class="subnav-title">Action Approvals</span>
-                    <span class="tab-badge badge-amber" id="approvals-badge">0 Pending</span>
+                    <span class="subnav-title">action approvals</span>
+                    <span class="tab-badge badge-amber hidden" id="approvals-badge">0</span>
                 </button>
             </div>
 
@@ -297,19 +279,19 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- Telemetry Charts Grid -->
+                <!-- Telemetry Charts Grid (2x2 Layout) -->
                 <div class="telemetry-charts-grid">
                     <!-- Chart 1: Tool Invocations & Active Workload Velocity -->
                     <div class="glass-card chart-card">
                         <div class="chart-header">
                             <div class="chart-title">Tool Invocations & Workload Velocity</div>
                             <div class="chart-legend">
-                                <span class="legend-item"><i class="dot dot-cyan"></i> Tool Invocations (calls/s)</span>
+                                <span class="legend-item"><i class="dot dot-cyan"></i> Tool Calls/s</span>
                                 <span class="legend-item"><i class="dot dot-magenta"></i> Active Sessions</span>
                             </div>
                         </div>
                         <div class="svg-chart-container" id="token-velocity-chart">
-                            <svg class="metric-svg" id="token-svg" viewBox="0 0 800 240"></svg>
+                            <svg class="metric-svg" id="token-svg" viewBox="0 0 800 220"></svg>
                         </div>
                     </div>
 
@@ -318,7 +300,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                         <div class="chart-header">
                             <div>
                                 <div class="chart-title">Step Duration & Latency Envelope</div>
-                                <p class="chart-subtitle">P95 envelope tracks 95th percentile upper variance. Latency health: &lt; 3s Normal, 3–8s Moderate, &gt; 8s Degraded.</p>
+                                <p class="chart-subtitle">P95 variance (&lt;3s Normal, 3-8s Moderate, &gt;8s Degraded)</p>
                             </div>
                             <div class="chart-legend">
                                 <span class="legend-item"><i class="dot dot-blue"></i> Avg Duration</span>
@@ -326,7 +308,42 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                             </div>
                         </div>
                         <div class="svg-chart-container" id="latency-chart">
-                            <svg class="metric-svg" id="latency-svg" viewBox="0 0 800 240"></svg>
+                            <svg class="metric-svg" id="latency-svg" viewBox="0 0 800 220"></svg>
+                        </div>
+                    </div>
+
+                    <!-- Chart 3: Agent Activity & Task Execution Timeline (Gantt Swimlanes) -->
+                    <div class="glass-card chart-card">
+                        <div class="chart-header">
+                            <div>
+                                <div class="chart-title">Agent Activity & Task Execution Timeline</div>
+                                <p class="chart-subtitle">Session run intervals, active execution times & status</p>
+                            </div>
+                            <div class="chart-legend">
+                                <span class="legend-item"><i class="dot dot-emerald"></i> Active</span>
+                                <span class="legend-item"><i class="dot dot-cyan"></i> Done</span>
+                                <span class="legend-item"><i class="dot dot-coral"></i> Error</span>
+                            </div>
+                        </div>
+                        <div class="svg-chart-container" id="activity-gantt-chart">
+                            <svg class="metric-svg" id="activity-gantt-svg" viewBox="0 0 800 220"></svg>
+                        </div>
+                    </div>
+
+                    <!-- Chart 4: Agent Busyness & Concurrency Stack -->
+                    <div class="glass-card chart-card">
+                        <div class="chart-header">
+                            <div>
+                                <div class="chart-title">Agent Busyness & Concurrency Stack</div>
+                                <p class="chart-subtitle">Concurrent active agents and active workload duty cycle</p>
+                            </div>
+                            <div class="chart-legend">
+                                <span class="legend-item"><i class="dot dot-cyan"></i> Antigravity</span>
+                                <span class="legend-item"><i class="dot dot-purple"></i> Cursor</span>
+                            </div>
+                        </div>
+                        <div class="svg-chart-container" id="busyness-stack-chart">
+                            <svg class="metric-svg" id="busyness-stack-svg" viewBox="0 0 800 220"></svg>
                         </div>
                     </div>
                 </div>
@@ -397,7 +414,17 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                                     <li>Tap <strong>Scan QR / Enter Secret</strong> and point your camera at the QR code above.</li>
                                     <li>Approvals for sensitive tools (<code>run_command</code>, <code>write_to_file</code>) will vibrate directly on your lock screen with <code>[Approve]</code> and <code>[Deny]</code> action buttons.</li>
                                 </ol>
-                                <button type="button" class="btn-refresh" id="btn-new-qr">Regenerate Secret</button>
+                                <div class="pairing-action-row">
+                                    <button type="button" class="btn-refresh" id="btn-new-qr">Regenerate Secret</button>
+                                    <a href="/download/aimon-companion.apk" class="btn-download-apk" download title="Download compiled Android companion app">
+                                        <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+                                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                            <polyline points="7 10 12 15 17 10"></polyline>
+                                            <line x1="12" y1="15" x2="12" y2="3"></line>
+                                        </svg>
+                                        Download Android APK
+                                    </a>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -415,9 +442,9 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
             </div>
         </main>
 
-
-        <!-- Dynamic Discovered Monitor Embedded Panels -->
+        <!-- Dynamic Discovered Satellite Panels -->
         <div id="dynamic-panels"></div>
+    </div>
 
         <footer class="app-footer">
             <p>aimon daemon &bull; Pure C++17 AI Quota Monitor &bull; Local loopback on 127.0.0.1</p>
@@ -425,7 +452,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
     </div>
 
     <script src="qrcode.js"></script>
-    <script src="app.js?v=1.0.7"></script>
+    <script src="app.js?v=1.0.8"></script>
 </body>
 </html>
 )raw_asset";
@@ -467,19 +494,24 @@ body {
         radial-gradient(circle at 85% 30%, rgba(139, 92, 246, 0.06) 0%, transparent 45%);
     color: var(--text-primary);
     font-family: var(--font-sans);
-    min-height: 100vh;
+    height: 100vh;
+    margin: 0;
+    padding: 0;
     display: flex;
     justify-content: center;
     -webkit-font-smoothing: antialiased;
+    overflow: hidden;
 }
 
 .app-container {
     width: 100%;
-    max-width: 1540px;
-    padding: 20px 24px 36px;
+    max-width: 1600px;
+    height: 100vh;
+    padding: 12px 20px 6px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    box-sizing: border-box;
+    overflow: hidden;
 }
 
 /* Header */
@@ -2223,19 +2255,12 @@ body {
     z-index: 10;
 }
 
-/* Footer */
-.app-footer {
-    text-align: center;
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    padding-top: 10px;
-}
-
 /* ==========================================================================
-   Multi-Monitor Navigation Tabs & Iframe Embed Container
+   Top Navigation Bar & Multi-Monitor Switching
    ========================================================================== */
 
 .monitor-nav {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -2244,18 +2269,22 @@ body {
     backdrop-filter: blur(16px);
     border: 1px solid var(--border-color);
     border-radius: 14px;
+    margin-bottom: 14px;
     overflow-x: auto;
     white-space: nowrap;
     -webkit-overflow-scrolling: touch;
-    scrollbar-width: thin;
-    flex-wrap: nowrap;
+    scrollbar-width: none;
+}
+
+.monitor-nav::-webkit-scrollbar {
+    display: none;
 }
 
 .monitor-tab {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    padding: 8px 16px;
+    padding: 7px 16px;
     background: rgba(255, 255, 255, 0.03);
     border: 1px solid transparent;
     border-radius: 10px;
@@ -2268,6 +2297,7 @@ body {
     white-space: nowrap;
     user-select: none;
     flex-shrink: 0;
+    text-transform: lowercase;
 }
 
 .monitor-tab:hover {
@@ -2277,10 +2307,10 @@ body {
 }
 
 .monitor-tab.active {
-    background: rgba(0, 242, 254, 0.1);
+    background: rgba(0, 242, 254, 0.12);
     border-color: rgba(0, 242, 254, 0.35);
     color: #ffffff;
-    box-shadow: 0 0 16px rgba(0, 242, 254, 0.12);
+    box-shadow: 0 0 14px rgba(0, 242, 254, 0.12);
 }
 
 .tab-indicator {
@@ -2302,16 +2332,18 @@ body {
 
 .tab-title {
     font-weight: 600;
+    text-transform: lowercase;
 }
 
 .tab-badge {
-    font-size: 0.7rem;
-    font-weight: 500;
-    padding: 2px 6px;
-    border-radius: 6px;
-    background: rgba(255, 255, 255, 0.06);
+    font-size: 0.68rem;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.08);
     color: var(--text-muted);
     font-family: var(--font-mono);
+    text-transform: lowercase;
 }
 
 .monitor-tab.active .tab-badge {
@@ -2353,6 +2385,7 @@ body {
     white-space: nowrap;
     user-select: none;
     flex-shrink: 0;
+    text-transform: lowercase;
 }
 
 .aimon-subnav-tab:hover {
@@ -2397,7 +2430,6 @@ body {
 .aimon-subpanel {
     display: none;
     width: 100%;
-    animation: fadeInSubpanel 0.2s ease;
 }
 
 .aimon-subpanel.active {
@@ -2413,42 +2445,65 @@ body {
     display: none !important;
 }
 
-@keyframes fadeInSubpanel {
-    from { opacity: 0; transform: translateY(4px); }
-    to { opacity: 1; transform: translateY(0); }
+/* ==========================================================================
+   Main Viewport & View Panels Architecture
+   ========================================================================== */
+
+.main-viewport {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+    overflow: hidden;
+    width: 100%;
 }
 
-/* View panels */
 .view-panel {
     display: none;
     width: 100%;
-    transition: opacity 0.2s ease;
+    height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-right: 4px;
+    scrollbar-width: thin;
 }
 
 .view-panel.active {
     display: block;
 }
 
-.dashboard-grid.view-panel.active {
-    display: grid;
-}
-
 .view-panel.hidden {
     display: none !important;
 }
 
-/* Discovered Monitor Frame Container & Panels */
-.monitor-frame-container,
+.view-panel::-webkit-scrollbar {
+    width: 6px;
+}
+
+.view-panel::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+}
+
+.view-panel::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#dynamic-panels {
+    width: 100%;
+    height: 100%;
+}
+
+/* Discovered Monitor Frame Container & Panels (Zero Parent Scrollbars) */
 .monitor-frame-panel {
     display: none;
     flex-direction: column;
+    width: 100%;
+    height: 100%;
     background: var(--bg-card);
     backdrop-filter: blur(16px);
     border: 1px solid var(--border-color);
-    border-radius: 16px;
+    border-radius: 14px;
     overflow: hidden;
-    height: calc(100vh - 210px);
-    min-height: 520px;
     box-shadow: 0 16px 36px rgba(0, 0, 0, 0.35);
 }
 
@@ -2462,42 +2517,46 @@ body {
 }
 
 .frame-toolbar {
+    flex-shrink: 0;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 12px 18px;
+    padding: 8px 14px;
     background: rgba(10, 14, 23, 0.75);
     border-bottom: 1px solid var(--border-color);
-    gap: 16px;
+    gap: 12px;
+    height: 38px;
+    box-sizing: border-box;
 }
 
 .frame-info {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     min-width: 0;
 }
 
 .frame-title {
-    font-size: 0.95rem;
+    font-size: 0.88rem;
     font-weight: 600;
     color: var(--text-primary);
+    text-transform: lowercase;
 }
 
 .frame-badge {
-    font-size: 0.72rem;
+    font-size: 0.68rem;
     font-weight: 500;
-    padding: 2px 8px;
-    border-radius: 6px;
+    padding: 1px 6px;
+    border-radius: 4px;
     background: rgba(139, 92, 246, 0.15);
     border: 1px solid rgba(139, 92, 246, 0.3);
     color: var(--purple-glow);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
+    text-transform: lowercase;
+    letter-spacing: 0.02em;
 }
 
 .frame-url {
-    font-size: 0.78rem;
+    font-size: 0.74rem;
     font-family: var(--font-mono);
     color: var(--text-muted);
     overflow: hidden;
@@ -2508,17 +2567,17 @@ body {
 .frame-actions {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     flex-shrink: 0;
 }
 
 .btn-frame-action {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 12px;
-    border-radius: 8px;
-    font-size: 0.8rem;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 0.76rem;
     font-weight: 500;
     font-family: var(--font-sans);
     background: rgba(255, 255, 255, 0.05);
@@ -2538,6 +2597,7 @@ body {
 .frame-content-wrapper {
     position: relative;
     flex: 1;
+    min-height: 0;
     display: flex;
     width: 100%;
     height: 100%;
@@ -2551,12 +2611,22 @@ body {
     border: none;
     background: #0a0e17;
     transition: filter 0.3s ease, opacity 0.3s ease;
+    display: block;
 }
 
 .monitor-iframe.iframe-grayed-out {
     filter: grayscale(0.85) blur(1.5px);
     opacity: 0.45;
     pointer-events: none;
+}
+
+/* Footer */
+.app-footer {
+    flex-shrink: 0;
+    text-align: center;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    padding: 4px 0 2px;
 }
 
 .offline-overlay {
@@ -2740,16 +2810,22 @@ body {
     color: var(--text-muted);
 }
 
-/* Charts Grid */
+/* Charts Grid (2x2 Layout) */
 .telemetry-charts-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
-    gap: 20px;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
     margin-bottom: 20px;
 }
 
+@media (max-width: 1024px) {
+    .telemetry-charts-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
 .chart-card {
-    padding: 20px;
+    padding: 18px 20px;
     background: rgba(15, 23, 42, 0.6);
     backdrop-filter: blur(12px);
     border: 1px solid rgba(255, 255, 255, 0.07);
@@ -2788,10 +2864,52 @@ body {
     gap: 6px;
 }
 
-.dot-cyan { background: #38bdf8; }
-.dot-blue { background: #3b82f6; }
-.dot-amber { background: #f59e0b; }
-.dot-magenta { background: #e879f9; }
+.dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.dot-cyan { background: #38bdf8; box-shadow: 0 0 8px rgba(56, 189, 248, 0.7); }
+.dot-blue { background: #3b82f6; box-shadow: 0 0 8px rgba(59, 130, 246, 0.7); }
+.dot-amber { background: #f59e0b; box-shadow: 0 0 8px rgba(245, 158, 11, 0.7); }
+.dot-magenta { background: #e879f9; box-shadow: 0 0 8px rgba(232, 121, 249, 0.7); }
+.dot-emerald { background: #10b981; box-shadow: 0 0 8px rgba(16, 185, 129, 0.7); }
+.dot-purple { background: #a855f7; box-shadow: 0 0 8px rgba(168, 85, 247, 0.7); }
+.dot-coral { background: #f43f5e; box-shadow: 0 0 8px rgba(244, 63, 94, 0.7); }
+
+.pairing-action-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+}
+
+.btn-download-apk {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(139, 92, 246, 0.18));
+    border: 1px solid rgba(56, 189, 248, 0.4);
+    border-radius: 8px;
+    color: #38bdf8;
+    font-size: 0.85rem;
+    font-weight: 500;
+    text-decoration: none;
+    transition: all 0.2s ease;
+}
+
+.btn-download-apk:hover {
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.3), rgba(139, 92, 246, 0.3));
+    border-color: #38bdf8;
+    box-shadow: 0 0 14px rgba(56, 189, 248, 0.35);
+    transform: translateY(-1px);
+    color: #fff;
+}
 
 .svg-chart-container {
     width: 100%;
@@ -3865,7 +3983,7 @@ function renderCursorSpend(cr) {
 
 async function fetchStatus(isManual = false) {
     const refreshBtn = document.getElementById('refresh-btn');
-    if (isManual) {
+    if (isManual && refreshBtn) {
         refreshBtn.classList.add('spinning');
     }
 
@@ -3885,13 +4003,15 @@ async function fetchStatus(isManual = false) {
             updateCountdowns();
 
             const updatedEl = document.getElementById('last-updated');
-            const nowTime = new Date().toLocaleTimeString();
-            updatedEl.textContent = `Updated: ${nowTime}`;
+            if (updatedEl) {
+                const nowTime = new Date().toLocaleTimeString();
+                updatedEl.textContent = `Updated: ${nowTime}`;
+            }
         }
     } catch (e) {
         console.error('Failed to fetch status:', e);
     } finally {
-        if (isManual) {
+        if (isManual && refreshBtn) {
             setTimeout(() => refreshBtn.classList.remove('spinning'), 500);
         }
     }
@@ -4026,14 +4146,36 @@ function setupSse() {
 let discoveredMonitors = [];
 let activeMonitorId = 'aimon';
 
+function formatFullDateTime(epochSec) {
+    if (!epochSec || epochSec <= 0) return 'N/A';
+    const d = new Date(epochSec * 1000);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const hours = String(d.getHours()).padStart(2, '0');
+    const minutes = String(d.getMinutes()).padStart(2, '0');
+    const seconds = String(d.getSeconds()).padStart(2, '0');
+    return `${year}/${month}/${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function formatDurationSeconds(sec) {
+    if (!sec || sec <= 0) return '0s';
+    if (sec < 60) return `${Math.round(sec)}s`;
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    if (m < 60) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+    const h = Math.floor(m / 60);
+    const remM = m % 60;
+    return `${h}h ${remM}m`;
+}
+
 function formatLastSeen(epoch) {
     if (!epoch || epoch <= 0) return 'Just now';
     const diffSec = Math.floor(Date.now() / 1000) - epoch;
     if (diffSec < 10) return 'Just now';
     if (diffSec < 60) return `${diffSec}s ago`;
     if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
-    const d = new Date(epoch * 1000);
-    return d.toLocaleTimeString();
+    return formatFullDateTime(epoch);
 }
 
 function getResolvedMonitorUrl(m) {
@@ -4057,73 +4199,15 @@ async function fetchMonitors() {
     }
 }
 
-let activeAimonSubpanel = 'quotas';
-
-function switchToAimonSubpanel(subpanelId) {
-    if (!subpanelId) subpanelId = 'quotas';
-    activeAimonSubpanel = subpanelId;
-
-    // Update aimon subnav tabs
-    const subnavEl = document.getElementById('aimon-subnav');
-    if (subnavEl) {
-        subnavEl.querySelectorAll('.aimon-subnav-tab').forEach(tab => {
-            const id = tab.getAttribute('data-subpanel');
-            if (id === subpanelId) {
-                tab.classList.add('active');
-            } else {
-                tab.classList.remove('active');
-            }
-        });
-    }
-
-    // Toggle subpanels
-    document.querySelectorAll('.aimon-subpanel').forEach(panel => {
-        if (panel.id === `subpanel-${subpanelId}`) {
-            panel.classList.add('active');
-            panel.classList.remove('hidden');
-        } else {
-            panel.classList.remove('active');
-            panel.classList.add('hidden');
-        }
-    });
-
-    if (subpanelId === 'telemetry') {
-        fetchTelemetryOverview();
-        fetchTelemetryTimeseries();
-        fetchTelemetryTools();
-        fetchTelemetrySessions();
-    } else if (subpanelId === 'approvals') {
-        fetchPendingApprovals();
-        fetchMobileQr();
-        fetchMobileDevices();
-    }
-}
+let activeSubpanelId = 'quotas';
 
 function renderMonitorTabs(monitors) {
-    const navEl = document.getElementById('monitor-tabs');
+    const satelliteNavEl = document.getElementById('satellite-tabs');
     const dynamicPanelsEl = document.getElementById('dynamic-panels');
-    if (!navEl) return;
+    const dividerEl = document.getElementById('nav-divider');
+    if (!satelliteNavEl) return;
 
-    // Top-level peer monitors: aimon (Hub / Self) + external satellite monitors
-    const nativeTabs = [
-        {
-            id: 'aimon',
-            name: 'aimon',
-            short_name: 'aimon',
-            subsystem: 'aimon',
-            host: '127.0.0.1',
-            port: window.location.port || 3883,
-            path: '/',
-            connected: true,
-            reachable: true,
-            is_self: true,
-            badge: 'Hub',
-            badgeClass: '',
-            priority: 0
-        }
-    ];
-
-    let externalMonitors = Array.isArray(monitors) ? monitors.filter(m => m.id !== 'aimon' && m.id !== 'telemetry' && m.id !== 'approvals') : [];
+    let externalMonitors = Array.isArray(monitors) ? monitors.filter(m => m.id !== 'aimon' && m.id !== 'telemetry' && m.id !== 'approvals' && m.id !== 'quotas') : [];
     externalMonitors.sort((a, b) => {
         const pa = (a.priority !== undefined) ? a.priority : 100;
         const pb = (b.priority !== undefined) ? b.priority : 100;
@@ -4137,29 +4221,29 @@ function renderMonitorTabs(monitors) {
         return (a.port || 0) - (b.port || 0);
     });
 
-    const allTabs = [...nativeTabs, ...externalMonitors];
+    if (dividerEl) {
+        dividerEl.style.display = externalMonitors.length > 0 ? 'block' : 'none';
+    }
 
-    // Render navigation tabs
-    navEl.innerHTML = allTabs.map(m => {
-        const isActive = (m.id === activeMonitorId);
+    // Render satellite tabs strictly in lowercase
+    satelliteNavEl.innerHTML = externalMonitors.map(m => {
+        const sub = (m.subsystem || m.short_name || m.name || m.id || '').toLowerCase();
+        const fullId = m.id;
+        const isActive = (activeMonitorId === fullId || activeMonitorId === sub);
         const activeClass = isActive ? ' active' : '';
         const isOnline = Boolean(m.connected && m.reachable);
         const indClass = isOnline ? 'tab-indicator-online' : 'tab-indicator-offline';
-        const badgeText = m.badge || ((m.is_self || m.isSelf) ? 'Hub' : (m.subsystem || `${m.port}`));
-        const badgeClass = m.badgeClass ? ` ${m.badgeClass}` : '';
-        const displayLabel = m.short_name || m.name || m.subsystem || m.id;
 
         return `
-            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(m.id)}" title="${escapeHtml(m.name || m.id)}">
+            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(sub)}" data-full-id="${escapeHtml(fullId)}" title="${escapeHtml(m.name || m.id)}">
                 <span class="tab-indicator ${indClass}"></span>
-                <span class="tab-title">${escapeHtml(displayLabel)}</span>
-                <span class="tab-badge${badgeClass}">${escapeHtml(badgeText)}</span>
+                <span class="tab-title">${escapeHtml(sub)}</span>
             </button>
         `;
     }).join('');
 
     // Attach tab click handlers
-    navEl.querySelectorAll('.monitor-tab').forEach(tabBtn => {
+    satelliteNavEl.querySelectorAll('.monitor-tab').forEach(tabBtn => {
         tabBtn.addEventListener('click', () => {
             const id = tabBtn.getAttribute('data-id');
             switchToMonitor(id);
@@ -4295,7 +4379,7 @@ function renderMonitorTabs(monitors) {
 
         if (window.location.hash) {
             const hash = window.location.hash.replace(/^#/, '');
-            const target = allTabs.find(m => m.id === hash || m.subsystem === hash);
+            const target = externalMonitors.find(m => m.id === hash || m.subsystem === hash);
             if (target && activeMonitorId !== target.id) {
                 switchToMonitor(target.id);
             }
@@ -4558,6 +4642,279 @@ async function fetchTelemetryTimeseries() {
     } catch (_) {}
 }
 
+async function fetchActivityTimeline() {
+    try {
+        const res = await fetch(`/api/telemetry/activity_timeline?window=${activeTelemetryWindow}&max_sessions=40`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data) return;
+
+        renderAgentActivityGantt('activity-gantt-svg', data);
+        renderAgentBusynessStack('busyness-stack-svg', data);
+    } catch (_) {}
+}
+
+function renderAgentActivityGantt(svgId, data) {
+    const svg = document.getElementById(svgId);
+    if (!svg) return;
+
+    const width = 800;
+    const height = 220;
+    const padL = 75;
+    const padR = 25;
+    const padT = 18;
+    const padB = 30;
+    const plotW = width - padL - padR;
+    const plotH = height - padT - padB;
+
+    const startTime = data.start_time || (Math.floor(Date.now() / 1000) - 86400);
+    const endTime = data.end_time || Math.floor(Date.now() / 1000);
+    const totalDuration = Math.max(1, endTime - startTime);
+
+    const rawSessions = data.sessions || [];
+    const sessions = rawSessions.slice(0, 6);
+
+    if (sessions.length === 0) {
+        svg.innerHTML = `<text x="${width / 2}" y="${height / 2}" fill="#6b7280" font-size="12" text-anchor="middle" font-family="sans-serif">No agent task activity recorded in this timeframe</text>`;
+        return;
+    }
+
+    // Time Axis Ticks & Grid
+    const tickCount = 6;
+    let xTicksSvg = '';
+    let gridSvg = '';
+    for (let i = 0; i <= tickCount; i++) {
+        const x = padL + (i / tickCount) * plotW;
+        const tickEpoch = startTime + (i / tickCount) * totalDuration;
+        const d = new Date(tickEpoch * 1000);
+        const label = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+        xTicksSvg += `<text x="${x}" y="${height - 10}" fill="#9ca3af" font-size="9.5" text-anchor="middle" font-family="monospace">${label}</text>`;
+        gridSvg += `<line x1="${x}" y1="${padT}" x2="${x}" y2="${padT + plotH}" stroke="rgba(255,255,255,0.06)" stroke-width="1" />`;
+    }
+
+    const rowHeight = plotH / sessions.length;
+    let barsSvg = '';
+    let tooltipsData = [];
+
+    sessions.forEach((s, idx) => {
+        const y = padT + idx * rowHeight + 3;
+        const barH = Math.max(16, rowHeight - 6);
+
+        const sStart = Math.max(startTime, s.start_timestamp);
+        const sEnd = (s.end_timestamp && s.end_timestamp > 0) ? Math.min(endTime, s.end_timestamp) : endTime;
+        const barX = padL + ((sStart - startTime) / totalDuration) * plotW;
+        const barW = Math.max(8, ((sEnd - sStart) / totalDuration) * plotW);
+
+        const isRunning = (!s.end_timestamp || s.end_timestamp === 0 || s.status === 'RUNNING' || s.status === 'active');
+        const isError = (s.status === 'ERROR' || s.total_errors > 0);
+        let barColor = isRunning ? '#10b981' : (isError ? '#f43f5e' : '#38bdf8');
+        let bgOpacity = isRunning ? '0.85' : '0.65';
+
+        const agentName = (s.agent_type || 'agent').toLowerCase();
+        let shortId = s.session_id || 'sess';
+        if (shortId.startsWith('sess-')) shortId = shortId.substring(5);
+        if (shortId.length > 8) shortId = shortId.substring(0, 8);
+
+        barsSvg += `<text x="${padL - 8}" y="${y + barH / 2 + 3.5}" fill="#cbd5e1" font-size="9" text-anchor="end" font-family="monospace">${escapeHtml(shortId)}</text>`;
+
+        barsSvg += `
+            <g class="gantt-bar-group" data-idx="${idx}" style="cursor: pointer;">
+                <rect x="${barX}" y="${y}" width="${barW}" height="${barH}" rx="4" fill="${barColor}" fill-opacity="${bgOpacity}" stroke="${barColor}" stroke-width="1.2" />
+                <text x="${barX + 6}" y="${y + barH / 2 + 3}" fill="#ffffff" font-size="8.5" font-family="sans-serif" font-weight="500">${escapeHtml(s.model_name || agentName)} (${s.total_tool_calls || 0} tools)</text>
+            </g>
+        `;
+
+        tooltipsData.push({
+            barX, y,
+            session_id: s.session_id,
+            model_name: s.model_name || agentName,
+            status: isRunning ? 'Active (Running)' : (s.status || 'Done'),
+            tools: s.total_tool_calls || 0,
+            turns: s.total_turns || 0,
+            duration: formatDurationSeconds(s.duration_s || 0),
+            startTimeStr: formatFullDateTime(s.start_timestamp)
+        });
+    });
+
+    svg.innerHTML = `
+        ${gridSvg}
+        ${xTicksSvg}
+        ${barsSvg}
+        <g id="gantt-tip-${svgId}" style="display: none; pointer-events: none;">
+            <rect id="gantt-tip-bg-${svgId}" width="190" height="58" rx="6" fill="rgba(10, 14, 23, 0.95)" stroke="rgba(56, 189, 248, 0.5)" stroke-width="1" />
+            <text id="gantt-tip-title-${svgId}" x="0" y="0" fill="#38bdf8" font-size="9.5" font-weight="bold" font-family="monospace"></text>
+            <text id="gantt-tip-line1-${svgId}" x="0" y="0" fill="#e2e8f0" font-size="9" font-family="sans-serif"></text>
+            <text id="gantt-tip-line2-${svgId}" x="0" y="0" fill="#94a3b8" font-size="8.5" font-family="monospace"></text>
+        </g>
+    `;
+
+    const tipG = svg.querySelector(`#gantt-tip-${svgId}`);
+    const tipBg = svg.querySelector(`#gantt-tip-bg-${svgId}`);
+    const tipTitle = svg.querySelector(`#gantt-tip-title-${svgId}`);
+    const tipL1 = svg.querySelector(`#gantt-tip-line1-${svgId}`);
+    const tipL2 = svg.querySelector(`#gantt-tip-line2-${svgId}`);
+
+    svg.querySelectorAll('.gantt-bar-group').forEach(el => {
+        el.addEventListener('mouseenter', () => {
+            const idx = parseInt(el.getAttribute('data-idx'), 10);
+            const item = tooltipsData[idx];
+            if (!item || !tipG) return;
+
+            tipTitle.textContent = `${item.session_id} [${item.status}]`;
+            tipL1.textContent = `${item.model_name} • ${item.turns}t / ${item.tools} tools (${item.duration})`;
+            tipL2.textContent = `Started: ${item.startTimeStr}`;
+
+            let tipX = item.barX + 10;
+            if (tipX + 195 > width - padR) tipX = item.barX - 200;
+            const tipY = Math.max(padT, item.y - 10);
+
+            tipBg.setAttribute('x', tipX);
+            tipBg.setAttribute('y', tipY);
+            tipTitle.setAttribute('x', tipX + 8);
+            tipTitle.setAttribute('y', tipY + 16);
+            tipL1.setAttribute('x', tipX + 8);
+            tipL1.setAttribute('y', tipY + 32);
+            tipL2.setAttribute('x', tipX + 8);
+            tipL2.setAttribute('y', tipY + 48);
+
+            tipG.style.display = 'block';
+        });
+
+        el.addEventListener('mouseleave', () => {
+            if (tipG) tipG.style.display = 'none';
+        });
+    });
+}
+
+function renderAgentBusynessStack(svgId, data) {
+    const svg = document.getElementById(svgId);
+    if (!svg) return;
+
+    const width = 800;
+    const height = 220;
+    const padL = 45;
+    const padR = 25;
+    const padT = 18;
+    const padB = 30;
+    const plotW = width - padL - padR;
+    const plotH = height - padT - padB;
+
+    const buckets = data.buckets || [];
+    if (buckets.length === 0) {
+        svg.innerHTML = `<text x="${width / 2}" y="${height / 2}" fill="#6b7280" font-size="12" text-anchor="middle" font-family="sans-serif">No concurrency telemetry available</text>`;
+        return;
+    }
+
+    let maxAgents = 1;
+    buckets.forEach(b => {
+        const total = (b.antigravity_active || 0) + (b.cursor_active || 0);
+        if (total > maxAgents) maxAgents = total;
+    });
+    maxAgents = Math.max(2, maxAgents);
+
+    // Y Axis Grid
+    let yGridSvg = '';
+    for (let yVal = 0; yVal <= maxAgents; yVal++) {
+        const y = padT + plotH - (yVal / maxAgents) * plotH;
+        yGridSvg += `
+            <line x1="${padL}" y1="${y}" x2="${padL + plotW}" y2="${y}" stroke="rgba(255,255,255,0.06)" stroke-width="1" />
+            <text x="${padL - 8}" y="${y + 3.5}" fill="#9ca3af" font-size="9" text-anchor="end" font-family="monospace">${yVal}</text>
+        `;
+    }
+
+    const barSlotW = plotW / buckets.length;
+    const barW = Math.max(4, barSlotW * 0.75);
+    let barsSvg = '';
+    let xTicksSvg = '';
+    let tooltipBuckets = [];
+
+    buckets.forEach((b, idx) => {
+        const x = padL + idx * barSlotW + (barSlotW - barW) / 2;
+        const agy = b.antigravity_active || 0;
+        const cur = b.cursor_active || 0;
+        const tools = b.tool_calls || 0;
+
+        const hAgy = (agy / maxAgents) * plotH;
+        const hCur = (cur / maxAgents) * plotH;
+
+        const yAgy = padT + plotH - hAgy;
+        const yCur = yAgy - hCur;
+
+        if (hAgy > 0) {
+            barsSvg += `<rect x="${x}" y="${yAgy}" width="${barW}" height="${hAgy}" rx="2" fill="#38bdf8" fill-opacity="0.8" />`;
+        }
+        if (hCur > 0) {
+            barsSvg += `<rect x="${x}" y="${yCur}" width="${barW}" height="${hCur}" rx="2" fill="#a855f7" fill-opacity="0.8" />`;
+        }
+
+        if (idx % Math.max(1, Math.floor(buckets.length / 6)) === 0) {
+            const d = new Date(b.timestamp * 1000);
+            const label = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+            xTicksSvg += `<text x="${x + barW / 2}" y="${height - 10}" fill="#9ca3af" font-size="9.5" text-anchor="middle" font-family="monospace">${label}</text>`;
+        }
+
+        barsSvg += `<rect class="busyness-bar-hitbox" data-idx="${idx}" x="${padL + idx * barSlotW}" y="${padT}" width="${barSlotW}" height="${plotH}" fill="transparent" style="cursor: crosshair;" />`;
+
+        tooltipBuckets.push({
+            x: x + barW / 2,
+            timestamp: b.timestamp,
+            antigravity: agy,
+            cursor: cur,
+            total: agy + cur,
+            tools: tools
+        });
+    });
+
+    svg.innerHTML = `
+        ${yGridSvg}
+        ${xTicksSvg}
+        ${barsSvg}
+        <g id="busy-tip-${svgId}" style="display: none; pointer-events: none;">
+            <rect id="busy-tip-bg-${svgId}" width="165" height="50" rx="6" fill="rgba(10, 14, 23, 0.95)" stroke="rgba(255, 255, 255, 0.2)" stroke-width="1" />
+            <text id="busy-tip-time-${svgId}" x="0" y="0" fill="#9ca3af" font-size="9" font-family="monospace"></text>
+            <text id="busy-tip-val1-${svgId}" x="0" y="0" fill="#38bdf8" font-size="9.5" font-family="monospace" font-weight="bold"></text>
+            <text id="busy-tip-val2-${svgId}" x="0" y="0" fill="#a855f7" font-size="9.5" font-family="monospace" font-weight="bold"></text>
+        </g>
+    `;
+
+    const tipG = svg.querySelector(`#busy-tip-${svgId}`);
+    const tipBg = svg.querySelector(`#busy-tip-bg-${svgId}`);
+    const tipTime = svg.querySelector(`#busy-tip-time-${svgId}`);
+    const tipVal1 = svg.querySelector(`#busy-tip-val1-${svgId}`);
+    const tipVal2 = svg.querySelector(`#busy-tip-val2-${svgId}`);
+
+    svg.querySelectorAll('.busyness-bar-hitbox').forEach(el => {
+        el.addEventListener('mousemove', () => {
+            const idx = parseInt(el.getAttribute('data-idx'), 10);
+            const item = tooltipBuckets[idx];
+            if (!item || !tipG) return;
+
+            tipTime.textContent = `Time: ${formatFullDateTime(item.timestamp)}`;
+            tipVal1.textContent = `Antigravity: ${item.antigravity} active (${item.tools} tools)`;
+            tipVal2.textContent = `Cursor: ${item.cursor} active`;
+
+            let tipX = item.x + 10;
+            if (tipX + 170 > width - padR) tipX = item.x - 175;
+            const tipY = padT + 10;
+
+            tipBg.setAttribute('x', tipX);
+            tipBg.setAttribute('y', tipY);
+            tipTime.setAttribute('x', tipX + 8);
+            tipTime.setAttribute('y', tipY + 14);
+            tipVal1.setAttribute('x', tipX + 8);
+            tipVal1.setAttribute('y', tipY + 28);
+            tipVal2.setAttribute('x', tipX + 8);
+            tipVal2.setAttribute('y', tipY + 42);
+
+            tipG.style.display = 'block';
+        });
+
+        el.addEventListener('mouseleave', () => {
+            if (tipG) tipG.style.display = 'none';
+        });
+    });
+}
+
 async function fetchTelemetryTools() {
     try {
         const res = await fetch('/api/telemetry/tools');
@@ -4618,12 +4975,16 @@ async function fetchTelemetrySessions() {
             return;
         }
 
+        // Sort latest on top
+        sessions.sort((a, b) => (b.start_timestamp || 0) - (a.start_timestamp || 0));
+
         const chosenSessionId = currentVal || sessions[0].session_id;
         select.innerHTML = sessions.map(s => {
-            const tsStr = new Date(s.start_timestamp * 1000).toLocaleTimeString();
+            const dtStr = formatFullDateTime(s.start_timestamp);
             const turns = s.total_turns || 0;
             const tools = s.total_tool_calls || 0;
-            return `<option value="${s.session_id}" ${s.session_id === chosenSessionId ? 'selected' : ''}>[${s.agent_type.toUpperCase()}] ${s.session_id} - ${s.model_name} (${turns} turns, ${tools} tools &bull; ${tsStr})</option>`;
+            const agentLabel = (s.agent_type || 'agent').toLowerCase();
+            return `<option value="${s.session_id}" ${s.session_id === chosenSessionId ? 'selected' : ''}>[${agentLabel}] ${s.session_id} - ${s.model_name} (${turns} turns, ${tools} tools &bull; ${dtStr})</option>`;
         }).join('');
 
         select.value = chosenSessionId;
@@ -4747,7 +5108,10 @@ async function fetchMobileQr() {
         if (countEl) countEl.textContent = `Valid for ${data.expires_in || 300}s`;
 
         if (qrContainer && secret && typeof window.generateQrSvg === 'function') {
-            const host = window.location.hostname || '127.0.0.1';
+            let host = window.location.hostname || '127.0.0.1';
+            if ((host === '127.0.0.1' || host === 'localhost' || host === '0.0.0.0') && data.lan_ip) {
+                host = data.lan_ip;
+            }
             const port = window.location.port || 3883;
             const pairingUri = `aimon://pair?host=${host}&port=${port}&secret=${secret}`;
             qrContainer.innerHTML = window.generateQrSvg(pairingUri, {
@@ -4798,81 +5162,144 @@ async function revokeDevice(deviceId) {
     } catch (_) {}
 }
 
-function switchToMonitor(id) {
-    activeMonitorId = id;
-    if (window.location.hash !== '#' + id) {
-        try {
-            history.replaceState(null, '', '#' + id);
-        } catch (_) {}
+function switchToSubpanel(subpanelId) {
+    if (!subpanelId) subpanelId = 'quotas';
+    activeSubpanelId = subpanelId;
+    activeMonitorId = 'aimon';
+
+    try {
+        history.replaceState(null, '', '#' + subpanelId);
+    } catch (_) {}
+
+    // 1. Activate aimon top tab, deactivate satellite tabs
+    const navEl = document.getElementById('monitor-tabs');
+    if (navEl) {
+        navEl.querySelectorAll('.monitor-tab').forEach(tab => {
+            const isAimon = (tab.getAttribute('data-id') === 'aimon');
+            tab.classList.toggle('active', isAimon);
+        });
     }
 
-    // If switching to an aimon subpanel directly (e.g. #telemetry or #approvals or #quotas)
-    if (id === 'quotas' || id === 'telemetry' || id === 'approvals') {
-        switchToMonitor('aimon');
-        switchToAimonSubpanel(id);
+    // 2. Show aimon view panel, hide dynamic satellite panels
+    const viewAimon = document.getElementById('view-aimon');
+    if (viewAimon) {
+        viewAimon.classList.add('active');
+        viewAimon.classList.remove('hidden');
+    }
+    const dynamicPanelsEl = document.getElementById('dynamic-panels');
+    if (dynamicPanelsEl) {
+        dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(p => {
+            p.classList.remove('active');
+            p.classList.add('hidden');
+        });
+    }
+
+    // 3. Update aimon subnav tabs
+    const subnavEl = document.getElementById('aimon-subnav');
+    if (subnavEl) {
+        subnavEl.querySelectorAll('.aimon-subnav-tab').forEach(tab => {
+            const isMatch = (tab.getAttribute('data-subpanel') === subpanelId);
+            tab.classList.toggle('active', isMatch);
+        });
+    }
+
+    // 4. Show active subpanel, hide other subpanels
+    const subpanels = {
+        'quotas': document.getElementById('subpanel-quotas'),
+        'telemetry': document.getElementById('subpanel-telemetry'),
+        'approvals': document.getElementById('subpanel-approvals')
+    };
+    Object.keys(subpanels).forEach(key => {
+        const el = subpanels[key];
+        if (el) {
+            const isMatch = (key === subpanelId);
+            el.classList.toggle('active', isMatch);
+            el.classList.toggle('hidden', !isMatch);
+        }
+    });
+
+    // 5. Fetch subpanel data
+    if (subpanelId === 'quotas') {
+        fetchStatus();
+        fetchSessions();
+    } else if (subpanelId === 'telemetry') {
+        fetchTelemetryOverview();
+        fetchTelemetryTimeseries();
+        fetchActivityTimeline();
+        fetchTelemetryTools();
+        fetchTelemetrySessions();
+    } else if (subpanelId === 'approvals') {
+        fetchPendingApprovals();
+        fetchMobileQr();
+        fetchMobileDevices();
+    }
+}
+
+function switchToMonitor(monitorId) {
+    if (!monitorId || monitorId === 'aimon') {
+        switchToSubpanel(activeSubpanelId || 'quotas');
         return;
     }
 
-    activeMonitorId = id;
+    activeMonitorId = monitorId;
 
-    // Update active tab button styles in top nav
+    try {
+        history.replaceState(null, '', '#' + monitorId);
+    } catch (_) {}
+
+    // 1. Update top monitor tab active states
     const navEl = document.getElementById('monitor-tabs');
     if (navEl) {
         navEl.querySelectorAll('.monitor-tab').forEach(tab => {
             const tabId = tab.getAttribute('data-id');
-            const isMatch = (tabId === id || tabId.startsWith(id + '-'));
-            if (isMatch) {
-                tab.classList.add('active');
-            } else {
-                tab.classList.remove('active');
-            }
+            const fullId = tab.getAttribute('data-full-id');
+            const isMatch = (tabId === monitorId || fullId === monitorId || (fullId && fullId.startsWith(monitorId + '-')));
+            tab.classList.toggle('active', isMatch);
         });
     }
 
+    // 2. Hide aimon view panel
     const viewAimon = document.getElementById('view-aimon');
-    const isAimon = (id === 'aimon');
-
     if (viewAimon) {
-        viewAimon.classList.toggle('active', isAimon);
-        viewAimon.classList.toggle('hidden', !isAimon);
-        if (isAimon) {
-            switchToAimonSubpanel(activeAimonSubpanel);
-        }
+        viewAimon.classList.remove('active');
+        viewAimon.classList.add('hidden');
     }
 
-    // Toggle persistent satellite monitor panels
+    // 3. Show matching satellite frame panel
     const dynamicPanelsEl = document.getElementById('dynamic-panels');
     if (dynamicPanelsEl) {
         dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(panel => {
             const panelId = panel.id;
             const subsystem = panel.getAttribute('data-subsystem');
-            const isMatch = !isAimon && (panelId === `panel-${id}` || panelId.startsWith(`panel-${id}-`) || (subsystem && (subsystem === id || id.startsWith(subsystem))));
-            if (isMatch) {
-                panel.classList.add('active');
-                panel.classList.remove('hidden');
-            } else {
-                panel.classList.remove('active');
-                panel.classList.add('hidden');
-            }
+            const isMatch = (panelId === `panel-${monitorId}` || panelId.startsWith(`panel-${monitorId}-`) || (subsystem && (subsystem === monitorId || monitorId.startsWith(subsystem))));
+            panel.classList.toggle('active', isMatch);
+            panel.classList.toggle('hidden', !isMatch);
         });
+    }
+}
+
+function switchToTab(id) {
+    if (!id || id === 'aimon') {
+        switchToSubpanel(activeSubpanelId || 'quotas');
+    } else if (id === 'quotas' || id === 'telemetry' || id === 'approvals') {
+        switchToSubpanel(id);
+    } else {
+        switchToMonitor(id);
     }
 }
 
 window.addEventListener('hashchange', () => {
     const hash = window.location.hash.replace(/^#/, '');
     if (hash) {
-        if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
-            switchToMonitor('aimon');
-            switchToAimonSubpanel(hash);
-        } else if (hash.startsWith('aimon/')) {
-            const sub = hash.split('/')[1];
-            switchToMonitor('aimon');
-            switchToAimonSubpanel(sub);
+        if (hash.startsWith('aimon/')) {
+            switchToSubpanel(hash.split('/')[1]);
+        } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+            switchToSubpanel(hash);
         } else {
             switchToMonitor(hash);
         }
     } else {
-        switchToMonitor('aimon');
+        switchToSubpanel('quotas');
     }
 });
 
@@ -4886,37 +5313,37 @@ document.addEventListener('DOMContentLoaded', () => {
     if (window.location.hash) {
         const hash = window.location.hash.replace(/^#/, '');
         if (hash) {
-            if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
-                switchToMonitor('aimon');
-                switchToAimonSubpanel(hash);
-            } else if (hash.startsWith('aimon/')) {
-                const sub = hash.split('/')[1];
-                switchToMonitor('aimon');
-                switchToAimonSubpanel(sub);
+            if (hash.startsWith('aimon/')) {
+                switchToSubpanel(hash.split('/')[1]);
+            } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+                switchToSubpanel(hash);
             } else {
                 switchToMonitor(hash);
             }
         }
+    } else {
+        switchToSubpanel('quotas');
     }
 
-    // Top-level tab button click listeners
+    // Top-level monitor tabs listener
     const monitorTabsEl = document.getElementById('monitor-tabs');
     if (monitorTabsEl) {
         monitorTabsEl.addEventListener('click', (e) => {
             const btn = e.target.closest('.monitor-tab');
-            if (btn && btn.dataset.id) {
-                switchToMonitor(btn.dataset.id);
+            if (btn) {
+                const monitorId = btn.getAttribute('data-id');
+                switchToMonitor(monitorId);
             }
         });
     }
 
-    // Aimon Sub-Navigation button click listeners
+    // Aimon sub-navigation tabs listener
     const aimonSubnavEl = document.getElementById('aimon-subnav');
     if (aimonSubnavEl) {
         aimonSubnavEl.addEventListener('click', (e) => {
             const btn = e.target.closest('.aimon-subnav-tab');
             if (btn && btn.dataset.subpanel) {
-                switchToAimonSubpanel(btn.dataset.subpanel);
+                switchToSubpanel(btn.dataset.subpanel);
             }
         });
     }
@@ -4931,6 +5358,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 btn.classList.add('active');
                 activeTelemetryWindow = btn.dataset.window;
                 fetchTelemetryTimeseries();
+                fetchActivityTimeline();
             }
         });
     }
@@ -4948,23 +5376,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btnQr) {
         btnQr.addEventListener('click', fetchMobileQr);
     }
-
-    document.getElementById('refresh-btn').addEventListener('click', () => {
-        fetchStatus(true);
-        fetchSessions();
-        fetchMonitors();
-        if (activeMonitorId === 'aimon') {
-            if (activeAimonSubpanel === 'telemetry') {
-                fetchTelemetryOverview();
-                fetchTelemetryTimeseries();
-                fetchTelemetryTools();
-                fetchTelemetrySessions();
-            } else if (activeAimonSubpanel === 'approvals') {
-                fetchPendingApprovals();
-                fetchMobileDevices();
-            }
-        }
-    });
 
     const modelsToggleBtn = document.getElementById('ag-models-toggle');
     const modelsChevron = document.getElementById('ag-models-chevron');
@@ -4989,11 +5400,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Refresh telemetry & approvals periodically when respective tab is active
     setInterval(() => {
-        if (activeMonitorId === 'telemetry') {
+        if (activeTabId === 'telemetry') {
             fetchTelemetryOverview();
             fetchTelemetryTimeseries();
+            fetchActivityTimeline();
             fetchTelemetryTools();
-        } else if (activeMonitorId === 'approvals') {
+        } else if (activeTabId === 'approvals') {
             fetchPendingApprovals();
         }
     }, 8000);

@@ -912,7 +912,7 @@ function renderMonitorTabs(monitors) {
 
         if (window.location.hash) {
             const hash = window.location.hash.replace(/^#/, '');
-            const target = allTabs.find(m => m.id === hash || m.subsystem === hash);
+            const target = externalMonitors.find(m => m.id === hash || m.subsystem === hash);
             if (target && activeMonitorId !== target.id) {
                 switchToMonitor(target.id);
             }
