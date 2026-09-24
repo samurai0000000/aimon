@@ -1648,9 +1648,9 @@ async function fetchMobileQr() {
             const port = window.location.port || 3883;
             const pairingUri = `aimon://pair?host=${host}&port=${port}&secret=${secret}`;
             qrContainer.innerHTML = window.generateQrSvg(pairingUri, {
-                fg: '#38bdf8',
-                bg: '#0f172a',
-                margin: 2
+                fg: '#000000',
+                bg: '#ffffff',
+                margin: 4
             });
         }
     } catch (_) {}
