@@ -29,7 +29,8 @@ AgentTelemetryDb::AgentTelemetryDb()
     , _stmtInsertEvent(nullptr)
     , _stmtInsertSample(nullptr)
     , _stmtInsertSession(nullptr)
-    , _stmtUpdateSession(nullptr) {
+    , _stmtUpdateSession(nullptr)
+    , _stmtUpsertSession(nullptr) {
 }
 
 AgentTelemetryDb::~AgentTelemetryDb() {
@@ -96,6 +97,12 @@ void AgentTelemetryDb::close() {
 bool AgentTelemetryDb::isOpen() const {
     std::lock_guard<std::mutex> lock(_mutex);
     return _db != nullptr;
+}
+
+static bool isExcludedSession(const std::string &sid) {
+    return sid.empty() || sid.rfind("approval-", 0) == 0 ||
+           sid == "hook-selftest" || sid == "t1" || sid == "s1" ||
+           sid == "default_session" || sid == "test-cursor-1" || sid == "default";
 }
 
 bool AgentTelemetryDb::initSchema() {
@@ -193,12 +200,64 @@ bool AgentTelemetryDb::initSchema() {
         return false;
     }
 
+    // Database Purge & Deduplication Migration
+    const char *sqlDedupe =
+        "DELETE FROM agent_lifecycle_events "
+        "WHERE id NOT IN ("
+        "  SELECT MIN(id) FROM agent_lifecycle_events "
+        "  GROUP BY session_id, step_index, event_type, tool_name"
+        ");";
+    sqlite3_exec(_db, sqlDedupe, nullptr, nullptr, nullptr);
+
+    const char *sqlPurgeSessions =
+        "DELETE FROM agent_sessions WHERE session_id LIKE 'approval-%';"
+        "DELETE FROM agent_sessions WHERE session_id IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default');";
+    sqlite3_exec(_db, sqlPurgeSessions, nullptr, nullptr, nullptr);
+
+    const char *sqlPurgeEvents =
+        "DELETE FROM agent_lifecycle_events WHERE session_id IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default');";
+    sqlite3_exec(_db, sqlPurgeEvents, nullptr, nullptr, nullptr);
+
+    const char *sqlUniqueIndex =
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique "
+        "ON agent_lifecycle_events(session_id, step_index, event_type, tool_name);";
+    sqlite3_exec(_db, sqlUniqueIndex, nullptr, nullptr, nullptr);
+
+    // Auto-backfill orphan session records from historical lifecycle events if any
+    const char *sqlBackfill =
+        "INSERT OR IGNORE INTO agent_sessions ("
+        "  session_id, conversation_id, agent_type, workspace_path, model_name,"
+        "  start_timestamp, end_timestamp, status, total_turns, total_prompt_tokens,"
+        "  total_comp_tokens, total_tool_calls, total_errors, avg_turn_ms"
+        ") "
+        "SELECT "
+        "  session_id, "
+        "  session_id AS conversation_id, "
+        "  agent_type, "
+        "  COALESCE(json_extract(details_json, '$.workspace'), '') AS workspace_path, "
+        "  CASE WHEN agent_type = 'cursor' THEN 'Cursor' ELSE 'Agent' END AS model_name, "
+        "  MIN(timestamp) AS start_timestamp, "
+        "  MAX(timestamp) AS end_timestamp, "
+        "  'COMPLETED' AS status, "
+        "  SUM(CASE WHEN event_type IN ('USER_TURN', 'USER_INPUT') THEN 1 ELSE 0 END) AS total_turns, "
+        "  0 AS total_prompt_tokens, "
+        "  0 AS total_comp_tokens, "
+        "  SUM(CASE WHEN event_type IN ('TOOL_CALL', 'TOOL_PRE_USE') THEN 1 ELSE 0 END) AS total_tool_calls, "
+        "  SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) AS total_errors, "
+        "  AVG(CASE WHEN duration_ms > 0 THEN duration_ms ELSE NULL END) AS avg_turn_ms "
+        "FROM agent_lifecycle_events "
+        "WHERE session_id NOT IN (SELECT session_id FROM agent_sessions) "
+        "  AND session_id NOT LIKE 'approval-%' "
+        "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
+        "GROUP BY session_id;";
+    sqlite3_exec(_db, sqlBackfill, nullptr, nullptr, nullptr);
+
     return true;
 }
 
 void AgentTelemetryDb::prepareStatements() {
     const char *sqlEvent =
-        "INSERT INTO agent_lifecycle_events ("
+        "INSERT OR IGNORE INTO agent_lifecycle_events ("
         "  timestamp, session_id, agent_type, event_type, step_index, tool_name, duration_ms, status, details_json"
         ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
     sqlite3_prepare_v2(_db, sqlEvent, -1, &_stmtInsertEvent, nullptr);
@@ -222,6 +281,22 @@ void AgentTelemetryDb::prepareStatements() {
         "  total_comp_tokens = ?, total_tool_calls = ?, total_errors = ?, avg_turn_ms = ? "
         "WHERE session_id = ?;";
     sqlite3_prepare_v2(_db, sqlUpdateSession, -1, &_stmtUpdateSession, nullptr);
+
+    const char *sqlUpsertSession =
+        "INSERT INTO agent_sessions ("
+        "  session_id, conversation_id, agent_type, workspace_path, model_name,"
+        "  start_timestamp, end_timestamp, status, total_turns, total_prompt_tokens,"
+        "  total_comp_tokens, total_tool_calls, total_errors, avg_turn_ms"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, ?, ?, 0.0) "
+        "ON CONFLICT(session_id) DO UPDATE SET "
+        "  end_timestamp = MAX(end_timestamp, excluded.end_timestamp), "
+        "  total_tool_calls = total_tool_calls + excluded.total_tool_calls, "
+        "  total_errors = total_errors + excluded.total_errors, "
+        "  total_turns = total_turns + excluded.total_turns, "
+        "  workspace_path = CASE WHEN workspace_path = '' OR workspace_path = '/workspace' THEN excluded.workspace_path ELSE workspace_path END, "
+        "  model_name = CASE WHEN (model_name = '' OR model_name = 'Agent') AND excluded.model_name != '' THEN excluded.model_name ELSE model_name END, "
+        "  status = 'RUNNING';";
+    sqlite3_prepare_v2(_db, sqlUpsertSession, -1, &_stmtUpsertSession, nullptr);
 }
 
 void AgentTelemetryDb::finalizeStatements() {
@@ -241,6 +316,10 @@ void AgentTelemetryDb::finalizeStatements() {
         sqlite3_finalize(_stmtUpdateSession);
         _stmtUpdateSession = nullptr;
     }
+    if (_stmtUpsertSession) {
+        sqlite3_finalize(_stmtUpsertSession);
+        _stmtUpsertSession = nullptr;
+    }
 }
 
 bool AgentTelemetryDb::recordSessionStart(const std::string &sessionId,
@@ -249,6 +328,8 @@ bool AgentTelemetryDb::recordSessionStart(const std::string &sessionId,
                                          const std::string &workspace,
                                          const std::string &model,
                                          int64_t timestamp) {
+    if (isExcludedSession(sessionId)) return true;
+
     std::lock_guard<std::mutex> lock(_mutex);
     if (!_db || !_stmtInsertSession) return false;
 
@@ -271,6 +352,8 @@ bool AgentTelemetryDb::recordSessionEnd(const std::string &sessionId,
                                        int totalTurns, int promptTokens, int compTokens,
                                        int toolCalls, int errors, double avgTurnMs,
                                        int64_t timestamp) {
+    if (isExcludedSession(sessionId)) return true;
+
     std::lock_guard<std::mutex> lock(_mutex);
     if (!_db || !_stmtUpdateSession) return false;
 
@@ -291,11 +374,13 @@ bool AgentTelemetryDb::recordSessionEnd(const std::string &sessionId,
 }
 
 bool AgentTelemetryDb::updateSessionStats(const std::string &sessionId,
-                                        const std::string &status,
-                                        int totalTurns, int promptTokens, int compTokens,
-                                        int toolCalls, int errors, double avgTurnMs,
-                                        int64_t startTimestamp,
-                                        int64_t endTimestamp) {
+                                         const std::string &status,
+                                         int totalTurns, int promptTokens, int compTokens,
+                                         int toolCalls, int errors, double avgTurnMs,
+                                         int64_t startTimestamp,
+                                         int64_t endTimestamp) {
+    if (isExcludedSession(sessionId)) return true;
+
     std::lock_guard<std::mutex> lock(_mutex);
     if (!_db) return false;
 
@@ -347,8 +432,40 @@ bool AgentTelemetryDb::insertEvent(const AgentLifecycleEvent &event) {
     sqlite3_bind_double(_stmtInsertEvent, 7, event.durationMs);
     sqlite3_bind_text(_stmtInsertEvent, 8, event.status.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(_stmtInsertEvent, 9, detailsStr.c_str(), -1, SQLITE_TRANSIENT);
+    bool ok = (sqlite3_step(_stmtInsertEvent) == SQLITE_DONE);
 
-    return sqlite3_step(_stmtInsertEvent) == SQLITE_DONE;
+    // Auto-upsert corresponding agent_sessions record (excluding approval and transient test sessions)
+    if (_stmtUpsertSession && !isExcludedSession(event.sessionId)) {
+        bool isTool = (event.eventType == "TOOL_CALL" || event.eventType == "TOOL_PRE_USE");
+        bool isTurn = (event.eventType == "USER_TURN" || event.eventType == "USER_INPUT" || event.eventType == "TURN_START");
+        bool isError = (event.status == "ERROR");
+
+        std::string workspace = "";
+        std::string model = (event.agentType == "cursor") ? "Cursor" : "Agent";
+        if (event.detailsJson.is_object()) {
+            if (event.detailsJson.contains("workspace") && event.detailsJson["workspace"].is_string()) {
+                workspace = event.detailsJson["workspace"].get<std::string>();
+            }
+            if (event.detailsJson.contains("model") && event.detailsJson["model"].is_string()) {
+                model = event.detailsJson["model"].get<std::string>();
+            }
+        }
+
+        sqlite3_reset(_stmtUpsertSession);
+        sqlite3_bind_text(_stmtUpsertSession, 1, event.sessionId.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(_stmtUpsertSession, 2, event.sessionId.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(_stmtUpsertSession, 3, event.agentType.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(_stmtUpsertSession, 4, workspace.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(_stmtUpsertSession, 5, model.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(_stmtUpsertSession, 6, ts);
+        sqlite3_bind_int64(_stmtUpsertSession, 7, ts);
+        sqlite3_bind_int(_stmtUpsertSession, 8, isTurn ? 1 : 0);
+        sqlite3_bind_int(_stmtUpsertSession, 9, isTool ? 1 : 0);
+        sqlite3_bind_int(_stmtUpsertSession, 10, isError ? 1 : 0);
+        sqlite3_step(_stmtUpsertSession);
+    }
+
+    return ok;
 }
 
 bool AgentTelemetryDb::insertEventsBatch(const std::vector<AgentLifecycleEvent> &events) {
@@ -373,6 +490,36 @@ bool AgentTelemetryDb::insertEventsBatch(const std::vector<AgentLifecycleEvent> 
         sqlite3_bind_text(_stmtInsertEvent, 8, event.status.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(_stmtInsertEvent, 9, detailsStr.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(_stmtInsertEvent);
+
+        if (_stmtUpsertSession && !isExcludedSession(event.sessionId)) {
+            bool isTool = (event.eventType == "TOOL_CALL" || event.eventType == "TOOL_PRE_USE");
+            bool isTurn = (event.eventType == "USER_TURN" || event.eventType == "USER_INPUT" || event.eventType == "TURN_START");
+            bool isError = (event.status == "ERROR");
+
+            std::string workspace = "";
+            std::string model = (event.agentType == "cursor") ? "Cursor" : "Agent";
+            if (event.detailsJson.is_object()) {
+                if (event.detailsJson.contains("workspace") && event.detailsJson["workspace"].is_string()) {
+                    workspace = event.detailsJson["workspace"].get<std::string>();
+                }
+                if (event.detailsJson.contains("model") && event.detailsJson["model"].is_string()) {
+                    model = event.detailsJson["model"].get<std::string>();
+                }
+            }
+
+            sqlite3_reset(_stmtUpsertSession);
+            sqlite3_bind_text(_stmtUpsertSession, 1, event.sessionId.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(_stmtUpsertSession, 2, event.sessionId.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(_stmtUpsertSession, 3, event.agentType.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(_stmtUpsertSession, 4, workspace.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(_stmtUpsertSession, 5, model.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(_stmtUpsertSession, 6, ts);
+            sqlite3_bind_int64(_stmtUpsertSession, 7, ts);
+            sqlite3_bind_int(_stmtUpsertSession, 8, isTurn ? 1 : 0);
+            sqlite3_bind_int(_stmtUpsertSession, 9, isTool ? 1 : 0);
+            sqlite3_bind_int(_stmtUpsertSession, 10, isError ? 1 : 0);
+            sqlite3_step(_stmtUpsertSession);
+        }
     }
     sqlite3_exec(_db, "COMMIT;", nullptr, nullptr, nullptr);
     return true;
@@ -435,7 +582,7 @@ json AgentTelemetryDb::queryOverview(int windowHours) {
     // Active & total sessions
     const char *sqlSessions =
         "SELECT "
-        "  COUNT(CASE WHEN status = 'RUNNING' THEN 1 END) AS active_count,"
+        "  COUNT(CASE WHEN status = 'RUNNING' AND (end_timestamp >= ? - 300 OR (end_timestamp = 0 AND start_timestamp >= ? - 300)) THEN 1 END) AS active_count,"
         "  COUNT(*) AS total_sessions,"
         "  SUM(total_turns) AS total_turns,"
         "  SUM(total_prompt_tokens) AS total_prompt,"
@@ -443,12 +590,16 @@ json AgentTelemetryDb::queryOverview(int windowHours) {
         "  SUM(total_tool_calls) AS total_tools,"
         "  SUM(total_errors) AS total_errors,"
         "  AVG(CASE WHEN avg_turn_ms > 0 THEN avg_turn_ms ELSE NULL END) AS overall_avg_turn_ms "
-        "FROM agent_sessions WHERE (end_timestamp >= ? OR (end_timestamp = 0 AND start_timestamp >= ?));";
+        "FROM agent_sessions WHERE (end_timestamp >= ? OR (end_timestamp = 0 AND start_timestamp >= ?)) "
+        "  AND session_id NOT LIKE 'approval-%' "
+        "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default');";
 
     sqlite3_stmt *stmt = nullptr;
     if (sqlite3_prepare_v2(_db, sqlSessions, -1, &stmt, nullptr) == SQLITE_OK) {
-        sqlite3_bind_int64(stmt, 1, startTs);
-        sqlite3_bind_int64(stmt, 2, startTs);
+        sqlite3_bind_int64(stmt, 1, now);
+        sqlite3_bind_int64(stmt, 2, now);
+        sqlite3_bind_int64(stmt, 3, startTs);
+        sqlite3_bind_int64(stmt, 4, startTs);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             overview["active_sessions"] = sqlite3_column_int(stmt, 0);
             overview["total_sessions"] = sqlite3_column_int(stmt, 1);
@@ -465,11 +616,13 @@ json AgentTelemetryDb::queryOverview(int windowHours) {
     // Direct event counts in window
     const char *sqlEvents =
         "SELECT "
-        "  SUM(CASE WHEN event_type IN ('USER_TURN', 'THINKING') THEN 1 ELSE 0 END),"
-        "  SUM(CASE WHEN event_type = 'TOOL_CALL' THEN 1 ELSE 0 END),"
+        "  SUM(CASE WHEN event_type IN ('USER_TURN', 'THINKING', 'USER_INPUT') THEN 1 ELSE 0 END),"
+        "  SUM(CASE WHEN event_type IN ('TOOL_CALL', 'TOOL_PRE_USE') THEN 1 ELSE 0 END),"
         "  SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END),"
         "  AVG(CASE WHEN duration_ms > 0 THEN duration_ms ELSE NULL END) "
-        "FROM agent_lifecycle_events WHERE timestamp >= ?;";
+        "FROM agent_lifecycle_events WHERE timestamp >= ? "
+        "  AND session_id NOT LIKE 'approval-%' "
+        "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default');";
 
     if (sqlite3_prepare_v2(_db, sqlEvents, -1, &stmt, nullptr) == SQLITE_OK) {
         sqlite3_bind_int64(stmt, 1, startTs);
@@ -480,9 +633,11 @@ json AgentTelemetryDb::queryOverview(int windowHours) {
             double evLatency = sqlite3_column_double(stmt, 3);
 
             if (evTools > 0 || evTurns > 0) {
-                overview["total_turns"] = evTurns;
-                overview["total_tool_calls"] = evTools;
-                overview["total_errors"] = evErrors;
+                if (evTurns > 0 || overview.value("total_turns", 0) == 0) {
+                    overview["total_turns"] = std::max(overview.value("total_turns", 0), evTurns);
+                }
+                overview["total_tool_calls"] = std::max(overview.value("total_tool_calls", 0), evTools);
+                overview["total_errors"] = std::max(overview.value("total_errors", 0), evErrors);
                 if (evLatency > 0.0) {
                     overview["avg_turn_latency_ms"] = evLatency;
                 }
@@ -527,12 +682,14 @@ json AgentTelemetryDb::queryTimeseries(const std::string &window, int maxPoints)
         "SELECT "
         "  (timestamp / " + std::to_string(bucketWidth) + ") * " + std::to_string(bucketWidth) + " AS bucket_ts,"
         "  COUNT(DISTINCT session_id) AS active_agents,"
-        "  SUM(CASE WHEN event_type = 'TOOL_CALL' THEN 1 ELSE 0 END) * 1.0 / " + std::to_string(bucketWidth) + " AS tool_calls_sec,"
+        "  SUM(CASE WHEN event_type IN ('TOOL_CALL', 'TOOL_PRE_USE') THEN 1 ELSE 0 END) * 1.0 / " + std::to_string(bucketWidth) + " AS tool_calls_sec,"
         "  SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) * 100.0 / MAX(1, COUNT(*)) AS error_rate_pct,"
         "  AVG(CASE WHEN duration_ms > 0 THEN duration_ms ELSE NULL END) AS avg_turn_latency_ms,"
         "  MAX(duration_ms) AS p95_turn_latency_ms "
         "FROM agent_lifecycle_events "
         "WHERE timestamp >= ? AND timestamp <= ? "
+        "  AND session_id NOT LIKE 'approval-%' "
+        "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
         "GROUP BY bucket_ts ORDER BY bucket_ts ASC;";
 
     json timestamps = json::array();
@@ -612,6 +769,8 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
         "       start_timestamp, end_timestamp, status, total_turns, total_tool_calls, total_errors "
         "FROM agent_sessions "
         "WHERE start_timestamp <= ? AND (end_timestamp >= ? OR end_timestamp == 0) "
+        "  AND session_id NOT LIKE 'approval-%' "
+        "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
         "ORDER BY start_timestamp DESC LIMIT ?;";
 
     sqlite3_stmt *stmt = nullptr;
@@ -631,7 +790,11 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
             int64_t endTs = sqlite3_column_int64(stmt, 6);
             s["start_timestamp"] = startTs;
             s["end_timestamp"] = endTs;
-            s["status"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            std::string st = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            if (st == "RUNNING" && endTs > 0 && (now - endTs > 300)) {
+                st = "COMPLETED";
+            }
+            s["status"] = st;
             s["total_turns"] = sqlite3_column_int(stmt, 8);
             s["total_tool_calls"] = sqlite3_column_int(stmt, 9);
             s["total_errors"] = sqlite3_column_int(stmt, 10);
@@ -667,36 +830,18 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
         bucketMap[bTs] = b;
     }
 
-    // Overlay session concurrency across active bucket intervals
-    for (const auto &s : sessionsArray) {
-        int64_t sStart = s.value("start_timestamp", 0LL);
-        int64_t sEnd = s.value("end_timestamp", 0LL);
-        if (sEnd <= 0) sEnd = now;
-        std::string aType = s.value("agent_type", "antigravity");
-        std::transform(aType.begin(), aType.end(), aType.begin(), ::tolower);
-        bool isCursor = (aType.find("cursor") != std::string::npos);
-
-        for (auto &pair : bucketMap) {
-            int64_t bStart = pair.first;
-            int64_t bEnd = bStart + bucketWidth;
-            if (sStart < bEnd && sEnd >= bStart) {
-                if (isCursor) {
-                    pair.second["cursor_active"] = pair.second["cursor_active"].get<int>() + 1;
-                } else {
-                    pair.second["antigravity_active"] = pair.second["antigravity_active"].get<int>() + 1;
-                }
-            }
-        }
-    }
-
-    // Query granular tool call events from agent_lifecycle_events
+    // Query granular tool call events and active agent concurrency per bucket
     std::string sqlEvents =
         "SELECT "
         "  (timestamp / " + std::to_string(bucketWidth) + ") * " + std::to_string(bucketWidth) + " AS b_ts,"
-        "  SUM(CASE WHEN event_type = 'TOOL_CALL' THEN 1 ELSE 0 END) AS tools "
+        "  LOWER(agent_type) AS a_type,"
+        "  COUNT(DISTINCT session_id) AS active_count,"
+        "  SUM(CASE WHEN event_type IN ('TOOL_CALL', 'TOOL_PRE_USE') THEN 1 ELSE 0 END) AS tools "
         "FROM agent_lifecycle_events "
         "WHERE timestamp >= ? AND timestamp <= ? "
-        "GROUP BY b_ts ORDER BY b_ts ASC;";
+        "  AND session_id NOT LIKE 'approval-%' "
+        "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
+        "GROUP BY b_ts, a_type ORDER BY b_ts ASC;";
 
     int totalToolCalls = 0;
     if (sqlite3_prepare_v2(_db, sqlEvents.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
@@ -705,14 +850,45 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
 
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             int64_t bTs = sqlite3_column_int64(stmt, 0);
-            int tools = sqlite3_column_int(stmt, 1);
+            const char *aTypeTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            std::string aType = aTypeTxt ? aTypeTxt : "";
+            int activeCount = sqlite3_column_int(stmt, 2);
+            int tools = sqlite3_column_int(stmt, 3);
             totalToolCalls += tools;
 
             if (bucketMap.find(bTs) != bucketMap.end()) {
-                bucketMap[bTs]["tool_calls"] = tools;
+                if (aType.find("cursor") != std::string::npos) {
+                    bucketMap[bTs]["cursor_active"] = bucketMap[bTs]["cursor_active"].get<int>() + activeCount;
+                } else {
+                    bucketMap[bTs]["antigravity_active"] = bucketMap[bTs]["antigravity_active"].get<int>() + activeCount;
+                }
+                bucketMap[bTs]["tool_calls"] = bucketMap[bTs]["tool_calls"].get<int>() + tools;
             }
         }
         sqlite3_finalize(stmt);
+    }
+
+    // If there is an actively running session within the last 5 minutes, ensure the current bucket reflects it
+    for (const auto &s : sessionsArray) {
+        std::string st = s.value("status", "");
+        int64_t endTs = s.value("end_timestamp", 0LL);
+        int64_t startTs = s.value("start_timestamp", 0LL);
+        if (st == "RUNNING" && (now - std::max(startTs, endTs) <= 300)) {
+            int64_t currentBucketTs = (now / bucketWidth) * bucketWidth;
+            if (bucketMap.find(currentBucketTs) != bucketMap.end()) {
+                std::string aType = s.value("agent_type", "antigravity");
+                std::transform(aType.begin(), aType.end(), aType.begin(), ::tolower);
+                if (aType.find("cursor") != std::string::npos) {
+                    if (bucketMap[currentBucketTs]["cursor_active"].get<int>() == 0) {
+                        bucketMap[currentBucketTs]["cursor_active"] = 1;
+                    }
+                } else {
+                    if (bucketMap[currentBucketTs]["antigravity_active"].get<int>() == 0) {
+                        bucketMap[currentBucketTs]["antigravity_active"] = 1;
+                    }
+                }
+            }
+        }
     }
 
     int peakConcurrency = 0;
@@ -747,9 +923,11 @@ json AgentTelemetryDb::querySessions(int limit, const std::string &status) {
         "SELECT session_id, conversation_id, agent_type, workspace_path, model_name,"
         "       start_timestamp, end_timestamp, status, total_turns, total_prompt_tokens,"
         "       total_comp_tokens, total_tool_calls, total_errors, avg_turn_ms "
-        "FROM agent_sessions ";
+        "FROM agent_sessions "
+        "WHERE session_id NOT LIKE 'approval-%' "
+        "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') ";
     if (!status.empty()) {
-        sql += "WHERE status = ? ";
+        sql += "AND status = ? ";
     }
     sql += "ORDER BY start_timestamp DESC LIMIT ?;";
 
@@ -761,6 +939,7 @@ json AgentTelemetryDb::querySessions(int limit, const std::string &status) {
         }
         sqlite3_bind_int(stmt, bindIdx, limit > 0 ? limit : 50);
 
+        int64_t now = static_cast<int64_t>(time(nullptr));
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             json s = json::object();
             s["session_id"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
@@ -770,7 +949,12 @@ json AgentTelemetryDb::querySessions(int limit, const std::string &status) {
             s["model_name"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
             s["start_timestamp"] = sqlite3_column_int64(stmt, 5);
             s["end_timestamp"] = sqlite3_column_int64(stmt, 6);
-            s["status"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            std::string st = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            int64_t endTs = s["end_timestamp"];
+            if (st == "RUNNING" && endTs > 0 && (now - endTs > 300)) {
+                st = "COMPLETED";
+            }
+            s["status"] = st;
             s["total_turns"] = sqlite3_column_int(stmt, 8);
             s["total_prompt_tokens"] = sqlite3_column_int64(stmt, 9);
             s["total_comp_tokens"] = sqlite3_column_int64(stmt, 10);
@@ -845,6 +1029,8 @@ json AgentTelemetryDb::queryToolStats(int windowHours) {
         "       MAX(duration_ms) AS max_duration_ms "
         "FROM agent_lifecycle_events "
         "WHERE timestamp >= ? AND tool_name != '' AND tool_name IS NOT NULL "
+        "  AND session_id NOT LIKE 'approval-%' "
+        "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
         "GROUP BY tool_name ORDER BY invocations DESC;";
 
     sqlite3_stmt *stmt = nullptr;

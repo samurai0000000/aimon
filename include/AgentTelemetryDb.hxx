@@ -124,6 +124,7 @@ private:
     sqlite3_stmt *_stmtInsertSample;
     sqlite3_stmt *_stmtInsertSession;
     sqlite3_stmt *_stmtUpdateSession;
+    sqlite3_stmt *_stmtUpsertSession;
 };
 
 } // namespace aimon

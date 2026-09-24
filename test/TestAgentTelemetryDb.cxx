@@ -144,6 +144,7 @@ static void testPercentileAndRollup() {
         ev.sessionId = "old-sess-1";
         ev.agentType = "cursor";
         ev.eventType = (i % 2 == 0) ? "TOOL_POST_USE" : "TURN_END";
+        ev.stepIndex = i;
         ev.durationMs = 100.0 + i * 50.0;
         ev.status = "OK";
         ev.toolName = "replace_file_content";
