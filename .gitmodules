@@ -6,4 +6,5 @@
 	url = https://github.com/nlohmann/json.git
 [submodule "third_party/antimatter"]
 	path = third_party/antimatter
-	url = https://github.com/saifmukhtar/antimatter
+	url = https://github.com/samurai0000000/antimatter
+	branch = aimon
