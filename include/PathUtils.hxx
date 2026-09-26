@@ -18,6 +18,7 @@ public:
     static std::string getDefaultCursorDbPath();
     static std::string getAimonConfigDir();
     static std::string getDefaultConfigFilePath();
+    static std::string getDefaultLibConfigFilePath();
     static std::string getDefaultHistoryDbPath();
 };
 

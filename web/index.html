@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css?v=1.0.8">
+    <link rel="stylesheet" href="style.css?v=1.0.9">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -228,6 +228,22 @@
                         </div>
                     </div>
                 </section>
+
+                <!-- Fleet Daemons Section -->
+                <section class="card glass-card fleet-daemons-card" id="fleet-daemons-section">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-online" id="fleet-status-dot"></span>
+                            <h2>Supervised Fleet Daemons</h2>
+                        </div>
+                        <div class="agents-header-actions">
+                            <span id="fleet-count-badge" class="badge badge-cyan">0 Daemons</span>
+                        </div>
+                    </div>
+                    <div class="fleet-daemons-list" id="fleet-daemons-list">
+                        <div class="loading-placeholder">Loading fleet daemons...</div>
+                    </div>
+                </section>
             </div>
 
             <!-- Subpanel 2: Agent Telemetry & Analytics -->
@@ -440,6 +456,6 @@
     </div>
 
     <script src="qrcode.js"></script>
-    <script src="app.js?v=1.0.8"></script>
+    <script src="app.js?v=1.0.9"></script>
 </body>
 </html>

@@ -19,10 +19,17 @@ all:
 	@$(MAKE) -C $(BUILD_DIR) -j$(NUM_PROCS)
 
 test: all
+	@./$(BUILD_DIR)/test_libconfig_parser
+	@./$(BUILD_DIR)/test_process_monitor_lifecycle
+	@./$(BUILD_DIR)/test_circuit_breaker_quarantine
+	@./$(BUILD_DIR)/test_service_supervisor
+	@./$(BUILD_DIR)/test_gemini_triage
 	@./$(BUILD_DIR)/test_gateway_timeout
 	@./$(BUILD_DIR)/test_agent_telemetry_db
 	@./$(BUILD_DIR)/test_mobile_gateway
 	@./$(BUILD_DIR)/test_web_server_api
+	@./$(BUILD_DIR)/test_supervisor_api_and_mcp
+	@./$(BUILD_DIR)/test_fleet_integration
 
 mobile:
 	@if [ -d mobile/android ] && command -v ./mobile/android/gradlew >/dev/null 2>&1; then \

@@ -87,6 +87,10 @@ std::string PathUtils::getDefaultConfigFilePath() {
     return getAimonConfigDir() + "/config.json";
 }
 
+std::string PathUtils::getDefaultLibConfigFilePath() {
+    return getAimonConfigDir() + "/aimon.cfg";
+}
+
 std::string PathUtils::getDefaultHistoryDbPath() {
     return getAimonConfigDir() + "/history.db";
 }
