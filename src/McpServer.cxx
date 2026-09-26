@@ -8,6 +8,7 @@
 #include "DynamicToolRegistry.hxx"
 #include "TcpGateway.hxx"
 #include "TaskRegistry.hxx"
+#include "ServiceSupervisor.hxx"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -41,10 +42,11 @@ bool McpServer::isToolAllowedInProfile(const std::string& toolName, const std::s
         return true;
     }
 
-    // Core AI quota tools are always accessible in all profiles
+    // Core AI quota and fleet supervisor tools are always accessible in all profiles
     if (toolName == "check_antigravity_quota" ||
         toolName == "check_cursor_usage" ||
-        toolName == "get_combined_ai_status") {
+        toolName == "get_combined_ai_status" ||
+        toolName.rfind("service_", 0) == 0) {
         return true;
     }
 
@@ -210,7 +212,55 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id, const std::s
         }}
     });
 
-    // 2. Dynamic Satellite Tools filtered by active profile
+    // 2. Fleet Service Supervisor Tools (available in all profiles)
+    toolsArray.push_back({
+        {"name", "service_list"},
+        {"description", "Lists all supervised satellite services across the fleet with their current health state (HEALTHY, DEGRADED, RESTARTING, CRASH_LOOP, DISABLED), host, ports, and latency."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", nlohmann::json::object()}
+        }}
+    });
+
+    toolsArray.push_back({
+        {"name", "service_status"},
+        {"description", "Gets detailed runtime health status, latency, failure counts, and restart history for a specific supervised service."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"service", {{"type", "string"}, {"description", "The service identifier (e.g. meshmon, netmon, embdevenv)"}}}
+            }},
+            {"required", nlohmann::json::array({"service"})}
+        }}
+    });
+
+    toolsArray.push_back({
+        {"name", "service_restart"},
+        {"description", "Requests an asynchronous restart of a supervised satellite service."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"service", {{"type", "string"}, {"description", "The service identifier to restart"}}},
+                {"force", {{"type", "boolean"}, {"description", "Force restart even if the service is in CRASH_LOOP state"}}}
+            }},
+            {"required", nlohmann::json::array({"service"})}
+        }}
+    });
+
+    toolsArray.push_back({
+        {"name", "service_get_logs"},
+        {"description", "Retrieves trailing log lines from a supervised satellite service."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"service", {{"type", "string"}, {"description", "The service identifier"}}},
+                {"lines", {{"type", "integer"}, {"description", "Number of trailing lines to fetch (default: 50)"}}}
+            }},
+            {"required", nlohmann::json::array({"service"})}
+        }}
+    });
+
+    // 3. Dynamic Satellite Tools filtered by active profile
     if (profile != "core" && _dynamicRegistry) {
         nlohmann::json dynTools = _dynamicRegistry->getToolsListJson();
         if (dynTools.is_array()) {
@@ -257,6 +307,91 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         contentText = formatCursorStatus(current.cursor);
     } else if (toolName == "get_combined_ai_status") {
         contentText = formatCombinedStatus(current);
+    } else if (toolName == "service_list") {
+        if (!_serviceSupervisor) {
+            contentText = "Fleet supervisor is not enabled or not running.";
+        } else {
+            auto statuses = _serviceSupervisor->getAllStatuses();
+            std::ostringstream oss;
+            oss << "### Fleet Satellite Daemons (" << statuses.size() << " monitored)\n\n"
+                << "| Service | Host | Port | Status | Latency | Restarts | Last Probe |\n"
+                << "|---------|------|------|--------|---------|----------|------------|\n";
+            for (const auto& s : statuses) {
+                oss << "| " << s.config.name << " (`" << s.config.id << "`) | "
+                    << s.config.host << " | " << s.config.port << " | "
+                    << serviceStateToString(s.state) << " | "
+                    << s.probeLatencyMs << " ms | "
+                    << s.restartCount << " | "
+                    << s.lastProbeEpoch << " |\n";
+            }
+            contentText = oss.str();
+        }
+    } else if (toolName == "service_status") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string serviceId = args.value("service", args.value("id", ""));
+        if (serviceId.empty()) {
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"error", {{"code", -32602}, {"message", "Missing required argument 'service'"}}}
+            };
+        }
+        if (!_serviceSupervisor) {
+            contentText = "Fleet supervisor is not enabled or not running.";
+        } else {
+            ServiceRuntimeStatus status;
+            if (!_serviceSupervisor->getStatus(serviceId, status)) {
+                return {
+                    {"jsonrpc", "2.0"},
+                    {"id", id},
+                    {"error", {{"code", -32602}, {"message", "Unknown service: " + serviceId}}}
+                };
+            }
+            contentText = status.toJson().dump(2);
+        }
+    } else if (toolName == "service_restart") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string serviceId = args.value("service", args.value("id", ""));
+        bool force = args.value("force", false);
+        if (serviceId.empty()) {
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"error", {{"code", -32602}, {"message", "Missing required argument 'service'"}}}
+            };
+        }
+        if (!_serviceSupervisor) {
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"error", {{"code", -32603}, {"message", "Fleet supervisor is not running"}}}
+            };
+        }
+        bool ok = _serviceSupervisor->requestRestart(serviceId, force);
+        if (!ok) {
+            contentText = "Failed to restart service '" + serviceId + "' (not found or anti-thrashing circuit breaker active).";
+        } else {
+            contentText = "Successfully dispatched restart for service '" + serviceId + "'.";
+        }
+    } else if (toolName == "service_get_logs") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string serviceId = args.value("service", args.value("id", ""));
+        int lines = args.value("lines", 50);
+        if (serviceId.empty()) {
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"error", {{"code", -32602}, {"message", "Missing required argument 'service'"}}}
+            };
+        }
+        if (!_serviceSupervisor) {
+            contentText = "Fleet supervisor is not running.";
+        } else {
+            contentText = _serviceSupervisor->getServiceLogs(serviceId, lines);
+            if (contentText.empty()) {
+                contentText = "(No log output retrieved for " + serviceId + ")";
+            }
+        }
     } else if (_dynamicRegistry && _tcpGateway && _dynamicRegistry->hasTool(toolName)) {
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         nlohmann::json gwResult;

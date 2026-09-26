@@ -661,6 +661,7 @@ function setupSse() {
                 if (data.event === 'tools_changed') {
                     fetchSessions();
                     fetchMonitors();
+                    fetchFleetServices();
                 }
             } catch (_) {}
         };
@@ -669,6 +670,152 @@ function setupSse() {
         };
     } catch (e) {
         console.warn('SSE connection error:', e);
+    }
+}
+
+// ==========================================================================
+// Fleet Satellite Daemons Supervision Controller
+// ==========================================================================
+
+async function fetchFleetServices() {
+    try {
+        const res = await fetch('/api/services');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderFleetServices(data.services || []);
+    } catch (e) {
+        console.warn('Failed to fetch fleet services:', e);
+    }
+}
+
+async function restartFleetService(serviceId, force = false) {
+    try {
+        const res = await fetch('/api/services/restart', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service: serviceId, force: force })
+        });
+        const result = await res.json();
+        if (!res.ok || !result.success) {
+            alert(`Restart failed: ${result.error || 'Unknown error'}`);
+        }
+        await fetchFleetServices();
+    } catch (e) {
+        alert(`Error restarting service: ${e.message}`);
+    }
+}
+
+function renderFleetServices(services) {
+    const listEl = document.getElementById('fleet-daemons-list');
+    const badgeEl = document.getElementById('fleet-count-badge');
+    const dotEl = document.getElementById('fleet-status-dot');
+    if (!listEl) return;
+
+    if (!Array.isArray(services) || services.length === 0) {
+        listEl.innerHTML = `
+            <div class="client-badge client-badge-empty">
+                <span class="dot-status dot-offline"></span>
+                No supervised fleet daemons configured
+            </div>`;
+        if (badgeEl) badgeEl.textContent = '0 Daemons';
+        if (dotEl) {
+            dotEl.className = 'dot-status dot-offline';
+        }
+        return;
+    }
+
+    let healthyCount = 0;
+    listEl.innerHTML = '';
+
+    services.forEach(svc => {
+        const isHealthy = svc.state === 'HEALTHY';
+        if (isHealthy) healthyCount++;
+
+        const row = document.createElement('div');
+        row.className = 'fleet-daemon-row';
+
+        let badgeClass = 'daemon-badge';
+        let dotClass = 'daemon-dot-status';
+        let stateText = svc.state || 'UNKNOWN';
+
+        switch (svc.state) {
+            case 'HEALTHY':
+                badgeClass += ' healthy';
+                dotClass += ' dot-online';
+                break;
+            case 'DEGRADED':
+                badgeClass += ' degraded';
+                dotClass += ' dot-busy';
+                break;
+            case 'RESTARTING':
+                badgeClass += ' restarting';
+                dotClass += ' dot-busy';
+                break;
+            case 'CRASH_LOOP':
+                badgeClass += ' crash-loop';
+                dotClass += ' dot-offline';
+                break;
+            case 'DISABLED':
+                badgeClass += ' disabled';
+                dotClass += ' dot-offline';
+                break;
+            default:
+                badgeClass += ' disabled';
+                dotClass += ' dot-offline';
+                break;
+        }
+
+        const latencyText = svc.last_latency_ms !== undefined && svc.last_latency_ms > 0
+            ? `${svc.last_latency_ms.toFixed(1)} ms`
+            : (isHealthy ? '< 1 ms' : '--');
+
+        const activePort = svc.current_port || svc.port || 0;
+        const portInfo = svc.secondary_port && svc.secondary_port > 0
+            ? `${svc.host}:${activePort} (alt: ${svc.secondary_port})`
+            : `${svc.host}:${activePort}`;
+
+        const isCrashLoop = svc.state === 'CRASH_LOOP';
+        const restartBtnText = isCrashLoop ? 'Force Restart' : 'Restart';
+
+        row.innerHTML = `
+            <div class="fleet-daemon-left">
+                <span class="${dotClass}"></span>
+                <div class="fleet-daemon-meta">
+                    <span class="fleet-daemon-name">${escapeHtml(svc.name || svc.id)}</span>
+                    <span class="fleet-daemon-sub">${escapeHtml(portInfo)}${svc.restart_count > 0 ? ` &bull; Restarts: ${svc.restart_count}` : ''}</span>
+                </div>
+            </div>
+            <div class="fleet-daemon-right">
+                <span class="daemon-latency">${latencyText}</span>
+                <span class="${badgeClass}">${stateText}</span>
+                <button type="button" class="btn-service-restart" data-service-id="${escapeHtml(svc.id)}" data-force="${isCrashLoop}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none">
+                        <polyline points="23 4 23 10 17 10"></polyline>
+                        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                    </svg>
+                    ${restartBtnText}
+                </button>
+            </div>
+        `;
+
+        const btn = row.querySelector('.btn-service-restart');
+        if (btn) {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                btn.disabled = true;
+                btn.textContent = 'Restarting...';
+                await restartFleetService(svc.id, isCrashLoop);
+            });
+        }
+
+        listEl.appendChild(row);
+    });
+
+    if (badgeEl) {
+        badgeEl.textContent = `${healthyCount}/${services.length} Healthy`;
+    }
+    if (dotEl) {
+        dotEl.className = healthyCount === services.length ? 'dot-status dot-online' : 'dot-status dot-busy';
     }
 }
 
@@ -1840,6 +1987,7 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
     fetchSessions();
     fetchMonitors();
+    fetchFleetServices();
     fetchMobileQr();
     setupSse();
 
@@ -1930,6 +2078,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(() => fetchStatus(false), 12000);
     setInterval(fetchSessions, 10000);
     setInterval(fetchMonitors, 15000);
+    setInterval(fetchFleetServices, 10000);
 
     // Refresh telemetry & approvals periodically when respective tab is active
     setInterval(() => {

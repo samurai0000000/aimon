@@ -3007,4 +3007,146 @@ body {
     }
 }
 
+/* Fleet Daemons Section */
+.fleet-daemons-card {
+    margin-top: 16px;
+    padding: 16px 20px;
+}
+
+.fleet-daemons-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.fleet-daemon-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 10px 16px;
+    transition: all 0.2s ease;
+}
+
+.fleet-daemon-row:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(0, 242, 254, 0.2);
+}
+
+.fleet-daemon-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.daemon-dot-status {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.fleet-daemon-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.fleet-daemon-name {
+    font-weight: 600;
+    font-size: 0.92rem;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.fleet-daemon-sub {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+.fleet-daemon-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.daemon-badge {
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-family: var(--font-mono);
+}
+
+.daemon-badge.healthy {
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.daemon-badge.degraded {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.daemon-badge.restarting {
+    background: rgba(0, 242, 254, 0.15);
+    color: #00f2fe;
+    border: 1px solid rgba(0, 242, 254, 0.3);
+    animation: pulse 1.5s infinite;
+}
+
+.daemon-badge.crash-loop {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.daemon-badge.disabled {
+    background: rgba(107, 114, 128, 0.15);
+    color: #6b7280;
+    border: 1px solid rgba(107, 114, 128, 0.3);
+}
+
+.daemon-latency {
+    font-size: 0.75rem;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+}
+
+.btn-service-restart {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.btn-service-restart:hover {
+    background: rgba(0, 242, 254, 0.15);
+    border-color: rgba(0, 242, 254, 0.4);
+    color: #00f2fe;
+}
+
+.btn-service-restart:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+
 

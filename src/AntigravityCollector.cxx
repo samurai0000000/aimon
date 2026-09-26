@@ -433,6 +433,10 @@ AntigravityStatus AntigravityCollector::fetchStatus() {
 }
 
 void AntigravityCollector::syncTranscriptTelemetry() {
+    if (!_config.autoDiscover) {
+        return;
+    }
+
     time_t now = time(nullptr);
     if (_lastTranscriptScan != 0 && (now - _lastTranscriptScan < 5)) {
         return; // Throttle scan to every 5s

@@ -30,6 +30,7 @@ namespace aimon {
 
 class McpServer;
 class TcpGateway;
+class ServiceSupervisor;
 
 struct SseSession {
     std::string id;
@@ -54,6 +55,14 @@ public:
     void stop();
     void broadcastSseNotification(const std::string& jsonRpcNotification);
 
+    void setServiceSupervisor(ServiceSupervisor* supervisor) {
+        _serviceSupervisor = supervisor;
+    }
+
+    int getPort() const {
+        return _config.port;
+    }
+
 private:
     void setupRoutes();
 
@@ -67,6 +76,7 @@ private:
     RefreshCallback _onRefresh;
     McpServer* _mcpServer = nullptr;
     TcpGateway* _tcpGateway = nullptr;
+    ServiceSupervisor* _serviceSupervisor = nullptr;
 
     bool _endpointsEnabled = false;
     mutable std::mutex _sessionMutex;

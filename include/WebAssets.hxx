@@ -16,7 +16,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css?v=1.0.8">
+    <link rel="stylesheet" href="style.css?v=1.0.9">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -240,6 +240,22 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                         </div>
                     </div>
                 </section>
+
+                <!-- Fleet Daemons Section -->
+                <section class="card glass-card fleet-daemons-card" id="fleet-daemons-section">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-online" id="fleet-status-dot"></span>
+                            <h2>Supervised Fleet Daemons</h2>
+                        </div>
+                        <div class="agents-header-actions">
+                            <span id="fleet-count-badge" class="badge badge-cyan">0 Daemons</span>
+                        </div>
+                    </div>
+                    <div class="fleet-daemons-list" id="fleet-daemons-list">
+                        <div class="loading-placeholder">Loading fleet daemons...</div>
+                    </div>
+                </section>
             </div>
 
             <!-- Subpanel 2: Agent Telemetry & Analytics -->
@@ -452,7 +468,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
     </div>
 
     <script src="qrcode.js"></script>
-    <script src="app.js?v=1.0.8"></script>
+    <script src="app.js?v=1.0.9"></script>
 </body>
 </html>
 )raw_asset";
@@ -3243,18 +3259,22 @@ body {
 }
 
 .qr-code-canvas-box {
-    width: 160px;
-    height: 160px;
+    width: 180px;
+    height: 180px;
     margin-bottom: 12px;
     display: flex;
     align-items: center;
     justify-content: center;
+    background: #ffffff;
+    border-radius: 12px;
+    padding: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5), 0 0 12px rgba(255, 255, 255, 0.2);
 }
 
 .qr-code-canvas-box svg {
     width: 100%;
     height: 100%;
-    border-radius: 8px;
+    border-radius: 6px;
 }
 
 .secret-code-display {
@@ -3461,6 +3481,148 @@ body {
         grid-template-columns: 1fr;
     }
 }
+
+/* Fleet Daemons Section */
+.fleet-daemons-card {
+    margin-top: 16px;
+    padding: 16px 20px;
+}
+
+.fleet-daemons-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.fleet-daemon-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 10px 16px;
+    transition: all 0.2s ease;
+}
+
+.fleet-daemon-row:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(0, 242, 254, 0.2);
+}
+
+.fleet-daemon-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.daemon-dot-status {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.fleet-daemon-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.fleet-daemon-name {
+    font-weight: 600;
+    font-size: 0.92rem;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.fleet-daemon-sub {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+.fleet-daemon-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.daemon-badge {
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-family: var(--font-mono);
+}
+
+.daemon-badge.healthy {
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.daemon-badge.degraded {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.daemon-badge.restarting {
+    background: rgba(0, 242, 254, 0.15);
+    color: #00f2fe;
+    border: 1px solid rgba(0, 242, 254, 0.3);
+    animation: pulse 1.5s infinite;
+}
+
+.daemon-badge.crash-loop {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.daemon-badge.disabled {
+    background: rgba(107, 114, 128, 0.15);
+    color: #6b7280;
+    border: 1px solid rgba(107, 114, 128, 0.3);
+}
+
+.daemon-latency {
+    font-size: 0.75rem;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+}
+
+.btn-service-restart {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.btn-service-restart:hover {
+    background: rgba(0, 242, 254, 0.15);
+    border-color: rgba(0, 242, 254, 0.4);
+    color: #00f2fe;
+}
+
+.btn-service-restart:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 
 
 )raw_asset";
@@ -4128,6 +4290,7 @@ function setupSse() {
                 if (data.event === 'tools_changed') {
                     fetchSessions();
                     fetchMonitors();
+                    fetchFleetServices();
                 }
             } catch (_) {}
         };
@@ -4136,6 +4299,152 @@ function setupSse() {
         };
     } catch (e) {
         console.warn('SSE connection error:', e);
+    }
+}
+
+// ==========================================================================
+// Fleet Satellite Daemons Supervision Controller
+// ==========================================================================
+
+async function fetchFleetServices() {
+    try {
+        const res = await fetch('/api/services');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderFleetServices(data.services || []);
+    } catch (e) {
+        console.warn('Failed to fetch fleet services:', e);
+    }
+}
+
+async function restartFleetService(serviceId, force = false) {
+    try {
+        const res = await fetch('/api/services/restart', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service: serviceId, force: force })
+        });
+        const result = await res.json();
+        if (!res.ok || !result.success) {
+            alert(`Restart failed: ${result.error || 'Unknown error'}`);
+        }
+        await fetchFleetServices();
+    } catch (e) {
+        alert(`Error restarting service: ${e.message}`);
+    }
+}
+
+function renderFleetServices(services) {
+    const listEl = document.getElementById('fleet-daemons-list');
+    const badgeEl = document.getElementById('fleet-count-badge');
+    const dotEl = document.getElementById('fleet-status-dot');
+    if (!listEl) return;
+
+    if (!Array.isArray(services) || services.length === 0) {
+        listEl.innerHTML = `
+            <div class="client-badge client-badge-empty">
+                <span class="dot-status dot-offline"></span>
+                No supervised fleet daemons configured
+            </div>`;
+        if (badgeEl) badgeEl.textContent = '0 Daemons';
+        if (dotEl) {
+            dotEl.className = 'dot-status dot-offline';
+        }
+        return;
+    }
+
+    let healthyCount = 0;
+    listEl.innerHTML = '';
+
+    services.forEach(svc => {
+        const isHealthy = svc.state === 'HEALTHY';
+        if (isHealthy) healthyCount++;
+
+        const row = document.createElement('div');
+        row.className = 'fleet-daemon-row';
+
+        let badgeClass = 'daemon-badge';
+        let dotClass = 'daemon-dot-status';
+        let stateText = svc.state || 'UNKNOWN';
+
+        switch (svc.state) {
+            case 'HEALTHY':
+                badgeClass += ' healthy';
+                dotClass += ' dot-online';
+                break;
+            case 'DEGRADED':
+                badgeClass += ' degraded';
+                dotClass += ' dot-busy';
+                break;
+            case 'RESTARTING':
+                badgeClass += ' restarting';
+                dotClass += ' dot-busy';
+                break;
+            case 'CRASH_LOOP':
+                badgeClass += ' crash-loop';
+                dotClass += ' dot-offline';
+                break;
+            case 'DISABLED':
+                badgeClass += ' disabled';
+                dotClass += ' dot-offline';
+                break;
+            default:
+                badgeClass += ' disabled';
+                dotClass += ' dot-offline';
+                break;
+        }
+
+        const latencyText = svc.last_latency_ms !== undefined && svc.last_latency_ms > 0
+            ? `${svc.last_latency_ms.toFixed(1)} ms`
+            : (isHealthy ? '< 1 ms' : '--');
+
+        const activePort = svc.current_port || svc.port || 0;
+        const portInfo = svc.secondary_port && svc.secondary_port > 0
+            ? `${svc.host}:${activePort} (alt: ${svc.secondary_port})`
+            : `${svc.host}:${activePort}`;
+
+        const isCrashLoop = svc.state === 'CRASH_LOOP';
+        const restartBtnText = isCrashLoop ? 'Force Restart' : 'Restart';
+
+        row.innerHTML = `
+            <div class="fleet-daemon-left">
+                <span class="${dotClass}"></span>
+                <div class="fleet-daemon-meta">
+                    <span class="fleet-daemon-name">${escapeHtml(svc.name || svc.id)}</span>
+                    <span class="fleet-daemon-sub">${escapeHtml(portInfo)}${svc.restart_count > 0 ? ` &bull; Restarts: ${svc.restart_count}` : ''}</span>
+                </div>
+            </div>
+            <div class="fleet-daemon-right">
+                <span class="daemon-latency">${latencyText}</span>
+                <span class="${badgeClass}">${stateText}</span>
+                <button type="button" class="btn-service-restart" data-service-id="${escapeHtml(svc.id)}" data-force="${isCrashLoop}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none">
+                        <polyline points="23 4 23 10 17 10"></polyline>
+                        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                    </svg>
+                    ${restartBtnText}
+                </button>
+            </div>
+        `;
+
+        const btn = row.querySelector('.btn-service-restart');
+        if (btn) {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                btn.disabled = true;
+                btn.textContent = 'Restarting...';
+                await restartFleetService(svc.id, isCrashLoop);
+            });
+        }
+
+        listEl.appendChild(row);
+    });
+
+    if (badgeEl) {
+        badgeEl.textContent = `${healthyCount}/${services.length} Healthy`;
+    }
+    if (dotEl) {
+        dotEl.className = healthyCount === services.length ? 'dot-status dot-online' : 'dot-status dot-busy';
     }
 }
 
@@ -5115,9 +5424,9 @@ async function fetchMobileQr() {
             const port = window.location.port || 3883;
             const pairingUri = `aimon://pair?host=${host}&port=${port}&secret=${secret}`;
             qrContainer.innerHTML = window.generateQrSvg(pairingUri, {
-                fg: '#38bdf8',
-                bg: '#0f172a',
-                margin: 2
+                fg: '#000000',
+                bg: '#ffffff',
+                margin: 4
             });
         }
     } catch (_) {}
@@ -5307,6 +5616,7 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
     fetchSessions();
     fetchMonitors();
+    fetchFleetServices();
     fetchMobileQr();
     setupSse();
 
@@ -5397,6 +5707,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(() => fetchStatus(false), 12000);
     setInterval(fetchSessions, 10000);
     setInterval(fetchMonitors, 15000);
+    setInterval(fetchFleetServices, 10000);
 
     // Refresh telemetry & approvals periodically when respective tab is active
     setInterval(() => {
