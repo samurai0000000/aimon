@@ -29,6 +29,7 @@ test: all
 	@./$(BUILD_DIR)/test_mobile_gateway
 	@./$(BUILD_DIR)/test_web_server_api
 	@./$(BUILD_DIR)/test_supervisor_api_and_mcp
+	@./$(BUILD_DIR)/test_cursor_collector
 	@./$(BUILD_DIR)/test_fleet_integration
 
 mobile:

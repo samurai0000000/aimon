@@ -9,6 +9,7 @@
 #include <iostream>
 #include <filesystem>
 #include <chrono>
+#include <ctime>
 
 namespace fs = std::filesystem;
 
@@ -212,6 +213,76 @@ double HistoryStore::queryTotalUsage(const std::string& provider, const std::str
 
     sqlite3_finalize(stmt);
     return total;
+}
+
+std::vector<DailySpendPoint> HistoryStore::queryDailyUsageSummary(const std::string& provider,
+                                                                 const std::string& metricKey,
+                                                                 time_t startTimestamp,
+                                                                 time_t endTimestamp) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<DailySpendPoint> points;
+    if (!_db) {
+        return points;
+    }
+
+    const char* sql =
+        "SELECT "
+        "  strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch')) AS day_str, "
+        "  MIN(timestamp) AS min_ts, "
+        "  MAX(metric_value) AS max_val "
+        "FROM quota_samples "
+        "WHERE provider = ? AND metric_key = ? AND timestamp >= ? AND timestamp <= ? "
+        "GROUP BY day_str "
+        "ORDER BY day_str ASC;";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return points;
+    }
+
+    sqlite3_bind_text(stmt, 1, provider.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, metricKey.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, startTimestamp);
+    sqlite3_bind_int64(stmt, 4, endTimestamp);
+
+    int prevCumulative = 0;
+    bool isFirst = true;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* dayText = sqlite3_column_text(stmt, 0);
+        if (!dayText) continue;
+
+        DailySpendPoint pt;
+        pt.dayStr = reinterpret_cast<const char*>(dayText);
+
+        std::tm tm = {};
+        if (strptime(pt.dayStr.c_str(), "%Y-%m-%d", &tm)) {
+            time_t dayEpoch = timegm(&tm);
+            pt.dayMs = static_cast<int64_t>(dayEpoch) * 1000;
+        } else {
+            time_t minTs = sqlite3_column_int64(stmt, 1);
+            pt.dayMs = static_cast<int64_t>(minTs) * 1000;
+        }
+
+        double maxVal = sqlite3_column_double(stmt, 2);
+        int cumReq = static_cast<int>(maxVal);
+
+        if (isFirst) {
+            pt.requestsUsed = cumReq;
+            pt.cumulativeRequests = cumReq;
+            prevCumulative = cumReq;
+            isFirst = false;
+        } else {
+            pt.requestsUsed = (cumReq >= prevCumulative) ? (cumReq - prevCumulative) : cumReq;
+            pt.cumulativeRequests = cumReq;
+            prevCumulative = cumReq;
+        }
+
+        points.push_back(pt);
+    }
+
+    sqlite3_finalize(stmt);
+    return points;
 }
 
 } // namespace aimon

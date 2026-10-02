@@ -256,11 +256,229 @@ The assistant will invoke `get_combined_ai_status` and return a clean markdown t
 
 ---
 
-## Step 6: Home Assistant (HA) Integration (Optional)
+## Step 6: Agent Telemetry Hooks (Optional)
+
+The **Agent Telemetry** tab (`http://<aimon-host>:3883/#telemetry`) charts sessions, turns, tool calls, error rates, and tool latency. Both IDEs can feed it through lifecycle hooks that post events to `aimon`.
+
+These hooks are **statistics only**. They never ask for approval, never block a tool, and never wait on a phone or dashboard. If `aimon` is down, the hook drops the event and the agent continues.
+
+> [!WARNING]
+> Do not register a telemetry reporter on `preToolUse` (Cursor) or `PreToolUse` (Antigravity), and do not set `failClosed: true`. Those events decide whether a tool may run. A slow or failing reporter there stalls or blocks the agent.
+
+### 6.1 The Reporter Script
+
+Both IDEs can share one small reporter script. Place it anywhere readable, for example:
+
+```text
+~/.local/share/aimon/hooks/aimon_telemetry.py
+```
+
+The script must:
+
+1. Read the hook payload as JSON from **stdin**.
+2. Post one event to `aimon` with a short timeout (under 1 second), ignoring every network error.
+3. Print an empty JSON object `{}` to **stdout** and exit `0`. For Antigravity's `Stop` event, print `{"decision": "allow"}` so the agent is allowed to stop.
+4. Send only statistics: tool name, duration, status, and counts. Do not forward command lines, file contents, or tool output.
+
+By default the reporter should target `http://127.0.0.1:3883`. Let users override it with an environment variable such as `AIMON_ENDPOINT=http://<aimon-host>:3883`.
+
+### 6.2 The Ingest Endpoint
+
+Hooks post to:
+
+```text
+POST http://<aimon-host>:3883/api/telemetry/event
+Content-Type: application/json
+```
+
+Every event carries `event_type`, `session_id`, `agent_type` (`cursor` or `antigravity`), and a Unix `timestamp` in seconds.
+
+**Session start** creates the session row:
+
+```json
+{
+  "event_type": "SESSION_START",
+  "session_id": "<conversation-id>",
+  "conversation_id": "<conversation-id>",
+  "agent_type": "cursor",
+  "workspace": "/path/to/workspace",
+  "model": "<model-name>",
+  "timestamp": 1790000000
+}
+```
+
+**Tool call** records one tool execution. `TOOL_CALL` is what the overview and activity charts count, and `tool_name` feeds the tool matrix:
+
+```json
+{
+  "event_type": "TOOL_CALL",
+  "session_id": "<conversation-id>",
+  "agent_type": "cursor",
+  "tool_name": "Shell",
+  "step_index": 12,
+  "duration_ms": 420.0,
+  "status": "OK",
+  "timestamp": 1790000000,
+  "details": {
+    "workspace": "/path/to/workspace",
+    "model": "<model-name>"
+  }
+}
+```
+
+Set `"status": "ERROR"` for a failed tool. `aimon` ignores a repeated event with the same `session_id`, `step_index`, `event_type`, and `tool_name`, so a retried post does not double-count.
+
+**User turn** increments the turn counter:
+
+```json
+{
+  "event_type": "USER_TURN",
+  "session_id": "<conversation-id>",
+  "agent_type": "cursor",
+  "step_index": 13,
+  "status": "OK",
+  "timestamp": 1790000000
+}
+```
+
+**Session end** writes the final totals the reporter has accumulated:
+
+```json
+{
+  "event_type": "SESSION_END",
+  "session_id": "<conversation-id>",
+  "agent_type": "cursor",
+  "status": "COMPLETED",
+  "total_turns": 4,
+  "prompt_tokens": 120000,
+  "comp_tokens": 8000,
+  "tool_calls": 37,
+  "errors": 1,
+  "avg_turn_ms": 45000.0,
+  "timestamp": 1790000000
+}
+```
+
+`status` may be `RUNNING`, `COMPLETED`, `ABORTED`, or `ERROR`. A reporter can send `SESSION_END` with `RUNNING` after each turn to refresh live totals.
+
+### 6.3 Cursor: `~/.cursor/hooks.json`
+
+Create a user-level hooks file so every workspace reports:
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+    ],
+    "postToolUse": [
+      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+    ],
+    "postToolUseFailure": [
+      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+    ],
+    "stop": [
+      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+    ],
+    "sessionEnd": [
+      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+    ]
+  }
+}
+```
+
+What each event is used for:
+
+| Cursor event | Reporter action | Useful payload fields |
+| :--- | :--- | :--- |
+| `sessionStart` | Send `SESSION_START` | `session_id`, `model`, `workspace_roots` |
+| `postToolUse` | Send `TOOL_CALL` with `status: OK` | `conversation_id`, `tool_name`, `tool_use_id`, `duration` (ms) |
+| `postToolUseFailure` | Send `TOOL_CALL` with `status: ERROR` | same as above |
+| `stop` | Send `USER_TURN`, then `SESSION_END` with `RUNNING` | `conversation_id`, `status`, `input_tokens`, `output_tokens` |
+| `sessionEnd` | Send final `SESSION_END` | `session_id`, `reason`, `duration_ms` |
+
+Cursor includes `hook_event_name` in every payload, so a single script can branch on it. Use `tool_use_id` to skip duplicate tool events. Tool events can sometimes arrive with an empty `conversation_id`; keep the last known session id in a small state file and fall back to it.
+
+Cursor reloads `~/.cursor/hooks.json` automatically. Check the **Hooks** output channel if a hook does not run.
+
+### 6.4 Antigravity: `~/.gemini/config/hooks.json`
+
+Antigravity reads hooks from a customization root. Use the global root so every workspace reports:
+
+- **Linux / macOS**: `~/.gemini/config/hooks.json`
+- **Windows**: `%USERPROFILE%\.gemini\config\hooks.json`
+
+```json
+{
+  "aimon-telemetry": {
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py --event post-tool",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py --event pre-invocation",
+        "timeout": 2
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py --event stop",
+        "timeout": 2
+      }
+    ]
+  }
+}
+```
+
+How this differs from Cursor:
+
+- The top-level key (`aimon-telemetry`) is a hook name. Add `"enabled": false` next to the event lists to turn it off without deleting it.
+- `PostToolUse` must be wrapped in a group with a `matcher`. An empty matcher (`""`) matches every tool.
+- Antigravity payloads do not include an event name, so pass it on the command line (`--event post-tool`).
+- Payload keys are camelCase: `conversationId`, `stepIdx`, `toolCall.name`, `workspacePaths`, `modelName`, and `error` (present only when the tool failed).
+- `Stop` must not return `"decision": "continue"`. Return `{"decision": "allow"}` so the agent is free to stop.
+
+`aimon` also scans Antigravity conversation transcripts in the background and assigns them session ids of the form `sess-<first 8 characters of the conversation id>`. Have the reporter use the same form, so hook events and transcript events merge into one session instead of appearing twice.
+
+Reload Antigravity after creating the file (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> → `Developer: Reload Window`).
+
+### 6.5 Verifying Telemetry
+
+Send a hand-made tool event from a shell. This mimics a Cursor tool event and should print `{}`:
+
+```bash
+printf '%s' '{"hook_event_name":"postToolUse","conversation_id":"telemetry-selfcheck","tool_name":"Shell","tool_use_id":"t1","duration":42}' \
+  | python3 ~/.local/share/aimon/hooks/aimon_telemetry.py
+```
+
+Then confirm `aimon` stored it:
+
+```bash
+curl -s http://<aimon-host>:3883/api/telemetry/tools | jq .
+curl -s "http://<aimon-host>:3883/api/telemetry/session_events?sessionId=telemetry-selfcheck" | jq .
+```
+
+Finally, run one real prompt in each IDE and open the **Agent Telemetry** tab. A new session should appear with its tool calls counted.
+
+---
+
+## Step 7: Home Assistant (HA) Integration (Optional)
 
 `aimon` has a built-in MQTT client with automatic Home Assistant MQTT Discovery.
 
-### 6.1 Enable MQTT in `~/.config/aimon/config.json`
+### 7.1 Enable MQTT in `~/.config/aimon/config.json`
 ```json
 {
   "mqtt": {
@@ -276,7 +494,7 @@ The assistant will invoke `get_combined_ai_status` and return a clean markdown t
 }
 ```
 
-### 6.2 View in Home Assistant
+### 7.2 View in Home Assistant
 1. Ensure the Mosquitto broker integration is active in Home Assistant.
 2. Start `aimon` in daemon mode.
 3. In Home Assistant, navigate to **Settings > Devices & Services > MQTT**.
@@ -301,6 +519,9 @@ The assistant will invoke `get_combined_ai_status` and return a clean markdown t
 | **In-App Settings UI** | Cursor Settings > Open Customize → > MCP | Chat Header `...` > MCP Servers |
 | **Reload Command** | Click refresh button in Customize > MCP | Command Palette > `Developer: Reload Window` |
 | **Authentication Source** | Browser cookie `WorkosCursorSessionToken` or local `state.vscdb` | Auto-discovered `--csrf_token` from language server process |
+| **Telemetry Hooks File** | `~/.cursor/hooks.json` | `~/.gemini/config/hooks.json` |
+| **Telemetry Hook Events** | `sessionStart`, `postToolUse`, `postToolUseFailure`, `stop`, `sessionEnd` | `PostToolUse` (matcher `""`), `PreInvocation`, `Stop` |
+| **Payload Key Style** | snake_case (`conversation_id`, `tool_name`) | camelCase (`conversationId`, `toolCall.name`) |
 
 ---
 
@@ -313,6 +534,14 @@ The assistant will invoke `get_combined_ai_status` and return a clean markdown t
 #### Q: Antigravity shows "Offline".
 - **Cause**: Antigravity IDE is not open, or the language server process has closed.
 - **Fix**: Open Antigravity IDE. `aimon` will detect the process on its next polling interval (or immediately when you click Refresh).
+
+#### Q: The Agent Telemetry tab shows no new sessions.
+- **Cause**: The hooks file is not loaded, the reporter cannot reach `aimon`, or the reporter exits with an error.
+- **Fix**: Run the self-check in Step 6.5. If it prints `{}` but nothing is stored, check `AIMON_ENDPOINT` and that port 3883 is reachable. For Cursor, open the **Hooks** output channel. For Antigravity, reload the window after editing `hooks.json`.
+
+#### Q: Tools are waiting on a phone or dashboard approval.
+- **Cause**: An approval hook is registered on `preToolUse` / `PreToolUse`, or with `failClosed: true`.
+- **Fix**: Remove it. Telemetry hooks belong only on the post-tool, stop, and session events shown in Step 6.
 
 #### Q: The MCP server fails to connect with "session not found".
 - **Cause**: Connecting with an outdated or mismatching session ID.

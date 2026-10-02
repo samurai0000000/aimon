@@ -13,6 +13,8 @@
 #include <ctime>
 #include <cstdio>
 #include <chrono>
+#include <limits>
+#include "HistoryStore.hxx"
 #include <sqlite3.h>
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -45,6 +47,10 @@ static std::string formatEpochMsToDate(int64_t ms) {
 
 CursorCollector::CursorCollector(const CursorConfig& config)
     : _config(config) {
+}
+
+void CursorCollector::setHistoryStore(HistoryStore* historyStore) {
+    _historyStore = historyStore;
 }
 
 std::string CursorCollector::extractTokenFromDb(const std::string& dbPath, std::string& outTier) {
@@ -299,7 +305,6 @@ void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
     httplib::Headers headers = {
         {"Authorization", "Bearer " + token},
         {"Cookie", "WorkosCursorSessionToken=" + token},
-        {"Content-Type", "application/json"},
         {"Connect-Protocol-Version", "1"}
     };
 
@@ -376,6 +381,58 @@ void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
             }
         }
     } catch (...) {}
+
+    if (status.dailySpendHistory.empty()) {
+        if (status.fastRequestsLimit > 0 || status.fastRequestsUsed > 0) {
+            status.usageMode = "requests";
+            if (_historyStore) {
+                time_t startSec = (startMs > 0) ? static_cast<time_t>(startMs / 1000) : 0;
+                time_t endSec = (endMs > 0) ? static_cast<time_t>(endMs / 1000) : std::numeric_limits<time_t>::max();
+                status.dailySpendHistory = _historyStore->queryDailyUsageSummary("cursor", "fast_requests_used", startSec, endSec);
+            }
+
+            auto now = std::chrono::system_clock::now();
+            time_t tNow = std::chrono::system_clock::to_time_t(now);
+            std::tm tmNow = {};
+            gmtime_r(&tNow, &tmNow);
+            char todayBuf[32];
+            std::snprintf(todayBuf, sizeof(todayBuf), "%04d-%02d-%02d", tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday);
+            std::string todayStr = todayBuf;
+
+            std::tm tmDay = tmNow;
+            tmDay.tm_hour = 0;
+            tmDay.tm_min = 0;
+            tmDay.tm_sec = 0;
+            int64_t todayMs = static_cast<int64_t>(timegm(&tmDay)) * 1000;
+
+            if (status.dailySpendHistory.empty()) {
+                DailySpendPoint pt;
+                pt.dayMs = todayMs;
+                pt.dayStr = todayStr;
+                pt.requestsUsed = status.fastRequestsUsed;
+                pt.cumulativeRequests = status.fastRequestsUsed;
+                status.dailySpendHistory.push_back(pt);
+            } else {
+                if (status.dailySpendHistory.back().dayStr == todayStr) {
+                    if (status.fastRequestsUsed > status.dailySpendHistory.back().cumulativeRequests) {
+                        int delta = status.fastRequestsUsed - status.dailySpendHistory.back().cumulativeRequests;
+                        status.dailySpendHistory.back().requestsUsed += delta;
+                        status.dailySpendHistory.back().cumulativeRequests = status.fastRequestsUsed;
+                    }
+                } else {
+                    DailySpendPoint pt;
+                    pt.dayMs = todayMs;
+                    pt.dayStr = todayStr;
+                    int prev = status.dailySpendHistory.back().cumulativeRequests;
+                    pt.requestsUsed = (status.fastRequestsUsed >= prev) ? (status.fastRequestsUsed - prev) : status.fastRequestsUsed;
+                    pt.cumulativeRequests = status.fastRequestsUsed;
+                    status.dailySpendHistory.push_back(pt);
+                }
+            }
+        }
+    } else {
+        status.usageMode = "spend";
+    }
 
     // 2. Previous billing cycle query (for comparison against last month)
     int64_t durationMs = endMs - startMs;

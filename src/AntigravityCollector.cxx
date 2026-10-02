@@ -21,7 +21,6 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include "AgentTelemetryDb.hxx"
-#include "PathUtils.hxx"
 
 namespace fs = std::filesystem;
 
@@ -471,7 +470,10 @@ void AntigravityCollector::syncTranscriptTelemetry() {
             }
 
             uintmax_t curSize = fs::file_size(transcriptPath);
+            std::string sessionId = "sess-" + (convId.length() >= 8 ? convId.substr(0, 8) : convId);
+            std::string sessionStatus = (now - mtime < 300) ? "RUNNING" : "COMPLETED";
             if (curSize <= static_cast<uintmax_t>(lastOffset)) {
+                AgentTelemetryDb::getInstance().touchSession(sessionId, sessionStatus, mtime);
                 continue; // No new data
             }
 
@@ -483,7 +485,6 @@ void AntigravityCollector::syncTranscriptTelemetry() {
             }
 
             std::string line;
-            std::string sessionId = "sess-" + (convId.length() >= 8 ? convId.substr(0, 8) : convId);
             std::vector<nlohmann::json> parsedSteps;
 
             while (std::getline(ifs, line)) {
@@ -500,12 +501,6 @@ void AntigravityCollector::syncTranscriptTelemetry() {
             if (parsedSteps.empty()) continue;
 
             std::vector<AgentLifecycleEvent> eventsBatch;
-            int totalTurns = 0;
-            int totalTools = 0;
-            int totalErrors = 0;
-            double sumDuration = 0.0;
-            int durationCount = 0;
-            int64_t firstTs = 0;
             int64_t lastTs = 0;
 
             for (size_t i = 0; i < parsedSteps.size(); ++i) {
@@ -519,7 +514,6 @@ void AntigravityCollector::syncTranscriptTelemetry() {
                 if (!iso.empty()) {
                     stepTs = std::chrono::system_clock::to_time_t(parseIsoTimestamp(iso));
                 }
-                if (firstTs == 0) firstTs = stepTs;
                 lastTs = stepTs;
 
                 double stepDurationMs = 0.0;
@@ -535,12 +529,7 @@ void AntigravityCollector::syncTranscriptTelemetry() {
                     }
                 }
 
-                if (status == "ERROR") {
-                    totalErrors++;
-                }
-
                 if (stype == "USER_INPUT") {
-                    totalTurns++;
                     AgentLifecycleEvent ev;
                     ev.timestamp = stepTs;
                     ev.sessionId = sessionId;
@@ -551,10 +540,6 @@ void AntigravityCollector::syncTranscriptTelemetry() {
                     ev.status = (status == "ERROR" ? "ERROR" : "OK");
                     eventsBatch.push_back(ev);
                 } else if (stype == "PLANNER_RESPONSE") {
-                    if (stepDurationMs > 0.0) {
-                        sumDuration += stepDurationMs;
-                        durationCount++;
-                    }
                     AgentLifecycleEvent ev;
                     ev.timestamp = stepTs;
                     ev.sessionId = sessionId;
@@ -569,7 +554,6 @@ void AntigravityCollector::syncTranscriptTelemetry() {
                 if (j.contains("tool_calls") && j["tool_calls"].is_array()) {
                     for (const auto& tc : j["tool_calls"]) {
                         if (tc.is_object() && tc.contains("name")) {
-                            totalTools++;
                             AgentLifecycleEvent ev;
                             ev.timestamp = stepTs;
                             ev.sessionId = sessionId;
@@ -587,7 +571,6 @@ void AntigravityCollector::syncTranscriptTelemetry() {
                 if (stype == "RUN_COMMAND" || stype == "VIEW_FILE" || stype == "WRITE_TO_FILE" ||
                     stype == "REPLACE_FILE_CONTENT" || stype == "MULTI_REPLACE_FILE_CONTENT" ||
                     stype == "GREP_SEARCH" || stype == "LIST_DIRECTORY") {
-                    totalTools++;
                     std::string tname = stype;
                     std::transform(tname.begin(), tname.end(), tname.begin(), ::tolower);
                     AgentLifecycleEvent ev;
@@ -605,16 +588,10 @@ void AntigravityCollector::syncTranscriptTelemetry() {
 
             if (!eventsBatch.empty()) {
                 AgentTelemetryDb::getInstance().insertEventsBatch(eventsBatch);
-                double avgTurnMs = durationCount > 0 ? (sumDuration / durationCount) : 0.0;
-                int64_t sessionStart = firstTs > 0 ? firstTs : mtime;
-                int64_t sessionEnd = lastTs > 0 ? lastTs : mtime;
-                std::string sessionStatus = (now - sessionEnd < 300) ? "RUNNING" : "COMPLETED";
-
-                AgentTelemetryDb::getInstance().recordSessionStart(
-                    sessionId, convId, "antigravity", PathUtils::expandHome("~/work"), "Antigravity", sessionStart);
-                AgentTelemetryDb::getInstance().updateSessionStats(
-                    sessionId, sessionStatus, totalTurns, 0, 0, totalTools, totalErrors, avgTurnMs, sessionStart, sessionEnd);
             }
+            int64_t sessionEnd = lastTs > 0 ? lastTs : mtime;
+            sessionStatus = (now - sessionEnd < 300) ? "RUNNING" : "COMPLETED";
+            AgentTelemetryDb::getInstance().touchSession(sessionId, sessionStatus, sessionEnd);
         }
     } catch (...) {}
 }

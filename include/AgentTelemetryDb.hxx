@@ -86,6 +86,11 @@ public:
                             int64_t startTimestamp = 0,
                             int64_t endTimestamp = 0);
 
+    // Update status and end time without replacing accumulated counters.
+    bool touchSession(const std::string &sessionId,
+                      const std::string &status,
+                      int64_t endTimestamp = 0);
+
     // Event & Sample Ingestion
     bool insertEvent(const AgentLifecycleEvent &event);
     bool insertEventsBatch(const std::vector<AgentLifecycleEvent> &events);

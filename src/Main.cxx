@@ -218,6 +218,9 @@ int main(int argc, char* argv[]) {
 
     AntigravityCollector agCollector(cfg.antigravity);
     CursorCollector crCollector(cfg.cursor);
+    if (cfg.history.enabled) {
+        crCollector.setHistoryStore(&historyStore);
+    }
     std::unique_ptr<MqttPublisher> mqttPublisher;
 
     if (cfg.mqtt.enabled) {

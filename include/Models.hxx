@@ -144,13 +144,17 @@ struct DailySpendPoint {
     std::string dayStr;
     double spendUsd = 0.0;
     double cumulativeUsd = 0.0;
+    int requestsUsed = 0;
+    int cumulativeRequests = 0;
 
     nlohmann::json toJson() const {
         return {
             {"day_ms", dayMs},
             {"day_str", dayStr},
             {"spend_usd", spendUsd},
-            {"cumulative_usd", cumulativeUsd}
+            {"cumulative_usd", cumulativeUsd},
+            {"requests_used", requestsUsed},
+            {"cumulative_requests", cumulativeRequests}
         };
     }
 };
@@ -172,6 +176,7 @@ struct CategorySpend {
 struct CursorStatus {
     bool isAuthenticated = false;
     std::string planTier = "Unknown";
+    std::string usageMode = "spend";
     int fastRequestsUsed = 0;
     int fastRequestsLimit = 0;
     double onDemandSpend = 0.0;
@@ -196,6 +201,7 @@ struct CursorStatus {
         return {
             {"is_authenticated", isAuthenticated},
             {"plan_tier", planTier},
+            {"usage_mode", usageMode},
             {"fast_requests_used", fastRequestsUsed},
             {"fast_requests_limit", fastRequestsLimit},
             {"on_demand_spend", onDemandSpend},
