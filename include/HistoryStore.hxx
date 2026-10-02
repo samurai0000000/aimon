@@ -36,6 +36,10 @@ public:
     bool recordSnapshot(const AggregateStatus& status);
     std::vector<HistoryRecord> queryRecentRecords(int limit = 50);
     double queryTotalUsage(const std::string& provider, const std::string& metricKey, time_t sinceEpoch);
+    std::vector<DailySpendPoint> queryDailyUsageSummary(const std::string& provider,
+                                                        const std::string& metricKey,
+                                                        time_t startTimestamp,
+                                                        time_t endTimestamp);
 
 private:
     bool insertSample(time_t timestamp, const std::string& provider,

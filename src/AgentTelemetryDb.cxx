@@ -415,6 +415,34 @@ bool AgentTelemetryDb::updateSessionStats(const std::string &sessionId,
     return rc == SQLITE_DONE;
 }
 
+bool AgentTelemetryDb::touchSession(const std::string &sessionId,
+                                   const std::string &status,
+                                   int64_t endTimestamp) {
+    if (isExcludedSession(sessionId)) return true;
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (!_db) return false;
+
+    const char *sql =
+        "UPDATE agent_sessions SET status = ?, "
+        "  end_timestamp = CASE WHEN ? > 0 THEN ? ELSE end_timestamp END "
+        "WHERE session_id = ?;";
+
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, status.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, endTimestamp);
+    sqlite3_bind_int64(stmt, 3, endTimestamp);
+    sqlite3_bind_text(stmt, 4, sessionId.c_str(), -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE;
+}
+
 bool AgentTelemetryDb::insertEvent(const AgentLifecycleEvent &event) {
     std::lock_guard<std::mutex> lock(_mutex);
     if (!_db || !_stmtInsertEvent) return false;
@@ -432,10 +460,13 @@ bool AgentTelemetryDb::insertEvent(const AgentLifecycleEvent &event) {
     sqlite3_bind_double(_stmtInsertEvent, 7, event.durationMs);
     sqlite3_bind_text(_stmtInsertEvent, 8, event.status.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(_stmtInsertEvent, 9, detailsStr.c_str(), -1, SQLITE_TRANSIENT);
-    bool ok = (sqlite3_step(_stmtInsertEvent) == SQLITE_DONE);
+    int stepRc = sqlite3_step(_stmtInsertEvent);
+    bool ok = (stepRc == SQLITE_DONE);
+    bool inserted = ok && (sqlite3_changes(_db) > 0);
 
-    // Auto-upsert corresponding agent_sessions record (excluding approval and transient test sessions)
-    if (_stmtUpsertSession && !isExcludedSession(event.sessionId)) {
+    // Count a session only when this event is new. A repeated tool step must not
+    // add another call, and a duplicate insert must not replace accumulated totals.
+    if (inserted && _stmtUpsertSession && !isExcludedSession(event.sessionId)) {
         bool isTool = (event.eventType == "TOOL_CALL" || event.eventType == "TOOL_PRE_USE");
         bool isTurn = (event.eventType == "USER_TURN" || event.eventType == "USER_INPUT" || event.eventType == "TURN_START");
         bool isError = (event.status == "ERROR");
@@ -489,9 +520,10 @@ bool AgentTelemetryDb::insertEventsBatch(const std::vector<AgentLifecycleEvent> 
         sqlite3_bind_double(_stmtInsertEvent, 7, event.durationMs);
         sqlite3_bind_text(_stmtInsertEvent, 8, event.status.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(_stmtInsertEvent, 9, detailsStr.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(_stmtInsertEvent);
+        int stepRc = sqlite3_step(_stmtInsertEvent);
+        bool inserted = (stepRc == SQLITE_DONE) && (sqlite3_changes(_db) > 0);
 
-        if (_stmtUpsertSession && !isExcludedSession(event.sessionId)) {
+        if (inserted && _stmtUpsertSession && !isExcludedSession(event.sessionId)) {
             bool isTool = (event.eventType == "TOOL_CALL" || event.eventType == "TOOL_PRE_USE");
             bool isTurn = (event.eventType == "USER_TURN" || event.eventType == "USER_INPUT" || event.eventType == "TURN_START");
             bool isError = (event.status == "ERROR");

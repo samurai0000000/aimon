@@ -1,0 +1,11 @@
+project: aimon
+envelope: envelope-1
+language: c++
+risk: regression
+red_command: make test
+red_result: fail
+green_command: make test
+green_result: pass
+sanitizer_command: not applicable: no memory ownership or pointer cast changes
+rapidcheck: not_applicable
+other_isa: not applicable: single host architecture

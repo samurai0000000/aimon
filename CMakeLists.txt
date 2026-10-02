@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.9 LANGUAGES CXX)
+project(aimon VERSION 1.0.10 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -195,6 +195,37 @@ target_link_libraries(test_web_server_api PRIVATE
 
 if(LIBCONFIGPP_LIBRARY_DIRS)
     target_link_directories(test_web_server_api PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
+endif()
+
+add_executable(test_cursor_collector
+    test/TestCursorCollector.cxx
+    ${LIB_SOURCES}
+)
+
+target_compile_definitions(test_cursor_collector PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+
+target_include_directories(test_cursor_collector PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+    ${MOSQUITTO_INCLUDE_DIRS}
+    ${CURSES_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_cursor_collector PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    SQLite::SQLite3
+    Threads::Threads
+    ${MOSQUITTO_LIBRARIES}
+    ${CURSES_LIBRARIES}
+    ${LIBCONFIGPP_LIBRARIES}
+)
+
+if(LIBCONFIGPP_LIBRARY_DIRS)
+    target_link_directories(test_cursor_collector PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
 endif()
 
 add_executable(test_libconfig_parser

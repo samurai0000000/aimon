@@ -1,0 +1,11 @@
+project: aimon
+envelope: envelope-2
+language: c++
+risk: none
+red_command: not applicable: frontend JavaScript and static header assets synchronization
+red_result: not_applicable
+green_command: make test
+green_result: pass
+sanitizer_command: not applicable: no memory ownership or pointer cast changes
+rapidcheck: not_applicable
+other_isa: not applicable: single host architecture

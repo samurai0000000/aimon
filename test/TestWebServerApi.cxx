@@ -46,9 +46,29 @@ int main() {
     client.set_connection_timeout(2, 0);
     client.set_read_timeout(5, 0);
 
-    // 1. Status API
+    // 1. Status API with Enterprise Fast Requests
+    AggregateStatus aggStatus;
+    aggStatus.cursor.isAuthenticated = true;
+    aggStatus.cursor.planTier = "Enterprise";
+    aggStatus.cursor.usageMode = "requests";
+    aggStatus.cursor.fastRequestsUsed = 12206;
+    aggStatus.cursor.fastRequestsLimit = 120000;
+    DailySpendPoint pt;
+    pt.dayStr = "2026-10-02";
+    pt.requestsUsed = 706;
+    pt.cumulativeRequests = 12206;
+    aggStatus.cursor.dailySpendHistory.push_back(pt);
+    stateStore.update(aggStatus);
+
     auto resStatus = client.Get("/api/status");
     assert(resStatus && resStatus->status == 200);
+    json statusJson = json::parse(resStatus->body);
+    assert(statusJson.contains("cursor"));
+    assert(statusJson["cursor"].contains("usage_mode") && statusJson["cursor"]["usage_mode"] == "requests");
+    assert(statusJson["cursor"].contains("fast_requests_used") && statusJson["cursor"]["fast_requests_used"] == 12206);
+    assert(statusJson["cursor"].contains("daily_spend") && statusJson["cursor"]["daily_spend"].size() == 1);
+    assert(statusJson["cursor"]["daily_spend"][0]["requests_used"] == 706);
+    assert(statusJson["cursor"]["daily_spend"][0]["cumulative_requests"] == 12206);
 
     // 2. Ingest Telemetry Events
     json evStart = {

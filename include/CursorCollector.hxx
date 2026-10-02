@@ -17,6 +17,8 @@ namespace httplib {
 
 namespace aimon {
 
+class HistoryStore;
+
 class CursorCollector {
 public:
     explicit CursorCollector(const CursorConfig& config);
@@ -24,6 +26,7 @@ public:
     CursorStatus fetchStatus();
 
     std::string resolveAccessToken();
+    void setHistoryStore(HistoryStore* historyStore);
 
 private:
     std::string extractTokenFromDb(const std::string& dbPath, std::string& outTier);
@@ -34,6 +37,7 @@ private:
                         CursorStatus& status);
 
     CursorConfig _config;
+    HistoryStore* _historyStore = nullptr;
 };
 
 } // namespace aimon
