@@ -1,6 +1,6 @@
 # aimon: Unified AI Quota & Usage Monitor
 
-`aimon` is a lightweight, high-performance C++17 monitor daemon, command-line utility, and Model Context Protocol (MCP) server for tracking usage quotas, weekly limits, and plan metrics across **Google Antigravity** and **Cursor**.
+`aimon` is a lightweight, high-performance C++17 monitor daemon, command-line utility, and Model Context Protocol (MCP) server for tracking usage quotas, weekly limits, and plan metrics across **Google Antigravity**, **Cursor** and **Claude Code**.
 
 It is designed specifically for developers who work remotely or off-network and cannot access web-based subscription dashboards due to corporate IP restrictions or single sign-on (SSO) geofences.
 
@@ -9,10 +9,11 @@ It is designed specifically for developers who work remotely or off-network and 
 ## Key Features
 
 - **Pure C++17 Architecture**: Zero Python, Node, or heavy runtime dependencies. Compiles to a single fast, self-contained binary.
-- **MCP Integration (Model Context Protocol)**: Exposes tools directly over stdio JSON-RPC 2.0 for both Cursor and Antigravity chat agents.
+- **MCP Integration (Model Context Protocol)**: Exposes tools directly over stdio JSON-RPC 2.0 for Cursor, Antigravity and Claude Code chat agents.
 - **Corporate Network Bypass**:
   - Cursor: Reads desktop application tokens locally and connects directly to `api2.cursor.sh` (bypassing web SSO restrictions).
   - Antigravity: Probes the local language server daemon via loopback HTTPS Connect-RPC on `127.0.0.1`.
+  - Claude Code: Reads Claude Code's own local transcripts and reports **estimated** tokens and cost per account, with prices fetched from Anthropic's published pricing page (never embedded).
 - **Modern Embedded Web Dashboard**: Built-in HTTP server serving a rich, dark-mode single-page interface with live gauges and countdown timers.
 - **Home Assistant (MQTT)**: Built-in MQTT publisher with Home Assistant Auto-Discovery and ready-to-import Lovelace view cards.
 - **Privacy & Security First**: All credential access stays strictly local on your machine. No telemetry, third-party relays, or external logging.
@@ -35,10 +36,32 @@ It is designed specifically for developers who work remotely or off-network and 
 
 1. **Antigravity Collector**: Automatically scans the local process table for the running `language_server` binary, extracts the launch CSRF token and loopback HTTPS port, and queries the internal `GetUserStatus` Connect-RPC endpoint.
 2. **Cursor Collector**: Reads local desktop authentication tokens from SQLite state storage (`~/.config/Cursor/User/globalStorage/state.vscdb`) and queries Cursor's IDE backend (`https://api2.cursor.sh`).
-3. **Delivery Surfaces**:
-   - **MCP Server (`aimon mcp`)**: Enables Cursor and Antigravity AI agents to inspect your usage in natural language.
+3. **Claude Code Collector**: Reads only the new bytes of each transcript under the Claude config directory (`~/.claude/projects`) on every poll, keeps deduplicated rows and file positions in SQLite, detects the account tier (Enterprise or personal) from the two descriptive strings of the credentials file (no token is ever read into a result), and costs usage in exact integer nano-dollars with a versioned price catalog. Every dollar figure is an estimate and can differ from the billing page. See [Claude Code usage](#claude-code-usage) below.
+4. **Delivery Surfaces**:
+   - **MCP Server (`aimon mcp`)**: Enables Cursor, Antigravity and Claude Code AI agents to inspect your usage in natural language (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`).
    - **Web Dashboard (`aimon web`)**: Displays visual progress gauges, credit balances, and reset countdown timers in your browser.
    - **Home Assistant (`aimon daemon`)**: Emits MQTT auto-discovery and live state updates to Home Assistant.
+
+### Claude Code usage
+
+Enabled by default; with no configuration it reads `~/.claude` (or `$CLAUDE_CONFIG_DIR`) as one account named `default`. Optional configuration in `~/.config/aimon/config.json`:
+
+```json
+"claude": {
+  "enabled": true,
+  "window_days": 30,
+  "retention_days": 400,
+  "pricing_refresh_hours": 24,
+  "accounts": [
+    {"name": "work", "config_dir": "~/.claude", "spend_limit_usd": 500, "cycle_reset_day": 1}
+  ]
+}
+```
+
+- `spend_limit_usd` and `cycle_reset_day` (1-28, UTC) are optional and give "est. $X of $Y" for the current cycle. They are only meaningful for plans with a dollar limit (Enterprise); personal subscription plans show their dollars as API-equivalent value with no budget.
+- Two accounts must not share a `config_dir`; a second login on the same machine needs its own Claude config directory.
+- Prices come from `https://platform.claude.com/docs/en/about-claude/pricing.md` and are cached next to the configuration. If the page cannot be fetched, the last good prices are used and flagged stale; with none at all, tokens are counted and cost is shown as unpriced.
+- Only Claude Code transcripts on the host where the daemon runs are counted (not claude.ai chat, other machines or other products).
 
 For comprehensive architectural specifications and protocol details, see [doc/Design.md](doc/Design.md).
 
@@ -172,6 +195,10 @@ aimon/
 │   ├── AntigravityCollector.hxx   # Antigravity local process probe & Connect-RPC client
 │   ├── ConfigManager.hxx          # Configuration manager (~/.config/aimon/config.json)
 │   ├── CursorCollector.hxx        # Cursor SQLite & API client
+│   ├── ClaudeCollector.hxx        # Claude Code transcript collector
+│   ├── ClaudeAccount.hxx          # Claude tier detection
+│   ├── ClaudeUsageStore.hxx       # Claude usage rows, cursors, price versions (SQLite)
+│   ├── PriceCatalog.hxx           # Online price catalog (pricing page parser, cache)
 │   ├── DynamicToolRegistry.hxx    # Thread-safe satellite tool registry & routing
 │   ├── HistoryStore.hxx           # SQLite3 time-series diff store (~/.config/aimon/history.db)
 │   ├── McpServer.hxx              # JSON-RPC 2.0 stdio & SSE engine with scoped profiling
@@ -190,6 +217,10 @@ aimon/
 │   ├── AntigravityCollector.cxx   # Antigravity collector implementation
 │   ├── ConfigManager.cxx          # Config manager implementation
 │   ├── CursorCollector.cxx        # Cursor collector implementation
+│   ├── ClaudeCollector.cxx        # Claude collector implementation
+│   ├── ClaudeAccount.cxx          # Tier detection implementation
+│   ├── ClaudeUsageStore.cxx       # Store implementation
+│   ├── PriceCatalog.cxx           # Price catalog implementation
 │   ├── DynamicToolRegistry.cxx    # Dynamic tool registry implementation
 │   ├── HistoryStore.cxx           # History & usage diff store implementation
 │   ├── Main.cxx                   # Application entrypoint & subcommand dispatch

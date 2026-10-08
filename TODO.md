@@ -18,10 +18,18 @@ Copyright (C) 2026, Charles Chiou. All rights reserved.
 
 ---
 
+### 3. Claude Code Usage Collector
+- [x] Daemon reads Claude Code transcripts itself: incremental, deduplicated, per-account, with tier detection (Enterprise or personal) and a configurable spend limit and billing cycle.
+- [x] Prices retrieved from the official pricing page (never embedded), cached, parsed strictly, versioned, with prompt-length tiers and quarantine of malformed rows.
+- [x] `check_claude_usage` MCP tool, history samples, MQTT/Home Assistant sensors and a static dashboard card.
+- [ ] Optional: authoritative account spend and limit from the claude.ai usage page (unofficial; needs a captured request).
+- [ ] Optional: push source for Claude Code running on other machines; OpenTelemetry receiver.
+
+---
+
 ## Future Backlog
 
 ### Telemetry & Collector Enhancements
-- [ ] Support Claude Desktop / Anthropic local token cache collector if official local daemon emerges.
 - [ ] Add Prometheus `/metrics` exporter endpoint for Grafana integration alongside existing Home Assistant MQTT auto-discovery.
 - [ ] Add historical trend graphs on web dashboard for weekly token consumption rate.
 - [ ] Add configurable alert thresholds via desktop notifications (`libnotify`) when Cursor fast requests fall below 5%.

@@ -282,7 +282,20 @@ All services typically run as systemd daemons or inside persistent terminal mult
 | :--- | :--- | :--- |
 | `check_antigravity_quota` | **Analytics** | Queries remaining 5-hour rolling capacity %, prompt/flow credits, model tiers, and reset countdown timestamps for Google Antigravity / Gemini models. |
 | `check_cursor_usage` | **Analytics** | Queries fast requests used vs plan limit, total billing spend ($), and monthly billing cycle reset date for Cursor. |
-| `get_combined_ai_status` | **Analytics** | Formats an executive summary contrasting both Google Antigravity and Cursor subscriptions in a single Markdown card. |
+| `check_claude_usage` | **Analytics** | Estimated Claude Code tokens and cost per account over 5 hours, 7 days, the configured window and the billing cycle, per-model table, plan tier, and price freshness. Read from local transcripts; figures are estimates. |
+| `get_combined_ai_status` | **Analytics** | Formats an executive summary of Google Antigravity, Cursor and Claude Code in a single Markdown card. |
+
+### 5.1 Claude Code Usage Subsystem
+
+**Data path.** `ClaudeCollector` runs in the daemon's poll cycle. For each configured account it walks `<config dir>/projects/**/*.jsonl` (subagent transcripts live in `<session>/subagents/` and are covered by the same walk), reads only bytes added since the last poll (per-file cursors persisted in SQLite, partial trailing lines deferred, 4 MiB line cap, shrunk or replaced files re-read), and turns assistant lines carrying `usage` into rows `(account, message id, request id, time, model, speed, input, output, cache read, cache write 5m, cache write 1h, web searches)`. No prompt text, working directory or identity is extracted. `ClaudeUsageStore` upserts rows keyed by `(account, message id, request id)`, keeping the row with the strictly greatest output tokens (streamed duplicates), and prunes rows older than `retention_days`.
+
+**Costing.** All amounts are integer nano-dollars per token (`$P / MTok` is `P x 1000`), summed exactly; there is no floating point in the cost path. `PriceCatalog` fetches the markdown form of Anthropic's pricing page, parses the model and fast-mode tables strictly (exact headings and column headers, every row validated: positive prices, cache writes 1.25x and 2x of input, cache read not above input, at most 3 decimals), caches it atomically with mode `0600`, and refreshes it off the poll thread (back-off after a failure). Structural problems reject the page; a problem in one model's row quarantines only that model, which stays unpriced. A model priced by prompt length (two rows, `up to` and `over` N tokens) uses the upper rate set when `input + cache read + cache writes` exceeds N. Each fetched page with a new hash is stored as a **price version**; a message is costed with the latest version fetched at or before its time (older messages use the first version), so past days do not change when prices do. Fast mode uses the fast rates and is unpriced for models without them.
+
+**Tier and limits.** The tier comes only from two descriptive strings of `<config dir>/.credentials.json` (`subscriptionType`, `rateLimitTier`); the file must be mode `0600`, is capped at 64 KiB, is never written, and token values never leave the parsing buffer. `enterprise` maps to Enterprise (dollar cycle with optional `spend_limit_usd`); any other value is Personal (dollars labelled API-equivalent value, no budget); anything unreadable is Unknown while usage is still collected.
+
+**Surfaces.** `check_claude_usage` (in every profile), the combined status, history samples `claude:<account>` (`est_cost_usd`, `total_tokens`), MQTT/Home Assistant sensors per account, the `claude` section of the status JSON, and a static dashboard card (no JavaScript-generated cards). Every dollar figure is labelled an estimate: it can differ from the billing page (price changes, other machines, other products).
+
+**Verification.** Totals are checked against an independent Python recount that re-parses the pricing page and the transcripts with its own code and the same integer arithmetic, including every time window, per model and per day.
 
 ### Satellite-Proxied Toolsets
 Connected subsystem daemons dynamically export their domain-specific MCP tools through `aimon`:

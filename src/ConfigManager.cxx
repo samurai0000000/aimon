@@ -152,6 +152,24 @@ nlohmann::json AimonConfig::toJson() const {
     }
     j["services"] = svcArray;
 
+    nlohmann::json claudeAccounts = nlohmann::json::array();
+    for (const auto& a : claude.accounts) {
+        claudeAccounts.push_back({
+            {"name", a.name},
+            {"config_dir", a.configDir},
+            {"spend_limit_usd", a.spendLimitUsd},
+            {"cycle_reset_day", a.cycleResetDay}
+        });
+    }
+    j["claude"] = {
+        {"enabled", claude.enabled},
+        {"window_days", claude.windowDays},
+        {"retention_days", claude.retentionDays},
+        {"pricing_url", claude.pricingUrl},
+        {"pricing_refresh_hours", claude.pricingRefreshHours},
+        {"accounts", claudeAccounts}
+    };
+
     return j;
 }
 
@@ -201,6 +219,29 @@ void AimonConfig::fromJson(const nlohmann::json& j) {
         if (c.contains("auto_discover")) cursor.autoDiscover = c["auto_discover"];
         if (c.contains("db_path")) cursor.dbPath = c["db_path"];
         if (c.contains("access_token")) cursor.accessToken = c["access_token"];
+    }
+
+    if (j.contains("claude") && j["claude"].is_object()) {
+        const auto& c = j["claude"];
+        if (c.contains("enabled") && c["enabled"].is_boolean()) claude.enabled = c["enabled"];
+        if (c.contains("window_days") && c["window_days"].is_number_integer()) claude.windowDays = c["window_days"];
+        if (c.contains("retention_days") && c["retention_days"].is_number_integer()) claude.retentionDays = c["retention_days"];
+        if (c.contains("pricing_url") && c["pricing_url"].is_string()) claude.pricingUrl = c["pricing_url"];
+        if (c.contains("pricing_refresh_hours") && c["pricing_refresh_hours"].is_number_integer()) {
+            claude.pricingRefreshHours = c["pricing_refresh_hours"];
+        }
+        if (c.contains("accounts") && c["accounts"].is_array()) {
+            claude.accounts.clear();
+            for (const auto& a : c["accounts"]) {
+                if (!a.is_object()) continue;
+                ClaudeAccountConfig acct;
+                if (a.contains("name") && a["name"].is_string()) acct.name = a["name"];
+                if (a.contains("config_dir") && a["config_dir"].is_string()) acct.configDir = a["config_dir"];
+                if (a.contains("spend_limit_usd") && a["spend_limit_usd"].is_number()) acct.spendLimitUsd = a["spend_limit_usd"];
+                if (a.contains("cycle_reset_day") && a["cycle_reset_day"].is_number_integer()) acct.cycleResetDay = a["cycle_reset_day"];
+                claude.accounts.push_back(acct);
+            }
+        }
     }
 
     if (j.contains("gateway")) {
@@ -260,6 +301,76 @@ void AimonConfig::fromJson(const nlohmann::json& j) {
         if (g.contains("prompt_template")) gemini.promptTemplate = g["prompt_template"];
         if (g.contains("incident_log_dir")) gemini.incidentLogDir = g["incident_log_dir"];
     }
+}
+
+std::vector<ClaudeAccountConfig> ClaudeConfig::resolvedAccounts() const {
+    if (!accounts.empty()) {
+        return accounts;
+    }
+    ClaudeAccountConfig def;
+    def.name = "default";
+    const char* env = std::getenv("CLAUDE_CONFIG_DIR");
+    def.configDir = (env && *env) ? env : "~/.claude";
+    return {def};
+}
+
+bool ClaudeConfig::validate(std::string& error) const {
+    if (windowDays < 1 || windowDays > 365) {
+        error = "claude.window_days must be between 1 and 365";
+        return false;
+    }
+    if (retentionDays < 30 || retentionDays > 3650) {
+        error = "claude.retention_days must be between 30 and 3650";
+        return false;
+    }
+    if (pricingRefreshHours < 1 || pricingRefreshHours > 168) {
+        error = "claude.pricing_refresh_hours must be between 1 and 168";
+        return false;
+    }
+    if (!pricingUrl.empty() && pricingUrl.rfind("https://", 0) != 0) {
+        error = "claude.pricing_url must start with https://";
+        return false;
+    }
+    std::vector<std::string> names;
+    std::vector<std::string> dirs;
+    for (const auto& a : resolvedAccounts()) {
+        if (a.name.empty() || a.name.size() > 64 ||
+            a.name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-") != std::string::npos) {
+            error = "claude account names must be 1-64 characters of letters, digits, '_', '.' or '-'";
+            return false;
+        }
+        if (a.configDir.empty()) {
+            error = "claude account '" + a.name + "' has no config_dir";
+            return false;
+        }
+        if (!(a.spendLimitUsd >= 0.0) || a.spendLimitUsd > 1e9) {
+            error = "claude account '" + a.name + "' has an invalid spend_limit_usd";
+            return false;
+        }
+        if (a.cycleResetDay != 0 && (a.cycleResetDay < 1 || a.cycleResetDay > 28)) {
+            error = "claude account '" + a.name + "' has cycle_reset_day outside 1..28";
+            return false;
+        }
+        std::string dir = fs::path(PathUtils::expandHome(a.configDir)).lexically_normal().string();
+        while (dir.size() > 1 && dir.back() == '/') {
+            dir.pop_back();
+        }
+        for (const auto& n : names) {
+            if (n == a.name) {
+                error = "duplicate claude account name '" + a.name + "'";
+                return false;
+            }
+        }
+        for (const auto& d : dirs) {
+            if (d == dir) {
+                error = "claude accounts must not share a config_dir ('" + a.name + "')";
+                return false;
+            }
+        }
+        names.push_back(a.name);
+        dirs.push_back(dir);
+    }
+    return true;
 }
 
 ConfigManager::ConfigManager() {
@@ -412,6 +523,30 @@ bool ConfigManager::loadLibConfig(const std::string& customPath) {
             readSetting(cr, "access_token", _config.cursor.accessToken);
         }
 
+        if (root.exists("claude")) {
+            const libconfig::Setting& cl = root["claude"];
+            readSetting(cl, "enabled", _config.claude.enabled);
+            readSetting(cl, "window_days", _config.claude.windowDays);
+            readSetting(cl, "retention_days", _config.claude.retentionDays);
+            readSetting(cl, "pricing_url", _config.claude.pricingUrl);
+            readSetting(cl, "pricing_refresh_hours", _config.claude.pricingRefreshHours);
+            if (cl.exists("accounts")) {
+                const libconfig::Setting& aList = cl["accounts"];
+                if (aList.isList() || aList.isArray()) {
+                    _config.claude.accounts.clear();
+                    for (int i = 0; i < aList.getLength(); ++i) {
+                        const libconfig::Setting& aElem = aList[i];
+                        ClaudeAccountConfig acct;
+                        readSetting(aElem, "name", acct.name);
+                        readSetting(aElem, "config_dir", acct.configDir);
+                        readSetting(aElem, "spend_limit_usd", acct.spendLimitUsd);
+                        readSetting(aElem, "cycle_reset_day", acct.cycleResetDay);
+                        _config.claude.accounts.push_back(acct);
+                    }
+                }
+            }
+        }
+
         if (root.exists("gateway")) {
             const libconfig::Setting& gw = root["gateway"];
             readSetting(gw, "enabled", _config.gateway.enabled);
@@ -537,6 +672,22 @@ bool ConfigManager::saveLibConfig(const std::string& customPath) const {
         cr.add("auto_discover", libconfig::Setting::TypeBoolean) = _config.cursor.autoDiscover;
         cr.add("db_path", libconfig::Setting::TypeString) = _config.cursor.dbPath;
         cr.add("access_token", libconfig::Setting::TypeString) = _config.cursor.accessToken;
+
+        // claude
+        libconfig::Setting& cl = root.add("claude", libconfig::Setting::TypeGroup);
+        cl.add("enabled", libconfig::Setting::TypeBoolean) = _config.claude.enabled;
+        cl.add("window_days", libconfig::Setting::TypeInt) = _config.claude.windowDays;
+        cl.add("retention_days", libconfig::Setting::TypeInt) = _config.claude.retentionDays;
+        cl.add("pricing_url", libconfig::Setting::TypeString) = _config.claude.pricingUrl;
+        cl.add("pricing_refresh_hours", libconfig::Setting::TypeInt) = _config.claude.pricingRefreshHours;
+        libconfig::Setting& aList = cl.add("accounts", libconfig::Setting::TypeList);
+        for (const auto& acct : _config.claude.accounts) {
+            libconfig::Setting& aElem = aList.add(libconfig::Setting::TypeGroup);
+            aElem.add("name", libconfig::Setting::TypeString) = acct.name;
+            aElem.add("config_dir", libconfig::Setting::TypeString) = acct.configDir;
+            aElem.add("spend_limit_usd", libconfig::Setting::TypeFloat) = acct.spendLimitUsd;
+            aElem.add("cycle_reset_day", libconfig::Setting::TypeInt) = acct.cycleResetDay;
+        }
 
         // gateway
         libconfig::Setting& gw = root.add("gateway", libconfig::Setting::TypeGroup);

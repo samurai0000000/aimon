@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.10 LANGUAGES CXX)
+project(aimon VERSION 1.0.11 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,6 +10,15 @@ if(MSVC)
     add_compile_options(/W4)
 else()
     add_compile_options(-Wall -Wextra -pedantic -Wno-unused-parameter)
+endif()
+
+# Optional sanitizer build (driven by `make test SANITIZE=1`)
+option(AIMON_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
+option(AIMON_SANITIZE_CANARY "Build the sanitizer canary test" OFF)
+if(AIMON_SANITIZE AND NOT MSVC)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
+                        -fno-sanitize-recover=undefined)
+    add_link_options(-fsanitize=address,undefined)
 endif()
 
 # Build metadata & version header generation
@@ -66,6 +75,10 @@ set(LIB_SOURCES
     src/StateStore.cxx
     src/AntigravityCollector.cxx
     src/CursorCollector.cxx
+    src/PriceCatalog.cxx
+    src/ClaudeUsageStore.cxx
+    src/ClaudeAccount.cxx
+    src/ClaudeCollector.cxx
     src/TaskRegistry.cxx
     src/DynamicToolRegistry.cxx
     src/TcpGateway.cxx
@@ -447,4 +460,115 @@ if(CPPUTEST_LIBRARY_DIRS)
     target_link_directories(test_fleet_integration PRIVATE ${CPPUTEST_LIBRARY_DIRS})
 endif()
 
+if(AIMON_SANITIZE_CANARY)
+    add_executable(test_sanitizer_canary test/TestSanitizerCanary.cxx)
+endif()
 
+# Property tests need RapidCheck; the library is installed system-wide.
+find_library(RAPIDCHECK_LIBRARY rapidcheck)
+if(NOT RAPIDCHECK_LIBRARY)
+    message(FATAL_ERROR "RapidCheck library not found (needed by the property tests)")
+endif()
+
+# Helper for the Claude usage test binaries: CppUTest or RapidCheck based, all
+# linked against OpenSSL/SQLite/threads and the sources they exercise.
+function(aimon_add_claude_test name)
+    cmake_parse_arguments(T "RAPIDCHECK;PLAIN;LIBCONFIG" "" "SOURCES" ${ARGN})
+    add_executable(${name} ${T_SOURCES})
+    target_compile_definitions(${name} PRIVATE
+        CPPHTTPLIB_OPENSSL_SUPPORT
+        AIMON_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+        ${CPPUTEST_INCLUDE_DIRS})
+    target_link_libraries(${name} PRIVATE
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        SQLite::SQLite3
+        Threads::Threads)
+    if(T_LIBCONFIG)
+        target_include_directories(${name} PRIVATE ${LIBCONFIGPP_INCLUDE_DIRS})
+        target_link_libraries(${name} PRIVATE ${LIBCONFIGPP_LIBRARIES})
+        if(LIBCONFIGPP_LIBRARY_DIRS)
+            target_link_directories(${name} PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
+        endif()
+    endif()
+    if(T_PLAIN)
+        # no test framework (ground-truth tools driven by a gate)
+    elseif(T_RAPIDCHECK)
+        target_link_libraries(${name} PRIVATE ${RAPIDCHECK_LIBRARY})
+    else()
+        target_link_libraries(${name} PRIVATE ${CPPUTEST_LIBRARIES})
+        if(CPPUTEST_LIBRARY_DIRS)
+            target_link_directories(${name} PRIVATE ${CPPUTEST_LIBRARY_DIRS})
+        endif()
+    endif()
+endfunction()
+
+aimon_add_claude_test(test_price_catalog
+    SOURCES test/TestPriceCatalog.cxx src/PriceCatalog.cxx src/PathUtils.cxx)
+
+aimon_add_claude_test(test_price_catalog_props RAPIDCHECK
+    SOURCES test/TestPriceCatalogProps.cxx src/PriceCatalog.cxx src/PathUtils.cxx)
+
+aimon_add_claude_test(test_claude_usage_store
+    SOURCES test/TestClaudeUsageStore.cxx src/ClaudeUsageStore.cxx src/PriceCatalog.cxx src/PathUtils.cxx)
+
+# Ground-truth tool, not a unit test: run by the gate with explicit arguments.
+aimon_add_claude_test(test_claude_recount PLAIN
+    SOURCES test/TestClaudeRecount.cxx src/ClaudeUsageStore.cxx src/PriceCatalog.cxx src/PathUtils.cxx)
+
+aimon_add_claude_test(test_claude_account LIBCONFIG
+    SOURCES test/TestClaudeAccount.cxx src/ClaudeAccount.cxx src/ConfigManager.cxx src/PathUtils.cxx)
+
+aimon_add_claude_test(test_claude_collector LIBCONFIG
+    SOURCES test/TestClaudeCollector.cxx src/ClaudeCollector.cxx src/ClaudeAccount.cxx
+            src/ClaudeUsageStore.cxx src/PriceCatalog.cxx src/ConfigManager.cxx src/PathUtils.cxx)
+
+aimon_add_claude_test(test_claude_parser_props RAPIDCHECK LIBCONFIG
+    SOURCES test/TestClaudeParserProps.cxx src/ClaudeCollector.cxx src/ClaudeAccount.cxx
+            src/ClaudeUsageStore.cxx src/PriceCatalog.cxx src/ConfigManager.cxx src/PathUtils.cxx)
+
+add_executable(test_claude_surfaces
+    test/TestClaudeSurfaces.cxx
+    ${LIB_SOURCES}
+)
+
+target_compile_definitions(test_claude_surfaces PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+
+target_include_directories(test_claude_surfaces PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+    ${MOSQUITTO_INCLUDE_DIRS}
+    ${CURSES_INCLUDE_DIRS}
+    ${LIBCONFIGPP_INCLUDE_DIRS}
+    ${CPPUTEST_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_claude_surfaces PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    SQLite::SQLite3
+    Threads::Threads
+    ${MOSQUITTO_LIBRARIES}
+    ${CURSES_LIBRARIES}
+    ${LIBCONFIGPP_LIBRARIES}
+    ${CPPUTEST_LIBRARIES}
+)
+
+if(MOSQUITTO_LIBRARY_DIRS)
+    target_link_directories(test_claude_surfaces PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+endif()
+if(LIBCONFIGPP_LIBRARY_DIRS)
+    target_link_directories(test_claude_surfaces PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
+endif()
+if(CPPUTEST_LIBRARY_DIRS)
+    target_link_directories(test_claude_surfaces PRIVATE ${CPPUTEST_LIBRARY_DIRS})
+endif()

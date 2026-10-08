@@ -16,7 +16,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css?v=1.0.10">
+    <link rel="stylesheet" href="style.css?v=1.0.11">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -206,6 +206,71 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                     </div>
 
                     <div id="cursor-error" class="error-banner hidden"></div>
+                </section>
+
+                <!-- Claude Section -->
+                <section class="card glass-card claude-card" id="claude-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-offline" id="claude-status-dot"></span>
+                            <h2>Claude Code</h2>
+                        </div>
+                        <span id="claude-tier-badge" class="badge">--</span>
+                    </div>
+
+                    <div class="claude-metrics">
+                        <div class="usage-stat-box">
+                            <div class="stat-top">
+                                <span id="claude-main-label" class="stat-label">Est. cost</span>
+                                <span id="claude-main-value" class="stat-ratio" data-nano="0">--</span>
+                            </div>
+                            <div id="claude-progress-track" class="progress-track hidden">
+                                <div id="claude-progress-bar" class="progress-fill" style="width: 0%;"></div>
+                            </div>
+                            <div class="stat-bottom">
+                                <span id="claude-main-sub" class="stat-sub">Waiting for data...</span>
+                                <span id="claude-main-pct" class="stat-pct"></span>
+                            </div>
+                        </div>
+
+                        <div class="claude-windows">
+                            <div class="claude-window-tile">
+                                <span class="claude-tile-label">Last 5 h</span>
+                                <span id="claude-5h-cost" class="claude-tile-cost" data-nano="0">--</span>
+                                <span id="claude-5h-tokens" class="claude-tile-tokens" data-tokens="0">--</span>
+                            </div>
+                            <div class="claude-window-tile">
+                                <span class="claude-tile-label">Last 7 d</span>
+                                <span id="claude-7d-cost" class="claude-tile-cost" data-nano="0">--</span>
+                                <span id="claude-7d-tokens" class="claude-tile-tokens" data-tokens="0">--</span>
+                            </div>
+                            <div class="claude-window-tile">
+                                <span id="claude-window-label" class="claude-tile-label">Last 30 d</span>
+                                <span id="claude-window-cost" class="claude-tile-cost" data-nano="0">--</span>
+                                <span id="claude-window-tokens" class="claude-tile-tokens" data-tokens="0">--</span>
+                            </div>
+                            <div class="claude-window-tile">
+                                <span class="claude-tile-label">Today (UTC)</span>
+                                <span id="claude-today-cost" class="claude-tile-cost" data-nano="0">--</span>
+                                <span id="claude-today-tokens" class="claude-tile-tokens" data-tokens="0">--</span>
+                            </div>
+                        </div>
+
+                        <div class="categories-breakdown">
+                            <div class="breakdown-header">Est. cost by model</div>
+                            <div id="claude-models-list" class="categories-list"></div>
+                        </div>
+
+                        <div class="categories-breakdown">
+                            <div class="breakdown-header">Est. cost per day (UTC)</div>
+                            <svg id="claude-daily-chart" class="claude-daily-svg" viewBox="0 0 420 110"></svg>
+                        </div>
+
+                        <div id="claude-other-accounts" class="claude-other-accounts hidden"></div>
+                    </div>
+
+                    <p id="claude-footnote" class="claude-footnote">Estimates from Claude Code transcripts on this host.</p>
+                    <div id="claude-error" class="error-banner hidden"></div>
                 </section>
 
                 <!-- Connected MCP Clients Section -->
@@ -468,7 +533,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
     </div>
 
     <script src="qrcode.js"></script>
-    <script src="app.js?v=1.0.10"></script>
+    <script src="app.js?v=1.0.11"></script>
 </body>
 </html>
 )raw_asset";
@@ -3623,8 +3688,94 @@ body {
     cursor: not-allowed;
 }
 
+/* Claude Code card */
+.claude-metrics {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
 
+.claude-windows {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+}
 
+@media (max-width: 1400px) {
+    .claude-windows {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.claude-window-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 10px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.025);
+}
+
+.claude-tile-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+}
+
+.claude-tile-cost {
+    font-family: var(--font-mono);
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.claude-tile-tokens {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-muted);
+}
+
+.claude-bar {
+    fill: #d97757;
+}
+
+.claude-bar-fill {
+    background: linear-gradient(90deg, #d97757, #f59e0b);
+}
+
+.claude-daily-svg {
+    width: 100%;
+    height: auto;
+}
+
+.claude-other-accounts {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.claude-other-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.78rem;
+    color: var(--text-primary);
+}
+
+.claude-footnote {
+    margin-top: 12px;
+    font-size: 0.7rem;
+    line-height: 1.4;
+    color: var(--text-muted);
+}
+
+#claude-main-pct {
+    color: var(--text-secondary);
+}
 )raw_asset";
 
 inline const char* APP_JS = R"raw_asset(//
@@ -4143,6 +4294,239 @@ function renderCursorSpend(cr) {
     }
 }
 
+// -------------------------------------------------------------
+// Claude Code usage (estimates from local transcripts)
+// -------------------------------------------------------------
+function claudeUsd(nano) {
+    const n = Math.max(0, Number(nano) || 0);
+    const cents = Math.floor((n + 5000000) / 10000000);
+    return '$' + Math.floor(cents / 100) + '.' + String(cents % 100).padStart(2, '0');
+}
+
+function claudeTokens(n) {
+    const v = Math.max(0, Number(n) || 0);
+    if (v < 1000) return String(v);
+    if (v < 1000000) return (v / 1e3).toFixed(1) + 'K';
+    if (v < 1000000000) return (v / 1e6).toFixed(2) + 'M';
+    return (v / 1e9).toFixed(2) + 'B';
+}
+
+function claudeSetNumber(id, nano, tokens) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (nano !== null) {
+        el.dataset.nano = String(nano);
+        el.textContent = claudeUsd(nano);
+    } else {
+        el.dataset.tokens = String(tokens);
+        el.textContent = claudeTokens(tokens) + ' tokens';
+    }
+}
+
+function claudeWindowTokens(w) {
+    return w ? (w.total_tokens || 0) : 0;
+}
+
+function renderClaudeDaily(daily) {
+    const svg = document.getElementById('claude-daily-chart');
+    if (!svg) return;
+    const points = (daily || []).slice(-30);
+    if (points.length === 0) {
+        svg.innerHTML = '<text x="210" y="60" text-anchor="middle" class="chart-axis-lbl">No data</text>';
+        return;
+    }
+    const left = 6, right = 414, top = 8, bottom = 88;
+    const maxCost = Math.max(1, ...points.map(p => p.est_cost_nano || 0));
+    const slot = (right - left) / points.length;
+    const barW = Math.max(2, slot * 0.72);
+    let bars = '';
+    points.forEach((p, i) => {
+        const h = Math.max(1, Math.round(((p.est_cost_nano || 0) / maxCost) * (bottom - top)));
+        const x = left + i * slot + (slot - barW) / 2;
+        const label = escapeHtml(p.day_str) + ': ' + claudeUsd(p.est_cost_nano) + ', ' +
+            claudeTokens(p.tokens) + ' tokens, ' + (p.messages || 0) + ' messages';
+        bars += `<rect class="claude-bar" x="${x.toFixed(1)}" y="${bottom - h}" width="${barW.toFixed(1)}" height="${h}" rx="1.5"><title>${label}</title></rect>`;
+    });
+    const first = escapeHtml(points[0].day_str);
+    const last = escapeHtml(points[points.length - 1].day_str);
+    svg.innerHTML = bars +
+        `<line x1="${left}" y1="${bottom}" x2="${right}" y2="${bottom}" class="chart-grid-line"></line>` +
+        `<text x="${left}" y="104" style="text-anchor: start" class="chart-axis-lbl">${first}</text>` +
+        `<text x="${right}" y="104" style="text-anchor: end" class="chart-axis-lbl">${last}</text>` +
+        `<text x="${right}" y="${top + 6}" style="text-anchor: end" class="chart-axis-lbl">max ${claudeUsd(maxCost)}</text>`;
+}
+
+function renderClaude(cl) {
+    const dot = document.getElementById('claude-status-dot');
+    const badge = document.getElementById('claude-tier-badge');
+    const mainLabel = document.getElementById('claude-main-label');
+    const mainValue = document.getElementById('claude-main-value');
+    const track = document.getElementById('claude-progress-track');
+    const bar = document.getElementById('claude-progress-bar');
+    const mainSub = document.getElementById('claude-main-sub');
+    const mainPct = document.getElementById('claude-main-pct');
+    const modelsList = document.getElementById('claude-models-list');
+    const others = document.getElementById('claude-other-accounts');
+    const footnote = document.getElementById('claude-footnote');
+    const errorBanner = document.getElementById('claude-error');
+
+    const resetTiles = () => {
+        ['5h', '7d', 'window', 'today'].forEach(k => {
+            claudeSetNumber('claude-' + k + '-cost', 0, 0);
+            const c = document.getElementById('claude-' + k + '-cost');
+            if (c) c.textContent = '--';
+            const t = document.getElementById('claude-' + k + '-tokens');
+            if (t) { t.dataset.tokens = '0'; t.textContent = '--'; }
+        });
+        if (modelsList) modelsList.innerHTML = '';
+        renderClaudeDaily([]);
+        if (others) others.classList.add('hidden');
+        if (track) track.classList.add('hidden');
+        if (mainPct) mainPct.textContent = '';
+        if (mainValue) { mainValue.dataset.nano = '0'; mainValue.textContent = '--'; }
+    };
+    const showError = (text) => {
+        if (!errorBanner) return;
+        if (text) {
+            errorBanner.textContent = text;
+            errorBanner.classList.remove('hidden');
+        } else {
+            errorBanner.classList.add('hidden');
+        }
+    };
+
+    if (!cl || !cl.enabled) {
+        if (dot) dot.className = 'dot-status dot-offline';
+        if (badge) { badge.textContent = 'Disabled'; badge.className = 'badge'; }
+        resetTiles();
+        if (mainSub) mainSub.textContent = 'Claude usage collection is disabled.';
+        showError('');
+        return;
+    }
+    const accounts = cl.accounts || [];
+    if (accounts.length === 0) {
+        if (dot) dot.className = 'dot-status dot-offline';
+        if (badge) { badge.textContent = 'No account'; badge.className = 'badge'; }
+        resetTiles();
+        if (mainSub) mainSub.textContent = 'No Claude accounts are configured.';
+        showError('');
+        return;
+    }
+
+    const a = accounts[0];
+    const tier = a.tier || 'unknown';
+    const tierName = tier === 'enterprise' ? 'Enterprise' : (tier === 'personal' ? 'Personal' : 'Unknown tier');
+    const valueLabel = tier === 'enterprise' ? 'Est. cost' : (tier === 'personal' ? 'Est. API-equivalent value' : 'Est. value');
+    if (badge) {
+        badge.textContent = tierName;
+        badge.className = tier === 'enterprise' ? 'badge badge-cyan' : (tier === 'personal' ? 'badge badge-magenta' : 'badge');
+        badge.title = [a.raw_subscription_type, a.raw_rate_limit_tier].filter(Boolean).join(' / ');
+    }
+
+    const problems = [];
+    if (a.error_message) problems.push(a.error_message);
+    if (a.warning) problems.push(a.warning);
+    showError(problems.join(' | '));
+
+    if (!a.has_data) {
+        if (dot) dot.className = 'dot-status dot-offline';
+        resetTiles();
+        if (mainLabel) mainLabel.textContent = valueLabel;
+        if (mainSub) mainSub.textContent = 'No Claude Code usage found';
+        if (footnote) footnote.textContent = 'Estimates from Claude Code transcripts on this host.';
+        return;
+    }
+    if (dot) dot.className = 'dot-status dot-online';
+
+    const windowDays = a.window_days || 30;
+    if (a.cycle_configured) {
+        const limit = a.spend_limit_usd || 0;
+        if (mainLabel) mainLabel.textContent = valueLabel + ' this cycle';
+        if (mainValue) {
+            mainValue.dataset.nano = String(a.cycle.est_cost_nano || 0);
+            mainValue.textContent = claudeUsd(a.cycle.est_cost_nano) + (limit > 0 ? ' / $' + limit.toFixed(2) : '');
+        }
+        if (limit > 0) {
+            if (track) track.classList.remove('hidden');
+            if (bar) bar.style.width = Math.min(100, Math.max(0, a.est_pct_of_limit || 0)) + '%';
+            if (mainPct) mainPct.textContent = (a.est_pct_of_limit || 0).toFixed(1) + '% of limit';
+        } else {
+            if (track) track.classList.add('hidden');
+            if (mainPct) mainPct.textContent = '';
+        }
+        if (mainSub) {
+            const reset = a.cycle_reset_iso ? new Date(a.cycle_reset_iso).toLocaleDateString() : 'n/a';
+            mainSub.textContent = 'Cycle resets ' + reset;
+        }
+    } else {
+        if (mainLabel) mainLabel.textContent = valueLabel + ' (' + windowDays + ' d)';
+        if (mainValue) {
+            mainValue.dataset.nano = String(a.window.est_cost_nano || 0);
+            mainValue.textContent = claudeUsd(a.window.est_cost_nano);
+        }
+        if (track) track.classList.add('hidden');
+        if (mainPct) mainPct.textContent = '';
+        if (mainSub) mainSub.textContent = (a.window.messages || 0).toLocaleString() + ' messages';
+    }
+
+    const windowLabel = document.getElementById('claude-window-label');
+    if (windowLabel) windowLabel.textContent = 'Last ' + windowDays + ' d';
+    [['5h', a.last_5h], ['7d', a.last_7d], ['window', a.window], ['today', a.today]].forEach(([key, w]) => {
+        claudeSetNumber('claude-' + key + '-cost', (w && w.est_cost_nano) || 0, null);
+        claudeSetNumber('claude-' + key + '-tokens', null, claudeWindowTokens(w));
+    });
+
+    if (modelsList) {
+        modelsList.innerHTML = '';
+        const models = (a.models || []).slice(0, 6);
+        const maxCost = Math.max(1, ...models.map(m => m.est_cost_nano || 0));
+        models.forEach(m => {
+            const row = document.createElement('div');
+            row.className = 'cat-row';
+            const width = Math.max(1, Math.round(((m.est_cost_nano || 0) / maxCost) * 100));
+            const tokens = (m.input_tokens || 0) + (m.output_tokens || 0) + (m.cache_read_tokens || 0) +
+                (m.cache_write_5m_tokens || 0) + (m.cache_write_1h_tokens || 0);
+            row.innerHTML = `
+                <div class="cat-info">
+                    <span class="cat-name">${escapeHtml(m.model)}</span>
+                    <span class="cat-val" data-nano="${m.est_cost_nano || 0}">${claudeUsd(m.est_cost_nano)} \u00b7 ${claudeTokens(tokens)}</span>
+                </div>
+                <div class="cat-bar-track"><div class="cat-bar-fill claude-bar-fill" style="width: ${width}%;"></div></div>`;
+            modelsList.appendChild(row);
+        });
+    }
+    renderClaudeDaily(a.daily);
+
+    if (others) {
+        if (accounts.length > 1) {
+            others.classList.remove('hidden');
+            others.innerHTML = '<div class="breakdown-header">Other accounts</div>' + accounts.slice(1).map(o =>
+                `<div class="claude-other-row"><span>${escapeHtml(o.name)} (${escapeHtml(o.tier)})</span>` +
+                `<span>${claudeUsd(o.window && o.window.est_cost_nano)} \u00b7 ${claudeTokens(claudeWindowTokens(o.window))}</span></div>`).join('');
+        } else {
+            others.classList.add('hidden');
+            others.innerHTML = '';
+        }
+    }
+
+    if (footnote) {
+        const pr = cl.pricing || {};
+        let text = 'Estimates from Claude Code transcripts on this host at list prices; they can differ from the billing page.';
+        if (pr.fetched_at_epoch) {
+            text += ' Prices as of ' + new Date(pr.fetched_at_epoch * 1000).toLocaleDateString() + '.';
+            if (pr.stale) text += ' STALE: no successful price fetch for over 3 refresh intervals.';
+            if (pr.quarantined_count) text += ' ' + pr.quarantined_count + ' models quarantined (unpriced).';
+        } else {
+            text += ' No prices loaded yet.';
+        }
+        if (a.unpriced_models && a.unpriced_models.length) {
+            text += ' Unpriced models (tokens counted, no cost): ' + a.unpriced_models.join(', ') + '.';
+        }
+        if (pr.error) text += ' Price fetch: ' + pr.error + '.';
+        footnote.textContent = text;
+    }
+}
+
 async function fetchStatus(isManual = false) {
     const refreshBtn = document.getElementById('refresh-btn');
     if (isManual && refreshBtn) {
@@ -4162,6 +4546,7 @@ async function fetchStatus(isManual = false) {
             }
             renderAntigravity(data.antigravity);
             renderCursor(data.cursor);
+            renderClaude(data.claude);
             updateCountdowns();
 
             const updatedEl = document.getElementById('last-updated');

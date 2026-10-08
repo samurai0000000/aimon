@@ -54,6 +54,17 @@ void StateStore::updateCursor(const CursorStatus& cr) {
     notifyListeners(copy);
 }
 
+void StateStore::updateClaude(const ClaudeStatus& cl) {
+    AggregateStatus copy;
+    {
+        std::unique_lock<std::shared_mutex> lock(_mutex);
+        _currentStatus.claude = cl;
+        _currentStatus.lastUpdated = std::chrono::system_clock::now();
+        copy = _currentStatus;
+    }
+    notifyListeners(copy);
+}
+
 void StateStore::addListener(UpdateListener listener) {
     std::unique_lock<std::shared_mutex> lock(_mutex);
     _listeners.push_back(listener);
