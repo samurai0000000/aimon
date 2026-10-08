@@ -17,6 +17,11 @@ struct mosquitto;
 
 namespace aimon {
 
+struct MqttMessage {
+    std::string topic;
+    std::string payload;
+};
+
 class MqttPublisher {
 public:
     explicit MqttPublisher(const MqttConfig& config);
@@ -27,6 +32,13 @@ public:
 
     void publishDiscovery();
     void publishState(const AggregateStatus& status);
+
+    // Pure builders for the Claude sensors (no broker needed): Home Assistant
+    // discovery configs and the current state and attribute messages.
+    static std::vector<MqttMessage> buildClaudeDiscovery(const std::string& topicPrefix,
+                                                         const std::string& discoveryPrefix,
+                                                         const ClaudeStatus& status);
+    static std::vector<MqttMessage> buildClaudeState(const std::string& topicPrefix, const ClaudeStatus& status);
 
 private:
     bool publishMessage(const std::string& topic, const std::string& payload, bool retain = true);

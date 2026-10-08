@@ -3148,5 +3148,91 @@ body {
     cursor: not-allowed;
 }
 
+/* Claude Code card */
+.claude-metrics {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
 
+.claude-windows {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+}
 
+@media (max-width: 1400px) {
+    .claude-windows {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.claude-window-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 10px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.025);
+}
+
+.claude-tile-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+}
+
+.claude-tile-cost {
+    font-family: var(--font-mono);
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.claude-tile-tokens {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-muted);
+}
+
+.claude-bar {
+    fill: #d97757;
+}
+
+.claude-bar-fill {
+    background: linear-gradient(90deg, #d97757, #f59e0b);
+}
+
+.claude-daily-svg {
+    width: 100%;
+    height: auto;
+}
+
+.claude-other-accounts {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.claude-other-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.78rem;
+    color: var(--text-primary);
+}
+
+.claude-footnote {
+    margin-top: 12px;
+    font-size: 0.7rem;
+    line-height: 1.4;
+    color: var(--text-muted);
+}
+
+#claude-main-pct {
+    color: var(--text-secondary);
+}

@@ -1,0 +1,150 @@
+{
+  "gate_id": "g5-collector",
+  "runs": [
+    {
+      "command": [
+        "./build/test_claude_account"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "Errors (",
+        "Assertion failed",
+        "Segmentation fault"
+      ],
+      "id": "c1-account-and-config"
+    },
+    {
+      "command": [
+        "./build/test_claude_collector"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "Errors (",
+        "Assertion failed",
+        "Segmentation fault"
+      ],
+      "id": "c2-collector"
+    },
+    {
+      "command": [
+        "./build/test_claude_parser_props"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "Falsifiable",
+        "Some of your tests failed"
+      ],
+      "id": "c3-parser-properties"
+    },
+    {
+      "command": [
+        "make",
+        "test",
+        "SANITIZE=1"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "Errors (",
+        "Assertion failed",
+        "Segmentation fault",
+        "AddressSanitizer",
+        "LeakSanitizer",
+        "runtime error:",
+        "Falsifiable"
+      ],
+      "id": "c4-sanitized-suite"
+    },
+    {
+      "command": [
+        "bash",
+        "plan/plan_claude_usage_collector.artifacts/scripts/g5_throwaway_daemon.sh"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "LIVE STATE CHANGED",
+        "did not stop",
+        "still listening"
+      ],
+      "id": "c5-throwaway-daemon",
+      "identity": {
+        "script_sha256": "12f4d4a155e92fc63b1e072f5cb70b87f0cf768939819ecba3eb0b99358fb0e9"
+      }
+    },
+    {
+      "command": [
+        "python3",
+        "-I",
+        "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+        "status-compare",
+        "--status",
+        "build/g5/status1.json",
+        "--second",
+        "build/g5/status2.json",
+        "--account",
+        "real",
+        "--root",
+        "build/recount-snapshot",
+        "--page",
+        "test/fixtures/pricing_page_v2.md",
+        "--creds",
+        "build/throwaway-claude/.credentials.json",
+        "--records-out",
+        "build/g5/records.jsonl"
+      ],
+      "expect_exit": 0,
+      "id": "c6-status-vs-oracle",
+      "records": {
+        "match_pairs": [
+          [
+            "cpp",
+            "oracle"
+          ]
+        ],
+        "min_count": 60,
+        "min_distinct": {
+          "key": 10
+        },
+        "required_fields": [
+          "key",
+          "field",
+          "cpp",
+          "oracle"
+        ]
+      }
+    },
+    {
+      "command": [
+        "python3",
+        "-I",
+        "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+        "tamper-status",
+        "--in",
+        "build/g5/status1.json",
+        "--out",
+        "build/g5/status_tampered.json"
+      ],
+      "expect_exit": 0,
+      "id": "c7-tamper-copy"
+    },
+    {
+      "command": [
+        "python3",
+        "-I",
+        "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+        "status-compare",
+        "--status",
+        "build/g5/status_tampered.json",
+        "--account",
+        "real",
+        "--root",
+        "build/recount-snapshot",
+        "--page",
+        "test/fixtures/pricing_page_v2.md",
+        "--creds",
+        "build/throwaway-claude/.credentials.json"
+      ],
+      "expect_exit": 1,
+      "id": "c8-negative-control-tampered"
+    }
+  ]
+}

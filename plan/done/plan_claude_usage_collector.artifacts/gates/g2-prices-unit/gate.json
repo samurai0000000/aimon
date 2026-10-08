@@ -1,0 +1,71 @@
+{
+  "gate_id": "g2-prices-unit",
+  "runs": [
+    {
+      "command": [
+        "python3",
+        "-I",
+        "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+        "selftest",
+        "--page",
+        "test/fixtures/pricing_page.md"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "FAIL"
+      ],
+      "id": "p0-oracle-selftest"
+    },
+    {
+      "command": [
+        "./build/test_price_catalog"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "Errors (",
+        "Assertion failed",
+        "Segmentation fault"
+      ],
+      "id": "p1-unit"
+    },
+    {
+      "command": [
+        "./build/test_price_catalog_props"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "Falsifiable",
+        "Some of your tests failed",
+        "fixture page missing"
+      ],
+      "id": "p2-properties"
+    },
+    {
+      "command": [
+        "make",
+        "test",
+        "SANITIZE=1"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "Errors (",
+        "Assertion failed",
+        "Segmentation fault",
+        "AddressSanitizer",
+        "LeakSanitizer",
+        "runtime error:",
+        "Falsifiable"
+      ],
+      "id": "p3-sanitized-suite"
+    },
+    {
+      "command": [
+        "./build/test_price_catalog",
+        "--expect",
+        "test/fixtures/pricing_expected_wrong.json"
+      ],
+      "expect_exit": 1,
+      "id": "p4-negative-control-wrong-expected"
+    }
+  ]
+}

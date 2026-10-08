@@ -1,0 +1,7 @@
+{
+  "gate_id": "g6-surface",
+  "gate_sha256": "8dce89ea815252c348e7dd62481b7f0cd3786092189ae2fa45613a62a622d56f",
+  "sealed_at": "2026-10-08T06:00:46Z",
+  "verifier": "scripts/plan_gate.py",
+  "verifier_sha256": "57dab9232d902db15a14d63a40540bfc844f24f541860d6cc1bdfbb8736da9c7"
+}

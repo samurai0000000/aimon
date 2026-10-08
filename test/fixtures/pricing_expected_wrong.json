@@ -1,0 +1,150 @@
+{
+ "claude-fable-5": {
+  "input_nano": 10000,
+  "output_nano": 50000,
+  "read_nano": 1000,
+  "write1h_nano": 20000,
+  "write5m_nano": 12500
+ },
+ "claude-fable-5-1": {
+  "input_nano": 10000,
+  "output_nano": 50000,
+  "read_nano": 250,
+  "write1h_nano": 20000,
+  "write5m_nano": 12500
+ },
+ "claude-haiku-3-5": {
+  "input_nano": 800,
+  "output_nano": 4000,
+  "read_nano": 80,
+  "write1h_nano": 1600,
+  "write5m_nano": 1000
+ },
+ "claude-haiku-4-5": {
+  "input_nano": 1000,
+  "output_nano": 5000,
+  "read_nano": 100,
+  "write1h_nano": 2000,
+  "write5m_nano": 1250
+ },
+ "claude-mythos-5": {
+  "input_nano": 10000,
+  "output_nano": 50000,
+  "read_nano": 1000,
+  "write1h_nano": 20000,
+  "write5m_nano": 12500
+ },
+ "claude-mythos-5-1": {
+  "input_nano": 10000,
+  "output_nano": 50000,
+  "read_nano": 250,
+  "write1h_nano": 20000,
+  "write5m_nano": 12500
+ },
+ "claude-opus-4": {
+  "input_nano": 15000,
+  "output_nano": 75000,
+  "read_nano": 1500,
+  "write1h_nano": 30000,
+  "write5m_nano": 18750
+ },
+ "claude-opus-4-1": {
+  "input_nano": 15000,
+  "output_nano": 75000,
+  "read_nano": 1500,
+  "write1h_nano": 30000,
+  "write5m_nano": 18750
+ },
+ "claude-opus-4-5": {
+  "input_nano": 5000,
+  "output_nano": 25000,
+  "read_nano": 500,
+  "write1h_nano": 10000,
+  "write5m_nano": 6250
+ },
+ "claude-opus-4-6": {
+  "input_nano": 5000,
+  "output_nano": 25000,
+  "read_nano": 500,
+  "write1h_nano": 10000,
+  "write5m_nano": 6250
+ },
+ "claude-opus-4-7": {
+  "input_nano": 5000,
+  "output_nano": 25000,
+  "read_nano": 500,
+  "write1h_nano": 10000,
+  "write5m_nano": 6250
+ },
+ "claude-opus-4-8": {
+  "fast_input_nano": 10000,
+  "fast_output_nano": 50000,
+  "fast_read_nano": 1000,
+  "fast_write1h_nano": 20000,
+  "fast_write5m_nano": 12500,
+  "input_nano": 5000,
+  "output_nano": 25000,
+  "read_nano": 500,
+  "write1h_nano": 10000,
+  "write5m_nano": 6250
+ },
+ "claude-opus-5": {
+  "fast_input_nano": 10000,
+  "fast_output_nano": 50000,
+  "fast_read_nano": 1000,
+  "fast_write1h_nano": 20000,
+  "fast_write5m_nano": 12500,
+  "input_nano": 5000,
+  "output_nano": 25000,
+  "read_nano": 500,
+  "write1h_nano": 10000,
+  "write5m_nano": 6250
+ },
+ "claude-opus-5-5": {
+  "fast_input_nano": 8000,
+  "fast_output_nano": 40000,
+  "fast_read_nano": 400,
+  "fast_write1h_nano": 16000,
+  "fast_write5m_nano": 10000,
+  "input_nano": 4001,
+  "output_nano": 20000,
+  "read_nano": 200,
+  "write1h_nano": 8000,
+  "write5m_nano": 5000
+ },
+ "claude-sonnet-4": {
+  "input_nano": 3000,
+  "output_nano": 15000,
+  "read_nano": 300,
+  "write1h_nano": 6000,
+  "write5m_nano": 3750
+ },
+ "claude-sonnet-4-5": {
+  "input_nano": 3000,
+  "output_nano": 15000,
+  "read_nano": 300,
+  "write1h_nano": 6000,
+  "write5m_nano": 3750
+ },
+ "claude-sonnet-4-6": {
+  "input_nano": 3000,
+  "output_nano": 15000,
+  "read_nano": 300,
+  "write1h_nano": 6000,
+  "write5m_nano": 3750
+ },
+ "claude-sonnet-5": {
+  "input_nano": 2000,
+  "output_nano": 10000,
+  "read_nano": 200,
+  "write1h_nano": 4000,
+  "write5m_nano": 2500
+ },
+ "claude-sonnet-5-5": {
+  "input_nano": 2000,
+  "output_nano": 10000,
+  "read_nano": 200,
+  "write1h_nano": 4000,
+  "write5m_nano": 2500
+ }
+}

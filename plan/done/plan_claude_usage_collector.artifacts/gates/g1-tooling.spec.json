@@ -1,0 +1,13 @@
+{
+  "gate_id": "g1-tooling",
+  "runs": [
+    {"id": "t1-make-test", "command": ["make", "test"], "expect_exit": 0,
+     "forbidden_output": ["Errors (", "Assertion failed", "Segmentation fault"],
+     "identity": {"home": "isolated-empty-dir", "build": "Debug"}},
+    {"id": "t2-make-test-sanitized", "command": ["make", "test", "SANITIZE=1"], "expect_exit": 0,
+     "forbidden_output": ["Errors (", "Assertion failed", "Segmentation fault", "AddressSanitizer", "LeakSanitizer", "runtime error:"],
+     "identity": {"home": "isolated-empty-dir", "sanitizer": "address,undefined"}},
+    {"id": "t3-canary-must-fail", "command": ["make", "test", "SANITIZE=1", "SANITIZE_CANARY=1"], "expect_exit": 2,
+     "identity": {"home": "isolated-empty-dir", "sanitizer": "address,undefined"}}
+  ]
+}

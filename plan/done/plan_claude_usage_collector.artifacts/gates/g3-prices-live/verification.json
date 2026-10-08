@@ -1,0 +1,13 @@
+{
+  "errors": [
+    "runs ledger does not match the sealed run list",
+    "run l1-live-fetch-and-parse exit 1, expected 0",
+    "run l1-live-fetch-and-parse contains forbidden text 'rejected'",
+    "missing plan/plan_claude_usage_collector.artifacts/gates/g3-prices-live/runs/l2-oracle-compare/environment.json",
+    "run l3-tamper-copy exit 1, expected 0"
+  ],
+  "gate_id": "g3-prices-live",
+  "gate_sha256": "6a9c9378aca6018a828ad253e96575ec6c3e5a7516fda7dadd77c125c4c10edd",
+  "result": "fail",
+  "verified_at": "2026-10-08T02:23:16Z"
+}

@@ -150,6 +150,16 @@ bool HistoryStore::recordSnapshot(const AggregateStatus& status) {
         recordMetric("cursor", "fast_requests_used", status.cursor.fastRequestsUsed, status.cursor.fastRequestsLimit);
     }
 
+    // Claude Code: estimated cost and tokens over the configured window, one provider per account.
+    for (const auto& acct : status.claude.accounts) {
+        if (!acct.hasData || acct.window.costOverflow) {
+            continue;
+        }
+        const std::string provider = "claude:" + acct.name;
+        recordMetric(provider, "est_cost_usd", claudeNanoToUsd(acct.window.costNano), acct.spendLimitUsd);
+        recordMetric(provider, "total_tokens", static_cast<double>(acct.window.totalTokens()), 0.0);
+    }
+
     return true;
 }
 

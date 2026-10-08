@@ -11,6 +11,9 @@ config.json
 .DS_Store
 plan/*
 !plan/done/
+# Raw gate runs and failing-before build logs hold host-specific absolute paths; they stay on disk beside the plan
+plan/done/*.artifacts/gates/*/runs/
+plan/done/*.artifacts/logs/
 __pycache__/
 *.pyc
 

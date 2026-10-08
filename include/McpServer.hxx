@@ -47,6 +47,7 @@ private:
 
     std::string formatAntigravityStatus(const AntigravityStatus& ag);
     std::string formatCursorStatus(const CursorStatus& cr);
+    std::string formatClaudeStatus(const ClaudeStatus& cl);
     std::string formatCombinedStatus(const AggregateStatus& status);
 
     StateStore& _stateStore;

@@ -1,0 +1,223 @@
+{
+ "gate_id": "g6-surface",
+ "runs": [
+  {
+   "id": "d1-surfaces-unit",
+   "command": [
+    "./build/test_claude_surfaces"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "Errors (",
+    "Assertion failed",
+    "Segmentation fault"
+   ]
+  },
+  {
+   "id": "d2-web-api-regression",
+   "command": [
+    "./build/test_web_server_api"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "Errors (",
+    "Assertion failed",
+    "Segmentation fault",
+    "FAILED"
+   ]
+  },
+  {
+   "id": "d3-mcp-regression",
+   "command": [
+    "./build/test_supervisor_api_and_mcp"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "Errors (",
+    "Assertion failed",
+    "Segmentation fault"
+   ]
+  },
+  {
+   "id": "d4-sanitized-suite",
+   "command": [
+    "make",
+    "test",
+    "SANITIZE=1"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "Errors (",
+    "Assertion failed",
+    "Segmentation fault",
+    "AddressSanitizer",
+    "LeakSanitizer",
+    "runtime error:",
+    "Falsifiable"
+   ]
+  },
+  {
+   "id": "d5-webassets-parity",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/scripts/webassets_sync.py",
+    "check"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "DIFFERENT"
+   ]
+  },
+  {
+   "id": "d6-tamper-webassets",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/scripts/webassets_sync.py",
+    "tamper",
+    "--out",
+    "build/g6_WebAssets_tampered.hxx"
+   ],
+   "expect_exit": 0
+  },
+  {
+   "id": "d7-negative-control-parity",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/scripts/webassets_sync.py",
+    "check",
+    "--header",
+    "build/g6_WebAssets_tampered.hxx"
+   ],
+   "expect_exit": 1
+  },
+  {
+   "id": "d8-live-surfaces",
+   "command": [
+    "bash",
+    "plan/plan_claude_usage_collector.artifacts/scripts/g6_surfaces_live.sh"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "LIVE STATE CHANGED",
+    "differs",
+    "did not stop",
+    "still listening"
+   ],
+   "identity": {
+    "g6_surfaces_live_sh": "1f3f9582deca94e49735e3c12f95dcfb974594ec5d846ff5963f7f9de0382175",
+    "cdp_page_py": "139aa577f173eb4cd9054ff12a66151bd91d803b7b4fb49c61f279e98bee5c8d",
+    "g6_harness_py": "66da67a45d8c6e8f3073d9fb76b833fa9f5e9a880456f197b11f5454dbb67d76",
+    "mcp_call_py": "2dcf7fad422a9dab469ca9c5c3dcaf6687589a74b9d7cd006c15c4d58f7fa7ce"
+   }
+  },
+  {
+   "id": "d9-card-vs-mcp-and-status",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/scripts/g6_card_check.py",
+    "check",
+    "--dom",
+    "build/g6/dom.html",
+    "--mcp",
+    "build/g6/mcp.txt",
+    "--status",
+    "build/g6/status.json",
+    "--records-out",
+    "build/g6/card_records.jsonl"
+   ],
+   "expect_exit": 0,
+   "records": {
+    "min_count": 25,
+    "required_fields": [
+     "key",
+     "field",
+     "cpp",
+     "oracle"
+    ],
+    "match_pairs": [
+     [
+      "cpp",
+      "oracle"
+     ]
+    ],
+    "min_distinct": {
+     "key": 10
+    }
+   }
+  },
+  {
+   "id": "d10-status-vs-oracle",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+    "status-compare",
+    "--status",
+    "build/g6/status.json",
+    "--account",
+    "real",
+    "--root",
+    "build/recount-snapshot",
+    "--page",
+    "test/fixtures/pricing_page_v2.md",
+    "--creds",
+    "build/throwaway-claude/.credentials.json",
+    "--records-out",
+    "build/g6/status_records.jsonl"
+   ],
+   "expect_exit": 0,
+   "records": {
+    "min_count": 80,
+    "required_fields": [
+     "key",
+     "field",
+     "cpp",
+     "oracle"
+    ],
+    "match_pairs": [
+     [
+      "cpp",
+      "oracle"
+     ]
+    ],
+    "min_distinct": {
+     "key": 15
+    }
+   }
+  },
+  {
+   "id": "d11-tamper-dom",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/scripts/g6_card_check.py",
+    "tamper-dom",
+    "--in",
+    "build/g6/dom.html",
+    "--out",
+    "build/g6/dom_tampered.html"
+   ],
+   "expect_exit": 0
+  },
+  {
+   "id": "d12-negative-control-card",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/scripts/g6_card_check.py",
+    "check",
+    "--dom",
+    "build/g6/dom_tampered.html",
+    "--mcp",
+    "build/g6/mcp.txt",
+    "--status",
+    "build/g6/status.json"
+   ],
+   "expect_exit": 1
+  }
+ ]
+}

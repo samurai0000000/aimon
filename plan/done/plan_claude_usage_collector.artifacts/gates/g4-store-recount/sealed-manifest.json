@@ -1,0 +1,7 @@
+{
+  "gate_id": "g4-store-recount",
+  "gate_sha256": "488f2550f1be789e998588bedd5f4d8c9f993bbe5f5ac288cb6e0121063df508",
+  "sealed_at": "2026-10-08T01:20:41Z",
+  "verifier": "scripts/plan_gate.py",
+  "verifier_sha256": "57dab9232d902db15a14d63a40540bfc844f24f541860d6cc1bdfbb8736da9c7"
+}

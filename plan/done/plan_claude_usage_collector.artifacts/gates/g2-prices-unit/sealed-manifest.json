@@ -1,0 +1,7 @@
+{
+  "gate_id": "g2-prices-unit",
+  "gate_sha256": "4b800bfe8a9deb756b2aa96ec4ec2009972c50533592e2c2ee4d68db12265690",
+  "sealed_at": "2026-10-08T01:14:44Z",
+  "verifier": "scripts/plan_gate.py",
+  "verifier_sha256": "57dab9232d902db15a14d63a40540bfc844f24f541860d6cc1bdfbb8736da9c7"
+}

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>aimon | Unified AI Quota Monitor</title>
-    <link rel="stylesheet" href="style.css?v=1.0.10">
+    <link rel="stylesheet" href="style.css?v=1.0.11">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -194,6 +194,71 @@
                     </div>
 
                     <div id="cursor-error" class="error-banner hidden"></div>
+                </section>
+
+                <!-- Claude Section -->
+                <section class="card glass-card claude-card" id="claude-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="dot-status dot-offline" id="claude-status-dot"></span>
+                            <h2>Claude Code</h2>
+                        </div>
+                        <span id="claude-tier-badge" class="badge">--</span>
+                    </div>
+
+                    <div class="claude-metrics">
+                        <div class="usage-stat-box">
+                            <div class="stat-top">
+                                <span id="claude-main-label" class="stat-label">Est. cost</span>
+                                <span id="claude-main-value" class="stat-ratio" data-nano="0">--</span>
+                            </div>
+                            <div id="claude-progress-track" class="progress-track hidden">
+                                <div id="claude-progress-bar" class="progress-fill" style="width: 0%;"></div>
+                            </div>
+                            <div class="stat-bottom">
+                                <span id="claude-main-sub" class="stat-sub">Waiting for data...</span>
+                                <span id="claude-main-pct" class="stat-pct"></span>
+                            </div>
+                        </div>
+
+                        <div class="claude-windows">
+                            <div class="claude-window-tile">
+                                <span class="claude-tile-label">Last 5 h</span>
+                                <span id="claude-5h-cost" class="claude-tile-cost" data-nano="0">--</span>
+                                <span id="claude-5h-tokens" class="claude-tile-tokens" data-tokens="0">--</span>
+                            </div>
+                            <div class="claude-window-tile">
+                                <span class="claude-tile-label">Last 7 d</span>
+                                <span id="claude-7d-cost" class="claude-tile-cost" data-nano="0">--</span>
+                                <span id="claude-7d-tokens" class="claude-tile-tokens" data-tokens="0">--</span>
+                            </div>
+                            <div class="claude-window-tile">
+                                <span id="claude-window-label" class="claude-tile-label">Last 30 d</span>
+                                <span id="claude-window-cost" class="claude-tile-cost" data-nano="0">--</span>
+                                <span id="claude-window-tokens" class="claude-tile-tokens" data-tokens="0">--</span>
+                            </div>
+                            <div class="claude-window-tile">
+                                <span class="claude-tile-label">Today (UTC)</span>
+                                <span id="claude-today-cost" class="claude-tile-cost" data-nano="0">--</span>
+                                <span id="claude-today-tokens" class="claude-tile-tokens" data-tokens="0">--</span>
+                            </div>
+                        </div>
+
+                        <div class="categories-breakdown">
+                            <div class="breakdown-header">Est. cost by model</div>
+                            <div id="claude-models-list" class="categories-list"></div>
+                        </div>
+
+                        <div class="categories-breakdown">
+                            <div class="breakdown-header">Est. cost per day (UTC)</div>
+                            <svg id="claude-daily-chart" class="claude-daily-svg" viewBox="0 0 420 110"></svg>
+                        </div>
+
+                        <div id="claude-other-accounts" class="claude-other-accounts hidden"></div>
+                    </div>
+
+                    <p id="claude-footnote" class="claude-footnote">Estimates from Claude Code transcripts on this host.</p>
+                    <div id="claude-error" class="error-banner hidden"></div>
                 </section>
 
                 <!-- Connected MCP Clients Section -->
@@ -456,6 +521,6 @@
     </div>
 
     <script src="qrcode.js"></script>
-    <script src="app.js?v=1.0.10"></script>
+    <script src="app.js?v=1.0.11"></script>
 </body>
 </html>

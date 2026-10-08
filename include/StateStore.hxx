@@ -24,6 +24,7 @@ public:
     void update(const AggregateStatus& status);
     void updateAntigravity(const AntigravityStatus& ag);
     void updateCursor(const CursorStatus& cr);
+    void updateClaude(const ClaudeStatus& cl);
 
     void addListener(UpdateListener listener);
 

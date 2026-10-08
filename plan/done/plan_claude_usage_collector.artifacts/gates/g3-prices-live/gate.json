@@ -1,0 +1,88 @@
+{
+  "gate_id": "g3-prices-live",
+  "runs": [
+    {
+      "command": [
+        "./build/test_price_catalog",
+        "--live",
+        "--out",
+        "build/g3/prices_cpp.jsonl",
+        "--page-out",
+        "build/g3/live_page.md"
+      ],
+      "expect_exit": 0,
+      "forbidden_output": [
+        "failed",
+        "rejected"
+      ],
+      "id": "l1-live-fetch-and-parse"
+    },
+    {
+      "command": [
+        "python3",
+        "-I",
+        "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+        "compare",
+        "--kind",
+        "prices",
+        "--cpp",
+        "build/g3/prices_cpp.jsonl",
+        "--page",
+        "build/g3/live_page.md",
+        "--records-out",
+        "build/g3/records.jsonl"
+      ],
+      "expect_exit": 0,
+      "id": "l2-oracle-compare",
+      "records": {
+        "match_pairs": [
+          [
+            "cpp",
+            "oracle"
+          ]
+        ],
+        "min_count": 20,
+        "min_distinct": {
+          "field": 5,
+          "model": 5
+        },
+        "required_fields": [
+          "model",
+          "field",
+          "cpp",
+          "oracle"
+        ]
+      }
+    },
+    {
+      "command": [
+        "python3",
+        "-I",
+        "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+        "tamper",
+        "--in",
+        "build/g3/prices_cpp.jsonl",
+        "--out",
+        "build/g3/prices_cpp_tampered.jsonl"
+      ],
+      "expect_exit": 0,
+      "id": "l3-tamper-copy"
+    },
+    {
+      "command": [
+        "python3",
+        "-I",
+        "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+        "compare",
+        "--kind",
+        "prices",
+        "--cpp",
+        "build/g3/prices_cpp_tampered.jsonl",
+        "--page",
+        "build/g3/live_page.md"
+      ],
+      "expect_exit": 1,
+      "id": "l4-negative-control-tampered"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+[
+ {
+  "effective_from": 0,
+  "page": "test/fixtures/pricing_page.md"
+ },
+ {
+  "effective_from": 1791439200,
+  "page": "test/fixtures/pricing_page_v2.md"
+ }
+]

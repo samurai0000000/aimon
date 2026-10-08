@@ -54,6 +54,27 @@ struct CursorConfig {
     std::string accessToken;
 };
 
+struct ClaudeAccountConfig {
+    std::string name;
+    std::string configDir;          // Claude Code configuration directory (holds projects/)
+    double spendLimitUsd = 0.0;     // 0 = not configured
+    int cycleResetDay = 0;          // 1..28 (UTC), 0 = not configured
+};
+
+struct ClaudeConfig {
+    bool enabled = true;
+    int windowDays = 30;
+    int retentionDays = 400;
+    std::string pricingUrl;         // empty = the official pricing page
+    int pricingRefreshHours = 24;
+    std::vector<ClaudeAccountConfig> accounts;
+
+    // The configured accounts, or one "default" account at $CLAUDE_CONFIG_DIR
+    // (else ~/.claude) when none are configured.
+    std::vector<ClaudeAccountConfig> resolvedAccounts() const;
+    bool validate(std::string& error) const;
+};
+
 struct GatewayConfig {
     bool enabled = true;
     std::string host = "0.0.0.0";
@@ -110,6 +131,7 @@ struct AimonConfig {
     HistoryConfig history;
     AntigravityConfig antigravity;
     CursorConfig cursor;
+    ClaudeConfig claude;
     GatewayConfig gateway;
     SupervisorConfig supervisor;
     std::vector<SupervisedServiceConfig> services;

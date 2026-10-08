@@ -1,0 +1,7 @@
+{
+  "gate_id": "g5-collector",
+  "gate_sha256": "0a23076614b80b934b6afce4b154fc412a9b1f637d6b2f0f40c6b4f0d1c0a3e4",
+  "sealed_at": "2026-10-08T03:43:48Z",
+  "verifier": "scripts/plan_gate.py",
+  "verifier_sha256": "57dab9232d902db15a14d63a40540bfc844f24f541860d6cc1bdfbb8736da9c7"
+}

@@ -1,0 +1,186 @@
+{
+ "gate_id": "g4b-store-recount",
+ "runs": [
+  {
+   "id": "s1-store-unit",
+   "command": [
+    "./build/test_claude_usage_store"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "Errors (",
+    "Assertion failed",
+    "Segmentation fault"
+   ]
+  },
+  {
+   "id": "s2-fixture-recount",
+   "command": [
+    "./build/test_claude_recount",
+    "--root",
+    "test/fixtures/claude_projects",
+    "--versions",
+    "test/fixtures/price_versions.json",
+    "--out",
+    "build/g4b/fixture_cpp.jsonl"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "failed",
+    "rejected: "
+   ]
+  },
+  {
+   "id": "s3-fixture-compare",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+    "compare",
+    "--kind",
+    "usage",
+    "--cpp",
+    "build/g4b/fixture_cpp.jsonl",
+    "--root",
+    "test/fixtures/claude_projects",
+    "--versions",
+    "test/fixtures/price_versions.json",
+    "--records-out",
+    "build/g4b/fixture_records.jsonl"
+   ],
+   "expect_exit": 0,
+   "records": {
+    "min_count": 50,
+    "required_fields": [
+     "day",
+     "model",
+     "field",
+     "cpp",
+     "oracle"
+    ],
+    "match_pairs": [
+     [
+      "cpp",
+      "oracle"
+     ]
+    ],
+    "min_distinct": {
+     "day": 2,
+     "model": 5
+    }
+   }
+  },
+  {
+   "id": "s4-real-recount",
+   "command": [
+    "./build/test_claude_recount",
+    "--root",
+    "build/recount-snapshot",
+    "--versions",
+    "build/g4b/versions_real.json",
+    "--out",
+    "build/g4b/real_cpp.jsonl"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "failed"
+   ],
+   "identity": {
+    "snapshot_sha256": "c1634619e2767a0d2d8e0a40d26bbd9e93e98b3a2b797ecd8ab3487fd81e2445"
+   }
+  },
+  {
+   "id": "s5-real-compare",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+    "compare",
+    "--kind",
+    "usage",
+    "--cpp",
+    "build/g4b/real_cpp.jsonl",
+    "--root",
+    "build/recount-snapshot",
+    "--versions",
+    "build/g4b/versions_real.json",
+    "--records-out",
+    "build/g4b/real_records.jsonl"
+   ],
+   "expect_exit": 0,
+   "identity": {
+    "snapshot_sha256": "c1634619e2767a0d2d8e0a40d26bbd9e93e98b3a2b797ecd8ab3487fd81e2445"
+   },
+   "records": {
+    "min_count": 100,
+    "required_fields": [
+     "day",
+     "model",
+     "field",
+     "cpp",
+     "oracle"
+    ],
+    "match_pairs": [
+     [
+      "cpp",
+      "oracle"
+     ]
+    ],
+    "min_distinct": {
+     "day": 3,
+     "model": 3
+    }
+   }
+  },
+  {
+   "id": "s6-tamper-copy",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+    "tamper",
+    "--in",
+    "build/g4b/real_cpp.jsonl",
+    "--out",
+    "build/g4b/real_cpp_tampered.jsonl"
+   ],
+   "expect_exit": 0
+  },
+  {
+   "id": "s7-negative-control-tampered",
+   "command": [
+    "python3",
+    "-I",
+    "plan/plan_claude_usage_collector.artifacts/oracle/claude_oracle.py",
+    "compare",
+    "--kind",
+    "usage",
+    "--cpp",
+    "build/g4b/real_cpp_tampered.jsonl",
+    "--root",
+    "build/recount-snapshot",
+    "--versions",
+    "build/g4b/versions_real.json"
+   ],
+   "expect_exit": 1
+  },
+  {
+   "id": "s8-sanitized-suite",
+   "command": [
+    "make",
+    "test",
+    "SANITIZE=1"
+   ],
+   "expect_exit": 0,
+   "forbidden_output": [
+    "Errors (",
+    "Assertion failed",
+    "Segmentation fault",
+    "AddressSanitizer",
+    "LeakSanitizer",
+    "runtime error:",
+    "Falsifiable"
+   ]
+  }
+ ]
+}

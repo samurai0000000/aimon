@@ -14,6 +14,8 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <cstdio>
+#include <ctime>
 
 namespace aimon {
 
@@ -45,6 +47,7 @@ bool McpServer::isToolAllowedInProfile(const std::string& toolName, const std::s
     // Core AI quota and fleet supervisor tools are always accessible in all profiles
     if (toolName == "check_antigravity_quota" ||
         toolName == "check_cursor_usage" ||
+        toolName == "check_claude_usage" ||
         toolName == "get_combined_ai_status" ||
         toolName.rfind("service_", 0) == 0) {
         return true;
@@ -204,8 +207,17 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id, const std::s
     });
 
     toolsArray.push_back({
+        {"name", "check_claude_usage"},
+        {"description", "Returns estimated Claude Code usage and cost per account: tokens and est. cost over 5 hours, 7 days, the configured window and the billing cycle, per-model breakdown, plan tier, and price freshness. Figures are estimates at published list prices from local transcripts and can differ from the billing page."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", nlohmann::json::object()}
+        }}
+    });
+
+    toolsArray.push_back({
         {"name", "get_combined_ai_status"},
-        {"description", "Returns a comprehensive markdown summary of both Google Antigravity and Cursor AI quotas and limits."},
+        {"description", "Returns a comprehensive markdown summary of Google Antigravity, Cursor and Claude Code usage, quotas and limits."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", nlohmann::json::object()}
@@ -305,6 +317,8 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         contentText = formatAntigravityStatus(current.antigravity);
     } else if (toolName == "check_cursor_usage") {
         contentText = formatCursorStatus(current.cursor);
+    } else if (toolName == "check_claude_usage") {
+        contentText = formatClaudeStatus(current.claude);
     } else if (toolName == "get_combined_ai_status") {
         contentText = formatCombinedStatus(current);
     } else if (toolName == "service_list") {
@@ -567,6 +581,163 @@ std::string McpServer::formatCombinedStatus(const AggregateStatus& status) {
     ss << formatAntigravityStatus(status.antigravity);
     ss << "\n---\n\n";
     ss << formatCursorStatus(status.cursor);
+    ss << "\n---\n\n";
+    ss << formatClaudeStatus(status.claude);
+    return ss.str();
+}
+
+namespace {
+
+// Dollars from integer nano-dollars, rounded half up to the cent.
+std::string claudeUsd(int64_t nano) {
+    if (nano < 0) {
+        nano = 0;
+    }
+    const int64_t cents = (nano + 5000000) / 10000000;
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "$%lld.%02lld", static_cast<long long>(cents / 100),
+                  static_cast<long long>(cents % 100));
+    return buf;
+}
+
+std::string claudeTokens(int64_t n) {
+    char buf[48];
+    if (n < 1000) {
+        std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(n));
+    } else if (n < 1000000) {
+        std::snprintf(buf, sizeof(buf), "%.1fK", static_cast<double>(n) / 1e3);
+    } else if (n < 1000000000) {
+        std::snprintf(buf, sizeof(buf), "%.2fM", static_cast<double>(n) / 1e6);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%.2fB", static_cast<double>(n) / 1e9);
+    }
+    return buf;
+}
+
+// Names come from files and config; keep them from breaking markdown tables.
+std::string claudeMdSafe(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '|' || c == '`' || c == '\n' || c == '\r') {
+            out.push_back('_');
+        } else {
+            out.push_back(c);
+        }
+        if (out.size() >= 80) {
+            break;
+        }
+    }
+    return out;
+}
+
+std::string claudeUtc(int64_t epoch) {
+    time_t t = static_cast<time_t>(epoch);
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    char buf[48];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M UTC", &tmv);
+    return buf;
+}
+
+} // namespace
+
+std::string McpServer::formatClaudeStatus(const ClaudeStatus& cl) {
+    std::ostringstream ss;
+    ss << "### Claude Code Usage (estimated)\n\n";
+    if (!cl.enabled) {
+        ss << "Claude usage collection is disabled.\n";
+        return ss.str();
+    }
+    if (cl.accounts.empty()) {
+        ss << "No Claude accounts are configured.\n";
+        return ss.str();
+    }
+    ss << "_Estimates from Claude Code transcripts on this host at published list prices. "
+       << "All dollar figures are est. values, not invoices, and can differ from the billing page "
+       << "(price changes, other machines, other products)._\n";
+
+    for (const ClaudeAccountStatus& a : cl.accounts) {
+        const char* tierName = a.tier == ClaudeTier::Enterprise ? "Enterprise"
+                             : a.tier == ClaudeTier::Personal ? "Personal" : "Unknown tier";
+        const char* valueLabel = a.tier == ClaudeTier::Enterprise ? "Est. cost"
+                               : a.tier == ClaudeTier::Personal ? "Est. API-equivalent value" : "Est. value";
+        ss << "\n#### Account `" << claudeMdSafe(a.name) << "` \xE2\x80\x94 " << tierName;
+        if (!a.rawSubscriptionType.empty()) {
+            ss << " (" << claudeMdSafe(a.rawSubscriptionType);
+            if (!a.rawRateLimitTier.empty()) {
+                ss << " / " << claudeMdSafe(a.rawRateLimitTier);
+            }
+            ss << ")";
+        }
+        ss << "\n";
+
+        if (!a.hasData) {
+            ss << "- **Status**: no Claude Code usage found\n";
+        } else {
+            if (a.cycleConfigured) {
+                ss << "- **" << valueLabel << " this cycle**: " << claudeUsd(a.cycle.costNano);
+                if (a.spendLimitUsd > 0.0) {
+                    ss << " of $" << std::fixed << std::setprecision(2) << a.spendLimitUsd << " ("
+                       << std::setprecision(1) << a.estPctOfLimit << "%)";
+                }
+                ss << ", cycle resets " << a.cycleResetIso << "\n";
+            }
+            ss << "- **" << valueLabel << "**: " << claudeUsd(a.last5h.costNano) << " (5 h) \xC2\xB7 "
+               << claudeUsd(a.last7d.costNano) << " (7 d) \xC2\xB7 " << claudeUsd(a.window.costNano)
+               << " (" << a.windowDays << " d)\n";
+            ss << "- **Tokens**: " << claudeTokens(a.last5h.totalTokens()) << " (5 h) \xC2\xB7 "
+               << claudeTokens(a.last7d.totalTokens()) << " (7 d) \xC2\xB7 "
+               << claudeTokens(a.window.totalTokens()) << " (" << a.windowDays << " d)\n";
+            ss << "- **Messages (" << a.windowDays << " d)**: " << a.window.messages << "\n";
+
+            if (!a.models.empty()) {
+                ss << "\n| Model | Messages | Tokens | Est. cost |\n|---|---:|---:|---:|\n";
+                size_t shown = 0;
+                for (const ClaudeModelUsage& m : a.models) {
+                    if (++shown > 10) {
+                        break;
+                    }
+                    const int64_t tokens = m.input + m.output + m.cacheRead + m.cacheWrite5m + m.cacheWrite1h;
+                    ss << "| `" << claudeMdSafe(m.model) << "` | " << m.messages << " | " << claudeTokens(tokens)
+                       << " | " << claudeUsd(m.costNano) << " |\n";
+                }
+                ss << "\n";
+            }
+            if (!a.unpricedModels.empty()) {
+                ss << "- **Unpriced models**: ";
+                for (size_t i = 0; i < a.unpricedModels.size(); ++i) {
+                    ss << (i ? ", " : "") << "`" << claudeMdSafe(a.unpricedModels[i]) << "`";
+                }
+                ss << " (tokens counted, no cost)\n";
+            }
+        }
+        if (a.skippedLines > 0) {
+            ss << "- **Skipped**: " << a.skippedLines << " lines skipped (malformed or out of range)\n";
+        }
+        if (!a.errorMessage.empty()) {
+            ss << "- **Error**: " << claudeMdSafe(a.errorMessage) << "\n";
+        }
+        if (!a.warning.empty()) {
+            ss << "- **Warning**: " << claudeMdSafe(a.warning) << "\n";
+        }
+    }
+
+    ss << "\n- **Prices**: ";
+    if (cl.pricing.fetchedAtEpoch > 0) {
+        ss << cl.pricing.modelsLoaded << " models, as of " << claudeUtc(cl.pricing.fetchedAtEpoch);
+        if (cl.pricing.stale) {
+            ss << " \xE2\x80\x94 STALE (no successful fetch for over 3 refresh intervals)";
+        }
+        if (cl.pricing.quarantinedCount > 0) {
+            ss << "; " << cl.pricing.quarantinedCount << " models quarantined (left unpriced)";
+        }
+    } else {
+        ss << "none loaded";
+    }
+    ss << "\n";
+    if (!cl.pricing.error.empty()) {
+        ss << "- **Price fetch**: " << claudeMdSafe(cl.pricing.error) << "\n";
+    }
     return ss.str();
 }
 

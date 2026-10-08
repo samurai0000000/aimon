@@ -1,0 +1,7 @@
+{
+  "gate_id": "g3b-prices-live",
+  "gate_sha256": "c1a79a7acee6b2029a20a15f77001711b876212f16d736e36668a831ce1a4742",
+  "sealed_at": "2026-10-08T02:20:34Z",
+  "verifier": "scripts/plan_gate.py",
+  "verifier_sha256": "57dab9232d902db15a14d63a40540bfc844f24f541860d6cc1bdfbb8736da9c7"
+}

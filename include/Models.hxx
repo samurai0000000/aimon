@@ -215,10 +215,213 @@ struct CursorStatus {
     }
 };
 
+enum class ClaudeTier { Unknown, Enterprise, Personal };
+
+inline const char* claudeTierName(ClaudeTier tier) {
+    switch (tier) {
+    case ClaudeTier::Enterprise: return "enterprise";
+    case ClaudeTier::Personal: return "personal";
+    default: return "unknown";
+    }
+}
+
+inline double claudeNanoToUsd(int64_t nano) {
+    return static_cast<double>(nano) / 1e9;
+}
+
+struct ClaudeModelUsage {
+    std::string model;
+    int64_t messages = 0;
+    int64_t input = 0;
+    int64_t output = 0;
+    int64_t cacheRead = 0;
+    int64_t cacheWrite5m = 0;
+    int64_t cacheWrite1h = 0;
+    int64_t costNano = 0;
+    int64_t unpricedMessages = 0;
+
+    nlohmann::json toJson() const {
+        return {
+            {"model", model},
+            {"messages", messages},
+            {"input_tokens", input},
+            {"output_tokens", output},
+            {"cache_read_tokens", cacheRead},
+            {"cache_write_5m_tokens", cacheWrite5m},
+            {"cache_write_1h_tokens", cacheWrite1h},
+            {"est_cost_nano", costNano},
+            {"est_cost_usd", claudeNanoToUsd(costNano)},
+            {"unpriced_messages", unpricedMessages}
+        };
+    }
+};
+
+struct ClaudeWindowTotals {
+    std::string label;
+    int64_t fromEpoch = 0;
+    int64_t toEpoch = 0;
+    int64_t messages = 0;
+    int64_t input = 0;
+    int64_t output = 0;
+    int64_t cacheRead = 0;
+    int64_t cacheWrite5m = 0;
+    int64_t cacheWrite1h = 0;
+    int64_t costNano = 0;
+    int64_t unpricedMessages = 0;
+    bool costOverflow = false;
+
+    int64_t totalTokens() const {
+        return input + output + cacheRead + cacheWrite5m + cacheWrite1h;
+    }
+
+    nlohmann::json toJson() const {
+        return {
+            {"label", label},
+            {"from_epoch", fromEpoch},
+            {"to_epoch", toEpoch},
+            {"messages", messages},
+            {"input_tokens", input},
+            {"output_tokens", output},
+            {"cache_read_tokens", cacheRead},
+            {"cache_write_5m_tokens", cacheWrite5m},
+            {"cache_write_1h_tokens", cacheWrite1h},
+            {"total_tokens", totalTokens()},
+            {"est_cost_nano", costNano},
+            {"est_cost_usd", claudeNanoToUsd(costNano)},
+            {"unpriced_messages", unpricedMessages},
+            {"cost_overflow", costOverflow}
+        };
+    }
+};
+
+struct ClaudeDailyPoint {
+    std::string dayStr;
+    int64_t dayMs = 0;
+    int64_t messages = 0;
+    int64_t tokens = 0;
+    int64_t costNano = 0;
+
+    nlohmann::json toJson() const {
+        return {
+            {"day_str", dayStr},
+            {"day_ms", dayMs},
+            {"messages", messages},
+            {"tokens", tokens},
+            {"est_cost_nano", costNano},
+            {"est_cost_usd", claudeNanoToUsd(costNano)}
+        };
+    }
+};
+
+struct ClaudePricingStatus {
+    std::string sourceUrl;
+    int64_t fetchedAtEpoch = 0;
+    bool stale = true;
+    size_t modelsLoaded = 0;
+    size_t quarantinedCount = 0;
+    size_t versionCount = 0;
+    std::string error;
+
+    nlohmann::json toJson() const {
+        return {
+            {"source_url", sourceUrl},
+            {"fetched_at_epoch", fetchedAtEpoch},
+            {"stale", stale},
+            {"models_loaded", modelsLoaded},
+            {"quarantined_count", quarantinedCount},
+            {"version_count", versionCount},
+            {"error", error}
+        };
+    }
+};
+
+struct ClaudeAccountStatus {
+    std::string name;
+    ClaudeTier tier = ClaudeTier::Unknown;
+    std::string rawSubscriptionType;
+    std::string rawRateLimitTier;
+    bool hasData = false;
+    std::string errorMessage;
+    std::string warning;
+    int windowDays = 30;
+    ClaudeWindowTotals last5h;
+    ClaudeWindowTotals last7d;
+    ClaudeWindowTotals window;
+    ClaudeWindowTotals today;
+    bool cycleConfigured = false;
+    ClaudeWindowTotals cycle;
+    double spendLimitUsd = 0.0;
+    double estPctOfLimit = 0.0;
+    std::string cycleResetIso;
+    std::vector<ClaudeModelUsage> models;
+    std::vector<ClaudeDailyPoint> daily;
+    std::vector<std::string> unpricedModels;
+    int64_t skippedLines = 0;
+    int64_t filesScanned = 0;
+    int64_t bytesReadLastPoll = 0;
+    int64_t rowsInStore = 0;
+
+    nlohmann::json toJson() const {
+        nlohmann::json modelsArr = nlohmann::json::array();
+        for (const auto& m : models) {
+            modelsArr.push_back(m.toJson());
+        }
+        nlohmann::json dailyArr = nlohmann::json::array();
+        for (const auto& d : daily) {
+            dailyArr.push_back(d.toJson());
+        }
+        return {
+            {"name", name},
+            {"tier", claudeTierName(tier)},
+            {"raw_subscription_type", rawSubscriptionType},
+            {"raw_rate_limit_tier", rawRateLimitTier},
+            {"has_data", hasData},
+            {"error_message", errorMessage},
+            {"warning", warning},
+            {"window_days", windowDays},
+            {"last_5h", last5h.toJson()},
+            {"last_7d", last7d.toJson()},
+            {"window", window.toJson()},
+            {"today", today.toJson()},
+            {"cycle_configured", cycleConfigured},
+            {"cycle", cycle.toJson()},
+            {"spend_limit_usd", spendLimitUsd},
+            {"est_pct_of_limit", estPctOfLimit},
+            {"cycle_reset_iso", cycleResetIso},
+            {"models", modelsArr},
+            {"daily", dailyArr},
+            {"unpriced_models", unpricedModels},
+            {"skipped_lines", skippedLines},
+            {"files_scanned", filesScanned},
+            {"bytes_read_last_poll", bytesReadLastPoll},
+            {"rows_in_store", rowsInStore}
+        };
+    }
+};
+
+struct ClaudeStatus {
+    bool enabled = false;
+    ClaudePricingStatus pricing;
+    std::vector<ClaudeAccountStatus> accounts;
+
+    nlohmann::json toJson() const {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& a : accounts) {
+            arr.push_back(a.toJson());
+        }
+        return {
+            {"enabled", enabled},
+            {"pricing", pricing.toJson()},
+            {"accounts", arr}
+        };
+    }
+};
+
 struct AggregateStatus {
     std::chrono::system_clock::time_point lastUpdated;
     AntigravityStatus antigravity;
     CursorStatus cursor;
+    ClaudeStatus claude;
 
     nlohmann::json toJson() const {
         auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -230,7 +433,8 @@ struct AggregateStatus {
             {"server_timestamp_ms", nowMs},
             {"last_updated_epoch", epoch},
             {"antigravity", antigravity.toJson()},
-            {"cursor", cursor.toJson()}
+            {"cursor", cursor.toJson()},
+            {"claude", claude.toJson()}
         };
     }
 };

@@ -9,6 +9,7 @@
 #include <vector>
 #include <atomic>
 #include <csignal>
+#include <ctime>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -20,6 +21,9 @@
 #include "HistoryStore.hxx"
 #include "AntigravityCollector.hxx"
 #include "CursorCollector.hxx"
+#include "ClaudeCollector.hxx"
+#include "ClaudeUsageStore.hxx"
+#include "PriceCatalog.hxx"
 #include "McpServer.hxx"
 #include "MqttPublisher.hxx"
 #include "WebServer.hxx"
@@ -221,6 +225,29 @@ int main(int argc, char* argv[]) {
     if (cfg.history.enabled) {
         crCollector.setHistoryStore(&historyStore);
     }
+
+    // Claude Code usage: the daemon reads the local transcripts itself. Declared
+    // before the poller thread and destroyed after it (the collector joins its
+    // price refresh thread in its destructor).
+    ClaudeUsageStore claudeStore;
+    std::unique_ptr<PriceCatalog> claudePrices;
+    std::unique_ptr<ClaudeCollector> claudeCollector;
+    if (cfg.claude.enabled) {
+        std::string claudeError;
+        if (!cfg.claude.validate(claudeError)) {
+            std::cerr << "[aimon] Claude collector disabled: " << claudeError << std::endl;
+        } else if (!claudeStore.open(cfg.history.dbPath)) {
+            std::cerr << "[aimon] Claude collector disabled: cannot open " << cfg.history.dbPath << std::endl;
+        } else {
+            claudePrices = std::make_unique<PriceCatalog>(
+                PathUtils::getAimonConfigDir() + "/claude_prices.json",
+                cfg.claude.pricingUrl.empty() ? std::string(PriceCatalog::kDefaultUrl) : cfg.claude.pricingUrl,
+                PriceCatalog::httpFetcher());
+            claudePrices->loadCache();
+            claudeCollector = std::make_unique<ClaudeCollector>(cfg.claude, claudeStore, *claudePrices);
+            claudeCollector->startPriceRefresh();
+        }
+    }
     std::unique_ptr<MqttPublisher> mqttPublisher;
 
     if (cfg.mqtt.enabled) {
@@ -231,10 +258,15 @@ int main(int argc, char* argv[]) {
     auto pollOnce = [&]() {
         AntigravityStatus ag = agCollector.fetchStatus();
         CursorStatus cr = crCollector.fetchStatus();
+        ClaudeStatus cl;
+        if (claudeCollector) {
+            cl = claudeCollector->fetchStatus(static_cast<int64_t>(std::time(nullptr)));
+        }
 
         AggregateStatus status;
         status.antigravity = ag;
         status.cursor = cr;
+        status.claude = cl;
         status.lastUpdated = std::chrono::system_clock::now();
 
         stateStore.update(status);
