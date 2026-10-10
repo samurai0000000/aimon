@@ -235,7 +235,7 @@ bool AgentTelemetryDb::initSchema() {
         "  session_id AS conversation_id, "
         "  agent_type, "
         "  COALESCE(json_extract(details_json, '$.workspace'), '') AS workspace_path, "
-        "  CASE WHEN agent_type = 'cursor' THEN 'Cursor' ELSE 'Agent' END AS model_name, "
+        "  CASE WHEN agent_type = 'cursor' THEN 'Cursor' WHEN agent_type = 'claude' THEN 'Claude' ELSE 'Agent' END AS model_name, "
         "  MIN(timestamp) AS start_timestamp, "
         "  MAX(timestamp) AS end_timestamp, "
         "  'COMPLETED' AS status, "
@@ -857,6 +857,7 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
         b["timestamp"] = bTs;
         b["antigravity_active"] = 0;
         b["cursor_active"] = 0;
+        b["claude_active"] = 0;
         b["active_agents"] = 0;
         b["tool_calls"] = 0;
         bucketMap[bTs] = b;
@@ -891,6 +892,8 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
             if (bucketMap.find(bTs) != bucketMap.end()) {
                 if (aType.find("cursor") != std::string::npos) {
                     bucketMap[bTs]["cursor_active"] = bucketMap[bTs]["cursor_active"].get<int>() + activeCount;
+                } else if (aType.find("claude") != std::string::npos) {
+                    bucketMap[bTs]["claude_active"] = bucketMap[bTs]["claude_active"].get<int>() + activeCount;
                 } else {
                     bucketMap[bTs]["antigravity_active"] = bucketMap[bTs]["antigravity_active"].get<int>() + activeCount;
                 }
@@ -914,6 +917,10 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
                     if (bucketMap[currentBucketTs]["cursor_active"].get<int>() == 0) {
                         bucketMap[currentBucketTs]["cursor_active"] = 1;
                     }
+                } else if (aType.find("claude") != std::string::npos) {
+                    if (bucketMap[currentBucketTs]["claude_active"].get<int>() == 0) {
+                        bucketMap[currentBucketTs]["claude_active"] = 1;
+                    }
                 } else {
                     if (bucketMap[currentBucketTs]["antigravity_active"].get<int>() == 0) {
                         bucketMap[currentBucketTs]["antigravity_active"] = 1;
@@ -929,7 +936,8 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
     for (auto &pair : bucketMap) {
         int agy = pair.second["antigravity_active"].get<int>();
         int cur = pair.second["cursor_active"].get<int>();
-        int active = agy + cur;
+        int cla = pair.second["claude_active"].get<int>();
+        int active = agy + cur + cla;
         pair.second["active_agents"] = active;
         if (active > peakConcurrency) peakConcurrency = active;
         if (active > 0) totalActiveSec += bucketWidth;

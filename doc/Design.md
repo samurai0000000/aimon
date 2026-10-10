@@ -315,6 +315,7 @@ To prevent agent context pollution and minimize token consumption across diverse
 | `embedded` | Target boardbringup (`boards`, `embdevenv`) | Core tools + all `embdevenv_*` tools (19 tools total) |
 | `network` | Network diagnostics & firewall (`netmon`, `network`) | Core tools + `firewall_*`, `lan_*`, `snmp_*` |
 | `mesh` | LoRa RF telemetry (`meshmon`) | Core tools + `meshmon_*` tools |
+| `mail` | Mail access via `alpine-mcp` | Core tools + `mail_*` tools |
 | `all` | Full gateway administrator | Complete catalog across all connected satellites |
 
 ### Profile Selection Mechanisms
@@ -339,6 +340,10 @@ All AI agents in the ecosystem must interact with `aimon` exclusively through th
 ## 8. Rolling Agent Telemetry Database Subsystem (`AgentTelemetryDb`)
 
 To provide deep observability into agent cognitive cycles, execution durations, and resource consumption without relying on third-party cloud analytics, `aimon` includes an integrated, local-first rolling time-series engine modeled after the proven `SnmpDatabase` architecture in `netmon`.
+
+### 8.0 Event Sources
+
+Events arrive on `POST /api/telemetry/event` from lifecycle hooks. `agent_type` is free text; the dashboard knows three values: `antigravity`, `cursor` and `claude` (any other value is grouped with Antigravity). The concurrency chart (`queryActivityTimeline`) keeps one series per type: `antigravity_active`, `cursor_active` and `claude_active`. Claude Code hooks send no token counts; its tokens and estimated cost come from the Claude usage collector instead (see Setup Step 6.5).
 
 ### 8.1 SQLite WAL Schema & Storage Engine
 `AgentTelemetryDb` stores data in SQLite with Write-Ahead Logging (`WAL`) enabled, dynamic downsampling, and automated retention pruning:
@@ -432,7 +437,7 @@ Autonomous agent tasks frequently stall when sensitive tools (`run_command`, `wr
 The `aimon` dashboard (`web/index.html`, `web/app.js`, `web/style.css`, `include/WebAssets.hxx`) provides a multi-tab single-page interface:
 
 1. **AI Quotas (`#view-aimon`)**: Untouched front page displaying Google Antigravity quotas, credit allowances, and Cursor Fast Request usage.
-2. **Agent Telemetry & Analytics (`#view-telemetry`)**: Interactive SVG/Canvas charts for Token Velocity, Turn Latency & P95 Distribution, Tool Invocation Matrices, and Session Waterfalls with timeframe selectors (`1H`, `24H`, `7D`, `30D`, `1Y`).
+2. **Agent Telemetry & Analytics (`#view-telemetry`)**: Fed by lifecycle hooks from Antigravity, Cursor and Claude Code (see section 8.0). Interactive SVG/Canvas charts for Token Velocity, Turn Latency & P95 Distribution, Tool Invocation Matrices, and Session Waterfalls with timeframe selectors (`1H`, `24H`, `7D`, `30D`, `1Y`).
 3. **Action Approvals (`#view-approvals`)**: Live pending approval actions, 128-bit mobile pairing QR interface, and paired device management.
 4. **Dynamic Satellite Panels (`#panel-<id>`)**: Seamless embedded iframe monitors for connected subsystems (`netmon`, `meshmon`, `embdevenv`).
 
