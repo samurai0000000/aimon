@@ -71,6 +71,10 @@ bool McpServer::isToolAllowedInProfile(const std::string& toolName, const std::s
         return (toolName.rfind("meshmon_", 0) == 0);
     }
 
+    if (profile == "mail") {
+        return (toolName.rfind("mail_", 0) == 0);
+    }
+
     return true;
 }
 

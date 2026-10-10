@@ -258,7 +258,7 @@ The assistant will invoke `get_combined_ai_status` and return a clean markdown t
 
 ## Step 6: Agent Telemetry Hooks (Optional)
 
-The **Agent Telemetry** tab (`http://<aimon-host>:3883/#telemetry`) charts sessions, turns, tool calls, error rates, and tool latency. Both IDEs can feed it through lifecycle hooks that post events to `aimon`.
+The **Agent Telemetry** tab (`http://<aimon-host>:3883/#telemetry`) charts sessions, turns, tool calls, error rates, and tool latency. Cursor, Antigravity and Claude Code can feed it through lifecycle hooks that post events to `aimon`.
 
 These hooks are **statistics only**. They never ask for approval, never block a tool, and never wait on a phone or dashboard. If `aimon` is down, the hook drops the event and the agent continues.
 
@@ -291,7 +291,7 @@ POST http://<aimon-host>:3883/api/telemetry/event
 Content-Type: application/json
 ```
 
-Every event carries `event_type`, `session_id`, `agent_type` (`cursor` or `antigravity`), and a Unix `timestamp` in seconds.
+Every event carries `event_type`, `session_id`, `agent_type` (`cursor`, `antigravity` or `claude`), and a Unix `timestamp` in seconds.
 
 **Session start** creates the session row:
 
@@ -454,7 +454,48 @@ How this differs from Cursor:
 
 Reload Antigravity after creating the file (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> → `Developer: Reload Window`).
 
-### 6.5 Verifying Telemetry
+### 6.5 Claude Code: `~/.claude/settings.json`
+
+Claude Code has its own reporter, separate from the Cursor and Antigravity script, because its payloads differ (`session_id`, PascalCase event names such as `PostToolUse`). Place it at:
+
+```text
+~/.claude/hooks/aimon_telemetry.py
+```
+
+It follows the rules in Step 6.1: statistics only (it never forwards `tool_input`, `tool_response`, prompt text or assistant text), a short HTTP timeout, and it always prints `{}` and exits `0`. It posts `agent_type: "claude"`.
+
+| Claude Code event | aimon event |
+| :--- | :--- |
+| `SessionStart` | `SESSION_START` (`cwd` becomes the workspace; `model` when Claude Code supplies it) |
+| `UserPromptSubmit` | none; marks the start of a turn for latency |
+| `PostToolUse` | `TOOL_CALL`, status `OK`, `duration_ms` when supplied |
+| `PostToolUseFailure` | `TOOL_CALL`, status `ERROR` |
+| `Stop` | `USER_TURN` and a `SESSION_END` with status `RUNNING` (live totals) |
+| `SessionEnd` | `SESSION_END`, status `COMPLETED` |
+
+Register it in the user-level settings file so every project reports. User-level hooks merge with a project's own hooks and run alongside them, so a project's `.claude/settings.json` does not need to change:
+
+```json
+{
+  "hooks": {
+    "SessionStart":       [ { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/hooks/aimon_telemetry.py\"", "timeout": 2 } ] } ],
+    "UserPromptSubmit":   [ { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/hooks/aimon_telemetry.py\"", "timeout": 2 } ] } ],
+    "PostToolUse":        [ { "matcher": "*", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/hooks/aimon_telemetry.py\"", "timeout": 2 } ] } ],
+    "PostToolUseFailure": [ { "matcher": "*", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/hooks/aimon_telemetry.py\"", "timeout": 2 } ] } ],
+    "Stop":               [ { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/hooks/aimon_telemetry.py\"", "timeout": 2 } ] } ],
+    "SessionEnd":         [ { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/hooks/aimon_telemetry.py\"", "timeout": 2 } ] } ]
+  }
+}
+```
+
+Notes:
+- Do not register a reporter on `PreToolUse`. Exit code `2` on `Stop` stops Claude from finishing, which is why the reporter never uses it.
+- `SessionEnd` has a short default budget (1.5 seconds), so keep an explicit `timeout` on it.
+- Claude Code hook payloads carry no token counts. Tokens and estimated cost reach aimon through the Claude usage collector (the Quotas tab and the `check_claude_usage` tool), so the token columns in the Agent Telemetry tab stay `0` for Claude sessions.
+- Set `AIMON_ENDPOINT=http://<aimon-host>:3883` to report to another host. Set `AIMON_WORKSPACE=basename` to send only the last path component of the working directory instead of the full path.
+- Claude Code loads hooks when a session starts. Start a new session after editing the settings file.
+
+### 6.6 Verifying Telemetry
 
 Send a hand-made tool event from a shell. This mimics a Cursor tool event and should print `{}`:
 
@@ -470,7 +511,15 @@ curl -s http://<aimon-host>:3883/api/telemetry/tools | jq .
 curl -s "http://<aimon-host>:3883/api/telemetry/session_events?sessionId=telemetry-selfcheck" | jq .
 ```
 
-Finally, run one real prompt in each IDE and open the **Agent Telemetry** tab. A new session should appear with its tool calls counted.
+For Claude Code, send a hand-made event the same way. It should print `{}`:
+
+```bash
+printf '%s' '{"hook_event_name":"PostToolUse","session_id":"telemetry-selfcheck-claude","tool_name":"Bash","tool_use_id":"t1","duration_ms":42}' \
+  | python3 ~/.claude/hooks/aimon_telemetry.py
+curl -s "http://<aimon-host>:3883/api/telemetry/session_events?sessionId=telemetry-selfcheck-claude" | jq .
+```
+
+Finally, run one real prompt in each IDE and in Claude Code, and open the **Agent Telemetry** tab. A new session should appear with its tool calls counted. The concurrency chart shows Claude Code as its own amber series.
 
 ---
 
@@ -521,6 +570,7 @@ Finally, run one real prompt in each IDE and open the **Agent Telemetry** tab. A
 | **Authentication Source** | Browser cookie `WorkosCursorSessionToken` or local `state.vscdb` | Auto-discovered `--csrf_token` from language server process |
 | **Telemetry Hooks File** | `~/.cursor/hooks.json` | `~/.gemini/config/hooks.json` |
 | **Telemetry Hook Events** | `sessionStart`, `postToolUse`, `postToolUseFailure`, `stop`, `sessionEnd` | `PostToolUse` (matcher `""`), `PreInvocation`, `Stop` |
+| **Telemetry Hooks (Claude Code)** | `~/.claude/settings.json`: `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SessionEnd` (see Step 6.5) | |
 | **Payload Key Style** | snake_case (`conversation_id`, `tool_name`) | camelCase (`conversationId`, `toolCall.name`) |
 
 ---
@@ -537,7 +587,7 @@ Finally, run one real prompt in each IDE and open the **Agent Telemetry** tab. A
 
 #### Q: The Agent Telemetry tab shows no new sessions.
 - **Cause**: The hooks file is not loaded, the reporter cannot reach `aimon`, or the reporter exits with an error.
-- **Fix**: Run the self-check in Step 6.5. If it prints `{}` but nothing is stored, check `AIMON_ENDPOINT` and that port 3883 is reachable. For Cursor, open the **Hooks** output channel. For Antigravity, reload the window after editing `hooks.json`.
+- **Fix**: Run the self-check in Step 6.6. If it prints `{}` but nothing is stored, check `AIMON_ENDPOINT` and that port 3883 is reachable. For Cursor, open the **Hooks** output channel. For Antigravity, reload the window after editing `hooks.json`. For Claude Code, start a new session after editing `~/.claude/settings.json` and run `/hooks` to confirm the hooks are listed.
 
 #### Q: Tools are waiting on a phone or dashboard approval.
 - **Cause**: An approval hook is registered on `preToolUse` / `PreToolUse`, or with `failClosed: true`.

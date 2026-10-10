@@ -96,6 +96,18 @@ TEST_GROUP(SupervisorMcp_Unit) {
     }
 };
 
+TEST(SupervisorMcp_Unit, MailProfileAllowsMailAndCoreToolsOnly) {
+    CHECK_TRUE(McpServer::isToolAllowedInProfile("mail_search", "mail"));
+    CHECK_TRUE(McpServer::isToolAllowedInProfile("mail_send", "mail"));
+    CHECK_TRUE(McpServer::isToolAllowedInProfile("service_list", "mail"));
+    CHECK_TRUE(McpServer::isToolAllowedInProfile("check_claude_usage", "mail"));
+    CHECK_FALSE(McpServer::isToolAllowedInProfile("firewall_block_ip", "mail"));
+    CHECK_FALSE(McpServer::isToolAllowedInProfile("meshmon_send_message", "mail"));
+    CHECK_FALSE(McpServer::isToolAllowedInProfile("embdevenv_mcu_power", "mail"));
+    CHECK_FALSE(McpServer::isToolAllowedInProfile("mail_search", "core"));
+    CHECK_FALSE(McpServer::isToolAllowedInProfile("mail_search", "embedded"));
+}
+
 TEST(SupervisorMcp_Unit, ToolsListIncludesSupervisorTools) {
     json req = {
         {"jsonrpc", "2.0"},

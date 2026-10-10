@@ -165,10 +165,59 @@ static void testPercentileAndRollup() {
     std::cout << "[TestAgentTelemetryDb] testPercentileAndRollup passed!" << std::endl;
 }
 
+static void testClaudeSeriesIsSeparate() {
+    std::cout << "[TestAgentTelemetryDb] Running testClaudeSeriesIsSeparate..." << std::endl;
+    std::string testDbPath = "/tmp/test_aimon_telemetry_claude.db";
+    if (fs::exists(testDbPath)) {
+        fs::remove(testDbPath);
+    }
+
+    auto &db = AgentTelemetryDb::getInstance();
+    assert(db.open(testDbPath));
+
+    int64_t now = static_cast<int64_t>(time(nullptr));
+    assert(db.recordSessionStart("claude-sess-1", "claude-sess-1", "claude", "/workspace/a", "claude-sonnet-5-5", now - 1000));
+    assert(db.recordSessionStart("agy-sess-1", "agy-sess-1", "antigravity", "/workspace/b", "Antigravity", now - 1000));
+
+    AgentLifecycleEvent claudeTool;
+    claudeTool.timestamp = now - 900;
+    claudeTool.sessionId = "claude-sess-1";
+    claudeTool.agentType = "claude";
+    claudeTool.eventType = "TOOL_CALL";
+    claudeTool.stepIndex = 1;
+    claudeTool.toolName = "Bash";
+    claudeTool.durationMs = 12.0;
+    claudeTool.status = "OK";
+    assert(db.insertEvent(claudeTool));
+
+    AgentLifecycleEvent agyTool = claudeTool;
+    agyTool.sessionId = "agy-sess-1";
+    agyTool.agentType = "antigravity";
+    assert(db.insertEvent(agyTool));
+
+    auto timeline = db.queryActivityTimeline("1h", 50);
+    int claudeActive = 0;
+    int agyActive = 0;
+    int peak = 0;
+    for (const auto &b : timeline["buckets"]) {
+        claudeActive += b["claude_active"].get<int>();
+        agyActive += b["antigravity_active"].get<int>();
+        peak = std::max(peak, b["active_agents"].get<int>());
+    }
+    // The Claude session must be counted under its own series and not as Antigravity.
+    assert(claudeActive >= 1);
+    assert(agyActive >= 1);
+    assert(peak >= 2);
+    std::cout << "[TestAgentTelemetryDb] testClaudeSeriesIsSeparate passed (claude=" << claudeActive
+              << " antigravity=" << agyActive << " peak=" << peak << ")" << std::endl;
+    db.close();
+}
+
 int main() {
     std::cout << "=== Starting TestAgentTelemetryDb ===" << std::endl;
     testBasicOperations();
     testPercentileAndRollup();
+    testClaudeSeriesIsSeparate();
     std::cout << "=== TestAgentTelemetryDb: ALL TESTS PASSED ===" << std::endl;
     return 0;
 }

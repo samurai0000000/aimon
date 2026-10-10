@@ -1721,7 +1721,7 @@ function renderAgentBusynessStack(svgId, data) {
 
     let maxAgents = 1;
     buckets.forEach(b => {
-        const total = (b.antigravity_active || 0) + (b.cursor_active || 0);
+        const total = (b.antigravity_active || 0) + (b.cursor_active || 0) + (b.claude_active || 0);
         if (total > maxAgents) maxAgents = total;
     });
     maxAgents = Math.max(2, maxAgents);
@@ -1746,19 +1746,25 @@ function renderAgentBusynessStack(svgId, data) {
         const x = padL + idx * barSlotW + (barSlotW - barW) / 2;
         const agy = b.antigravity_active || 0;
         const cur = b.cursor_active || 0;
+        const cla = b.claude_active || 0;
         const tools = b.tool_calls || 0;
 
         const hAgy = (agy / maxAgents) * plotH;
         const hCur = (cur / maxAgents) * plotH;
+        const hCla = (cla / maxAgents) * plotH;
 
         const yAgy = padT + plotH - hAgy;
         const yCur = yAgy - hCur;
+        const yCla = yCur - hCla;
 
         if (hAgy > 0) {
             barsSvg += `<rect x="${x}" y="${yAgy}" width="${barW}" height="${hAgy}" rx="2" fill="#38bdf8" fill-opacity="0.8" />`;
         }
         if (hCur > 0) {
             barsSvg += `<rect x="${x}" y="${yCur}" width="${barW}" height="${hCur}" rx="2" fill="#a855f7" fill-opacity="0.8" />`;
+        }
+        if (hCla > 0) {
+            barsSvg += `<rect x="${x}" y="${yCla}" width="${barW}" height="${hCla}" rx="2" fill="#f59e0b" fill-opacity="0.8" />`;
         }
 
         if (idx % Math.max(1, Math.floor(buckets.length / 6)) === 0) {
@@ -1774,7 +1780,8 @@ function renderAgentBusynessStack(svgId, data) {
             timestamp: b.timestamp,
             antigravity: agy,
             cursor: cur,
-            total: agy + cur,
+            claude: cla,
+            total: agy + cur + cla,
             tools: tools
         });
     });
@@ -1784,10 +1791,11 @@ function renderAgentBusynessStack(svgId, data) {
         ${xTicksSvg}
         ${barsSvg}
         <g id="busy-tip-${svgId}" style="display: none; pointer-events: none;">
-            <rect id="busy-tip-bg-${svgId}" width="165" height="50" rx="6" fill="rgba(10, 14, 23, 0.95)" stroke="rgba(255, 255, 255, 0.2)" stroke-width="1" />
+            <rect id="busy-tip-bg-${svgId}" width="165" height="64" rx="6" fill="rgba(10, 14, 23, 0.95)" stroke="rgba(255, 255, 255, 0.2)" stroke-width="1" />
             <text id="busy-tip-time-${svgId}" x="0" y="0" fill="#9ca3af" font-size="9" font-family="monospace"></text>
             <text id="busy-tip-val1-${svgId}" x="0" y="0" fill="#38bdf8" font-size="9.5" font-family="monospace" font-weight="bold"></text>
             <text id="busy-tip-val2-${svgId}" x="0" y="0" fill="#a855f7" font-size="9.5" font-family="monospace" font-weight="bold"></text>
+            <text id="busy-tip-val3-${svgId}" x="0" y="0" fill="#f59e0b" font-size="9.5" font-family="monospace" font-weight="bold"></text>
         </g>
     `;
 
@@ -1796,6 +1804,7 @@ function renderAgentBusynessStack(svgId, data) {
     const tipTime = svg.querySelector(`#busy-tip-time-${svgId}`);
     const tipVal1 = svg.querySelector(`#busy-tip-val1-${svgId}`);
     const tipVal2 = svg.querySelector(`#busy-tip-val2-${svgId}`);
+    const tipVal3 = svg.querySelector(`#busy-tip-val3-${svgId}`);
 
     svg.querySelectorAll('.busyness-bar-hitbox').forEach(el => {
         el.addEventListener('mousemove', () => {
@@ -1806,6 +1815,7 @@ function renderAgentBusynessStack(svgId, data) {
             tipTime.textContent = `Time: ${formatFullDateTime(item.timestamp)}`;
             tipVal1.textContent = `Antigravity: ${item.antigravity} active (${item.tools} tools)`;
             tipVal2.textContent = `Cursor: ${item.cursor} active`;
+            tipVal3.textContent = `Claude: ${item.claude} active`;
 
             let tipX = item.x + 10;
             if (tipX + 170 > width - padR) tipX = item.x - 175;
@@ -1819,6 +1829,8 @@ function renderAgentBusynessStack(svgId, data) {
             tipVal1.setAttribute('y', tipY + 28);
             tipVal2.setAttribute('x', tipX + 8);
             tipVal2.setAttribute('y', tipY + 42);
+            tipVal3.setAttribute('x', tipX + 8);
+            tipVal3.setAttribute('y', tipY + 56);
 
             tipG.style.display = 'block';
         });

@@ -71,7 +71,7 @@ static void printUsage(const char* progName) {
               << "  mcp                    Run as stdio JSON-RPC 2.0 MCP server for AI agents\n\n"
               << "Options:\n"
               << "  --config <path>        Custom path to configuration file (default: ~/.config/aimon/config.json)\n"
-              << "  --profile <profile>    Default MCP tool profile (core, embedded, network, mesh, all)\n"
+              << "  --profile <profile>    Default MCP tool profile (core, embedded, network, mesh, mail, all)\n"
               << "  --host <host>          Host interface for web dashboard (default: 0.0.0.0)\n"
               << "  --port <port>          Port for web dashboard (default: 3883)\n"
               << "  --mqtt-enable          Enable MQTT publishing to Home Assistant\n"

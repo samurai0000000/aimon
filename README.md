@@ -16,6 +16,7 @@ It is designed specifically for developers who work remotely or off-network and 
   - Claude Code: Reads Claude Code's own local transcripts and reports **estimated** tokens and cost per account, with prices fetched from Anthropic's published pricing page (never embedded).
 - **Modern Embedded Web Dashboard**: Built-in HTTP server serving a rich, dark-mode single-page interface with live gauges and countdown timers.
 - **Home Assistant (MQTT)**: Built-in MQTT publisher with Home Assistant Auto-Discovery and ready-to-import Lovelace view cards.
+- **Agent Telemetry Tab (optional hooks)**: Cursor, Antigravity and Claude Code lifecycle hooks post statistics only (session, turn, tool name, duration, status) to the local daemon. See `doc/Setup.md` Step 6.
 - **Privacy & Security First**: All credential access stays strictly local on your machine. No telemetry, third-party relays, or external logging.
 
 ---
@@ -140,6 +141,7 @@ To prevent token exhaustion and eliminate irrelevant context in specialized work
 | `embedded` | Embedded hardware development (`boards`, `embdevenv`) | Core + all `embdevenv_*` tools (19 tools) |
 | `network` | Network monitoring & security (`netmon`, `network`) | Core + `firewall_*`, `lan_*`, `snmp_*` tools (19 tools) |
 | `mesh` | LoRa wireless mesh networking (`meshmon`) | Core + all `meshmon_*` tools (9 tools) |
+| `mail` | Mail access through `alpine-mcp` | Core + all `mail_*` tools (10 tools) |
 | `all` | Full administrative & gateway access | Full unified catalog across all satellites (48+ tools) |
 
 `aimon` detects profiles automatically from workspace folder names during MCP client initialization (e.g. `boards` -> `embedded`), or you can explicitly select a profile via URL query parameter:
