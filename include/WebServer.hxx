@@ -30,7 +30,6 @@ namespace aimon {
 
 class McpServer;
 class TcpGateway;
-class ServiceSupervisor;
 class InsightEngine;
 
 struct SseSession {
@@ -56,10 +55,6 @@ public:
     void stop();
     void broadcastSseNotification(const std::string& jsonRpcNotification);
 
-    void setServiceSupervisor(ServiceSupervisor* supervisor) {
-        _serviceSupervisor = supervisor;
-    }
-
     void setInsightEngine(InsightEngine* engine) {
         _insightEngine = engine;
     }
@@ -81,7 +76,6 @@ private:
     RefreshCallback _onRefresh;
     McpServer* _mcpServer = nullptr;
     TcpGateway* _tcpGateway = nullptr;
-    ServiceSupervisor* _serviceSupervisor = nullptr;
     InsightEngine* _insightEngine = nullptr;
 
     bool _endpointsEnabled = false;

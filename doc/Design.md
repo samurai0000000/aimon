@@ -289,7 +289,6 @@ All services typically run as systemd daemons or inside persistent terminal mult
 | `export_usage_dataset` | **Analytics** | Exports the normalized `insights.db` tables (`sqlite`, `csv`, or `jsonl` with `0600` permissions and optional `--anonymize` project hashing) for offline or agent-driven SQL analysis. |
 | `describe_usage_dataset` | **Analytics** | Returns the `insights.db` table schemas, privacy guarantees, and sample SQL queries. |
 | `compare_experiment` | **Coaching** | Compares a detector's target metric before and after a `split_epoch` timestamp to evaluate a workflow-coaching experiment (`improved`, `regressed`, `unchanged`, or `insufficient_data`). |
-| `service_list` / `service_status` / `service_restart` / `service_get_logs` | **Supervision** | Monitors and controls registered satellite daemons (`meshmon`, `netmon`, `embdevenv`, `abc80`, etc.). |
 
 ### 5.1 Claude Code Usage Subsystem
 
@@ -333,7 +332,7 @@ To prevent agent context pollution and minimize token consumption across diverse
 
 | Profile | Purpose / Domain | Included Tools |
 | :--- | :--- | :--- |
-| `core` | Default / general programming | Quota tools (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`), Insights tools (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`), and Fleet supervision (`service_list`, `service_status`, `service_restart`, `service_get_logs`) |
+| `core` | Default / general programming | Quota tools (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`) and Insights tools (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`) |
 | `embedded` | Target board bringup (`boards`, `embdevenv`) | Core tools + all `embdevenv_*` tools |
 | `network` | Network diagnostics & firewall (`netmon`, `network`) | Core tools + `firewall_*`, `lan_*`, `snmp_*` |
 | `mesh` | LoRa RF telemetry (`meshmon`) | Core tools + `meshmon_*` tools |

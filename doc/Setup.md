@@ -146,7 +146,6 @@ Add the `aimon` entry:
 6. Click the **Refresh** button next to MCP. A green status dot will appear showing the active core tools:
    - `check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`
    - `get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`
-   - `service_list`, `service_status`, `service_restart`, `service_get_logs`
 
 ---
 
@@ -197,7 +196,7 @@ Open the configuration file for your operating system:
 #### 3. Reload Antigravity
 1. Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> (or <kbd>F1</kbd>) to open the Command Palette.
 2. Type and select: `Developer: Reload Window`.
-3. Open the Antigravity Chat panel and check the **`...` > MCP Servers** list. `aimon` will display connected with its quota, usage insights, and fleet supervision tools.
+3. Open the Antigravity Chat panel and check the **`...` > MCP Servers** list. `aimon` will display connected with its quota and usage insights tools.
 
 ---
 

@@ -179,7 +179,7 @@ To prevent token exhaustion and eliminate irrelevant context in specialized work
 
 | Profile | Target Domain | Tools Included |
 | :--- | :--- | :--- |
-| `core` | General development, quota & insights tracking | Quota (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`), Insights (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`), and Supervision (`service_*`) tools |
+| `core` | General development, quota & insights tracking | Quota (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`) and Insights (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`) tools |
 | `embedded` | Embedded hardware development (`boards`, `embdevenv`) | Core + all `embdevenv_*` tools |
 | `network` | Network monitoring & security (`netmon`, `network`) | Core + `firewall_*`, `lan_*`, `snmp_*` tools |
 | `mesh` | LoRa wireless mesh networking (`meshmon`) | Core + all `meshmon_*` tools |

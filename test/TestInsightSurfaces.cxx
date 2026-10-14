@@ -160,7 +160,28 @@ TEST(InsightSurfacesGroup, McpToolsListedAndCallableAcrossProfiles) {
             }
             CHECK_TEXT(found, expected);
         }
+
+        static constexpr const char* kRemovedServiceTools[] = {
+            "service_list",
+            "service_status",
+            "service_restart",
+            "service_get_logs"
+        };
+        for (const char* removed : kRemovedServiceTools) {
+            bool found = false;
+            for (const auto& t : res["result"]["tools"]) {
+                if (t["name"] == removed) {
+                    found = true;
+                    break;
+                }
+            }
+            CHECK_FALSE_TEXT(found, removed);
+        }
     }
+
+    // Calling removed service_list tool must return an unregistered tool error
+    json resSvc = callMcpTool(*mcp, "service_list", json::object(), "core");
+    CHECK_TRUE(resSvc.contains("error"));
 
     // Call get_usage_insights
     json resIns = callMcpTool(*mcp, "get_usage_insights", {{"days", 30}}, "core");
@@ -252,6 +273,15 @@ TEST(InsightSurfacesGroup, WebApiInsightsEndpointsReturnStructuredJson) {
     json j5 = json::parse(r5->body);
     CHECK_TRUE(j5.contains("files"));
     CHECK_TRUE(j5["files"].size() >= 8);
+
+    // Removed supervisor endpoints must return 404
+    auto rSvc = cli.Get("/api/services");
+    CHECK_TRUE(rSvc != nullptr);
+    LONGS_EQUAL(404, rSvc->status);
+
+    auto rSup = cli.Get("/api/supervisor/status");
+    CHECK_TRUE(rSup != nullptr);
+    LONGS_EQUAL(404, rSup->status);
 
     server.stop();
 }

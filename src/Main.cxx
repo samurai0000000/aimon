@@ -33,8 +33,6 @@
 #include "Version.hxx"
 #include "AgentTelemetryDb.hxx"
 #include "MobileGateway.hxx"
-#include "ProcessMonitor.hxx"
-#include "ServiceSupervisor.hxx"
 #include "InsightEngine.hxx"
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 
@@ -51,7 +49,6 @@ static NcursesConsole* g_console = nullptr;
 
 static void signalHandler(int sig) {
     (void)sig;
-    ProcessMonitor::notifyWorkerShutdown();
     g_shutdown = true;
     if (g_console) {
         g_console->shutdown();
@@ -105,10 +102,6 @@ int main(int argc, char* argv[]) {
     int optGatewayPort = 0;
     bool optGatewayDisable = false;
     bool optNoNcurses = false;
-    bool optNoSupervisor = false;
-    bool isChildWorker = false;
-    bool optSafeMode = false;
-    int optIpcFd = -1;
 
     int argIdx = 1;
     if (argIdx < argc && argv[argIdx][0] != '-') {
@@ -257,16 +250,6 @@ int main(int argc, char* argv[]) {
             optGatewayDisable = true;
         } else if (arg == "--no-ncurses") {
             optNoNcurses = true;
-        } else if (arg == "--no-supervisor") {
-            optNoSupervisor = true;
-        } else if (arg == "--child-worker") {
-            isChildWorker = true;
-        } else if (arg == "--safe-mode") {
-            optSafeMode = true;
-        } else if (arg.rfind("--ipc-fd=", 0) == 0) {
-            optIpcFd = std::stoi(arg.substr(9));
-        } else if (arg == "--ipc-fd" && argIdx < argc) {
-            optIpcFd = std::stoi(argv[argIdx++]);
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             printUsage(argv[0]);
@@ -291,20 +274,6 @@ int main(int argc, char* argv[]) {
     ConfigManager configMgr;
     configMgr.load(customConfigPath);
     AimonConfig& cfg = configMgr.getConfig();
-
-    if (optIpcFd >= 0) {
-        ProcessMonitor::setChildIpcFd(optIpcFd);
-    }
-
-    // Run as parent monitor if in daemon mode with supervisor enabled
-    if (command == "daemon" && !optNoSupervisor && !isChildWorker && cfg.supervisor.enabled) {
-        ProcessMonitor monitor(cfg.supervisor, cfg.gemini, argc, argv);
-        return monitor.run();
-    }
-
-    if (optSafeMode) {
-        cfg.web.port = cfg.supervisor.safeModePort;
-    }
 
     // Apply CLI overrides
     if (!optHost.empty()) cfg.web.host = optHost;
@@ -493,17 +462,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::unique_ptr<ServiceSupervisor> serviceSupervisor;
-    if (cfg.supervisor.enabled && !optSafeMode) {
-        serviceSupervisor = std::make_unique<ServiceSupervisor>(cfg.supervisor, cfg.services);
-        if (!serviceSupervisor->start()) {
-            std::cerr << "[aimon] Warning: failed to start ServiceSupervisor" << std::endl;
-        } else {
-            webServer.setServiceSupervisor(serviceSupervisor.get());
-            mcpServer.setServiceSupervisor(serviceSupervisor.get());
-        }
-    }
-
     std::cout << "[aimon] Running in " << command << " mode (PID: " << getpid() << ")" << std::endl;
 
     bool isTty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
@@ -572,9 +530,6 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n[aimon] Shutting down cleanly..." << std::endl;
-    if (serviceSupervisor) {
-        serviceSupervisor->stop();
-    }
     tcpGateway.stop();
     webServer.stop();
     if (mqttPublisher) {

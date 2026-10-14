@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.13 LANGUAGES CXX)
+project(aimon VERSION 1.0.14 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
     add_compile_options(/W4)
 else()
-    add_compile_options(-Wall -Wextra -pedantic -Wno-unused-parameter)
+    add_compile_options(-Wall -Wextra -pedantic -Wno-unused-parameter -UNDEBUG)
 endif()
 
 # Optional sanitizer build (driven by `make test SANITIZE=1`)
@@ -86,9 +86,6 @@ set(LIB_SOURCES
     src/MqttPublisher.cxx
     src/WebServer.cxx
     src/NcursesConsole.cxx
-    src/ProcessMonitor.cxx
-    src/ServiceSupervisor.cxx
-    src/GeminiTriage.cxx
     src/InsightEngine.cxx
 )
 
@@ -268,197 +265,6 @@ if(LIBCONFIGPP_LIBRARY_DIRS)
 endif()
 if(CPPUTEST_LIBRARY_DIRS)
     target_link_directories(test_libconfig_parser PRIVATE ${CPPUTEST_LIBRARY_DIRS})
-endif()
-
-add_executable(test_process_monitor_lifecycle
-    test/TestProcessMonitorLifecycle.cxx
-    src/ProcessMonitor.cxx
-    src/ConfigManager.cxx
-    src/PathUtils.cxx
-)
-
-target_include_directories(test_process_monitor_lifecycle PRIVATE
-    ${CMAKE_CURRENT_BINARY_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
-    ${LIBCONFIGPP_INCLUDE_DIRS}
-    ${CPPUTEST_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_process_monitor_lifecycle PRIVATE
-    ${LIBCONFIGPP_LIBRARIES}
-    ${CPPUTEST_LIBRARIES}
-    Threads::Threads
-)
-
-if(LIBCONFIGPP_LIBRARY_DIRS)
-    target_link_directories(test_process_monitor_lifecycle PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
-endif()
-if(CPPUTEST_LIBRARY_DIRS)
-    target_link_directories(test_process_monitor_lifecycle PRIVATE ${CPPUTEST_LIBRARY_DIRS})
-endif()
-
-add_executable(test_circuit_breaker_quarantine
-    test/TestCircuitBreakerQuarantine.cxx
-    src/ProcessMonitor.cxx
-    src/ConfigManager.cxx
-    src/PathUtils.cxx
-)
-
-target_include_directories(test_circuit_breaker_quarantine PRIVATE
-    ${CMAKE_CURRENT_BINARY_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
-    ${LIBCONFIGPP_INCLUDE_DIRS}
-    ${CPPUTEST_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_circuit_breaker_quarantine PRIVATE
-    ${LIBCONFIGPP_LIBRARIES}
-    ${CPPUTEST_LIBRARIES}
-    Threads::Threads
-)
-
-if(LIBCONFIGPP_LIBRARY_DIRS)
-    target_link_directories(test_circuit_breaker_quarantine PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
-endif()
-if(CPPUTEST_LIBRARY_DIRS)
-    target_link_directories(test_circuit_breaker_quarantine PRIVATE ${CPPUTEST_LIBRARY_DIRS})
-endif()
-
-add_executable(test_service_supervisor
-    test/TestServiceSupervisor.cxx
-    src/ServiceSupervisor.cxx
-    src/ConfigManager.cxx
-    src/PathUtils.cxx
-)
-
-target_include_directories(test_service_supervisor PRIVATE
-    ${CMAKE_CURRENT_BINARY_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
-    ${LIBCONFIGPP_INCLUDE_DIRS}
-    ${CPPUTEST_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_service_supervisor PRIVATE
-    ${LIBCONFIGPP_LIBRARIES}
-    ${CPPUTEST_LIBRARIES}
-    Threads::Threads
-)
-
-if(LIBCONFIGPP_LIBRARY_DIRS)
-    target_link_directories(test_service_supervisor PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
-endif()
-if(CPPUTEST_LIBRARY_DIRS)
-    target_link_directories(test_service_supervisor PRIVATE ${CPPUTEST_LIBRARY_DIRS})
-endif()
-
-add_executable(test_gemini_triage
-    test/TestGeminiTriage.cxx
-    src/GeminiTriage.cxx
-    src/ConfigManager.cxx
-    src/PathUtils.cxx
-)
-
-target_compile_definitions(test_gemini_triage PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-
-target_include_directories(test_gemini_triage PRIVATE
-    ${CMAKE_CURRENT_BINARY_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
-    ${LIBCONFIGPP_INCLUDE_DIRS}
-    ${CPPUTEST_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_gemini_triage PRIVATE
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    ${LIBCONFIGPP_LIBRARIES}
-    ${CPPUTEST_LIBRARIES}
-    Threads::Threads
-)
-
-if(LIBCONFIGPP_LIBRARY_DIRS)
-    target_link_directories(test_gemini_triage PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
-endif()
-if(CPPUTEST_LIBRARY_DIRS)
-    target_link_directories(test_gemini_triage PRIVATE ${CPPUTEST_LIBRARY_DIRS})
-endif()
-
-add_executable(test_supervisor_api_and_mcp
-    test/TestSupervisorApiAndMcp.cxx
-    ${LIB_SOURCES}
-)
-
-target_compile_definitions(test_supervisor_api_and_mcp PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-
-target_include_directories(test_supervisor_api_and_mcp PRIVATE
-    ${CMAKE_CURRENT_BINARY_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
-    ${MOSQUITTO_INCLUDE_DIRS}
-    ${CURSES_INCLUDE_DIRS}
-    ${LIBCONFIGPP_INCLUDE_DIRS}
-    ${CPPUTEST_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_supervisor_api_and_mcp PRIVATE
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    SQLite::SQLite3
-    Threads::Threads
-    ${MOSQUITTO_LIBRARIES}
-    ${CURSES_LIBRARIES}
-    ${LIBCONFIGPP_LIBRARIES}
-    ${CPPUTEST_LIBRARIES}
-)
-
-if(MOSQUITTO_LIBRARY_DIRS)
-    target_link_directories(test_supervisor_api_and_mcp PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
-endif()
-if(LIBCONFIGPP_LIBRARY_DIRS)
-    target_link_directories(test_supervisor_api_and_mcp PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
-endif()
-if(CPPUTEST_LIBRARY_DIRS)
-    target_link_directories(test_supervisor_api_and_mcp PRIVATE ${CPPUTEST_LIBRARY_DIRS})
-endif()
-
-add_executable(test_fleet_integration
-    test/TestFleetIntegration.cxx
-    src/ServiceSupervisor.cxx
-    src/ProcessMonitor.cxx
-    src/ConfigManager.cxx
-    src/PathUtils.cxx
-)
-
-target_include_directories(test_fleet_integration PRIVATE
-    ${CMAKE_CURRENT_BINARY_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
-    ${LIBCONFIGPP_INCLUDE_DIRS}
-    ${CPPUTEST_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_fleet_integration PRIVATE
-    ${LIBCONFIGPP_LIBRARIES}
-    ${CPPUTEST_LIBRARIES}
-    Threads::Threads
-)
-
-if(LIBCONFIGPP_LIBRARY_DIRS)
-    target_link_directories(test_fleet_integration PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
-endif()
-if(CPPUTEST_LIBRARY_DIRS)
-    target_link_directories(test_fleet_integration PRIVATE ${CPPUTEST_LIBRARY_DIRS})
 endif()
 
 if(AIMON_SANITIZE_CANARY)

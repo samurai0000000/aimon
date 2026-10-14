@@ -81,49 +81,6 @@ struct GatewayConfig {
     int port = 3885;
 };
 
-struct SupervisedServiceConfig {
-    std::string id;
-    std::string name;
-    std::string host = "127.0.0.1";
-    int port = 0;
-    int secondaryPort = 0;
-    bool enabled = true;
-    int probeIntervalMs = 5000;
-    int probeTimeoutMs = 2000;
-    int maxRestartRetries = 5;
-    int restartWindowSec = 60;
-    std::string startCmd;
-    std::string stopCmd;
-    std::string statusCmd;
-    std::string pidFile;
-    std::string logFile;
-};
-
-struct SupervisorConfig {
-    bool enabled = true;
-    bool autoRestart = true;
-    int probeIntervalSec = 5;
-    int probeTimeoutSec = 2;
-    int probeTimeoutMs = 1000;
-    int crashLoopWindowSec = 60;
-    int crashLoopMaxRetries = 5;
-    int backoffInitialSec = 1;
-    int backoffMaxSec = 30;
-    int maxDbQuarantineVersions = 5;
-    int safeModePort = 3889;
-    std::string prevBinaryPath = "/usr/local/bin/aimon.prev";
-};
-
-struct GeminiConfig {
-    bool enabled = false;
-    std::string apiKey;
-    std::string model = "gemini-2.5-flash";
-    int maxTokens = 2048;
-    double temperature = 0.2;
-    std::string promptTemplate = "Analyze the following crash telemetry and provide root-cause diagnostics:\n\n${INCIDENT_REPORT}";
-    std::string incidentLogDir = "~/.local/state/aimon/incidents";
-};
-
 struct InsightsConfig {
     bool enabled = true;
     std::string dbPath = "~/.config/aimon/insights.db";
@@ -155,9 +112,6 @@ struct AimonConfig {
     CursorConfig cursor;
     ClaudeConfig claude;
     GatewayConfig gateway;
-    SupervisorConfig supervisor;
-    std::vector<SupervisedServiceConfig> services;
-    GeminiConfig gemini;
     InsightsConfig insights;
 
     nlohmann::json toJson() const;

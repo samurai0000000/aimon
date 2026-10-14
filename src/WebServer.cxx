@@ -12,7 +12,6 @@
 #include "AgentTelemetryDb.hxx"
 #include "MobileGateway.hxx"
 #include "PathUtils.hxx"
-#include "ServiceSupervisor.hxx"
 #include "InsightEngine.hxx"
 #include <iostream>
 #include <fstream>
@@ -207,8 +206,6 @@ void WebServer::setupRoutes() {
                 req.path.rfind("/api/mobile", 0) == 0 ||
                 req.path.rfind("/api/agent", 0) == 0 ||
                 req.path.rfind("/api/workspace", 0) == 0 ||
-                req.path.rfind("/api/services", 0) == 0 ||
-                req.path.rfind("/api/supervisor", 0) == 0 ||
                 req.path.rfind("/api/v1/insights", 0) == 0) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
@@ -421,121 +418,6 @@ void WebServer::setupRoutes() {
             arr.push_back(selfMon.toJson());
         }
         res.set_content(arr.dump(2), "application/json");
-    });
-
-    // --- Fleet Supervisor Endpoints ---
-
-    _server->Get("/api/services", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.set_header("Pragma", "no-cache");
-        res.set_header("Expires", "0");
-        nlohmann::json arr = nlohmann::json::array();
-        if (_serviceSupervisor) {
-            auto statuses = _serviceSupervisor->getAllStatuses();
-            for (const auto& s : statuses) {
-                arr.push_back(s.toJson());
-            }
-        }
-        res.set_content(nlohmann::json({{"services", arr}}).dump(2), "application/json");
-    });
-
-    _server->Get("/api/supervisor/status", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.set_header("Pragma", "no-cache");
-        res.set_header("Expires", "0");
-        nlohmann::json j;
-        if (_serviceSupervisor) {
-            j["running"] = _serviceSupervisor->isRunning();
-            auto statuses = _serviceSupervisor->getAllStatuses();
-            j["services_count"] = statuses.size();
-            int healthy = 0, degraded = 0, restarting = 0, crashLoop = 0, disabled = 0;
-            for (const auto& s : statuses) {
-                switch (s.state) {
-                    case ServiceState::HEALTHY: healthy++; break;
-                    case ServiceState::DEGRADED: degraded++; break;
-                    case ServiceState::RESTARTING: restarting++; break;
-                    case ServiceState::CRASH_LOOP: crashLoop++; break;
-                    case ServiceState::DISABLED: disabled++; break;
-                }
-            }
-            j["healthy_count"] = healthy;
-            j["degraded_count"] = degraded;
-            j["restarting_count"] = restarting;
-            j["crash_loop_count"] = crashLoop;
-            j["disabled_count"] = disabled;
-        } else {
-            j["running"] = false;
-            j["services_count"] = 0;
-            j["healthy_count"] = 0;
-            j["degraded_count"] = 0;
-            j["restarting_count"] = 0;
-            j["crash_loop_count"] = 0;
-            j["disabled_count"] = 0;
-        }
-        res.set_content(j.dump(2), "application/json");
-    });
-
-    _server->Post("/api/services/restart", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        if (!_serviceSupervisor) {
-            res.status = 503;
-            res.set_content(nlohmann::json({{"error", "ServiceSupervisor not running"}}).dump(2), "application/json");
-            return;
-        }
-        try {
-            nlohmann::json body = nlohmann::json::parse(req.body);
-            std::string serviceId = body.value("service", body.value("id", ""));
-            bool force = body.value("force", false);
-            if (serviceId.empty()) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", "Missing required field 'service'"}}).dump(2), "application/json");
-                return;
-            }
-            bool ok = _serviceSupervisor->requestRestart(serviceId, force);
-            if (!ok) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"success", false}, {"error", "Failed to restart service '" + serviceId + "' (not found or in crash loop)"}}).dump(2), "application/json");
-                return;
-            }
-            res.status = 200;
-            res.set_content(nlohmann::json({{"success", true}, {"service", serviceId}}).dump(2), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", std::string("Malformed JSON request: ") + e.what()}}).dump(2), "application/json");
-        }
-    });
-
-    _server->Get("/api/services/logs", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.set_header("Pragma", "no-cache");
-        res.set_header("Expires", "0");
-        if (!_serviceSupervisor) {
-            res.status = 503;
-            res.set_content(nlohmann::json({{"error", "ServiceSupervisor not running"}}).dump(2), "application/json");
-            return;
-        }
-        std::string serviceId = req.get_param_value("service");
-        if (serviceId.empty()) {
-            serviceId = req.get_param_value("id");
-        }
-        if (serviceId.empty()) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", "Missing query parameter 'service'"}}).dump(2), "application/json");
-            return;
-        }
-        int lines = 50;
-        if (req.has_param("lines")) {
-            try {
-                lines = std::stoi(req.get_param_value("lines"));
-            } catch (...) {
-                lines = 50;
-            }
-        }
-        std::string logs = _serviceSupervisor->getServiceLogs(serviceId, lines);
-        res.set_content(nlohmann::json({{"service", serviceId}, {"logs", logs}}).dump(2), "application/json");
     });
 
     // --- Telemetry Endpoints ---

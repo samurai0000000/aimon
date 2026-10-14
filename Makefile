@@ -10,9 +10,6 @@ NUM_PROCS := $(shell nproc 2>/dev/null || echo 4)
 CMAKE := $(shell if [ -x /usr/bin/cmake ]; then echo /usr/bin/cmake; else echo cmake; fi)
 
 # The tests run with HOME pointing at an empty directory under the build tree.
-# Some of them (circuit breaker, process monitor) write incident reports and
-# move database files in the configuration directory; with a real HOME they
-# quarantine a running daemon's databases.
 TEST_HOME = $(CURDIR)/$(BUILD_DIR)/test-home
 TEST_ENV = HOME=$(TEST_HOME)
 
@@ -30,12 +27,6 @@ ifeq ($(SANITIZE),1)
 BUILD_DIR := build/asan
 CMAKE_FLAGS := -DCMAKE_BUILD_TYPE=Debug -DAIMON_SANITIZE=ON \
 	-DAIMON_SANITIZE_CANARY=$(if $(filter 1,$(SANITIZE_CANARY)),ON,OFF)
-# TestProcessMonitorLifecycle deliberately raises SIGSEGV in a forked child to
-# exercise crash detection, so ASan's SEGV handler is disabled for that one
-# binary only; every other test keeps full AddressSanitizer reporting.
-ASAN_PM_ENV := ASAN_OPTIONS=handle_segv=0
-else
-ASAN_PM_ENV :=
 endif
 ifeq ($(SANITIZE_CANARY),1)
 ifneq ($(SANITIZE),1)
@@ -59,17 +50,11 @@ endif
 test: all
 	@mkdir -p $(TEST_HOME)
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_libconfig_parser
-	@$(ASAN_PM_ENV) $(TEST_ENV) ./$(BUILD_DIR)/test_process_monitor_lifecycle
-	@$(TEST_ENV) ./$(BUILD_DIR)/test_circuit_breaker_quarantine
-	@$(TEST_ENV) ./$(BUILD_DIR)/test_service_supervisor
-	@$(TEST_ENV) ./$(BUILD_DIR)/test_gemini_triage
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_gateway_timeout
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_agent_telemetry_db
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_mobile_gateway
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_web_server_api
-	@$(TEST_ENV) ./$(BUILD_DIR)/test_supervisor_api_and_mcp
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_cursor_collector
-	@$(TEST_ENV) ./$(BUILD_DIR)/test_fleet_integration
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_price_catalog
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_price_catalog_props
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_claude_usage_store
