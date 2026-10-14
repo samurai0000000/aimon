@@ -143,10 +143,10 @@ Add the `aimon` entry:
    - **Name**: `aimon`
    - **Type**: `sse`
    - **URL**: `http://<aimon-server-ip-or-host>:3883/sse`
-6. Click the **Refresh** button next to MCP. A green status dot will appear showing **3 tools active**:
-   - `check_antigravity_quota`
-   - `check_cursor_usage`
-   - `get_combined_ai_status`
+6. Click the **Refresh** button next to MCP. A green status dot will appear showing the active core tools:
+   - `check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`
+   - `get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`
+   - `service_list`, `service_status`, `service_restart`, `service_get_logs`
 
 ---
 
@@ -197,7 +197,7 @@ Open the configuration file for your operating system:
 #### 3. Reload Antigravity
 1. Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> (or <kbd>F1</kbd>) to open the Command Palette.
 2. Type and select: `Developer: Reload Window`.
-3. Open the Antigravity Chat panel and check the **`...` > MCP Servers** list. `aimon` will display connected with its 3 tools.
+3. Open the Antigravity Chat panel and check the **`...` > MCP Servers** list. `aimon` will display connected with its quota, usage insights, and fleet supervision tools.
 
 ---
 
@@ -270,15 +270,17 @@ These hooks are **statistics only**. They never ask for approval, never block a 
 Both IDEs can share one small reporter script. Place it anywhere readable, for example:
 
 ```text
-~/.local/share/aimon/hooks/aimon_telemetry.py
+~/.cursor/hooks/aimon_telemetry.py
 ```
+
+*(or `~/.local/share/aimon/hooks/aimon_telemetry.py`).*
 
 The script must:
 
 1. Read the hook payload as JSON from **stdin**.
 2. Post one event to `aimon` with a short timeout (under 1 second), ignoring every network error.
 3. Print an empty JSON object `{}` to **stdout** and exit `0`. For Antigravity's `Stop` event, print `{"decision": "allow"}` so the agent is allowed to stop.
-4. Send only statistics: tool name, duration, status, and counts. Do not forward command lines, file contents, or tool output.
+4. Send only statistics: tool name, duration, status, and counts (including optional numeric prompt structure features in `USER_TURN` `details`). Do not forward command lines, file contents, prompt text, or tool output.
 
 By default the reporter should target `http://127.0.0.1:3883`. Let users override it with an environment variable such as `AIMON_ENDPOINT=http://<aimon-host>:3883`.
 
@@ -328,7 +330,7 @@ Every event carries `event_type`, `session_id`, `agent_type` (`cursor`, `antigra
 
 Set `"status": "ERROR"` for a failed tool. `aimon` ignores a repeated event with the same `session_id`, `step_index`, `event_type`, and `tool_name`, so a retried post does not double-count.
 
-**User turn** increments the turn counter:
+**User turn** increments the turn counter (and may optionally carry numeric prompt structure counts in `details` for workflow coaching):
 
 ```json
 {
@@ -337,7 +339,16 @@ Set `"status": "ERROR"` for a failed tool. `aimon` ignores a repeated event with
   "agent_type": "cursor",
   "step_index": 13,
   "status": "OK",
-  "timestamp": 1790000000
+  "timestamp": 1790000000,
+  "details": {
+    "prose_chars": 145,
+    "prose_words": 24,
+    "fenced_blocks": 0,
+    "fenced_chars": 0,
+    "paste_chars": 0,
+    "mixed_paste": 0,
+    "file_refs": 1
+  }
 }
 ```
 
@@ -370,19 +381,22 @@ Create a user-level hooks file so every workspace reports:
   "version": 1,
   "hooks": {
     "sessionStart": [
-      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+      { "command": "python3 ~/.cursor/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+    ],
+    "beforeSubmitPrompt": [
+      { "command": "python3 ~/.cursor/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
     ],
     "postToolUse": [
-      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+      { "command": "python3 ~/.cursor/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
     ],
     "postToolUseFailure": [
-      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+      { "command": "python3 ~/.cursor/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
     ],
     "stop": [
-      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+      { "command": "python3 ~/.cursor/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
     ],
     "sessionEnd": [
-      { "command": "python3 ~/.local/share/aimon/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
+      { "command": "python3 ~/.cursor/hooks/aimon_telemetry.py", "timeout": 2, "failClosed": false }
     ]
   }
 }
@@ -393,6 +407,7 @@ What each event is used for:
 | Cursor event | Reporter action | Useful payload fields |
 | :--- | :--- | :--- |
 | `sessionStart` | Send `SESSION_START` | `session_id`, `model`, `workspace_roots` |
+| `beforeSubmitPrompt` | Record turn start timestamp (and optionally compute numeric prompt structure features in memory; never persist or transmit raw prompt text) | `conversation_id`, `prompt` |
 | `postToolUse` | Send `TOOL_CALL` with `status: OK` | `conversation_id`, `tool_name`, `tool_use_id`, `duration` (ms) |
 | `postToolUseFailure` | Send `TOOL_CALL` with `status: ERROR` | same as above |
 | `stop` | Send `USER_TURN`, then `SESSION_END` with `RUNNING` | `conversation_id`, `status`, `input_tokens`, `output_tokens` |
@@ -569,7 +584,7 @@ Finally, run one real prompt in each IDE and in Claude Code, and open the **Agen
 | **Reload Command** | Click refresh button in Customize > MCP | Command Palette > `Developer: Reload Window` |
 | **Authentication Source** | Browser cookie `WorkosCursorSessionToken` or local `state.vscdb` | Auto-discovered `--csrf_token` from language server process |
 | **Telemetry Hooks File** | `~/.cursor/hooks.json` | `~/.gemini/config/hooks.json` |
-| **Telemetry Hook Events** | `sessionStart`, `postToolUse`, `postToolUseFailure`, `stop`, `sessionEnd` | `PostToolUse` (matcher `""`), `PreInvocation`, `Stop` |
+| **Telemetry Hook Events** | `sessionStart`, `beforeSubmitPrompt`, `postToolUse`, `postToolUseFailure`, `stop`, `sessionEnd` | `PostToolUse` (matcher `""`), `PreInvocation`, `Stop` |
 | **Telemetry Hooks (Claude Code)** | `~/.claude/settings.json`: `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SessionEnd` (see Step 6.5) | |
 | **Payload Key Style** | snake_case (`conversation_id`, `tool_name`) | camelCase (`conversationId`, `toolCall.name`) |
 

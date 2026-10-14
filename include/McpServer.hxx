@@ -17,6 +17,7 @@ namespace aimon {
 class DynamicToolRegistry;
 class TcpGateway;
 class ServiceSupervisor;
+class InsightEngine;
 
 class McpServer {
 public:
@@ -30,6 +31,7 @@ public:
     void setDynamicRegistry(DynamicToolRegistry* reg) { _dynamicRegistry = reg; }
     void setTcpGateway(TcpGateway* gw) { _tcpGateway = gw; }
     void setServiceSupervisor(ServiceSupervisor* supervisor) { _serviceSupervisor = supervisor; }
+    void setInsightEngine(InsightEngine* engine) { _insightEngine = engine; }
     void setNotificationBroadcaster(std::function<void(const std::string&)> broadcaster) {
         _notificationBroadcaster = broadcaster;
     }
@@ -54,6 +56,7 @@ private:
     DynamicToolRegistry* _dynamicRegistry = nullptr;
     TcpGateway* _tcpGateway = nullptr;
     ServiceSupervisor* _serviceSupervisor = nullptr;
+    InsightEngine* _insightEngine = nullptr;
     std::function<void(const std::string&)> _notificationBroadcaster;
     std::string _defaultProfile = "all";
 };

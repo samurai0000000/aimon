@@ -170,6 +170,28 @@ nlohmann::json AimonConfig::toJson() const {
         {"accounts", claudeAccounts}
     };
 
+    j["insights"] = {
+        {"enabled", insights.enabled},
+        {"db_path", insights.dbPath},
+        {"retention_days", insights.retentionDays},
+        {"refresh_interval_sec", insights.refreshIntervalSec},
+        {"long_context_threshold_tokens", insights.longContextThresholdTokens},
+        {"compact_context_threshold_tokens", insights.compactContextThresholdTokens},
+        {"compact_continue_requests", insights.compactContinueRequests},
+        {"subagent_share_threshold", insights.subagentShareThreshold},
+        {"long_session_hours", insights.longSessionHours},
+        {"cache_efficiency_threshold", insights.cacheEfficiencyThreshold},
+        {"cache_efficiency_min_requests", insights.cacheEfficiencyMinRequests},
+        {"error_retry_streak_threshold", insights.errorRetryStreakThreshold},
+        {"idle_gap_seconds", insights.idleGapSeconds},
+        {"burn_rate_alert_fraction", insights.burnRateAlertFraction},
+        {"short_prompt_max_prose_chars", insights.shortPromptMaxProseChars},
+        {"drip_prompt_max_prose_chars", insights.dripPromptMaxProseChars},
+        {"drip_prompts_per_hour", insights.dripPromptsPerHour},
+        {"quick_reprompt_seconds", insights.quickRepromptSeconds},
+        {"coaching_min_sample_size", insights.coachingMinSampleSize}
+    };
+
     return j;
 }
 
@@ -300,6 +322,29 @@ void AimonConfig::fromJson(const nlohmann::json& j) {
         if (g.contains("temperature")) gemini.temperature = g["temperature"];
         if (g.contains("prompt_template")) gemini.promptTemplate = g["prompt_template"];
         if (g.contains("incident_log_dir")) gemini.incidentLogDir = g["incident_log_dir"];
+    }
+
+    if (j.contains("insights") && j["insights"].is_object()) {
+        const auto& ins = j["insights"];
+        if (ins.contains("enabled") && ins["enabled"].is_boolean()) insights.enabled = ins["enabled"];
+        if (ins.contains("db_path") && ins["db_path"].is_string()) insights.dbPath = ins["db_path"];
+        if (ins.contains("retention_days") && ins["retention_days"].is_number_integer()) insights.retentionDays = ins["retention_days"];
+        if (ins.contains("refresh_interval_sec") && ins["refresh_interval_sec"].is_number_integer()) insights.refreshIntervalSec = ins["refresh_interval_sec"];
+        if (ins.contains("long_context_threshold_tokens") && ins["long_context_threshold_tokens"].is_number_integer()) insights.longContextThresholdTokens = ins["long_context_threshold_tokens"];
+        if (ins.contains("compact_context_threshold_tokens") && ins["compact_context_threshold_tokens"].is_number_integer()) insights.compactContextThresholdTokens = ins["compact_context_threshold_tokens"];
+        if (ins.contains("compact_continue_requests") && ins["compact_continue_requests"].is_number_integer()) insights.compactContinueRequests = ins["compact_continue_requests"];
+        if (ins.contains("subagent_share_threshold") && ins["subagent_share_threshold"].is_number()) insights.subagentShareThreshold = ins["subagent_share_threshold"];
+        if (ins.contains("long_session_hours") && ins["long_session_hours"].is_number_integer()) insights.longSessionHours = ins["long_session_hours"];
+        if (ins.contains("cache_efficiency_threshold") && ins["cache_efficiency_threshold"].is_number()) insights.cacheEfficiencyThreshold = ins["cache_efficiency_threshold"];
+        if (ins.contains("cache_efficiency_min_requests") && ins["cache_efficiency_min_requests"].is_number_integer()) insights.cacheEfficiencyMinRequests = ins["cache_efficiency_min_requests"];
+        if (ins.contains("error_retry_streak_threshold") && ins["error_retry_streak_threshold"].is_number_integer()) insights.errorRetryStreakThreshold = ins["error_retry_streak_threshold"];
+        if (ins.contains("idle_gap_seconds") && ins["idle_gap_seconds"].is_number_integer()) insights.idleGapSeconds = ins["idle_gap_seconds"];
+        if (ins.contains("burn_rate_alert_fraction") && ins["burn_rate_alert_fraction"].is_number()) insights.burnRateAlertFraction = ins["burn_rate_alert_fraction"];
+        if (ins.contains("short_prompt_max_prose_chars") && ins["short_prompt_max_prose_chars"].is_number_integer()) insights.shortPromptMaxProseChars = ins["short_prompt_max_prose_chars"];
+        if (ins.contains("drip_prompt_max_prose_chars") && ins["drip_prompt_max_prose_chars"].is_number_integer()) insights.dripPromptMaxProseChars = ins["drip_prompt_max_prose_chars"];
+        if (ins.contains("drip_prompts_per_hour") && ins["drip_prompts_per_hour"].is_number_integer()) insights.dripPromptsPerHour = ins["drip_prompts_per_hour"];
+        if (ins.contains("quick_reprompt_seconds") && ins["quick_reprompt_seconds"].is_number_integer()) insights.quickRepromptSeconds = ins["quick_reprompt_seconds"];
+        if (ins.contains("coaching_min_sample_size") && ins["coaching_min_sample_size"].is_number_integer()) insights.coachingMinSampleSize = ins["coaching_min_sample_size"];
     }
 }
 
@@ -554,6 +599,29 @@ bool ConfigManager::loadLibConfig(const std::string& customPath) {
             readSetting(gw, "port", _config.gateway.port);
         }
 
+        if (root.exists("insights")) {
+            const libconfig::Setting& ins = root["insights"];
+            readSetting(ins, "enabled", _config.insights.enabled);
+            readSetting(ins, "db_path", _config.insights.dbPath);
+            readSetting(ins, "retention_days", _config.insights.retentionDays);
+            readSetting(ins, "refresh_interval_sec", _config.insights.refreshIntervalSec);
+            readSetting(ins, "long_context_threshold_tokens", _config.insights.longContextThresholdTokens);
+            readSetting(ins, "compact_context_threshold_tokens", _config.insights.compactContextThresholdTokens);
+            readSetting(ins, "compact_continue_requests", _config.insights.compactContinueRequests);
+            readSetting(ins, "subagent_share_threshold", _config.insights.subagentShareThreshold);
+            readSetting(ins, "long_session_hours", _config.insights.longSessionHours);
+            readSetting(ins, "cache_efficiency_threshold", _config.insights.cacheEfficiencyThreshold);
+            readSetting(ins, "cache_efficiency_min_requests", _config.insights.cacheEfficiencyMinRequests);
+            readSetting(ins, "error_retry_streak_threshold", _config.insights.errorRetryStreakThreshold);
+            readSetting(ins, "idle_gap_seconds", _config.insights.idleGapSeconds);
+            readSetting(ins, "burn_rate_alert_fraction", _config.insights.burnRateAlertFraction);
+            readSetting(ins, "short_prompt_max_prose_chars", _config.insights.shortPromptMaxProseChars);
+            readSetting(ins, "drip_prompt_max_prose_chars", _config.insights.dripPromptMaxProseChars);
+            readSetting(ins, "drip_prompts_per_hour", _config.insights.dripPromptsPerHour);
+            readSetting(ins, "quick_reprompt_seconds", _config.insights.quickRepromptSeconds);
+            readSetting(ins, "coaching_min_sample_size", _config.insights.coachingMinSampleSize);
+        }
+
     } catch (const libconfig::SettingTypeException& stex) {
         _lastErrorMessage = "Setting type mismatch at " + std::string(stex.getPath());
         std::cerr << "[ConfigManager] " << _lastErrorMessage << std::endl;
@@ -694,6 +762,28 @@ bool ConfigManager::saveLibConfig(const std::string& customPath) const {
         gw.add("enabled", libconfig::Setting::TypeBoolean) = _config.gateway.enabled;
         gw.add("host", libconfig::Setting::TypeString) = _config.gateway.host;
         gw.add("port", libconfig::Setting::TypeInt) = _config.gateway.port;
+
+        // insights
+        libconfig::Setting& ins = root.add("insights", libconfig::Setting::TypeGroup);
+        ins.add("enabled", libconfig::Setting::TypeBoolean) = _config.insights.enabled;
+        ins.add("db_path", libconfig::Setting::TypeString) = _config.insights.dbPath;
+        ins.add("retention_days", libconfig::Setting::TypeInt) = _config.insights.retentionDays;
+        ins.add("refresh_interval_sec", libconfig::Setting::TypeInt) = _config.insights.refreshIntervalSec;
+        ins.add("long_context_threshold_tokens", libconfig::Setting::TypeInt) = _config.insights.longContextThresholdTokens;
+        ins.add("compact_context_threshold_tokens", libconfig::Setting::TypeInt) = _config.insights.compactContextThresholdTokens;
+        ins.add("compact_continue_requests", libconfig::Setting::TypeInt) = _config.insights.compactContinueRequests;
+        ins.add("subagent_share_threshold", libconfig::Setting::TypeFloat) = _config.insights.subagentShareThreshold;
+        ins.add("long_session_hours", libconfig::Setting::TypeInt) = _config.insights.longSessionHours;
+        ins.add("cache_efficiency_threshold", libconfig::Setting::TypeFloat) = _config.insights.cacheEfficiencyThreshold;
+        ins.add("cache_efficiency_min_requests", libconfig::Setting::TypeInt) = _config.insights.cacheEfficiencyMinRequests;
+        ins.add("error_retry_streak_threshold", libconfig::Setting::TypeInt) = _config.insights.errorRetryStreakThreshold;
+        ins.add("idle_gap_seconds", libconfig::Setting::TypeInt) = _config.insights.idleGapSeconds;
+        ins.add("burn_rate_alert_fraction", libconfig::Setting::TypeFloat) = _config.insights.burnRateAlertFraction;
+        ins.add("short_prompt_max_prose_chars", libconfig::Setting::TypeInt) = _config.insights.shortPromptMaxProseChars;
+        ins.add("drip_prompt_max_prose_chars", libconfig::Setting::TypeInt) = _config.insights.dripPromptMaxProseChars;
+        ins.add("drip_prompts_per_hour", libconfig::Setting::TypeInt) = _config.insights.dripPromptsPerHour;
+        ins.add("quick_reprompt_seconds", libconfig::Setting::TypeInt) = _config.insights.quickRepromptSeconds;
+        ins.add("coaching_min_sample_size", libconfig::Setting::TypeInt) = _config.insights.coachingMinSampleSize;
 
         cfg.writeFile(targetPath.c_str());
         return true;

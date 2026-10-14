@@ -9,6 +9,7 @@
 #include "TcpGateway.hxx"
 #include "TaskRegistry.hxx"
 #include "ServiceSupervisor.hxx"
+#include "InsightEngine.hxx"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -44,11 +45,16 @@ bool McpServer::isToolAllowedInProfile(const std::string& toolName, const std::s
         return true;
     }
 
-    // Core AI quota and fleet supervisor tools are always accessible in all profiles
+    // Core AI quota, usage insights, and fleet supervisor tools are always accessible in all profiles
     if (toolName == "check_antigravity_quota" ||
         toolName == "check_cursor_usage" ||
         toolName == "check_claude_usage" ||
         toolName == "get_combined_ai_status" ||
+        toolName == "get_usage_insights" ||
+        toolName == "get_usage_report" ||
+        toolName == "export_usage_dataset" ||
+        toolName == "describe_usage_dataset" ||
+        toolName == "compare_experiment" ||
         toolName.rfind("service_", 0) == 0) {
         return true;
     }
@@ -276,6 +282,70 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id, const std::s
         }}
     });
 
+    // 2b. Usage Insights & Workflow-Coaching Tools (available in all profiles)
+    toolsArray.push_back({
+        {"name", "get_usage_insights"},
+        {"description", "Returns programmatic AI usage and workflow-coaching findings across Claude Code, Cursor, and Google Antigravity, with severity, confidence, sample size n, and suggested experiments."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"platform", {{"type", "string"}, {"description", "Optional platform filter: claude, cursor, or antigravity"}}},
+                {"days", {{"type", "integer"}, {"description", "Lookback window in days (default: 30)"}}},
+                {"min_severity", {{"type", "string"}, {"description", "Optional minimum severity filter: info, warn, or high"}}}
+            }}
+        }}
+    });
+
+    toolsArray.push_back({
+        {"name", "get_usage_report"},
+        {"description", "Returns structured AI token, cache-hit ratio, thinking token, and estimated cost breakdowns grouped by project, model, day, tool, or session."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"platform", {{"type", "string"}, {"description", "Optional platform filter: claude, cursor, or antigravity"}}},
+                {"days", {{"type", "integer"}, {"description", "Lookback window in days (default: 30)"}}},
+                {"group_by", {{"type", "string"}, {"description", "Grouping dimension: project (default), model, day, tool, or session"}}}
+            }}
+        }}
+    });
+
+    toolsArray.push_back({
+        {"name", "export_usage_dataset"},
+        {"description", "Exports the normalized, privacy-preserving AI usage dataset (ins_requests, ins_sessions, ins_daily, ins_tool_calls, ins_quota, ins_spend_daily, ins_generations, ins_prompts, ins_findings) to JSONL, CSV, or self-contained SQLite."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"output_dir", {{"type", "string"}, {"description", "Target directory (default: ~/.local/share/aimon/exports)"}}},
+                {"format", {{"type", "string"}, {"description", "Export format: jsonl (default), csv, or sqlite"}}},
+                {"days", {{"type", "integer"}, {"description", "Lookback window in days (default: 90)"}}},
+                {"anonymize_projects", {{"type", "boolean"}, {"description", "Hash project names in exported files (default: false)"}}}
+            }}
+        }}
+    });
+
+    toolsArray.push_back({
+        {"name", "describe_usage_dataset"},
+        {"description", "Returns schema documentation, privacy guarantees, and sample SQL queries for the normalized insights.db tables."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", nlohmann::json::object()}
+        }}
+    });
+
+    toolsArray.push_back({
+        {"name", "compare_experiment"},
+        {"description", "Compares before/after metrics for a workflow-coaching detector around a split timestamp and returns an improved/regressed/unchanged/insufficient_data verdict."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"detector", {{"type", "string"}, {"description", "Detector identifier (e.g. cache_hit_collapse, subagent_fanout_overhead, short_vague_prompt_tax)"}}},
+                {"platform", {{"type", "string"}, {"description", "Optional platform filter: claude, cursor, or antigravity"}}},
+                {"split_epoch", {{"type", "integer"}, {"description", "Unix timestamp dividing before and after windows (default: 7 days ago)"}}}
+            }},
+            {"required", nlohmann::json::array({"detector"})}
+        }}
+    });
+
     // 3. Dynamic Satellite Tools filtered by active profile
     if (profile != "core" && _dynamicRegistry) {
         nlohmann::json dynTools = _dynamicRegistry->getToolsListJson();
@@ -325,6 +395,56 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
         contentText = formatClaudeStatus(current.claude);
     } else if (toolName == "get_combined_ai_status") {
         contentText = formatCombinedStatus(current);
+    } else if (toolName == "describe_usage_dataset") {
+        contentText = InsightEngine::describeDataset().dump(2);
+    } else if (toolName == "get_usage_insights") {
+        if (!_insightEngine) {
+            contentText = nlohmann::json({{"error", "InsightEngine is not enabled"}, {"findings", nlohmann::json::array()}}).dump(2);
+        } else {
+            nlohmann::json args = params.value("arguments", nlohmann::json::object());
+            std::string plat = args.value("platform", "");
+            int days = args.value("days", 30);
+            std::string minSev = args.value("min_severity", "");
+            contentText = _insightEngine->getInsights(plat, days, minSev).dump(2);
+        }
+    } else if (toolName == "get_usage_report") {
+        if (!_insightEngine) {
+            contentText = nlohmann::json({{"error", "InsightEngine is not enabled"}, {"rows", nlohmann::json::array()}}).dump(2);
+        } else {
+            nlohmann::json args = params.value("arguments", nlohmann::json::object());
+            std::string plat = args.value("platform", "");
+            int days = args.value("days", 30);
+            std::string groupBy = args.value("group_by", "project");
+            contentText = _insightEngine->getUsageReport(plat, days, groupBy).dump(2);
+        }
+    } else if (toolName == "export_usage_dataset") {
+        if (!_insightEngine) {
+            contentText = nlohmann::json({{"error", "InsightEngine is not enabled"}, {"files", nlohmann::json::array()}}).dump(2);
+        } else {
+            nlohmann::json args = params.value("arguments", nlohmann::json::object());
+            std::string outDir = args.value("output_dir", "");
+            std::string fmt = args.value("format", "jsonl");
+            int days = args.value("days", 90);
+            bool anon = args.value("anonymize_projects", false);
+            contentText = _insightEngine->exportDataset(outDir, fmt, days, anon).dump(2);
+        }
+    } else if (toolName == "compare_experiment") {
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        std::string det = args.value("detector", "");
+        if (det.empty()) {
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"error", {{"code", -32602}, {"message", "Missing required argument 'detector'"}}}
+            };
+        }
+        if (!_insightEngine) {
+            contentText = nlohmann::json({{"detector", det}, {"verdict", "insufficient_data"}}).dump(2);
+        } else {
+            std::string plat = args.value("platform", "");
+            int64_t splitEpoch = args.value("split_epoch", int64_t(0));
+            contentText = _insightEngine->compareExperiment(det, plat, splitEpoch).dump(2);
+        }
     } else if (toolName == "service_list") {
         if (!_serviceSupervisor) {
             contentText = "Fleet supervisor is not enabled or not running.";

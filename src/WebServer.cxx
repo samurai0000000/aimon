@@ -13,6 +13,7 @@
 #include "MobileGateway.hxx"
 #include "PathUtils.hxx"
 #include "ServiceSupervisor.hxx"
+#include "InsightEngine.hxx"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -21,6 +22,9 @@
 #include <iomanip>
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
+#ifndef CPPHTTPLIB_THREAD_POOL_COUNT
+#define CPPHTTPLIB_THREAD_POOL_COUNT 8
 #endif
 #include <httplib.h>
 
@@ -204,7 +208,8 @@ void WebServer::setupRoutes() {
                 req.path.rfind("/api/agent", 0) == 0 ||
                 req.path.rfind("/api/workspace", 0) == 0 ||
                 req.path.rfind("/api/services", 0) == 0 ||
-                req.path.rfind("/api/supervisor", 0) == 0) {
+                req.path.rfind("/api/supervisor", 0) == 0 ||
+                req.path.rfind("/api/v1/insights", 0) == 0) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
             if (req.path == "/api" || req.path.rfind("/api/", 0) == 0) {
@@ -1350,6 +1355,90 @@ void WebServer::setupRoutes() {
     _server->Options("/sse", handleOptions);
     _server->Options("/message", handleOptions);
     _server->Options("/messages", handleOptions);
+
+    // Usage Insights & Workflow-Coaching REST API endpoints
+    _server->Get("/api/v1/insights", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!_insightEngine) {
+            res.set_content(nlohmann::json({{"findings", nlohmann::json::array()}}).dump(), "application/json");
+            return;
+        }
+        std::string plat = req.has_param("platform") ? req.get_param_value("platform") : "";
+        int days = 30;
+        if (req.has_param("days")) {
+            try { days = std::stoi(req.get_param_value("days")); } catch (...) {}
+        }
+        std::string minSev = req.has_param("min_severity") ? req.get_param_value("min_severity") : "";
+        res.set_content(_insightEngine->getInsights(plat, days, minSev).dump(), "application/json");
+    });
+
+    _server->Get("/api/v1/insights/report", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!_insightEngine) {
+            res.set_content(nlohmann::json({{"rows", nlohmann::json::array()}}).dump(), "application/json");
+            return;
+        }
+        std::string plat = req.has_param("platform") ? req.get_param_value("platform") : "";
+        int days = 30;
+        if (req.has_param("days")) {
+            try { days = std::stoi(req.get_param_value("days")); } catch (...) {}
+        }
+        std::string groupBy = req.has_param("group_by") ? req.get_param_value("group_by") : "project";
+        res.set_content(_insightEngine->getUsageReport(plat, days, groupBy).dump(), "application/json");
+    });
+
+    _server->Get("/api/v1/insights/digest", [this](const httplib::Request& req, httplib::Response& res) {
+        int days = 7;
+        if (req.has_param("days")) {
+            try { days = std::stoi(req.get_param_value("days")); } catch (...) {}
+        }
+        std::string md = _insightEngine ? _insightEngine->generateWeeklyDigest(days) : "";
+        res.set_content(nlohmann::json({{"days", days}, {"markdown", md}}).dump(), "application/json");
+    });
+
+    _server->Get("/api/v1/insights/compare", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string det = req.has_param("detector") ? req.get_param_value("detector") : "cache_hit_collapse";
+        std::string plat = req.has_param("platform") ? req.get_param_value("platform") : "";
+        int64_t splitEpoch = 0;
+        if (req.has_param("split_epoch")) {
+            try { splitEpoch = std::stoll(req.get_param_value("split_epoch")); } catch (...) {}
+        }
+        if (!_insightEngine) {
+            res.set_content(nlohmann::json({{"detector", det}, {"verdict", "insufficient_data"}}).dump(), "application/json");
+            return;
+        }
+        res.set_content(_insightEngine->compareExperiment(det, plat, splitEpoch).dump(), "application/json");
+    });
+
+    _server->Post("/api/v1/insights/export", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!_insightEngine) {
+            res.set_content(nlohmann::json({{"files", nlohmann::json::array()}}).dump(), "application/json");
+            return;
+        }
+        nlohmann::json body = nlohmann::json::parse(req.body, nullptr, false);
+        std::string outDir;
+        std::string fmt = "jsonl";
+        int days = 90;
+        bool anon = false;
+        if (body.is_object()) {
+            outDir = body.value("output_dir", "");
+            fmt = body.value("format", "jsonl");
+            days = body.value("days", 90);
+            anon = body.value("anonymize_projects", false);
+        }
+        res.set_content(_insightEngine->exportDataset(outDir, fmt, days, anon).dump(), "application/json");
+    });
+
+    _server->Post("/api/v1/insights/rebuild", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!_insightEngine) {
+            res.set_content(nlohmann::json({{"ok", false}}).dump(), "application/json");
+            return;
+        }
+        nlohmann::json body = nlohmann::json::parse(req.body, nullptr, false);
+        bool full = body.is_object() ? body.value("full", false) : false;
+        std::string histPath = PathUtils::getAimonConfigDir() + "/history.db";
+        std::string telPath = PathUtils::getAimonConfigDir() + "/telemetry.db";
+        bool ok = _insightEngine->rebuildFromConfig(histPath, telPath, full);
+        res.set_content(nlohmann::json({{"ok", ok}}).dump(), "application/json");
+    });
 }
 
 bool WebServer::start(bool async) {

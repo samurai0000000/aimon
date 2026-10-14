@@ -281,9 +281,15 @@ All services typically run as systemd daemons or inside persistent terminal mult
 | Tool Name | Operation Mode | Utility Description |
 | :--- | :--- | :--- |
 | `check_antigravity_quota` | **Analytics** | Queries remaining 5-hour rolling capacity %, prompt/flow credits, model tiers, and reset countdown timestamps for Google Antigravity / Gemini models. |
-| `check_cursor_usage` | **Analytics** | Queries fast requests used vs plan limit, total billing spend ($), and monthly billing cycle reset date for Cursor. |
+| `check_cursor_usage` | **Analytics** | Queries fast requests used vs plan limit, total billing spend ($), per-category spend breakdown, and monthly billing cycle reset date for Cursor. |
 | `check_claude_usage` | **Analytics** | Estimated Claude Code tokens and cost per account over 5 hours, 7 days, the configured window and the billing cycle, per-model table, plan tier, and price freshness. Read from local transcripts; figures are estimates. |
 | `get_combined_ai_status` | **Analytics** | Formats an executive summary of Google Antigravity, Cursor and Claude Code in a single Markdown card. |
+| `get_usage_insights` | **Coaching & Analytics** | Returns programmatic and workflow-coaching findings across Claude Code, Cursor, and Antigravity with severity, confidence, sample size (`n`), and suggested experiments. |
+| `get_usage_report` | **Analytics** | Structured cross-platform token, cache-hit, sidechain, and cost breakdown grouped by `project`, `model`, `day`, `hour_of_day`, `tool`, or `session`. |
+| `export_usage_dataset` | **Analytics** | Exports the normalized `insights.db` tables (`sqlite`, `csv`, or `jsonl` with `0600` permissions and optional `--anonymize` project hashing) for offline or agent-driven SQL analysis. |
+| `describe_usage_dataset` | **Analytics** | Returns the `insights.db` table schemas, privacy guarantees, and sample SQL queries. |
+| `compare_experiment` | **Coaching** | Compares a detector's target metric before and after a `split_epoch` timestamp to evaluate a workflow-coaching experiment (`improved`, `regressed`, `unchanged`, or `insufficient_data`). |
+| `service_list` / `service_status` / `service_restart` / `service_get_logs` | **Supervision** | Monitors and controls registered satellite daemons (`meshmon`, `netmon`, `embdevenv`, `abc80`, etc.). |
 
 ### 5.1 Claude Code Usage Subsystem
 
@@ -296,6 +302,22 @@ All services typically run as systemd daemons or inside persistent terminal mult
 **Surfaces.** `check_claude_usage` (in every profile), the combined status, history samples `claude:<account>` (`est_cost_usd`, `total_tokens`), MQTT/Home Assistant sensors per account, the `claude` section of the status JSON, and a static dashboard card (no JavaScript-generated cards). Every dollar figure is labelled an estimate: it can differ from the billing page (price changes, other machines, other products).
 
 **Verification.** Totals are checked against an independent Python recount that re-parses the pricing page and the transcripts with its own code and the same integer arithmetic, including every time window, per model and per day.
+
+### 5.2 Usage Insights & Workflow Coaching Subsystem (`InsightEngine`)
+
+`InsightEngine` maintains a dedicated SQLite WAL database (`~/.config/aimon/insights.db`, mode `0600`) that normalizes cross-platform usage metadata across Claude Code, Cursor, and Google Antigravity without storing any prompt text, assistant text, thinking text, or raw file paths.
+
+- **Normalized Schema (`insights.db`)**:
+  - `ins_requests`: Per-request token, cache (`cache_read`, `cache_write_5m`, `cache_write_1h`), `thinking_tokens`, `context_tokens`, `compacted`, `is_sidechain`, and `est_cost_nano` records.
+  - `ins_sessions`: Session rollups (`duration_sec`, `active_sec`, `turn_count`, `request_count`, `tool_calls`, `tool_errors`, `edit_count`, `unique_files`, `peak_context`, `compaction_count`, `cost_basis`).
+  - `ins_daily`: Daily rollups by platform, day, and model.
+  - `ins_tool_calls`: Tool executions with 16-hex-char SHA-256 `target_hash` (never raw file paths).
+  - `ins_quota`: Rolling quota fraction and credit balance snapshots across platforms.
+  - `ins_spend_daily`: Vendor-reported daily spend in cents by category (`CursorCollector::fetchDailySpendByCategory`).
+  - `ins_generations`: Validated numeric records decoded from Antigravity `gen_metadata` protobuf blobs (`input_tokens`, `output_tokens`, `thinking_tokens`, `response_tokens`, `cache_read`, `ttft_ms`, `context_tokens`).
+  - `ins_prompts`: Numeric prompt structure features (`chars`, `words`, `lines`, `prose_chars`, `prose_words`, `fenced_blocks`, `fenced_chars`, `paste_chars`, `mixed_paste`, `file_refs`, `question_marks`, `has_imperative`, `is_first_in_session`) paired with outcome proxies (`next_tool_calls`, `next_tool_errors`, `next_edits`, `reprompt_within_120s`, `interrupted_turn`, `turn_tokens`).
+  - `ins_findings`: Programmatic and workflow-coaching detector findings (`cache_efficiency`, `subagent_share`, `delegation_style`, `long_context`, `compact_opportunity`, `long_running_sessions`, `session_sprawl`, `error_retry_loops`, `short_prompt_rate`, `first_prompt_specificity`, `drip_vs_batch`, `time_and_fatigue`, `spend_category_mix`, `cost_by_project`, `model_mix`, `model_choice_fit`, `idle_gap_cache_expiry`, `context_reset_habit`, `time_of_day`, `cross_platform_overlap`, `quota_pressure`, `burn_rate_forecast`).
+  - `ins_scan_cursors`: Independent per-file scan cursors (`claude_jsonl`, `ag_conv_db`, `ag_transcript`) so historical transcripts already at EOF in `claude_file_cursors` are backfilled from offset 0.
 
 ### Satellite-Proxied Toolsets
 Connected subsystem daemons dynamically export their domain-specific MCP tools through `aimon`:
@@ -311,8 +333,8 @@ To prevent agent context pollution and minimize token consumption across diverse
 
 | Profile | Purpose / Domain | Included Tools |
 | :--- | :--- | :--- |
-| `core` | Default / general programming | `check_antigravity_quota`, `check_cursor_usage`, `get_combined_ai_status` |
-| `embedded` | Target boardbringup (`boards`, `embdevenv`) | Core tools + all `embdevenv_*` tools (19 tools total) |
+| `core` | Default / general programming | Quota tools (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`), Insights tools (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`), and Fleet supervision (`service_list`, `service_status`, `service_restart`, `service_get_logs`) |
+| `embedded` | Target board bringup (`boards`, `embdevenv`) | Core tools + all `embdevenv_*` tools |
 | `network` | Network diagnostics & firewall (`netmon`, `network`) | Core tools + `firewall_*`, `lan_*`, `snmp_*` |
 | `mesh` | LoRa RF telemetry (`meshmon`) | Core tools + `meshmon_*` tools |
 | `mail` | Mail access via `alpine-mcp` | Core tools + `mail_*` tools |
@@ -352,18 +374,18 @@ Events arrive on `POST /api/telemetry/event` from lifecycle hooks. `agent_type` 
 -- Active and historical agent execution sessions
 CREATE TABLE IF NOT EXISTS agent_sessions (
     session_id          TEXT PRIMARY KEY,
-    conversation_id     TEXT,
+    conversation_id     TEXT NOT NULL,
     agent_type          TEXT NOT NULL,
-    workspace           TEXT,
-    model               TEXT,
+    workspace_path      TEXT NOT NULL,
+    model_name          TEXT NOT NULL,
     start_timestamp     INTEGER NOT NULL,
-    end_timestamp       INTEGER,
-    status              TEXT DEFAULT 'RUNNING',
+    end_timestamp       INTEGER DEFAULT 0,
+    status              TEXT NOT NULL,
     total_turns         INTEGER DEFAULT 0,
-    prompt_tokens       INTEGER DEFAULT 0,
-    comp_tokens         INTEGER DEFAULT 0,
-    tool_calls          INTEGER DEFAULT 0,
-    errors              INTEGER DEFAULT 0,
+    total_prompt_tokens INTEGER DEFAULT 0,
+    total_comp_tokens   INTEGER DEFAULT 0,
+    total_tool_calls    INTEGER DEFAULT 0,
+    total_errors        INTEGER DEFAULT 0,
     avg_turn_ms         REAL DEFAULT 0.0
 );
 
@@ -375,36 +397,41 @@ CREATE TABLE IF NOT EXISTS agent_lifecycle_events (
     agent_type          TEXT NOT NULL,
     event_type          TEXT NOT NULL,
     step_index          INTEGER DEFAULT 0,
-    tool_name           TEXT,
+    tool_name           TEXT DEFAULT '',
     duration_ms         REAL DEFAULT 0.0,
     status              TEXT DEFAULT 'OK',
-    details_json        TEXT,
-    FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
+    details_json        TEXT DEFAULT '{}'
 );
 
 -- High-frequency telemetry samples (14-day retention)
 CREATE TABLE IF NOT EXISTS agent_telemetry_samples (
-    timestamp           INTEGER PRIMARY KEY,
-    active_agents       INTEGER DEFAULT 0,
-    prompt_tokens_sec   REAL DEFAULT 0.0,
-    comp_tokens_sec     REAL DEFAULT 0.0,
-    tool_calls_sec      REAL DEFAULT 0.0,
-    error_rate_pct      REAL DEFAULT 0.0,
-    avg_turn_latency_ms REAL DEFAULT 0.0,
-    p95_turn_latency_ms REAL DEFAULT 0.0,
-    approval_wait_ms    REAL DEFAULT 0.0
+    timestamp           INTEGER NOT NULL,
+    active_agents       INTEGER NOT NULL,
+    prompt_tokens_sec   REAL NOT NULL,
+    comp_tokens_sec     REAL NOT NULL,
+    tool_calls_sec      REAL NOT NULL,
+    error_rate_pct      REAL NOT NULL,
+    avg_turn_latency_ms REAL NOT NULL,
+    p95_turn_latency_ms REAL NOT NULL,
+    approval_wait_ms    REAL NOT NULL
 );
 
 -- Aggregated hourly rollups (365-day retention)
 CREATE TABLE IF NOT EXISTS agent_hourly_rollups (
-    hour_bucket         INTEGER PRIMARY KEY,
-    total_prompt_tokens INTEGER DEFAULT 0,
-    total_comp_tokens   INTEGER DEFAULT 0,
-    total_tool_calls    INTEGER DEFAULT 0,
-    total_errors        INTEGER DEFAULT 0,
-    avg_turn_latency_ms REAL DEFAULT 0.0,
-    p95_turn_latency_ms REAL DEFAULT 0.0,
-    avg_approval_wait_ms REAL DEFAULT 0.0
+    hour_timestamp       INTEGER NOT NULL,
+    agent_type           TEXT NOT NULL,
+    model_name           TEXT NOT NULL,
+    total_sessions       INTEGER NOT NULL,
+    total_turns          INTEGER NOT NULL,
+    total_prompt_tokens  INTEGER NOT NULL,
+    total_comp_tokens    INTEGER NOT NULL,
+    total_tool_calls     INTEGER NOT NULL,
+    total_errors         INTEGER NOT NULL,
+    avg_turn_ms          REAL NOT NULL,
+    p95_turn_ms          REAL NOT NULL,
+    max_turn_ms          REAL NOT NULL,
+    avg_approval_wait_ms REAL NOT NULL,
+    PRIMARY KEY (hour_timestamp, agent_type, model_name)
 );
 ```
 
@@ -436,10 +463,11 @@ Autonomous agent tasks frequently stall when sensitive tools (`run_command`, `wr
 
 The `aimon` dashboard (`web/index.html`, `web/app.js`, `web/style.css`, `include/WebAssets.hxx`) provides a multi-tab single-page interface:
 
-1. **AI Quotas (`#view-aimon`)**: Untouched front page displaying Google Antigravity quotas, credit allowances, and Cursor Fast Request usage.
+1. **AI Quotas (`#view-aimon`)**: Front page displaying Google Antigravity quotas and credit allowances, Cursor Fast Request and per-category spend breakdown, and Claude Code estimated usage.
 2. **Agent Telemetry & Analytics (`#view-telemetry`)**: Fed by lifecycle hooks from Antigravity, Cursor and Claude Code (see section 8.0). Interactive SVG/Canvas charts for Token Velocity, Turn Latency & P95 Distribution, Tool Invocation Matrices, and Session Waterfalls with timeframe selectors (`1H`, `24H`, `7D`, `30D`, `1Y`).
-3. **Action Approvals (`#view-approvals`)**: Live pending approval actions, 128-bit mobile pairing QR interface, and paired device management.
-4. **Dynamic Satellite Panels (`#panel-<id>`)**: Seamless embedded iframe monitors for connected subsystems (`netmon`, `meshmon`, `embdevenv`).
+3. **Usage Insights (`#view-insights`)**: Programmatic and workflow-coaching findings across Claude Code, Cursor, and Antigravity (`7D`, `30D`, `90D`), severity/confidence badges, suggested experiments, per-project and per-model token/cache/cost tables, and dataset export instructions.
+4. **Action Approvals (`#view-approvals`)**: Live pending approval actions, 128-bit mobile pairing QR interface, and paired device management.
+5. **Dynamic Satellite Panels (`#panel-<id>`)**: Seamless embedded iframe monitors for connected subsystems (`netmon`, `meshmon`, `embdevenv`, `abc80`).
 
 ---
 

@@ -124,6 +124,28 @@ struct GeminiConfig {
     std::string incidentLogDir = "~/.local/state/aimon/incidents";
 };
 
+struct InsightsConfig {
+    bool enabled = true;
+    std::string dbPath = "~/.config/aimon/insights.db";
+    int retentionDays = 400;
+    int refreshIntervalSec = 300;
+    int longContextThresholdTokens = 150000;
+    int compactContextThresholdTokens = 100000;
+    int compactContinueRequests = 15;
+    double subagentShareThreshold = 0.30;
+    int longSessionHours = 8;
+    double cacheEfficiencyThreshold = 0.50;
+    int cacheEfficiencyMinRequests = 20;
+    int errorRetryStreakThreshold = 3;
+    int idleGapSeconds = 300;
+    double burnRateAlertFraction = 0.75;
+    int shortPromptMaxProseChars = 60;
+    int dripPromptMaxProseChars = 80;
+    int dripPromptsPerHour = 25;
+    int quickRepromptSeconds = 120;
+    int coachingMinSampleSize = 10;
+};
+
 struct AimonConfig {
     PollingConfig polling;
     WebConfig web;
@@ -136,6 +158,7 @@ struct AimonConfig {
     SupervisorConfig supervisor;
     std::vector<SupervisedServiceConfig> services;
     GeminiConfig gemini;
+    InsightsConfig insights;
 
     nlohmann::json toJson() const;
     void fromJson(const nlohmann::json& j);

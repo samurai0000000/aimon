@@ -31,6 +31,7 @@ namespace aimon {
 class McpServer;
 class TcpGateway;
 class ServiceSupervisor;
+class InsightEngine;
 
 struct SseSession {
     std::string id;
@@ -59,6 +60,10 @@ public:
         _serviceSupervisor = supervisor;
     }
 
+    void setInsightEngine(InsightEngine* engine) {
+        _insightEngine = engine;
+    }
+
     int getPort() const {
         return _config.port;
     }
@@ -77,6 +82,7 @@ private:
     McpServer* _mcpServer = nullptr;
     TcpGateway* _tcpGateway = nullptr;
     ServiceSupervisor* _serviceSupervisor = nullptr;
+    InsightEngine* _insightEngine = nullptr;
 
     bool _endpointsEnabled = false;
     mutable std::mutex _sessionMutex;

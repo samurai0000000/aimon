@@ -37,6 +37,10 @@
                     <span class="subnav-title">action approvals</span>
                     <span class="tab-badge badge-amber hidden" id="approvals-badge">0</span>
                 </button>
+                <button type="button" class="aimon-subnav-tab" data-subpanel="insights">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">usage insights</span>
+                </button>
             </div>
 
             <!-- Subpanel 1: AI Quotas (Antigravity, Cursor, MCP Clients) -->
@@ -508,6 +512,53 @@
                             <div class="loading-placeholder">Loading paired devices...</div>
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <!-- Subpanel 4: Usage Insights & Workflow Refinement -->
+            <div class="aimon-subpanel telemetry-container hidden" id="subpanel-insights">
+                <div class="telemetry-header-bar">
+                    <div class="telem-title-group">
+                        <h2>Multi-Platform AI Usage Insights &amp; Workflow Coaching</h2>
+                        <span class="badge badge-cyan" id="insights-window-badge">30-Day Window</span>
+                    </div>
+                    <div class="pairing-action-row">
+                        <button type="button" class="btn-refresh" id="btn-insights-rebuild">Rebuild Insights</button>
+                        <button type="button" class="btn-refresh" id="btn-insights-export">Export Dataset</button>
+                    </div>
+                </div>
+
+                <div class="telemetry-charts-row">
+                    <!-- Active Findings Card -->
+                    <div class="glass-card chart-card">
+                        <div class="card-header">
+                            <h3>Active Usage &amp; Workflow-Coaching Findings</h3>
+                            <span class="badge badge-amber" id="insights-findings-count">0 Findings</span>
+                        </div>
+                        <div id="insights-findings-list" class="sessions-list">
+                            <div class="loading-placeholder">Loading findings...</div>
+                        </div>
+                    </div>
+
+                    <!-- Project Spend & Cache Breakdown Card -->
+                    <div class="glass-card chart-card">
+                        <div class="card-header">
+                            <h3>Project Spend, Token &amp; Cache Reuse Breakdown</h3>
+                            <span class="badge badge-cyan">By Project</span>
+                        </div>
+                        <div id="insights-project-report" class="sessions-list">
+                            <div class="loading-placeholder">Loading project breakdown...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Weekly Markdown Digest Card -->
+                <div class="glass-card waterfall-card">
+                    <div class="card-header">
+                        <h3>Weekly Workflow &amp; Spend Digest (7 Days)</h3>
+                        <span class="badge badge-magenta" id="insights-export-status">Privacy: Numeric Only</span>
+                    </div>
+                    <pre id="insights-digest-box" style="white-space: pre-wrap; font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; color: #cbd5e1; margin: 0; padding: 12px; background: rgba(15,23,42,0.55); border-radius: 8px; overflow-x: auto;">Loading weekly digest...</pre>
                 </div>
             </div>
         </main>

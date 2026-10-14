@@ -36,11 +36,17 @@ Copyright (C) 2026, Charles Chiou. All rights reserved.
 - [ ] Optional: ship the reporter script in this repository instead of keeping it only in the user's home directory.
 - [ ] Optional: a Claude series in the other charts (turn latency, token velocity) once tokens are available.
 
+### 5. Usage Insights & Workflow Coaching Layer (`InsightEngine`)
+- [x] Normalized SQLite WAL database (`~/.config/aimon/insights.db`, mode `0600`) across Claude Code, Cursor, and Antigravity with strict numeric-only privacy (no prompt text, assistant text, or raw file paths).
+- [x] Incremental ingestion from `history.db`, `telemetry.db`, Claude transcripts (`ins_scan_cursors`), Antigravity `gen_metadata` protobuf blobs and compact transcripts, Cursor `GetDailySpendByCategory`, and Remote-SSH checkpoints.
+- [x] Full suite of programmatic and workflow-coaching detectors (`cache_efficiency`, `subagent_share`, `delegation_style`, `long_context`, `compact_opportunity`, `long_running_sessions`, `session_sprawl`, `error_retry_loops`, `short_prompt_rate`, `first_prompt_specificity`, `drip_vs_batch`, `time_and_fatigue`, `spend_category_mix`, `cost_by_project`, `model_mix`, `model_choice_fit`, `idle_gap_cache_expiry`, `context_reset_habit`, `time_of_day`, `cross_platform_overlap`, `quota_pressure`, `burn_rate_forecast`).
+- [x] MCP tools (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`), CLI subcommands (`aimon insights ...`), Web Dashboard **Insights** tab (`#view-insights`), weekly markdown digest, and `sqlite`/`csv`/`jsonl` dataset export.
+- [ ] Optional (Phase 8, inactive until admin key exists): Anthropic Enterprise Spend Limits API collector for authoritative dollar spend and budget limits.
+
 ---
 
 ## Future Backlog
 
 ### Telemetry & Collector Enhancements
 - [ ] Add Prometheus `/metrics` exporter endpoint for Grafana integration alongside existing Home Assistant MQTT auto-discovery.
-- [ ] Add historical trend graphs on web dashboard for weekly token consumption rate.
 - [ ] Add configurable alert thresholds via desktop notifications (`libnotify`) when Cursor fast requests fall below 5%.

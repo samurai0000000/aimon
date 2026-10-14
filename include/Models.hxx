@@ -173,6 +173,24 @@ struct CategorySpend {
     }
 };
 
+struct CursorDailyCategorySpend {
+    int64_t dayMs = 0;
+    std::string dayStr;
+    std::string category;
+    double spendCents = 0.0;
+    std::string cycleId;
+
+    nlohmann::json toJson() const {
+        return {
+            {"day_ms", dayMs},
+            {"day_str", dayStr},
+            {"category", category},
+            {"spend_cents", spendCents},
+            {"cycle_id", cycleId}
+        };
+    }
+};
+
 struct CursorStatus {
     bool isAuthenticated = false;
     std::string planTier = "Unknown";
@@ -184,6 +202,7 @@ struct CursorStatus {
     double prevCycleSpendUsd = 0.0;
     std::vector<DailySpendPoint> dailySpendHistory;
     std::vector<CategorySpend> categorySpendList;
+    std::vector<CursorDailyCategorySpend> dailyCategorySpends;
     std::string cycleResetIso;
     std::string errorMessage;
 

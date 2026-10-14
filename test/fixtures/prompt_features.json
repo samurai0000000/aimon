@@ -1,0 +1,122 @@
+[
+  {
+    "name": "empty_prompt",
+    "input": "",
+    "expected": {
+      "chars": 0,
+      "words": 0,
+      "lines": 0,
+      "prose_chars": 0,
+      "prose_words": 0,
+      "fenced_chars": 0,
+      "fenced_block_count": 0,
+      "paste_chars": 0,
+      "mixed_paste": 0,
+      "file_path_count": 0,
+      "bullet_count": 0,
+      "has_code_block": 0,
+      "has_file_ref": 0,
+      "has_constraints": 0
+    }
+  },
+  {
+    "name": "short_bare_prompt",
+    "input": "fix this",
+    "expected": {
+      "chars": 8,
+      "words": 2,
+      "lines": 1,
+      "prose_chars": 8,
+      "prose_words": 2,
+      "fenced_chars": 0,
+      "fenced_block_count": 0,
+      "paste_chars": 0,
+      "mixed_paste": 0,
+      "file_path_count": 0,
+      "bullet_count": 0,
+      "has_code_block": 0,
+      "has_file_ref": 0,
+      "has_constraints": 0
+    }
+  },
+  {
+    "name": "structured_specific_prompt",
+    "input": "Update src/ConfigManager.cxx and include/ConfigManager.hxx:\n- Must support libconfig++ and JSON round-trip\n- Do not modify existing service fields\n1. Add unit test in test/TestLibconfigParser.cxx",
+    "expected": {
+      "chars": 195,
+      "words": 24,
+      "lines": 4,
+      "prose_chars": 192,
+      "prose_words": 24,
+      "fenced_chars": 0,
+      "fenced_block_count": 0,
+      "paste_chars": 0,
+      "mixed_paste": 0,
+      "file_path_count": 3,
+      "bullet_count": 3,
+      "has_code_block": 0,
+      "has_file_ref": 1,
+      "has_constraints": 1
+    }
+  },
+  {
+    "name": "short_prompt_with_fenced_block",
+    "input": "fix this\n```cpp\nint calculateTotal(int a, int b) {\n    return a + b * 2;\n}\n```",
+    "expected": {
+      "chars": 78,
+      "words": 17,
+      "lines": 6,
+      "prose_chars": 8,
+      "prose_words": 2,
+      "fenced_chars": 65,
+      "fenced_block_count": 1,
+      "paste_chars": 0,
+      "mixed_paste": 1,
+      "file_path_count": 0,
+      "bullet_count": 0,
+      "has_code_block": 1,
+      "has_file_ref": 0,
+      "has_constraints": 0
+    }
+  },
+  {
+    "name": "short_prompt_with_unfenced_compiler_errors",
+    "input": "why did it fail\nsrc/Foo.cxx:42:10: error: undeclared identifier\nsrc/Foo.cxx:43:5: warning: unused variable\n2026-10-14 12:00:01 build failed with exit code 1",
+    "expected": {
+      "chars": 156,
+      "words": 20,
+      "lines": 4,
+      "prose_chars": 15,
+      "prose_words": 4,
+      "fenced_chars": 0,
+      "fenced_block_count": 0,
+      "paste_chars": 138,
+      "mixed_paste": 1,
+      "file_path_count": 0,
+      "bullet_count": 0,
+      "has_code_block": 0,
+      "has_file_ref": 0,
+      "has_constraints": 0
+    }
+  },
+  {
+    "name": "short_prompt_with_indented_paste_run",
+    "input": "check this\n    alpha = 100\n    beta = 200\n    gamma = 300\n    delta = 400",
+    "expected": {
+      "chars": 73,
+      "words": 14,
+      "lines": 5,
+      "prose_chars": 10,
+      "prose_words": 2,
+      "fenced_chars": 0,
+      "fenced_block_count": 0,
+      "paste_chars": 59,
+      "mixed_paste": 1,
+      "file_path_count": 0,
+      "bullet_count": 0,
+      "has_code_block": 0,
+      "has_file_ref": 0,
+      "has_constraints": 0
+    }
+  }
+]

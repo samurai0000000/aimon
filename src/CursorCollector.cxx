@@ -324,6 +324,8 @@ void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
                 std::map<int64_t, double> dailyTotals;
                 std::map<std::string, double> categoryTotals;
                 double totalCents = 0.0;
+                status.dailyCategorySpends.clear();
+                std::string cycleIdStr = formatEpochMsToDate(startMs);
 
                 for (const auto& item : spendJson["dailySpend"]) {
                     if (!item.is_object()) continue;
@@ -349,6 +351,16 @@ void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
                     dailyTotals[dayMs] += spendCents;
                     categoryTotals[cat] += spendCents;
                     totalCents += spendCents;
+
+                    if (dayMs > 0) {
+                        CursorDailyCategorySpend cdcs;
+                        cdcs.dayMs = dayMs;
+                        cdcs.dayStr = formatEpochMsToDate(dayMs);
+                        cdcs.category = cat;
+                        cdcs.spendCents = spendCents;
+                        cdcs.cycleId = cycleIdStr;
+                        status.dailyCategorySpends.push_back(cdcs);
+                    }
                 }
 
                 status.totalSpendUsd = totalCents / 100.0;

@@ -7,6 +7,7 @@
 SHELL := /bin/bash
 BUILD_DIR := build
 NUM_PROCS := $(shell nproc 2>/dev/null || echo 4)
+CMAKE := $(shell if [ -x /usr/bin/cmake ]; then echo /usr/bin/cmake; else echo cmake; fi)
 
 # The tests run with HOME pointing at an empty directory under the build tree.
 # Some of them (circuit breaker, process monitor) write incident reports and
@@ -21,6 +22,9 @@ TEST_ENV = HOME=$(TEST_HOME)
 # the sanitized run fail, proving the sanitizers are active.
 SANITIZE ?= 0
 SANITIZE_CANARY ?= 0
+ifneq (,$(findstring -fsanitize,$(CFLAGS) $(CXXFLAGS)))
+SANITIZE := 1
+endif
 CMAKE_FLAGS := -DCMAKE_BUILD_TYPE=Release
 ifeq ($(SANITIZE),1)
 BUILD_DIR := build/asan
@@ -46,9 +50,9 @@ all:
 		git submodule update --init --recursive; \
 	fi
 	@mkdir -p $(BUILD_DIR)
-	@cd $(BUILD_DIR) && (test -f Makefile || cmake $(CURDIR) $(CMAKE_FLAGS))
+	@cd $(BUILD_DIR) && (test -f Makefile || $(CMAKE) $(CURDIR) $(CMAKE_FLAGS))
 ifeq ($(SANITIZE),1)
-	@cd $(BUILD_DIR) && cmake $(CURDIR) $(CMAKE_FLAGS) > /dev/null
+	@cd $(BUILD_DIR) && $(CMAKE) $(CURDIR) $(CMAKE_FLAGS) > /dev/null
 endif
 	@$(MAKE) -C $(BUILD_DIR) -j$(NUM_PROCS)
 
@@ -73,6 +77,9 @@ test: all
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_claude_collector
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_claude_parser_props
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_claude_surfaces
+	@$(TEST_ENV) ./$(BUILD_DIR)/test_insight_engine
+	@$(TEST_ENV) ./$(BUILD_DIR)/test_insight_parser_props
+	@$(TEST_ENV) ./$(BUILD_DIR)/test_insight_surfaces
 ifeq ($(SANITIZE_CANARY),1)
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_sanitizer_canary
 endif

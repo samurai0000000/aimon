@@ -144,6 +144,29 @@ bool HistoryStore::recordSnapshot(const AggregateStatus& status) {
         for (const auto& m : status.antigravity.models) {
             recordMetric("antigravity", m.modelId, m.remainingFraction, 1.0);
         }
+        for (const auto& g : status.antigravity.quotaGroups) {
+            for (const auto& b : g.buckets) {
+                std::string bKey = "bucket:" + (b.bucketId.empty() ? (g.displayName + ":" + b.window) : b.bucketId);
+                recordMetric("antigravity", bKey, b.remainingFraction, 1.0);
+            }
+        }
+        if (status.antigravity.monthlyPromptCredits > 0 || status.antigravity.availablePromptCredits > 0) {
+            recordMetric("antigravity", "credit:prompt",
+                         static_cast<double>(status.antigravity.availablePromptCredits),
+                         static_cast<double>(status.antigravity.monthlyPromptCredits));
+        }
+        if (status.antigravity.monthlyFlowCredits > 0 || status.antigravity.availableFlowCredits > 0) {
+            recordMetric("antigravity", "credit:flow",
+                         static_cast<double>(status.antigravity.availableFlowCredits),
+                         static_cast<double>(status.antigravity.monthlyFlowCredits));
+        }
+        for (const auto& c : status.antigravity.availableCredits) {
+            if (!c.creditType.empty()) {
+                recordMetric("antigravity", "credit:" + c.creditType,
+                             static_cast<double>(c.creditAmount),
+                             static_cast<double>(c.minimumCreditAmountForUsage));
+            }
+        }
     }
 
     if (status.cursor.isAuthenticated) {

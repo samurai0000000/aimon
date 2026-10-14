@@ -35,6 +35,7 @@
 #include "MobileGateway.hxx"
 #include "ProcessMonitor.hxx"
 #include "ServiceSupervisor.hxx"
+#include "InsightEngine.hxx"
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -68,7 +69,8 @@ static void printUsage(const char* progName) {
               << "Commands:\n"
               << "  daemon                 Run full background daemon (Web + Poller + MQTT) [Default]\n"
               << "  web                    Run embedded web dashboard server\n"
-              << "  mcp                    Run as stdio JSON-RPC 2.0 MCP server for AI agents\n\n"
+              << "  mcp                    Run as stdio JSON-RPC 2.0 MCP server for AI agents\n"
+              << "  insights [subcommand]  Run usage insights CLI (findings|report|rebuild|export|digest|compare)\n\n"
               << "Options:\n"
               << "  --config <path>        Custom path to configuration file (default: ~/.config/aimon/config.json)\n"
               << "  --profile <profile>    Default MCP tool profile (core, embedded, network, mesh, mail, all)\n"
@@ -111,6 +113,110 @@ int main(int argc, char* argv[]) {
     int argIdx = 1;
     if (argIdx < argc && argv[argIdx][0] != '-') {
         command = argv[argIdx++];
+    }
+
+    if (command == "insights") {
+        std::string subcmd = "findings";
+        if (argIdx < argc && argv[argIdx][0] != '-') {
+            subcmd = argv[argIdx++];
+        }
+        std::string insPlatform;
+        std::string insGroupBy = "project";
+        std::string insMinSev;
+        std::string insFormat = "jsonl";
+        std::string insOutDir;
+        std::string insDetector = "cache_hit_collapse";
+        int insDays = (subcmd == "digest") ? 7 : ((subcmd == "export") ? 90 : 30);
+        int64_t insSplitEpoch = 0;
+        bool insFull = false;
+        bool insAnon = false;
+
+        if (subcmd == "compare" && argIdx < argc && argv[argIdx][0] != '-') {
+            insDetector = argv[argIdx++];
+        }
+
+        while (argIdx < argc) {
+            std::string arg = argv[argIdx++];
+            if (arg == "--config" && argIdx < argc) {
+                customConfigPath = argv[argIdx++];
+            } else if (arg == "--platform" && argIdx < argc) {
+                insPlatform = argv[argIdx++];
+            } else if (arg == "--days" && argIdx < argc) {
+                insDays = std::stoi(argv[argIdx++]);
+            } else if (arg == "--group-by" && argIdx < argc) {
+                insGroupBy = argv[argIdx++];
+            } else if (arg == "--min-severity" && argIdx < argc) {
+                insMinSev = argv[argIdx++];
+            } else if (arg == "--format" && argIdx < argc) {
+                insFormat = argv[argIdx++];
+            } else if (arg == "--dir" && argIdx < argc) {
+                insOutDir = argv[argIdx++];
+            } else if (arg == "--detector" && argIdx < argc) {
+                insDetector = argv[argIdx++];
+            } else if (arg == "--split-epoch" && argIdx < argc) {
+                insSplitEpoch = std::stoll(argv[argIdx++]);
+            } else if (arg == "--full" || arg == "--reset-cursors") {
+                insFull = true;
+            } else if (arg == "--anonymize") {
+                insAnon = true;
+            } else if (arg == "--help" || arg == "-h") {
+                printUsage(argv[0]);
+                return 0;
+            }
+        }
+
+        ConfigManager configMgr;
+        configMgr.load(customConfigPath);
+        AimonConfig& cfg = configMgr.getConfig();
+
+        InsightEngine engine;
+        engine.setConfig(cfg);
+        if (!engine.open(cfg.insights.dbPath)) {
+            std::cerr << "[aimon insights] Failed to open " << cfg.insights.dbPath << "\n";
+            return 1;
+        }
+
+        std::string histPath = cfg.history.dbPath.empty() ?
+            (PathUtils::getAimonConfigDir() + "/history.db") : cfg.history.dbPath;
+        std::string telPath = PathUtils::getAimonConfigDir() + "/telemetry.db";
+
+        if (subcmd == "rebuild") {
+            bool ok = engine.rebuildFromConfig(histPath, telPath, insFull);
+            if (!ok) {
+                std::cerr << "[aimon insights] Rebuild failed.\n";
+                return 1;
+            }
+            auto rep = engine.getUsageReport("", 30, "project");
+            auto ins = engine.getInsights("", 30, "");
+            std::cout << nlohmann::json({
+                {"ok", true},
+                {"db_path", PathUtils::expandHome(cfg.insights.dbPath)},
+                {"projects_30d", rep["rows"].size()},
+                {"active_findings_30d", ins["findings"].size()}
+            }).dump(2) << "\n";
+            return 0;
+        } else if (subcmd == "findings") {
+            std::cout << engine.getInsights(insPlatform, insDays, insMinSev).dump(2) << "\n";
+            return 0;
+        } else if (subcmd == "report") {
+            std::cout << engine.getUsageReport(insPlatform, insDays, insGroupBy).dump(2) << "\n";
+            return 0;
+        } else if (subcmd == "export") {
+            std::cout << engine.exportDataset(insOutDir, insFormat, insDays, insAnon).dump(2) << "\n";
+            return 0;
+        } else if (subcmd == "digest") {
+            std::cout << engine.generateWeeklyDigest(insDays);
+            return 0;
+        } else if (subcmd == "compare") {
+            std::cout << engine.compareExperiment(insDetector, insPlatform, insSplitEpoch).dump(2) << "\n";
+            return 0;
+        } else if (subcmd == "describe") {
+            std::cout << InsightEngine::describeDataset().dump(2) << "\n";
+            return 0;
+        } else {
+            std::cerr << "[aimon insights] Unknown subcommand: " << subcmd << "\n";
+            return 1;
+        }
     }
 
     while (argIdx < argc) {
@@ -216,6 +322,13 @@ int main(int argc, char* argv[]) {
         historyStore.open(cfg.history.dbPath);
     }
 
+    InsightEngine insightEngine;
+    insightEngine.setConfig(cfg);
+    if (cfg.insights.enabled) {
+        insightEngine.open(cfg.insights.dbPath);
+    }
+    int64_t lastInsightRebuildEpoch = 0;
+
     AgentTelemetryDb::getInstance().open();
     MobileGateway::getInstance().init();
 
@@ -276,6 +389,19 @@ int main(int argc, char* argv[]) {
             historyStore.recordSnapshot(status);
         }
 
+        if (cfg.insights.enabled) {
+            insightEngine.ingestLiveStatus(status);
+            int64_t nowEpoch = static_cast<int64_t>(std::time(nullptr));
+            int intervalSec = std::max(60, cfg.insights.refreshIntervalSec);
+            if (nowEpoch - lastInsightRebuildEpoch >= intervalSec) {
+                lastInsightRebuildEpoch = nowEpoch;
+                std::string histPath = cfg.history.dbPath.empty() ?
+                    (PathUtils::getAimonConfigDir() + "/history.db") : cfg.history.dbPath;
+                std::string telPath = PathUtils::getAimonConfigDir() + "/telemetry.db";
+                insightEngine.rebuildFromConfig(histPath, telPath, false);
+            }
+        }
+
         if (mqttPublisher) {
             mqttPublisher->publishState(status);
         }
@@ -304,6 +430,9 @@ int main(int argc, char* argv[]) {
         }
 
         McpServer mcpServer(stateStore, &dynamicRegistry, &tcpGateway);
+        if (cfg.insights.enabled) {
+            mcpServer.setInsightEngine(&insightEngine);
+        }
         if (!optProfile.empty()) {
             mcpServer.setDefaultProfile(optProfile);
         }
@@ -330,12 +459,18 @@ int main(int argc, char* argv[]) {
     TcpGateway tcpGateway(dynamicRegistry);
 
     McpServer mcpServer(stateStore, &dynamicRegistry, &tcpGateway);
+    if (cfg.insights.enabled) {
+        mcpServer.setInsightEngine(&insightEngine);
+    }
     if (!optProfile.empty()) {
         mcpServer.setDefaultProfile(optProfile);
     }
     WebServer webServer(stateStore, historyStore, cfg.web, [&]() {
         pollOnce();
     }, &mcpServer, &tcpGateway);
+    if (cfg.insights.enabled) {
+        webServer.setInsightEngine(&insightEngine);
+    }
 
     mcpServer.setNotificationBroadcaster([&](const std::string& notif) {
         webServer.broadcastSseNotification(notif);

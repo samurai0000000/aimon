@@ -333,6 +333,81 @@ TEST(LibconfigParser_Integrated, RealAimonCfgParity) {
     }
 }
 
+TEST(LibconfigParser_Integrated, InsightsConfigLibconfigAndJsonParity) {
+    std::string cfgPath = _tempDir + "/insights_test.cfg";
+    std::string jsonPath = _tempDir + "/insights_test.json";
+
+    ConfigManager cm1;
+    AimonConfig& c1 = cm1.getConfig();
+    c1.insights.enabled = false;
+    c1.insights.dbPath = "/tmp/custom_insights.db";
+    c1.insights.retentionDays = 180;
+    c1.insights.refreshIntervalSec = 120;
+    c1.insights.longContextThresholdTokens = 175000;
+    c1.insights.compactContextThresholdTokens = 110000;
+    c1.insights.compactContinueRequests = 20;
+    c1.insights.subagentShareThreshold = 0.45;
+    c1.insights.longSessionHours = 12;
+    c1.insights.cacheEfficiencyThreshold = 0.60;
+    c1.insights.cacheEfficiencyMinRequests = 25;
+    c1.insights.errorRetryStreakThreshold = 4;
+    c1.insights.idleGapSeconds = 600;
+    c1.insights.burnRateAlertFraction = 0.85;
+    c1.insights.shortPromptMaxProseChars = 75;
+    c1.insights.dripPromptMaxProseChars = 90;
+    c1.insights.dripPromptsPerHour = 30;
+    c1.insights.quickRepromptSeconds = 90;
+    c1.insights.coachingMinSampleSize = 15;
+
+    CHECK_TRUE(cm1.saveLibConfig(cfgPath));
+    ConfigManager cmLib;
+    CHECK_TRUE(cmLib.loadLibConfig(cfgPath));
+    const InsightsConfig& libIns = cmLib.getConfig().insights;
+    CHECK_FALSE(libIns.enabled);
+    CHECK_EQUAL("/tmp/custom_insights.db", libIns.dbPath);
+    CHECK_EQUAL(180, libIns.retentionDays);
+    CHECK_EQUAL(120, libIns.refreshIntervalSec);
+    CHECK_EQUAL(175000, libIns.longContextThresholdTokens);
+    CHECK_EQUAL(110000, libIns.compactContextThresholdTokens);
+    CHECK_EQUAL(20, libIns.compactContinueRequests);
+    DOUBLES_EQUAL(0.45, libIns.subagentShareThreshold, 0.001);
+    CHECK_EQUAL(12, libIns.longSessionHours);
+    DOUBLES_EQUAL(0.60, libIns.cacheEfficiencyThreshold, 0.001);
+    CHECK_EQUAL(25, libIns.cacheEfficiencyMinRequests);
+    CHECK_EQUAL(4, libIns.errorRetryStreakThreshold);
+    CHECK_EQUAL(600, libIns.idleGapSeconds);
+    DOUBLES_EQUAL(0.85, libIns.burnRateAlertFraction, 0.001);
+    CHECK_EQUAL(75, libIns.shortPromptMaxProseChars);
+    CHECK_EQUAL(90, libIns.dripPromptMaxProseChars);
+    CHECK_EQUAL(30, libIns.dripPromptsPerHour);
+    CHECK_EQUAL(90, libIns.quickRepromptSeconds);
+    CHECK_EQUAL(15, libIns.coachingMinSampleSize);
+
+    CHECK_TRUE(cm1.save(jsonPath));
+    ConfigManager cmJson;
+    CHECK_TRUE(cmJson.load(jsonPath));
+    const InsightsConfig& jsIns = cmJson.getConfig().insights;
+    CHECK_FALSE(jsIns.enabled);
+    CHECK_EQUAL("/tmp/custom_insights.db", jsIns.dbPath);
+    CHECK_EQUAL(180, jsIns.retentionDays);
+    CHECK_EQUAL(120, jsIns.refreshIntervalSec);
+    CHECK_EQUAL(175000, jsIns.longContextThresholdTokens);
+    CHECK_EQUAL(110000, jsIns.compactContextThresholdTokens);
+    CHECK_EQUAL(20, jsIns.compactContinueRequests);
+    DOUBLES_EQUAL(0.45, jsIns.subagentShareThreshold, 0.001);
+    CHECK_EQUAL(12, jsIns.longSessionHours);
+    DOUBLES_EQUAL(0.60, jsIns.cacheEfficiencyThreshold, 0.001);
+    CHECK_EQUAL(25, jsIns.cacheEfficiencyMinRequests);
+    CHECK_EQUAL(4, jsIns.errorRetryStreakThreshold);
+    CHECK_EQUAL(600, jsIns.idleGapSeconds);
+    DOUBLES_EQUAL(0.85, jsIns.burnRateAlertFraction, 0.001);
+    CHECK_EQUAL(75, jsIns.shortPromptMaxProseChars);
+    CHECK_EQUAL(90, jsIns.dripPromptMaxProseChars);
+    CHECK_EQUAL(30, jsIns.dripPromptsPerHour);
+    CHECK_EQUAL(90, jsIns.quickRepromptSeconds);
+    CHECK_EQUAL(15, jsIns.coachingMinSampleSize);
+}
+
 int main(int ac, char** av) {
     return CommandLineTestRunner::RunAllTests(ac, av);
 }

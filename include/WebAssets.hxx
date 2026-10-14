@@ -49,6 +49,10 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                     <span class="subnav-title">action approvals</span>
                     <span class="tab-badge badge-amber hidden" id="approvals-badge">0</span>
                 </button>
+                <button type="button" class="aimon-subnav-tab" data-subpanel="insights">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">usage insights</span>
+                </button>
             </div>
 
             <!-- Subpanel 1: AI Quotas (Antigravity, Cursor, MCP Clients) -->
@@ -520,6 +524,53 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                             <div class="loading-placeholder">Loading paired devices...</div>
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <!-- Subpanel 4: Usage Insights & Workflow Refinement -->
+            <div class="aimon-subpanel telemetry-container hidden" id="subpanel-insights">
+                <div class="telemetry-header-bar">
+                    <div class="telem-title-group">
+                        <h2>Multi-Platform AI Usage Insights &amp; Workflow Coaching</h2>
+                        <span class="badge badge-cyan" id="insights-window-badge">30-Day Window</span>
+                    </div>
+                    <div class="pairing-action-row">
+                        <button type="button" class="btn-refresh" id="btn-insights-rebuild">Rebuild Insights</button>
+                        <button type="button" class="btn-refresh" id="btn-insights-export">Export Dataset</button>
+                    </div>
+                </div>
+
+                <div class="telemetry-charts-row">
+                    <!-- Active Findings Card -->
+                    <div class="glass-card chart-card">
+                        <div class="card-header">
+                            <h3>Active Usage &amp; Workflow-Coaching Findings</h3>
+                            <span class="badge badge-amber" id="insights-findings-count">0 Findings</span>
+                        </div>
+                        <div id="insights-findings-list" class="sessions-list">
+                            <div class="loading-placeholder">Loading findings...</div>
+                        </div>
+                    </div>
+
+                    <!-- Project Spend & Cache Breakdown Card -->
+                    <div class="glass-card chart-card">
+                        <div class="card-header">
+                            <h3>Project Spend, Token &amp; Cache Reuse Breakdown</h3>
+                            <span class="badge badge-cyan">By Project</span>
+                        </div>
+                        <div id="insights-project-report" class="sessions-list">
+                            <div class="loading-placeholder">Loading project breakdown...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Weekly Markdown Digest Card -->
+                <div class="glass-card waterfall-card">
+                    <div class="card-header">
+                        <h3>Weekly Workflow &amp; Spend Digest (7 Days)</h3>
+                        <span class="badge badge-magenta" id="insights-export-status">Privacy: Numeric Only</span>
+                    </div>
+                    <pre id="insights-digest-box" style="white-space: pre-wrap; font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; color: #cbd5e1; margin: 0; padding: 12px; background: rgba(15,23,42,0.55); border-radius: 8px; overflow-x: auto;">Loading weekly digest...</pre>
                 </div>
             </div>
         </main>
@@ -5914,7 +5965,8 @@ function switchToSubpanel(subpanelId) {
     const subpanels = {
         'quotas': document.getElementById('subpanel-quotas'),
         'telemetry': document.getElementById('subpanel-telemetry'),
-        'approvals': document.getElementById('subpanel-approvals')
+        'approvals': document.getElementById('subpanel-approvals'),
+        'insights': document.getElementById('subpanel-insights')
     };
     Object.keys(subpanels).forEach(key => {
         const el = subpanels[key];
@@ -5939,6 +5991,79 @@ function switchToSubpanel(subpanelId) {
         fetchPendingApprovals();
         fetchMobileQr();
         fetchMobileDevices();
+    } else if (subpanelId === 'insights') {
+        fetchInsightsTab();
+    }
+}
+
+async function fetchInsightsTab() {
+    try {
+        const [insRes, repRes, digRes] = await Promise.all([
+            fetch('/api/v1/insights?days=30'),
+            fetch('/api/v1/insights/report?group_by=project&days=30'),
+            fetch('/api/v1/insights/digest?days=7')
+        ]);
+
+        if (insRes.ok) {
+            const insData = await insRes.json();
+            const findings = insData.findings || [];
+            const countEl = document.getElementById('insights-findings-count');
+            if (countEl) countEl.textContent = `${findings.length} Findings`;
+            const listEl = document.getElementById('insights-findings-list');
+            if (listEl) {
+                if (findings.length === 0) {
+                    listEl.innerHTML = '<div class="loading-placeholder">No waste or workflow anomalies exceeded thresholds in the 30-day window.</div>';
+                } else {
+                    listEl.innerHTML = findings.map(f => {
+                        const sevBadge = f.severity === 'high' ? 'badge-magenta' : (f.severity === 'warn' ? 'badge-amber' : 'badge-cyan');
+                        const expHtml = f.suggested_experiment ? `<div style="margin-top:6px; font-size:0.78rem; color:#94a3b8;"><strong>Experiment:</strong> ${f.suggested_experiment}</div>` : '';
+                        return `<div class="session-item" style="flex-direction:column; align-items:flex-start; gap:4px; padding:10px 12px;">
+                            <div style="display:flex; justify-content:space-between; width:100%; align-items:center;">
+                                <span style="font-weight:600; color:#e2e8f0;">${f.detector} <span style="color:#64748b; font-weight:400;">(${f.platform} &bull; ${f.scope}:${f.scope_id})</span></span>
+                                <span class="badge ${sevBadge}">${f.severity} &bull; ${f.confidence} &bull; n=${f.n}</span>
+                            </div>
+                            <div style="font-size:0.84rem; color:#cbd5e1;">${f.summary}</div>
+                            ${expHtml}
+                        </div>`;
+                    }).join('');
+                }
+            }
+        }
+
+        if (repRes.ok) {
+            const repData = await repRes.json();
+            const rows = repData.rows || [];
+            const projEl = document.getElementById('insights-project-report');
+            if (projEl) {
+                if (rows.length === 0) {
+                    projEl.innerHTML = '<div class="loading-placeholder">No project records in window.</div>';
+                } else {
+                    projEl.innerHTML = rows.map(r => {
+                        const hitPct = ((r.cache_hit_ratio || 0) * 100).toFixed(1);
+                        const costUsd = (r.est_cost_usd || 0).toFixed(2);
+                        return `<div class="session-item" style="justify-content:space-between; padding:8px 12px;">
+                            <div>
+                                <strong style="color:#f8fafc;">${r.key || 'unknown'}</strong>
+                                <span style="color:#64748b; font-size:0.78rem; margin-left:6px;">[${r.platform}] ${r.requests} reqs</span>
+                            </div>
+                            <div style="font-family:'JetBrains Mono', monospace; font-size:0.82rem; color:#cbd5e1;">
+                                Cache: <span style="color:#38bdf8;">${hitPct}%</span> &bull; Est: <span style="color:#4ade80;">$${costUsd}</span>
+                            </div>
+                        </div>`;
+                    }).join('');
+                }
+            }
+        }
+
+        if (digRes.ok) {
+            const digData = await digRes.json();
+            const digBox = document.getElementById('insights-digest-box');
+            if (digBox) {
+                digBox.textContent = digData.markdown || 'No digest available.';
+            }
+        }
+    } catch (err) {
+        console.error('Failed to fetch usage insights:', err);
     }
 }
 
@@ -5988,7 +6113,7 @@ function switchToMonitor(monitorId) {
 function switchToTab(id) {
     if (!id || id === 'aimon') {
         switchToSubpanel(activeSubpanelId || 'quotas');
-    } else if (id === 'quotas' || id === 'telemetry' || id === 'approvals') {
+    } else if (id === 'quotas' || id === 'telemetry' || id === 'approvals' || id === 'insights') {
         switchToSubpanel(id);
     } else {
         switchToMonitor(id);
@@ -6000,7 +6125,7 @@ window.addEventListener('hashchange', () => {
     if (hash) {
         if (hash.startsWith('aimon/')) {
             switchToSubpanel(hash.split('/')[1]);
-        } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+        } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights') {
             switchToSubpanel(hash);
         } else {
             switchToMonitor(hash);
@@ -6023,7 +6148,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (hash) {
             if (hash.startsWith('aimon/')) {
                 switchToSubpanel(hash.split('/')[1]);
-            } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals') {
+            } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights') {
                 switchToSubpanel(hash);
             } else {
                 switchToMonitor(hash);
@@ -6031,6 +6156,40 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     } else {
         switchToSubpanel('quotas');
+    }
+
+    const btnRebuildInsights = document.getElementById('btn-insights-rebuild');
+    if (btnRebuildInsights) {
+        btnRebuildInsights.addEventListener('click', async () => {
+            btnRebuildInsights.textContent = 'Rebuilding...';
+            try {
+                await fetch('/api/v1/insights/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+                await fetchInsightsTab();
+            } finally {
+                btnRebuildInsights.textContent = 'Rebuild Insights';
+            }
+        });
+    }
+
+    const btnExportInsights = document.getElementById('btn-insights-export');
+    if (btnExportInsights) {
+        btnExportInsights.addEventListener('click', async () => {
+            btnExportInsights.textContent = 'Exporting...';
+            try {
+                const res = await fetch('/api/v1/insights/export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ format: 'jsonl', days: 90, anonymize_projects: false })
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    const st = document.getElementById('insights-export-status');
+                    if (st) st.textContent = `Exported ${(data.files || []).length} files`;
+                }
+            } finally {
+                btnExportInsights.textContent = 'Export Dataset';
+            }
+        });
     }
 
     // Top-level monitor tabs listener
@@ -6116,6 +6275,8 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchTelemetryTools();
         } else if (activeTabId === 'approvals') {
             fetchPendingApprovals();
+        } else if (activeTabId === 'insights') {
+            fetchInsightsTab();
         }
     }, 8000);
 

@@ -17,7 +17,8 @@ It is designed specifically for developers who work remotely or off-network and 
 - **Modern Embedded Web Dashboard**: Built-in HTTP server serving a rich, dark-mode single-page interface with live gauges and countdown timers.
 - **Home Assistant (MQTT)**: Built-in MQTT publisher with Home Assistant Auto-Discovery and ready-to-import Lovelace view cards.
 - **Agent Telemetry Tab (optional hooks)**: Cursor, Antigravity and Claude Code lifecycle hooks post statistics only (session, turn, tool name, duration, status) to the local daemon. See `doc/Setup.md` Step 6.
-- **Privacy & Security First**: All credential access stays strictly local on your machine. No telemetry, third-party relays, or external logging.
+- **Usage Insights & Workflow Coaching (`insights.db`)**: Normalizes cross-platform session, token, cache, generation, and numeric prompt-structure metadata across Claude Code, Cursor, and Antigravity (`~/.config/aimon/insights.db`, mode `0600`), runs programmatic and workflow-coaching detectors, exports `sqlite`/`csv`/`jsonl` datasets, and generates weekly digests.
+- **Privacy & Security First**: All credential access stays strictly local on your machine. No prompt text, assistant text, thinking text, or raw file paths are ever persisted in `insights.db`.
 
 ---
 
@@ -36,11 +37,12 @@ It is designed specifically for developers who work remotely or off-network and 
 ```
 
 1. **Antigravity Collector**: Automatically scans the local process table for the running `language_server` binary, extracts the launch CSRF token and loopback HTTPS port, and queries the internal `GetUserStatus` Connect-RPC endpoint.
-2. **Cursor Collector**: Reads local desktop authentication tokens from SQLite state storage (`~/.config/Cursor/User/globalStorage/state.vscdb`) and queries Cursor's IDE backend (`https://api2.cursor.sh`).
+2. **Cursor Collector**: Reads local desktop authentication tokens from SQLite state storage (`~/.config/Cursor/User/globalStorage/state.vscdb`) and queries Cursor's IDE backend (`https://api2.cursor.sh`), including per-category spend (`GetDailySpendByCategory`).
 3. **Claude Code Collector**: Reads only the new bytes of each transcript under the Claude config directory (`~/.claude/projects`) on every poll, keeps deduplicated rows and file positions in SQLite, detects the account tier (Enterprise or personal) from the two descriptive strings of the credentials file (no token is ever read into a result), and costs usage in exact integer nano-dollars with a versioned price catalog. Every dollar figure is an estimate and can differ from the billing page. See [Claude Code usage](#claude-code-usage) below.
-4. **Delivery Surfaces**:
-   - **MCP Server (`aimon mcp`)**: Enables Cursor, Antigravity and Claude Code AI agents to inspect your usage in natural language (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`).
-   - **Web Dashboard (`aimon web`)**: Displays visual progress gauges, credit balances, and reset countdown timers in your browser.
+4. **Usage Insights Engine (`InsightEngine`)**: Incrementally ingests `history.db`, `telemetry.db`, Claude transcripts (`~/.claude/projects`), Antigravity conversation databases and compact transcripts (`~/.gemini/antigravity`), and Cursor checkpoints (`~/.cursor-server`) into `~/.config/aimon/insights.db` to surface programmatic and workflow-coaching findings.
+5. **Delivery Surfaces**:
+   - **MCP Server (`aimon mcp`)**: Enables Cursor, Antigravity and Claude Code AI agents to inspect quotas and usage insights in natural language (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`, `get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`).
+   - **Web Dashboard (`aimon web`)**: Displays visual progress gauges, credit balances, reset countdown timers, telemetry charts, and the Usage Insights tab in your browser.
    - **Home Assistant (`aimon daemon`)**: Emits MQTT auto-discovery and live state updates to Home Assistant.
 
 ### Claude Code usage
@@ -63,6 +65,46 @@ Enabled by default; with no configuration it reads `~/.claude` (or `$CLAUDE_CONF
 - Two accounts must not share a `config_dir`; a second login on the same machine needs its own Claude config directory.
 - Prices come from `https://platform.claude.com/docs/en/about-claude/pricing.md` and are cached next to the configuration. If the page cannot be fetched, the last good prices are used and flagged stale; with none at all, tokens are counted and cost is shown as unpriced.
 - Only Claude Code transcripts on the host where the daemon runs are counted (not claude.ai chat, other machines or other products).
+
+### Usage Insights & Workflow Coaching
+
+Enabled by default; writes to `~/.config/aimon/insights.db` (`0600` permissions). Optional configuration in `~/.config/aimon/config.json` (or `aimon.cfg`):
+
+```json
+"insights": {
+  "enabled": true,
+  "db_path": "~/.config/aimon/insights.db",
+  "retention_days": 400,
+  "rebuild_interval_minutes": 15,
+  "cache_efficiency_threshold": 0.50,
+  "subagent_share_threshold": 0.35,
+  "long_context_threshold_tokens": 150000,
+  "compact_context_threshold_tokens": 100000,
+  "compact_continue_requests": 20,
+  "idle_gap_seconds": 300,
+  "error_retry_streak_threshold": 3,
+  "burn_rate_alert_fraction": 0.85,
+  "short_prompt_max_prose_chars": 60,
+  "drip_prompt_max_prose_chars": 80,
+  "drip_prompts_per_hour": 8,
+  "quick_reprompt_seconds": 120,
+  "long_session_hours": 4,
+  "coaching_min_sample_size": 10,
+  "antigravity_gen_metadata_enabled": true
+}
+```
+
+CLI subcommands for inspecting insights, generating digests, and exporting datasets:
+
+```bash
+./build/aimon insights rebuild [--full]
+./build/aimon insights findings [--platform claude|cursor|antigravity] [--days 30] [--min-severity info|warn|crit]
+./build/aimon insights report [--platform ...] [--days 30] [--group-by project|model|day|hour_of_day|tool|session]
+./build/aimon insights export --dir /path/to/out [--format sqlite|csv|jsonl] [--days 90] [--anonymize]
+./build/aimon insights digest [--days 7]
+./build/aimon insights compare --detector <name> [--platform ...] [--split-epoch <ts>]
+./build/aimon insights describe
+```
 
 For comprehensive architectural specifications and protocol details, see [doc/Design.md](doc/Design.md).
 
@@ -137,12 +179,12 @@ To prevent token exhaustion and eliminate irrelevant context in specialized work
 
 | Profile | Target Domain | Tools Included |
 | :--- | :--- | :--- |
-| `core` | General development, prompt tracking | `check_antigravity_quota`, `check_cursor_usage`, `get_combined_ai_status` (3 tools) |
-| `embedded` | Embedded hardware development (`boards`, `embdevenv`) | Core + all `embdevenv_*` tools (19 tools) |
-| `network` | Network monitoring & security (`netmon`, `network`) | Core + `firewall_*`, `lan_*`, `snmp_*` tools (19 tools) |
-| `mesh` | LoRa wireless mesh networking (`meshmon`) | Core + all `meshmon_*` tools (9 tools) |
-| `mail` | Mail access through `alpine-mcp` | Core + all `mail_*` tools (10 tools) |
-| `all` | Full administrative & gateway access | Full unified catalog across all satellites (48+ tools) |
+| `core` | General development, quota & insights tracking | Quota (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`), Insights (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`), and Supervision (`service_*`) tools |
+| `embedded` | Embedded hardware development (`boards`, `embdevenv`) | Core + all `embdevenv_*` tools |
+| `network` | Network monitoring & security (`netmon`, `network`) | Core + `firewall_*`, `lan_*`, `snmp_*` tools |
+| `mesh` | LoRa wireless mesh networking (`meshmon`) | Core + all `meshmon_*` tools |
+| `mail` | Mail access through `alpine-mcp` | Core + all `mail_*` tools |
+| `all` | Full administrative & gateway access | Full unified catalog across all satellites |
 
 `aimon` detects profiles automatically from workspace folder names during MCP client initialization (e.g. `boards` -> `embedded`), or you can explicitly select a profile via URL query parameter:
 
@@ -176,7 +218,7 @@ Add `aimon` to your Antigravity MCP server configuration (`mcp_config.json`):
 *(Note: Stdio transport is also supported for pipe testing via `./build/aimon mcp --profile=core`.)*
 
 Once configured, ask your assistant:
-> *"Check my Antigravity quota and Cursor usage."*
+> *"Check my Antigravity quota, Cursor usage, and active usage insights."*
 
 ---
 
@@ -203,6 +245,7 @@ aimon/
 │   ├── PriceCatalog.hxx           # Online price catalog (pricing page parser, cache)
 │   ├── DynamicToolRegistry.hxx    # Thread-safe satellite tool registry & routing
 │   ├── HistoryStore.hxx           # SQLite3 time-series diff store (~/.config/aimon/history.db)
+│   ├── InsightEngine.hxx          # Cross-platform usage insights & workflow coaching engine
 │   ├── McpServer.hxx              # JSON-RPC 2.0 stdio & SSE engine with scoped profiling
 │   ├── MobileGateway.hxx          # Action approval latching & mobile pairing engine
 │   ├── Models.hxx                 # Core data structures and metrics
@@ -225,6 +268,7 @@ aimon/
 │   ├── PriceCatalog.cxx           # Price catalog implementation
 │   ├── DynamicToolRegistry.cxx    # Dynamic tool registry implementation
 │   ├── HistoryStore.cxx           # History & usage diff store implementation
+│   ├── InsightEngine.cxx          # Usage insights database, detectors, and dataset export
 │   ├── Main.cxx                   # Application entrypoint & subcommand dispatch
 │   ├── McpServer.cxx              # MCP tool registration, profiling, and handlers
 │   ├── MobileGateway.cxx          # 128-bit mobile pairing, promise latches, & reaper
@@ -238,6 +282,9 @@ aimon/
 ├── test/
 │   ├── TestAgentTelemetryDb.cxx   # Unit tests for SQLite WAL rolling timeseries DB
 │   ├── TestGatewayTimeout.cxx     # Unit tests for TcpGateway timeout execution
+│   ├── TestInsightEngine.cxx      # Unit tests for InsightEngine schema, detectors, and exports
+│   ├── TestInsightParserProps.cxx # RapidCheck property & golden tests for wire/prompt parsers
+│   ├── TestInsightSurfaces.cxx    # Integration tests for Insights MCP tools & Web endpoints
 │   ├── TestMobileGateway.cxx      # Unit tests for mobile action approval latching
 │   └── TestWebServerApi.cxx       # Integration tests for WebServer REST & WS routes
 ├── third_party/
@@ -245,7 +292,7 @@ aimon/
 │   └── json/                      # Git submodule (https://github.com/nlohmann/json)
 └── web/
     ├── app.js                     # Dashboard dynamics, SVG charts, and tab switching
-    ├── index.html                 # Multi-tab dashboard markup (Quotas, Telemetry, Approvals)
+    ├── index.html                 # Multi-tab dashboard markup (Quotas, Telemetry, Insights, Approvals)
     └── style.css                  # Dark-mode glassmorphic styling and charts
 
 ---
