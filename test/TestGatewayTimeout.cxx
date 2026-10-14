@@ -252,6 +252,176 @@ static void testTcpGatewayTimeoutExecution() {
     std::cout << "  [PASS] 2. End-to-end TcpGateway timeout verification passed." << std::endl;
 }
 
+static void testMonitorDeduplicationUnregisterAndTtl() {
+    std::cout << "[TEST] 3. Monitor deduplication, gateway/unregister, TTL eviction & multi-client tool fallback..." << std::endl;
+
+    // 3a. Multi-client tool fallback in DynamicToolRegistry
+    {
+        DynamicToolRegistry reg;
+        nlohmann::json tools = nlohmann::json::array({
+            {
+                {"name", "abc80_read_cpu"},
+                {"description", "Read Z80 CPU state"},
+                {"inputSchema", {{"type", "object"}}}
+            }
+        });
+        std::vector<std::string> added1, added2, removed;
+        assert(reg.registerTools(1, "abc80", tools, added1));
+        assert(reg.getToolClientId("abc80_read_cpu") == 1);
+
+        // Second (ephemeral) client registers same tool name
+        assert(reg.registerTools(2, "abc80", tools, added2));
+        assert(reg.getToolClientId("abc80_read_cpu") == 2);
+
+        // When client 2 disconnects, ownership must fall back to client 1!
+        reg.unregisterClient(2, removed);
+        assert(reg.hasTool("abc80_read_cpu"));
+        assert(reg.getToolClientId("abc80_read_cpu") == 1);
+
+        // When client 1 disconnects, tool is finally removed
+        assert(reg.unregisterClient(1, removed));
+        assert(!reg.hasTool("abc80_read_cpu"));
+        std::cout << "  [PASS] 3a. Multi-client DynamicToolRegistry fallback verified." << std::endl;
+    }
+
+    // 3b. Same-host stale monitor eviction, gateway/unregister, and TTL pruning
+    const int testPort = 29886;
+    DynamicToolRegistry registry;
+    TcpGateway gateway(registry);
+    assert(gateway.start("127.0.0.1", testPort));
+
+    auto connectClient = [testPort]() -> int {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        assert(fd >= 0);
+        struct sockaddr_in saddr;
+        std::memset(&saddr, 0, sizeof(saddr));
+        saddr.sin_family = AF_INET;
+        saddr.sin_port = htons(testPort);
+        ::inet_pton(AF_INET, "127.0.0.1", &saddr.sin_addr);
+        bool ok = false;
+        for (int i = 0; i < 20; ++i) {
+            if (::connect(fd, (struct sockaddr*)&saddr, sizeof(saddr)) == 0) {
+                ok = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        assert(ok);
+        return fd;
+    };
+
+    // Client A connects on web_port 18081 and disconnects ungracefully
+    int fdA = connectClient();
+    nlohmann::json regA = {
+        {"jsonrpc", "2.0"},
+        {"id", 1},
+        {"method", "gateway/register"},
+        {"params", {
+            {"subsystem", "abc80"},
+            {"display_name", "ABC-80 Microcomputer"},
+            {"short_name", "ABC-80"},
+            {"web_port", 18081},
+            {"tools", {{{"name", "abc80_read_cpu"}, {"description", "cpu"}, {"inputSchema", {{"type", "object"}}}}}}
+        }}
+    };
+    std::string regAStr = regA.dump() + "\n";
+    assert(::write(fdA, regAStr.data(), regAStr.size()) == (ssize_t)regAStr.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ::close(fdA);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Verify 18081 is currently retained as disconnected
+    {
+        auto mons = gateway.getDiscoveredMonitors();
+        int abcCount = 0;
+        for (const auto& m : mons) {
+            if (m.subsystem == "abc80") {
+                abcCount++;
+                assert(!m.connected);
+                assert(m.port == 18081);
+            }
+        }
+        assert(abcCount == 1);
+    }
+
+    // Client B connects on web_port 18082 from the same host; stale 18081 must be evicted
+    int fdB = connectClient();
+    nlohmann::json regB = {
+        {"jsonrpc", "2.0"},
+        {"id", 2},
+        {"method", "gateway/register"},
+        {"params", {
+            {"subsystem", "abc80"},
+            {"display_name", "ABC-80 Microcomputer"},
+            {"short_name", "ABC-80"},
+            {"web_port", 18082},
+            {"tools", {{{"name", "abc80_read_cpu"}, {"description", "cpu"}, {"inputSchema", {{"type", "object"}}}}}}
+        }}
+    };
+    std::string regBStr = regB.dump() + "\n";
+    assert(::write(fdB, regBStr.data(), regBStr.size()) == (ssize_t)regBStr.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    {
+        auto mons = gateway.getDiscoveredMonitors();
+        int abcCount = 0;
+        for (const auto& m : mons) {
+            if (m.subsystem == "abc80") {
+                abcCount++;
+                assert(m.connected);
+                assert(m.port == 18082);
+                assert(m.shortName == "ABC-80");
+            }
+        }
+        assert(abcCount == 1);
+    }
+    std::cout << "  [PASS] 3b. Stale disconnected monitor evicted when new port registers on same host." << std::endl;
+
+    // Client B sends explicit gateway/unregister
+    nlohmann::json unregB = {
+        {"jsonrpc", "2.0"},
+        {"id", 3},
+        {"method", "gateway/unregister"},
+        {"params", {
+            {"subsystem", "abc80"},
+            {"web_port", 18082}
+        }}
+    };
+    std::string unregBStr = unregB.dump() + "\n";
+    assert(::write(fdB, unregBStr.data(), unregBStr.size()) == (ssize_t)unregBStr.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ::close(fdB);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    {
+        auto mons = gateway.getDiscoveredMonitors();
+        for (const auto& m : mons) {
+            assert(m.subsystem != "abc80");
+        }
+        assert(!registry.hasTool("abc80_read_cpu"));
+    }
+    std::cout << "  [PASS] 3c. Explicit gateway/unregister immediately removes monitor and tools." << std::endl;
+
+    // 3d. Disconnected monitor TTL expiration
+    gateway.setDisconnectedMonitorTtlSec(1);
+    int fdC = connectClient();
+    std::string regCStr = regA.dump() + "\n";
+    assert(::write(fdC, regCStr.data(), regCStr.size()) == (ssize_t)regCStr.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ::close(fdC);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+
+    {
+        auto mons = gateway.getDiscoveredMonitors();
+        for (const auto& m : mons) {
+            assert(m.subsystem != "abc80");
+        }
+    }
+    std::cout << "  [PASS] 3d. Expired disconnected monitor pruned by TTL." << std::endl;
+
+    gateway.stop();
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "Running aimon TcpGateway Timeout Tests" << std::endl;
@@ -259,6 +429,7 @@ int main() {
 
     testTimeoutCalculation();
     testTcpGatewayTimeoutExecution();
+    testMonitorDeduplicationUnregisterAndTtl();
 
     std::cout << "\nALL VERIFICATION TESTS PASSED SUCCESSFULLY." << std::endl;
     return 0;

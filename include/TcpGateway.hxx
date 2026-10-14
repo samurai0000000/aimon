@@ -70,6 +70,11 @@ public:
     std::vector<DiscoveredMonitor> getDiscoveredMonitors(int selfWebPort = 3883) const;
     static bool checkTcpPortReachable(const std::string& host, int port, int timeoutMs = 800);
 
+    static constexpr int64_t kDisconnectedMonitorTtlSec = 180;
+    void setDisconnectedMonitorTtlSec(int64_t ttlSec) {
+        _disconnectedMonitorTtlSec.store(ttlSec);
+    }
+
 private:
     void listenerLoop();
     void clientReadLoop(std::shared_ptr<ClientConnection> client);
@@ -95,7 +100,8 @@ private:
     std::atomic<uint64_t> _nextRequestId{1};
 
     mutable std::mutex _retainedMutex;
-    std::map<std::string, DiscoveredMonitor> _retainedMonitors;
+    mutable std::map<std::string, DiscoveredMonitor> _retainedMonitors;
+    std::atomic<int64_t> _disconnectedMonitorTtlSec{kDisconnectedMonitorTtlSec};
 };
 
 } // namespace aimon

@@ -47,7 +47,7 @@ public:
 private:
     mutable std::mutex _mutex;
     std::map<std::string, DynamicTool> _tools;
-    std::map<int, std::vector<std::string>> _clientTools;
+    std::map<int, std::vector<DynamicTool>> _clientTools;
 };
 
 } // namespace aimon

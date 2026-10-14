@@ -21,6 +21,7 @@ bool DynamicToolRegistry::registerTools(int clientId, const std::string& subsyst
 
     std::lock_guard<std::mutex> lock(_mutex);
     addedToolNames.clear();
+    std::vector<DynamicTool> clientToolList;
 
     for (const auto& item : toolsArray) {
         if (!item.is_object() || !item.contains("name") || !item["name"].is_string()) {
@@ -46,10 +47,11 @@ bool DynamicToolRegistry::registerTools(int clientId, const std::string& subsyst
         tool.clientId = clientId;
 
         _tools[name] = tool;
-        _clientTools[clientId].push_back(name);
+        clientToolList.push_back(tool);
         addedToolNames.push_back(name);
     }
 
+    _clientTools[clientId] = std::move(clientToolList);
     return !addedToolNames.empty();
 }
 
@@ -62,14 +64,31 @@ bool DynamicToolRegistry::unregisterClient(int clientId, std::vector<std::string
         return false;
     }
 
-    for (const auto& name : it->second) {
-        auto tit = _tools.find(name);
+    std::vector<DynamicTool> ownedTools = std::move(it->second);
+    _clientTools.erase(it);
+
+    for (const auto& owned : ownedTools) {
+        auto tit = _tools.find(owned.name);
         if (tit != _tools.end() && tit->second.clientId == clientId) {
-            _tools.erase(tit);
-            removedToolNames.push_back(name);
+            bool restored = false;
+            for (auto cit = _clientTools.rbegin(); cit != _clientTools.rend(); ++cit) {
+                for (const auto& candidate : cit->second) {
+                    if (candidate.name == owned.name) {
+                        tit->second = candidate;
+                        restored = true;
+                        break;
+                    }
+                }
+                if (restored) {
+                    break;
+                }
+            }
+            if (!restored) {
+                _tools.erase(tit);
+                removedToolNames.push_back(owned.name);
+            }
         }
     }
-    _clientTools.erase(it);
 
     return !removedToolNames.empty();
 }

@@ -373,6 +373,17 @@ void TcpGateway::handleIncomingJson(std::shared_ptr<ClientConnection> client,
 
             {
                 std::lock_guard<std::mutex> lock(_retainedMutex);
+                for (auto it = _retainedMonitors.begin(); it != _retainedMonitors.end(); ) {
+                    if (!it->second.connected &&
+                        it->second.subsystem == client->subsystem &&
+                        it->second.host == peerIp &&
+                        it->first != key) {
+                        it = _retainedMonitors.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
                 DiscoveredMonitor dm;
                 dm.id = client->subsystem;
                 dm.name = client->displayName;
@@ -404,6 +415,46 @@ void TcpGateway::handleIncomingJson(std::shared_ptr<ClientConnection> client,
                 {"result", {
                     {"status", ok ? "registered" : "empty"},
                     {"registered_tools", addedNames.size()}
+                }}
+            };
+            sendLine(client->socketFd, resp.dump());
+
+            if (_onToolsChanged) {
+                _onToolsChanged();
+            }
+        } else if (method == "gateway/unregister") {
+            nlohmann::json params = msg.value("params", nlohmann::json::object());
+            std::string subsystem = params.value("subsystem", client->subsystem);
+            int webPort = params.value("web_port", client->webPort);
+
+            std::string peerIp = client->remoteAddress;
+            size_t colon = peerIp.rfind(':');
+            if (colon != std::string::npos) {
+                peerIp = peerIp.substr(0, colon);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(_retainedMutex);
+                std::string clientKey = client->subsystem + "@" + peerIp + ":" + std::to_string(client->webPort);
+                _retainedMonitors.erase(clientKey);
+                std::string paramKey = subsystem + "@" + peerIp + ":" + std::to_string(webPort);
+                _retainedMonitors.erase(paramKey);
+            }
+
+            std::vector<std::string> removedTools;
+            _registry.unregisterClient(client->clientId, removedTools);
+
+            std::cout << "[TcpGateway] Unregistered monitor " << subsystem
+                      << "@" << peerIp << ":" << webPort
+                      << " (client " << client->clientId
+                      << ", removed " << removedTools.size() << " tools)" << std::endl;
+
+            nlohmann::json resp = {
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"result", {
+                    {"status", "unregistered"},
+                    {"removed_tools", removedTools.size()}
                 }}
             };
             sendLine(client->socketFd, resp.dump());
@@ -609,6 +660,20 @@ std::vector<DiscoveredMonitor> TcpGateway::getDiscoveredMonitors(int selfWebPort
     list.push_back(selfMon);
 
     std::lock_guard<std::mutex> lock(_retainedMutex);
+
+    const int64_t now = std::time(nullptr);
+    const int64_t ttlSec = _disconnectedMonitorTtlSec.load();
+    for (auto it = _retainedMonitors.begin(); it != _retainedMonitors.end(); ) {
+        if (!it->second.isSelf &&
+            !it->second.connected &&
+            it->second.lastSeenEpoch > 0 &&
+            ttlSec >= 0 &&
+            (now - it->second.lastSeenEpoch) > ttlSec) {
+            it = _retainedMonitors.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
     // Count per subsystem for multi-host disambiguation
     std::map<std::string, int> countPerSubsystem;
