@@ -34,6 +34,7 @@
 #include "AgentTelemetryDb.hxx"
 #include "MobileGateway.hxx"
 #include "InsightEngine.hxx"
+#include "EdaBridge.hxx"
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -70,7 +71,7 @@ static void printUsage(const char* progName) {
               << "  insights [subcommand]  Run usage insights CLI (findings|report|rebuild|export|digest|compare)\n\n"
               << "Options:\n"
               << "  --config <path>        Custom path to configuration file (default: ~/.config/aimon/config.json)\n"
-              << "  --profile <profile>    Default MCP tool profile (core, embedded, network, mesh, mail, all)\n"
+              << "  --profile <profile>    Default MCP tool profile (core, embedded, network, mesh, mail, eda, all)\n"
               << "  --host <host>          Host interface for web dashboard (default: 0.0.0.0)\n"
               << "  --port <port>          Port for web dashboard (default: 3883)\n"
               << "  --mqtt-enable          Enable MQTT publishing to Home Assistant\n"
@@ -337,18 +338,32 @@ int main(int argc, char* argv[]) {
         mqttPublisher->start();
     }
 
+    EdaBridge edaBridge(cfg.eda);
+    int64_t lastEdaProbeEpoch = 0;
+
     auto pollOnce = [&]() {
         AntigravityStatus ag = agCollector.fetchStatus();
         CursorStatus cr = crCollector.fetchStatus();
         ClaudeStatus cl;
+        int64_t nowEpoch = static_cast<int64_t>(std::time(nullptr));
         if (claudeCollector) {
-            cl = claudeCollector->fetchStatus(static_cast<int64_t>(std::time(nullptr)));
+            cl = claudeCollector->fetchStatus(nowEpoch);
+        }
+
+        EdaBridgeConfig liveEdaCfg = edaBridge.getConfig();
+        if (liveEdaCfg.enabled) {
+            int probeIntSec = std::max(5, liveEdaCfg.healthPollIntervalSec);
+            if (nowEpoch - lastEdaProbeEpoch >= probeIntSec) {
+                lastEdaProbeEpoch = nowEpoch;
+                edaBridge.probeNow();
+            }
         }
 
         AggregateStatus status;
         status.antigravity = ag;
         status.cursor = cr;
         status.claude = cl;
+        status.eda = edaBridge.getStatus();
         status.lastUpdated = std::chrono::system_clock::now();
 
         stateStore.update(status);
@@ -360,7 +375,6 @@ int main(int argc, char* argv[]) {
 
         if (cfg.insights.enabled) {
             insightEngine.ingestLiveStatus(status);
-            int64_t nowEpoch = static_cast<int64_t>(std::time(nullptr));
             int intervalSec = std::max(60, cfg.insights.refreshIntervalSec);
             if (nowEpoch - lastInsightRebuildEpoch >= intervalSec) {
                 lastInsightRebuildEpoch = nowEpoch;
@@ -394,11 +408,13 @@ int main(int argc, char* argv[]) {
 
         DynamicToolRegistry dynamicRegistry;
         TcpGateway tcpGateway(dynamicRegistry);
+        edaBridge.attachTcpGateway(&tcpGateway);
         if (cfg.gateway.enabled) {
             tcpGateway.start(cfg.gateway.host, cfg.gateway.port);
         }
 
         McpServer mcpServer(stateStore, &dynamicRegistry, &tcpGateway);
+        mcpServer.setEdaBridge(&edaBridge);
         if (cfg.insights.enabled) {
             mcpServer.setInsightEngine(&insightEngine);
         }
@@ -426,8 +442,10 @@ int main(int argc, char* argv[]) {
     // Web or Daemon mode
     DynamicToolRegistry dynamicRegistry;
     TcpGateway tcpGateway(dynamicRegistry);
+    edaBridge.attachTcpGateway(&tcpGateway);
 
     McpServer mcpServer(stateStore, &dynamicRegistry, &tcpGateway);
+    mcpServer.setEdaBridge(&edaBridge);
     if (cfg.insights.enabled) {
         mcpServer.setInsightEngine(&insightEngine);
     }
@@ -437,6 +455,8 @@ int main(int argc, char* argv[]) {
     WebServer webServer(stateStore, historyStore, cfg.web, [&]() {
         pollOnce();
     }, &mcpServer, &tcpGateway);
+    webServer.setEdaBridge(&edaBridge);
+    webServer.setConfigManager(&configMgr);
     if (cfg.insights.enabled) {
         webServer.setInsightEngine(&insightEngine);
     }

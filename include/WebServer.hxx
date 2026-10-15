@@ -32,6 +32,7 @@ class McpServer;
 class TcpGateway;
 class InsightEngine;
 class MobileGateway;
+class EdaBridge;
 
 struct SseSession {
     std::string id;
@@ -64,6 +65,14 @@ public:
         _mobileGateway = gateway;
     }
 
+    void setEdaBridge(EdaBridge* edaBridge) {
+        _edaBridge = edaBridge;
+    }
+
+    void setConfigManager(ConfigManager* configManager) {
+        _configManager = configManager;
+    }
+
     int getPort() const {
         return _config.port;
     }
@@ -87,6 +96,8 @@ private:
     TcpGateway* _tcpGateway = nullptr;
     InsightEngine* _insightEngine = nullptr;
     MobileGateway* _mobileGateway = nullptr;
+    EdaBridge* _edaBridge = nullptr;
+    ConfigManager* _configManager = nullptr;
 
     bool _endpointsEnabled = false;
     mutable std::mutex _sessionMutex;

@@ -318,6 +318,29 @@ All services typically run as systemd daemons or inside persistent terminal mult
   - `ins_findings`: Programmatic and workflow-coaching detector findings (`cache_efficiency`, `subagent_share`, `delegation_style`, `long_context`, `compact_opportunity`, `long_running_sessions`, `session_sprawl`, `error_retry_loops`, `short_prompt_rate`, `first_prompt_specificity`, `drip_vs_batch`, `time_and_fatigue`, `spend_category_mix`, `cost_by_project`, `model_mix`, `model_choice_fit`, `idle_gap_cache_expiry`, `context_reset_habit`, `time_of_day`, `cross_platform_overlap`, `quota_pressure`, `burn_rate_forecast`).
   - `ins_scan_cursors`: Independent per-file scan cursors (`claude_jsonl`, `ag_conv_db`, `ag_transcript`) so historical transcripts already at EOF in `claude_file_cursors` are backfilled from offset 0.
 
+### 5.3 EDA & Robotics CAD Bridge & Local CPU Accelerators (`EdaBridge` / `EdaAccelerators` / `aimon-eda-bridge`)
+
+`aimon` provides a 100% native C++17 EDA and Robotics CAD subsystem (`EdaBridge` + `EdaAccelerators` + `EasyEdaConverter` + `KiCadSchematicEditor`) paired with the cross-platform `aimon-eda-bridge` daemon (`tools/eda-bridge/`) and companion desktop GUI plugins (`tools/eda-bridge/plugins/`). Together they expose **36 MCP tools** under the `eda` (and `all`) profile:
+
+1. **Always-Available Local C++17 CPU Algorithmic Accelerators (`EdaAccelerators` — 7 Tools)**:
+   Hosted directly in-process inside `aimon` so AI agents deterministically compute layout, routing, circuit synthesis, kinematics, and mechanisms in milliseconds without guessing math in tokens:
+   - `eda_calc_schematic_layout`: Sugiyama layered schematic placement + 50-mil (`1.27 mm`) A\* orthogonal wire router (`symbols[]`, `wires[]`).
+   - `eda_calc_pcb_placement`: Simulated annealing + force-directed Half-Perimeter Wire Length (`HPWL`) floorplanner with zero courtyard overlap and decoupling-capacitor clustering (`placements[]`).
+   - `eda_calc_pcb_autoroute`: PathFinder negotiated-congestion multi-layer 45-degree A\* trace and via router (`tracks[]`, `vias[]`).
+   - `eda_calc_electrical_synth`: E24/E96 & JLCPCB-Basic passive divider/filter solver, IPC-2152 trace/via sizing, microstrip impedance calculator, and power/thermal budget analyzer.
+   - `cad_calc_robot_kinematics_statics`: DH/URDF forward/inverse kinematics, gravity + payload joint torque budget, servo safety factor, and whole-body CoM support-polygon margin.
+   - `cad_calc_mechanism_synth`: Analytical involute spur/helical gears, planetary gearsets ($Z_s + 2Z_p = Z_r$), GT2/HTD timing pulleys, 25T/24T servo splines, and Grashof 4-bar linkages with FreeCAD CSG code generation.
+   - `cad_calc_print_orientation_dfm`: Spherical FDM build-orientation optimizer and anisotropic Z-layer delamination safety factor analyzer for `PLA`, `PETG`, `ABS`, `ASA`, and `PA-CF`.
+2. **KiCad Schematic, PCB & Manufacturing Tools (9 Tools)**:
+   Backed by `KiCadSchematicEditor` (C++17 S-expression engine), companion `pcbnew` plugin (`tools/eda-bridge/plugins/kicad-aimon-bridge/`), and `kicad-cli`: `kicad_search_library`, `kicad_inspect_project`, `kicad_edit_schematic`, `kicad_sync_sch_to_pcb`, `kicad_edit_pcb`, `kicad_run_erc`, `kicad_run_drc`, `kicad_export_fab_pack`, and `kicad_export_step`.
+3. **FreeCAD Robotics & 3D-Printing Tools (9 Tools)**:
+   Backed by `tools/eda-bridge/plugins/freecad-aimon-bridge/` and headless `FreeCADCmd` fallback, guarded by `EdaBridge::guardFreecadScript()` (rejecting brittle `Face1`/`Edge1`/`Vertex1` TNP references and OS/network escape imports): `freecad_live_status`, `freecad_inspect_document`, `freecad_generate_cad`, `freecad_edit_parameters`, `freecad_assemble_joint`, `freecad_analyze_printability`, `freecad_render_view`, `freecad_export_print_files`, and `freecad_invoke_api`.
+4. **EasyEDA Pro & Conversion Tools (11 Tools)**:
+   Backed by the packaged `.eext` extension (`tools/eda-bridge/plugins/easyeda-pro-extension/`) over `AppPluginRelay` (`127.0.0.1:3893`) and C++17 `EasyEdaConverter`: `easyeda_live_status`, `easyeda_search_library`, `easyeda_inspect_schematic`, `easyeda_edit_schematic`, `easyeda_sync_sch_to_pcb`, `easyeda_inspect_pcb`, `easyeda_edit_pcb`, `easyeda_run_drc`, `easyeda_export_jlcpcb`, `easyeda_invoke_api`, and `easyeda_convert`.
+5. **Bidirectional Transport, Sandboxed Path Translation & Safety**:
+   - Supports outward TCP JSON-RPC (`aimon` connects to `aimon-eda-bridge` on port `3892`) and inward `TcpGateway` registration (`aimon-eda-bridge --connect <aimon-host>:3885` registers as `subsystem: "eda"`), authenticated via shared secret (`authSecret` / `AIMON_EDA_AUTH_SECRET`).
+   - `EdaBridge` bidirectionally rewrites Linux workspace paths (`linux_path_prefix`, default `~/work`) and Windows drive paths (`windows_path_prefix`, default `Z:\`), rejecting any `..` traversal or out-of-workspace path with `-32602`.
+
 ### Satellite-Proxied Toolsets
 Connected subsystem daemons dynamically export their domain-specific MCP tools through `aimon`:
 - **`embdevenv`** (Embedded Hardware): `embdevenv_mcu_*`, `embdevenv_console_*`, `embdevenv_flash_*`, `embdevenv_list_targets`, `embdevenv_get_target_status` (16 tools).
@@ -333,6 +356,7 @@ To prevent agent context pollution and minimize token consumption across diverse
 | Profile | Purpose / Domain | Included Tools |
 | :--- | :--- | :--- |
 | `core` | Default / general programming | Quota tools (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`) and Insights tools (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`) |
+| `eda` | PCB design & 3D robotics CAD (`kicad`, `freecad`, `easyeda`, `pcb`, `cad`, `robot`, `hw-`) | Core tools + all 36 EDA/CAD & CPU accelerator tools (`eda_calc_*`, `cad_calc_*`, `kicad_*`, `freecad_*`, `easyeda_*`) |
 | `embedded` | Target board bringup (`boards`, `embdevenv`) | Core tools + all `embdevenv_*` tools |
 | `network` | Network diagnostics & firewall (`netmon`, `network`) | Core tools + `firewall_*`, `lan_*`, `snmp_*` |
 | `mesh` | LoRa RF telemetry (`meshmon`) | Core tools + `meshmon_*` tools |
@@ -462,11 +486,12 @@ Autonomous agent tasks frequently stall when sensitive tools (`run_command`, `wr
 
 The `aimon` dashboard (`web/index.html`, `web/app.js`, `web/style.css`, `include/WebAssets.hxx`) provides a multi-tab single-page interface:
 
-1. **AI Quotas (`#view-aimon`)**: Front page displaying Google Antigravity quotas and credit allowances, Cursor Fast Request and per-category spend breakdown, and Claude Code estimated usage.
-2. **Agent Telemetry & Analytics (`#view-telemetry`)**: Fed by lifecycle hooks from Antigravity, Cursor and Claude Code (see section 8.0). Interactive SVG/Canvas charts for Token Velocity, Turn Latency & P95 Distribution, Tool Invocation Matrices, and Session Waterfalls with timeframe selectors (`1H`, `24H`, `7D`, `30D`, `1Y`).
-3. **Usage Insights (`#view-insights`)**: Programmatic and workflow-coaching findings across Claude Code, Cursor, and Antigravity (`7D`, `30D`, `90D`), severity/confidence badges, suggested experiments, per-project and per-model token/cache/cost tables, and dataset export instructions.
-4. **Action Approvals (`#view-approvals`)**: Live pending approval actions, 128-bit mobile pairing QR interface, and paired device management.
-5. **Dynamic Satellite Panels (`#panel-<id>`)**: Seamless embedded iframe monitors for connected subsystems (`netmon`, `meshmon`, `embdevenv`, `abc80`).
+1. **AI Quotas (`#view-aimon` / `#subpanel-quotas`)**: Front page displaying Google Antigravity quotas and credit allowances, Cursor Fast Request and per-category spend breakdown, and Claude Code estimated usage.
+2. **Agent Telemetry & Analytics (`#subpanel-telemetry`)**: Fed by lifecycle hooks from Antigravity, Cursor and Claude Code (see section 8.0). Interactive SVG/Canvas charts for Token Velocity, Turn Latency & P95 Distribution, Tool Invocation Matrices, and Session Waterfalls with timeframe selectors (`1H`, `24H`, `7D`, `30D`, `1Y`).
+3. **Usage Insights (`#subpanel-insights`)**: Programmatic and workflow-coaching findings across Claude Code, Cursor, and Antigravity (`7D`, `30D`, `90D`), severity/confidence badges, suggested experiments, per-project and per-model token/cache/cost tables, and dataset export instructions.
+4. **Tool Bridges (`#subpanel-bridges`, `data-subpanel="bridges"`)**: Placed directly next to `usage insights` inside `#aimon-subnav`, providing global transport settings (`client` / `gateway` / `bidirectional`, host, RPC port `3892`, loopback plugin port `3893`, `~/work` $\leftrightarrow$ `Z:\` path mapping, masked `auth_secret`), four dedicated configuration and live telemetry cards (**Local CPU Accelerators**, **EasyEDA Pro**, **KiCad**, **FreeCAD**), and a rolling 50-call activity log table backed by session-protected `GET /api/eda/status`, `POST /api/eda/config`, and `POST /api/eda/probe`.
+5. **Action Approvals (`#subpanel-approvals`)**: Live pending approval actions, 128-bit mobile pairing QR interface, and paired device management.
+6. **Dynamic Satellite Panels (`#panel-<id>`)**: Seamless embedded iframe monitors for connected subsystems (`netmon`, `meshmon`, `embdevenv`, `abc80`).
 
 ---
 

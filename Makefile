@@ -65,6 +65,11 @@ test: all
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_insight_engine
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_insight_parser_props
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_insight_surfaces
+	@$(TEST_ENV) ./$(BUILD_DIR)/test_eda_bridge
+	@$(TEST_ENV) ./$(BUILD_DIR)/test_eda_bridge_props
+	@$(TEST_ENV) ./$(BUILD_DIR)/test_eda_bridge_daemon
+	@$(TEST_ENV) ./$(BUILD_DIR)/test_easyeda_converter_props
+	@$(TEST_ENV) ./$(BUILD_DIR)/test_eda_surfaces
 ifeq ($(SANITIZE_CANARY),1)
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_sanitizer_canary
 endif

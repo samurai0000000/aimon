@@ -337,6 +337,169 @@ TEST(LibconfigParser_Integrated, InsightsConfigLibconfigAndJsonParity) {
     CHECK_EQUAL(15, jsIns.coachingMinSampleSize);
 }
 
+TEST(LibconfigParser_Integrated, EdaConfigLibconfigJsonAndValidationParity) {
+    std::string cfgPath = _tempDir + "/eda_test.cfg";
+    std::string jsonPath = _tempDir + "/eda_test.json";
+
+    ConfigManager cm1;
+    AimonConfig& c1 = cm1.getConfig();
+    c1.eda.enabled = true;
+    c1.eda.mode = "bidirectional";
+    c1.eda.host = "eda-host.local";
+    c1.eda.port = 3892;
+    c1.eda.pluginPort = 3893;
+    c1.eda.authSecret = "test-secret-token";
+    c1.eda.healthPollIntervalSec = 45;
+    c1.eda.timeoutMs = 75000;
+    c1.eda.maxOutputBytes = 8388608;
+    c1.eda.requireApprovalForExports = true;
+    c1.eda.linuxPathPrefix = "~/work";
+    c1.eda.windowsPathPrefix = "Z:\\";
+
+    c1.eda.accelerators.enabled = true;
+    c1.eda.accelerators.saPlacementIterations = 25000;
+    c1.eda.accelerators.autorouteMaxRipupPasses = 30;
+    c1.eda.accelerators.autorouteGridMm = 0.20;
+    c1.eda.accelerators.preferJlcpcbBasicESeries = false;
+    c1.eda.accelerators.defaultCopperWeightOz = 2.0;
+    c1.eda.accelerators.defaultFilamentMaterial = "PA-CF";
+    c1.eda.accelerators.defaultGearPressureAngleDeg = 20.0;
+
+    c1.eda.easyeda.enabled = true;
+    c1.eda.easyeda.host = "easyeda.local";
+    c1.eda.easyeda.port = 3901;
+    c1.eda.easyeda.pluginPort = 3902;
+    c1.eda.easyeda.executionMode = "live_gui";
+    c1.eda.easyeda.customBinaryPath = "C:\\Program Files\\EasyEDA-Pro\\EasyEDA-Pro.exe";
+    c1.eda.easyeda.projectsDir = "~/work/pcb/easyeda_custom";
+    c1.eda.easyeda.preferJlcpcbBasicParts = false;
+    c1.eda.easyeda.minLcscStock = 250;
+    c1.eda.easyeda.autoDrcAfterEdit = false;
+    c1.eda.easyeda.jlcpcbLayerCount = 4;
+    c1.eda.easyeda.timeoutMs = 90000;
+
+    c1.eda.kicad.enabled = true;
+    c1.eda.kicad.host = "";
+    c1.eda.kicad.port = 0;
+    c1.eda.kicad.pluginPort = 0;
+    c1.eda.kicad.executionMode = "headless_cli";
+    c1.eda.kicad.customBinaryPath = "C:\\Program Files\\KiCad\\8.0\\bin\\kicad-cli.exe";
+    c1.eda.kicad.symbolLibDir = "Z:\\libs\\symbols";
+    c1.eda.kicad.footprintLibDir = "Z:\\libs\\footprints.pretty";
+    c1.eda.kicad.projectsDir = "~/work/pcb/kicad_custom";
+    c1.eda.kicad.schematicGridMils = 25;
+    c1.eda.kicad.autoErcAfterEdit = false;
+    c1.eda.kicad.drcSchematicParity = false;
+    c1.eda.kicad.fabTargetHouse = "pcbway";
+    c1.eda.kicad.timeoutMs = 80000;
+
+    c1.eda.freecad.enabled = true;
+    c1.eda.freecad.host = "freecad.local";
+    c1.eda.freecad.port = 3910;
+    c1.eda.freecad.pluginPort = 3911;
+    c1.eda.freecad.executionMode = "headless_cmd";
+    c1.eda.freecad.customBinaryPath = "C:\\Program Files\\FreeCAD 1.0\\bin\\FreeCADCmd.exe";
+    c1.eda.freecad.projectsDir = "~/work/robot/cad_custom";
+    c1.eda.freecad.enforceTnpGuard = true;
+    c1.eda.freecad.defaultPrintToleranceMm = 0.25;
+    c1.eda.freecad.minWallThicknessMm = 1.60;
+    c1.eda.freecad.maxOverhangDeg = 50.0;
+    c1.eda.freecad.meshLinearDeflectionMm = 0.04;
+    c1.eda.freecad.meshAngularDeflectionDeg = 4.0;
+    c1.eda.freecad.jointSweepStepDeg = 2.5;
+    c1.eda.freecad.renderWidth = 1920;
+    c1.eda.freecad.renderHeight = 1080;
+    c1.eda.freecad.timeoutMs = 150000;
+
+    std::string valErr;
+    CHECK_TRUE(c1.eda.validate(valErr));
+    CHECK_EQUAL("", valErr);
+
+    CHECK_EQUAL("easyeda.local", c1.eda.resolvedHostFor(c1.eda.easyeda.host));
+    CHECK_EQUAL("eda-host.local", c1.eda.resolvedHostFor(c1.eda.kicad.host));
+    CHECK_EQUAL(3901, c1.eda.resolvedPortFor(c1.eda.easyeda.port));
+    CHECK_EQUAL(3892, c1.eda.resolvedPortFor(c1.eda.kicad.port));
+    CHECK_EQUAL(3902, c1.eda.resolvedPluginPortFor(c1.eda.easyeda.pluginPort));
+    CHECK_EQUAL(3893, c1.eda.resolvedPluginPortFor(c1.eda.kicad.pluginPort));
+
+    CHECK_TRUE(cm1.saveLibConfig(cfgPath));
+    ConfigManager cmLib;
+    CHECK_TRUE(cmLib.loadLibConfig(cfgPath));
+    const EdaBridgeConfig& libEda = cmLib.getConfig().eda;
+    CHECK_TRUE(libEda.enabled);
+    CHECK_EQUAL("bidirectional", libEda.mode);
+    CHECK_EQUAL("eda-host.local", libEda.host);
+    CHECK_EQUAL(3892, libEda.port);
+    CHECK_EQUAL(3893, libEda.pluginPort);
+    CHECK_EQUAL("test-secret-token", libEda.authSecret);
+    CHECK_EQUAL(45, libEda.healthPollIntervalSec);
+    CHECK_EQUAL(75000, libEda.timeoutMs);
+    CHECK_EQUAL(8388608, libEda.maxOutputBytes);
+    CHECK_TRUE(libEda.requireApprovalForExports);
+    CHECK_EQUAL("~/work", libEda.linuxPathPrefix);
+    CHECK_EQUAL("Z:\\", libEda.windowsPathPrefix);
+
+    CHECK_EQUAL(25000, libEda.accelerators.saPlacementIterations);
+    CHECK_EQUAL(30, libEda.accelerators.autorouteMaxRipupPasses);
+    DOUBLES_EQUAL(0.20, libEda.accelerators.autorouteGridMm, 0.001);
+    CHECK_FALSE(libEda.accelerators.preferJlcpcbBasicESeries);
+    DOUBLES_EQUAL(2.0, libEda.accelerators.defaultCopperWeightOz, 0.001);
+    CHECK_EQUAL("PA-CF", libEda.accelerators.defaultFilamentMaterial);
+
+    CHECK_EQUAL("easyeda.local", libEda.easyeda.host);
+    CHECK_EQUAL(3901, libEda.easyeda.port);
+    CHECK_EQUAL(3902, libEda.easyeda.pluginPort);
+    CHECK_EQUAL("live_gui", libEda.easyeda.executionMode);
+    CHECK_EQUAL(4, libEda.easyeda.jlcpcbLayerCount);
+    CHECK_EQUAL(250, libEda.easyeda.minLcscStock);
+
+    CHECK_EQUAL("headless_cli", libEda.kicad.executionMode);
+    CHECK_EQUAL(25, libEda.kicad.schematicGridMils);
+    CHECK_EQUAL("pcbway", libEda.kicad.fabTargetHouse);
+    CHECK_EQUAL("Z:\\libs\\symbols", libEda.kicad.symbolLibDir);
+
+    CHECK_EQUAL("freecad.local", libEda.freecad.host);
+    DOUBLES_EQUAL(0.25, libEda.freecad.defaultPrintToleranceMm, 0.001);
+    DOUBLES_EQUAL(1.60, libEda.freecad.minWallThicknessMm, 0.001);
+    CHECK_EQUAL(1920, libEda.freecad.renderWidth);
+    CHECK_EQUAL(1080, libEda.freecad.renderHeight);
+
+    CHECK_TRUE(cm1.save(jsonPath));
+    ConfigManager cmJson;
+    CHECK_TRUE(cmJson.load(jsonPath));
+    const EdaBridgeConfig& jsEda = cmJson.getConfig().eda;
+    CHECK_TRUE(jsEda.enabled);
+    CHECK_EQUAL("eda-host.local", jsEda.host);
+    CHECK_EQUAL(25000, jsEda.accelerators.saPlacementIterations);
+    CHECK_EQUAL("PA-CF", jsEda.accelerators.defaultFilamentMaterial);
+    CHECK_EQUAL(4, jsEda.easyeda.jlcpcbLayerCount);
+    CHECK_EQUAL(25, jsEda.kicad.schematicGridMils);
+    DOUBLES_EQUAL(0.25, jsEda.freecad.defaultPrintToleranceMm, 0.001);
+
+    setenv("AIMON_EDA_AUTH_SECRET", "env-override-secret", 1);
+    setenv("AIMON_EDA_HOST", "env-eda.local", 1);
+    setenv("AIMON_EDA_PORT", "4892", 1);
+    cmJson.applyEnvironmentOverrides();
+    CHECK_EQUAL("env-override-secret", cmJson.getConfig().eda.authSecret);
+    CHECK_EQUAL("env-eda.local", cmJson.getConfig().eda.host);
+    CHECK_EQUAL(4892, cmJson.getConfig().eda.port);
+    unsetenv("AIMON_EDA_AUTH_SECRET");
+    unsetenv("AIMON_EDA_HOST");
+    unsetenv("AIMON_EDA_PORT");
+
+    EdaBridgeConfig badPort = c1.eda;
+    badPort.port = 70000;
+    CHECK_FALSE(badPort.validate(valErr));
+
+    EdaBridgeConfig badMode = c1.eda;
+    badMode.mode = "invalid_mode";
+    CHECK_FALSE(badMode.validate(valErr));
+
+    EdaBridgeConfig badTraversal = c1.eda;
+    badTraversal.linuxPathPrefix = "~/work/../escape";
+    CHECK_FALSE(badTraversal.validate(valErr));
+}
+
 int main(int ac, char** av) {
     return CommandLineTestRunner::RunAllTests(ac, av);
 }

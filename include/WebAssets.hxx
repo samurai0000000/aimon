@@ -53,6 +53,10 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                     <span class="subnav-indicator"></span>
                     <span class="subnav-title">usage insights</span>
                 </button>
+                <button type="button" class="aimon-subnav-tab" data-subpanel="bridges">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">tool bridges</span>
+                </button>
             </div>
 
             <!-- Subpanel 1: AI Quotas (Antigravity, Cursor, MCP Clients) -->
@@ -555,6 +559,517 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                         <span class="badge badge-magenta" id="insights-export-status">Privacy: Numeric Only</span>
                     </div>
                     <pre id="insights-digest-box" style="white-space: pre-wrap; font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; color: #cbd5e1; margin: 0; padding: 12px; background: rgba(15,23,42,0.55); border-radius: 8px; overflow-x: auto;">Loading weekly digest...</pre>
+                </div>
+            </div>
+
+            <!-- Subpanel 5: Unified EDA, CAD & CPU Accelerator Tool Bridges -->
+            <div class="aimon-subpanel telemetry-container hidden" id="subpanel-bridges">
+                <!-- 1. Global Tool Bridge Header & Transport Card -->
+                <div class="glass-card eda-global-card" id="eda-global-card">
+                    <div class="eda-global-header">
+                        <div class="eda-title-group">
+                            <h2>Unified EDA, CAD &amp; CPU Accelerator Bridges</h2>
+                            <span class="status-pill disconnected" id="eda-status-pill">
+                                <span class="dot"></span>
+                                <span id="eda-status-text">Local Only</span>
+                            </span>
+                            <span class="badge badge-cyan" id="eda-transport-badge">Transport: none</span>
+                            <span class="badge badge-sub" id="eda-latency-pill">RTT: -- ms</span>
+                        </div>
+                        <div class="eda-header-actions">
+                            <button type="button" class="btn-refresh" id="btn-eda-probe">Probe Bridges Now</button>
+                            <button type="button" class="btn-refresh" id="btn-eda-reload">Reload Saved Config</button>
+                            <button type="button" class="btn-approve" id="btn-eda-save">Save Configuration</button>
+                        </div>
+                    </div>
+
+                    <div id="eda-global-error" class="error-banner hidden"></div>
+                    <div id="eda-save-feedback" class="eda-feedback-banner hidden"></div>
+
+                    <div class="eda-form-grid eda-global-grid">
+                        <div class="eda-field eda-field-toggle">
+                            <label class="toggle-switch-label" for="eda-cfg-enabled">
+                                <input type="checkbox" id="eda-cfg-enabled">
+                                <span class="toggle-switch-slider"></span>
+                                <span class="toggle-switch-text">Enable Remote Windows Tool Bridge</span>
+                            </label>
+                        </div>
+                        <div class="eda-field eda-field-toggle">
+                            <label class="toggle-switch-label" for="eda-cfg-require-approval">
+                                <input type="checkbox" id="eda-cfg-require-approval">
+                                <span class="toggle-switch-slider"></span>
+                                <span class="toggle-switch-text">Require Action Approval for Exports</span>
+                            </label>
+                        </div>
+                        <div class="eda-field">
+                            <label for="eda-cfg-mode">Connection Mode</label>
+                            <select id="eda-cfg-mode" class="eda-select">
+                                <option value="bidirectional">bidirectional (Auto Client + Gateway)</option>
+                                <option value="client">client (Outward TCP :3892)</option>
+                                <option value="gateway">gateway (Inward Reverse :3885)</option>
+                            </select>
+                        </div>
+                        <div class="eda-field">
+                            <label for="eda-cfg-host">Default Remote Windows Host</label>
+                            <input type="text" id="eda-cfg-host" class="eda-input" placeholder="frog.selfso.com">
+                        </div>
+                        <div class="eda-field">
+                            <label for="eda-cfg-port">Default RPC Port</label>
+                            <input type="number" id="eda-cfg-port" class="eda-input" min="1" max="65535" value="3892">
+                        </div>
+                        <div class="eda-field">
+                            <label for="eda-cfg-plugin-port">Default Plugin Relay Port</label>
+                            <input type="number" id="eda-cfg-plugin-port" class="eda-input" min="1" max="65535" value="3893">
+                        </div>
+                        <div class="eda-field">
+                            <label for="eda-cfg-linux-prefix">Linux Path Prefix</label>
+                            <input type="text" id="eda-cfg-linux-prefix" class="eda-input" value="~/work" placeholder="~/work">
+                        </div>
+                        <div class="eda-field">
+                            <label for="eda-cfg-win-prefix">Windows Path Prefix</label>
+                            <input type="text" id="eda-cfg-win-prefix" class="eda-input" value="Z:\" placeholder="Z:\">
+                        </div>
+                        <div class="eda-field">
+                            <label for="eda-cfg-auth-secret">Shared Bearer Secret</label>
+                            <input type="password" id="eda-cfg-auth-secret" class="eda-input" placeholder="*** (leave *** to keep)">
+                        </div>
+                        <div class="eda-field">
+                            <label for="eda-cfg-poll-interval">Health Poll Interval (s)</label>
+                            <input type="number" id="eda-cfg-poll-interval" class="eda-input" min="5" max="3600" value="30">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 2. Four Component Configuration, Runtime Behavior & Telemetry Cards -->
+                <div class="eda-components-grid">
+                    <!-- Card 1: Local CPU Accelerators -->
+                    <section class="glass-card eda-component-card" id="eda-card-accelerators">
+                        <div class="card-header">
+                            <div class="provider-title">
+                                <span class="badge badge-cyan">C++17 In-Process</span>
+                                <h3>Local CPU Accelerators</h3>
+                            </div>
+                            <div class="eda-card-header-right">
+                                <span class="status-pill running" id="eda-telem-accelerators-status">In-Process Ready</span>
+                                <label class="toggle-switch-label" for="eda-acc-enabled">
+                                    <input type="checkbox" id="eda-acc-enabled" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Enabled</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="eda-telem-box">
+                            <div class="eda-telem-meta-row">
+                                <span>Endpoint: <code id="eda-telem-accelerators-endpoint">local (aimon)</code></span>
+                                <span>Version: <code id="eda-telem-accelerators-version">builtin-1.0</code></span>
+                                <span>Active Engine: <code id="eda-telem-accelerators-doc">7 C++17 Solvers</code></span>
+                            </div>
+                            <div class="eda-telem-counters">
+                                <div class="eda-counter-pill"><span>Total</span><strong id="eda-telem-accelerators-total">0</strong></div>
+                                <div class="eda-counter-pill"><span>Succeeded</span><strong id="eda-telem-accelerators-success" class="text-emerald">0</strong></div>
+                                <div class="eda-counter-pill"><span>Failed</span><strong id="eda-telem-accelerators-failed" class="text-coral">0</strong></div>
+                                <div class="eda-counter-pill"><span>Avg ms</span><strong id="eda-telem-accelerators-avg-ms">0.0</strong></div>
+                                <div class="eda-counter-pill"><span>Last ms</span><strong id="eda-telem-accelerators-last-ms">--</strong></div>
+                            </div>
+                            <div class="eda-telem-last-row">
+                                <div>Last Tool: <code id="eda-telem-accelerators-last-tool">None</code></div>
+                                <div>Summary: <span id="eda-telem-accelerators-summary">Ready for schematic, PCB, electrical &amp; robotics synthesis</span></div>
+                            </div>
+                            <div id="eda-telem-accelerators-error" class="error-banner hidden"></div>
+                        </div>
+
+                        <div class="eda-form-grid">
+                            <div class="eda-field">
+                                <label for="eda-acc-sa-iterations">SA Placement Iterations</label>
+                                <input type="number" id="eda-acc-sa-iterations" class="eda-input" min="100" max="500000" step="1000" value="50000">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-acc-ripup-passes">Autoroute Max Rip-up Passes</label>
+                                <input type="number" id="eda-acc-ripup-passes" class="eda-input" min="1" max="200" value="25">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-acc-grid-mm">Autoroute Grid (mm)</label>
+                                <input type="number" id="eda-acc-grid-mm" class="eda-input" min="0.05" max="2.54" step="0.05" value="0.25">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-acc-copper-oz">Default Copper Weight (oz)</label>
+                                <input type="number" id="eda-acc-copper-oz" class="eda-input" min="0.5" max="10.0" step="0.5" value="1.0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-acc-filament">Default 3D-Print Filament</label>
+                                <select id="eda-acc-filament" class="eda-select">
+                                    <option value="PETG">PETG</option>
+                                    <option value="PLA">PLA</option>
+                                    <option value="ABS">ABS</option>
+                                    <option value="ASA">ASA</option>
+                                    <option value="PA-CF">PA-CF</option>
+                                </select>
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-acc-gear-angle">Gear Pressure Angle (deg)</label>
+                                <input type="number" id="eda-acc-gear-angle" class="eda-input" min="10.0" max="35.0" step="0.5" value="20.0">
+                            </div>
+                            <div class="eda-field eda-field-toggle eda-field-full">
+                                <label class="toggle-switch-label" for="eda-acc-prefer-jlcpcb">
+                                    <input type="checkbox" id="eda-acc-prefer-jlcpcb" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Prefer JLCPCB Basic E24/E96 Series Values</span>
+                                </label>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Card 2: EasyEDA Pro -->
+                    <section class="glass-card eda-component-card" id="eda-card-easyeda">
+                        <div class="card-header">
+                            <div class="provider-title">
+                                <span class="badge badge-magenta">EDA / PCBA</span>
+                                <h3>EasyEDA Pro</h3>
+                            </div>
+                            <div class="eda-card-header-right">
+                                <span class="status-pill disconnected" id="eda-telem-easyeda-status">Offline</span>
+                                <label class="toggle-switch-label" for="eda-easyeda-enabled">
+                                    <input type="checkbox" id="eda-easyeda-enabled" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Enabled</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="eda-telem-box">
+                            <div class="eda-telem-meta-row">
+                                <span>Endpoint: <code id="eda-telem-easyeda-endpoint">--</code></span>
+                                <span>Version: <code id="eda-telem-easyeda-version">--</code></span>
+                                <span>Active Doc: <code id="eda-telem-easyeda-doc">None</code></span>
+                            </div>
+                            <div class="eda-telem-counters">
+                                <div class="eda-counter-pill"><span>Total</span><strong id="eda-telem-easyeda-total">0</strong></div>
+                                <div class="eda-counter-pill"><span>Succeeded</span><strong id="eda-telem-easyeda-success" class="text-emerald">0</strong></div>
+                                <div class="eda-counter-pill"><span>Failed</span><strong id="eda-telem-easyeda-failed" class="text-coral">0</strong></div>
+                                <div class="eda-counter-pill"><span>Avg ms</span><strong id="eda-telem-easyeda-avg-ms">0.0</strong></div>
+                                <div class="eda-counter-pill"><span>Last ms</span><strong id="eda-telem-easyeda-last-ms">--</strong></div>
+                            </div>
+                            <div class="eda-telem-last-row">
+                                <div>Last Tool: <code id="eda-telem-easyeda-last-tool">None</code></div>
+                                <div>Summary: <span id="eda-telem-easyeda-summary">No DRC or export run yet</span></div>
+                            </div>
+                            <div id="eda-telem-easyeda-error" class="error-banner hidden"></div>
+                        </div>
+
+                        <div class="eda-form-grid">
+                            <div class="eda-field">
+                                <label for="eda-easyeda-exec-mode">Execution Mode</label>
+                                <select id="eda-easyeda-exec-mode" class="eda-select">
+                                    <option value="auto">auto (Live GUI + Converter)</option>
+                                    <option value="live_gui">live_gui (.eext WebSocket :3893)</option>
+                                    <option value="converter_only">converter_only (C++17 EasyEdaConverter)</option>
+                                </select>
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-easyeda-projects-dir">Projects Directory</label>
+                                <input type="text" id="eda-easyeda-projects-dir" class="eda-input" value="~/work/pcb/easyeda">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-easyeda-host">Host Override (Optional)</label>
+                                <input type="text" id="eda-easyeda-host" class="eda-input" placeholder="Inherit default host">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-easyeda-port">RPC Port Override (0 = Inherit)</label>
+                                <input type="number" id="eda-easyeda-port" class="eda-input" min="0" max="65535" value="0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-easyeda-plugin-port">Plugin Port Override (0 = Inherit)</label>
+                                <input type="number" id="eda-easyeda-plugin-port" class="eda-input" min="0" max="65535" value="0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-easyeda-binary">Custom Binary Path</label>
+                                <input type="text" id="eda-easyeda-binary" class="eda-input" placeholder="Auto-detect EasyEDA-Pro.exe">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-easyeda-min-stock">Min LCSC Stock Filter</label>
+                                <input type="number" id="eda-easyeda-min-stock" class="eda-input" min="0" max="1000000" value="100">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-easyeda-layers">Default JLCPCB Layer Count</label>
+                                <select id="eda-easyeda-layers" class="eda-select">
+                                    <option value="1">1 Layer</option>
+                                    <option value="2" selected>2 Layers</option>
+                                    <option value="4">4 Layers</option>
+                                    <option value="6">6 Layers</option>
+                                </select>
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-easyeda-timeout">Timeout (ms)</label>
+                                <input type="number" id="eda-easyeda-timeout" class="eda-input" min="1000" max="600000" step="1000" value="60000">
+                            </div>
+                            <div class="eda-field eda-field-toggle">
+                                <label class="toggle-switch-label" for="eda-easyeda-prefer-basic">
+                                    <input type="checkbox" id="eda-easyeda-prefer-basic" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Prefer JLCPCB Basic Parts</span>
+                                </label>
+                            </div>
+                            <div class="eda-field eda-field-toggle">
+                                <label class="toggle-switch-label" for="eda-easyeda-auto-drc">
+                                    <input type="checkbox" id="eda-easyeda-auto-drc" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Auto-Run DRC After Edits</span>
+                                </label>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Card 3: KiCad -->
+                    <section class="glass-card eda-component-card" id="eda-card-kicad">
+                        <div class="card-header">
+                            <div class="provider-title">
+                                <span class="badge badge-cyan">Schematic &amp; PCB</span>
+                                <h3>KiCad 8</h3>
+                            </div>
+                            <div class="eda-card-header-right">
+                                <span class="status-pill disconnected" id="eda-telem-kicad-status">Offline</span>
+                                <label class="toggle-switch-label" for="eda-kicad-enabled">
+                                    <input type="checkbox" id="eda-kicad-enabled" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Enabled</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="eda-telem-box">
+                            <div class="eda-telem-meta-row">
+                                <span>Endpoint: <code id="eda-telem-kicad-endpoint">--</code></span>
+                                <span>Version: <code id="eda-telem-kicad-version">--</code></span>
+                                <span>Active Doc: <code id="eda-telem-kicad-doc">None</code></span>
+                            </div>
+                            <div class="eda-telem-counters">
+                                <div class="eda-counter-pill"><span>Total</span><strong id="eda-telem-kicad-total">0</strong></div>
+                                <div class="eda-counter-pill"><span>Succeeded</span><strong id="eda-telem-kicad-success" class="text-emerald">0</strong></div>
+                                <div class="eda-counter-pill"><span>Failed</span><strong id="eda-telem-kicad-failed" class="text-coral">0</strong></div>
+                                <div class="eda-counter-pill"><span>Avg ms</span><strong id="eda-telem-kicad-avg-ms">0.0</strong></div>
+                                <div class="eda-counter-pill"><span>Last ms</span><strong id="eda-telem-kicad-last-ms">--</strong></div>
+                            </div>
+                            <div class="eda-telem-last-row">
+                                <div>Last Tool: <code id="eda-telem-kicad-last-tool">None</code></div>
+                                <div>Summary: <span id="eda-telem-kicad-summary">No ERC/DRC validation run yet</span></div>
+                            </div>
+                            <div id="eda-telem-kicad-error" class="error-banner hidden"></div>
+                        </div>
+
+                        <div class="eda-form-grid">
+                            <div class="eda-field">
+                                <label for="eda-kicad-exec-mode">Execution Mode</label>
+                                <select id="eda-kicad-exec-mode" class="eda-select">
+                                    <option value="auto">auto (Live pcbnew + Headless CLI)</option>
+                                    <option value="live_gui">live_gui (pcbnew Action Plugin :3893)</option>
+                                    <option value="headless_cli">headless_cli (C++17 Editor + kicad-cli)</option>
+                                </select>
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-projects-dir">Projects Directory</label>
+                                <input type="text" id="eda-kicad-projects-dir" class="eda-input" value="~/work/pcb/kicad">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-host">Host Override (Optional)</label>
+                                <input type="text" id="eda-kicad-host" class="eda-input" placeholder="Inherit default host">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-port">RPC Port Override (0 = Inherit)</label>
+                                <input type="number" id="eda-kicad-port" class="eda-input" min="0" max="65535" value="0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-plugin-port">Plugin Port Override (0 = Inherit)</label>
+                                <input type="number" id="eda-kicad-plugin-port" class="eda-input" min="0" max="65535" value="0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-binary">Custom kicad-cli Path</label>
+                                <input type="text" id="eda-kicad-binary" class="eda-input" placeholder="Auto-detect kicad-cli">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-sym-dir">Symbol Library Dir (.kicad_sym)</label>
+                                <input type="text" id="eda-kicad-sym-dir" class="eda-input" placeholder="Default KICAD8_SYMBOL_DIR">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-fp-dir">Footprint Library Dir (.pretty)</label>
+                                <input type="text" id="eda-kicad-fp-dir" class="eda-input" placeholder="Default KICAD8_FOOTPRINT_DIR">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-grid-mils">Schematic Snap Grid (mils)</label>
+                                <select id="eda-kicad-grid-mils" class="eda-select">
+                                    <option value="25">25 mils (0.635 mm)</option>
+                                    <option value="50" selected>50 mils (1.27 mm)</option>
+                                    <option value="100">100 mils (2.54 mm)</option>
+                                </select>
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-fab-house">Target Fab House</label>
+                                <select id="eda-kicad-fab-house" class="eda-select">
+                                    <option value="jlcpcb" selected>jlcpcb</option>
+                                    <option value="pcbway">pcbway</option>
+                                    <option value="generic">generic</option>
+                                </select>
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-kicad-timeout">Timeout (ms)</label>
+                                <input type="number" id="eda-kicad-timeout" class="eda-input" min="1000" max="600000" step="1000" value="60000">
+                            </div>
+                            <div class="eda-field eda-field-toggle">
+                                <label class="toggle-switch-label" for="eda-kicad-auto-erc">
+                                    <input type="checkbox" id="eda-kicad-auto-erc" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Auto-Run ERC After Schematic Edit</span>
+                                </label>
+                            </div>
+                            <div class="eda-field eda-field-toggle">
+                                <label class="toggle-switch-label" for="eda-kicad-drc-parity">
+                                    <input type="checkbox" id="eda-kicad-drc-parity" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Enforce DRC Schematic Parity</span>
+                                </label>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Card 4: FreeCAD -->
+                    <section class="glass-card eda-component-card" id="eda-card-freecad">
+                        <div class="card-header">
+                            <div class="provider-title">
+                                <span class="badge badge-amber">3D CAD &amp; Robotics</span>
+                                <h3>FreeCAD</h3>
+                            </div>
+                            <div class="eda-card-header-right">
+                                <span class="status-pill disconnected" id="eda-telem-freecad-status">Offline</span>
+                                <label class="toggle-switch-label" for="eda-freecad-enabled">
+                                    <input type="checkbox" id="eda-freecad-enabled" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Enabled</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="eda-telem-box">
+                            <div class="eda-telem-meta-row">
+                                <span>Endpoint: <code id="eda-telem-freecad-endpoint">--</code></span>
+                                <span>Version: <code id="eda-telem-freecad-version">--</code></span>
+                                <span>Active Doc: <code id="eda-telem-freecad-doc">None</code></span>
+                            </div>
+                            <div class="eda-telem-counters">
+                                <div class="eda-counter-pill"><span>Total</span><strong id="eda-telem-freecad-total">0</strong></div>
+                                <div class="eda-counter-pill"><span>Succeeded</span><strong id="eda-telem-freecad-success" class="text-emerald">0</strong></div>
+                                <div class="eda-counter-pill"><span>Failed</span><strong id="eda-telem-freecad-failed" class="text-coral">0</strong></div>
+                                <div class="eda-counter-pill"><span>Avg ms</span><strong id="eda-telem-freecad-avg-ms">0.0</strong></div>
+                                <div class="eda-counter-pill"><span>Last ms</span><strong id="eda-telem-freecad-last-ms">--</strong></div>
+                            </div>
+                            <div class="eda-telem-last-row">
+                                <div>Last Tool: <code id="eda-telem-freecad-last-tool">None</code></div>
+                                <div>Summary: <span id="eda-telem-freecad-summary">No printability or joint sweep run yet</span></div>
+                            </div>
+                            <div id="eda-telem-freecad-error" class="error-banner hidden"></div>
+                        </div>
+
+                        <div class="eda-form-grid">
+                            <div class="eda-field">
+                                <label for="eda-freecad-exec-mode">Execution Mode</label>
+                                <select id="eda-freecad-exec-mode" class="eda-select">
+                                    <option value="auto">auto (Live GUI + FreeCADCmd)</option>
+                                    <option value="live_gui">live_gui (FreeCAD Qt Bridge :3893)</option>
+                                    <option value="headless_cmd">headless_cmd (FreeCADCmd CLI)</option>
+                                </select>
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-projects-dir">CAD Projects Directory</label>
+                                <input type="text" id="eda-freecad-projects-dir" class="eda-input" value="~/work/robot/cad">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-host">Host Override (Optional)</label>
+                                <input type="text" id="eda-freecad-host" class="eda-input" placeholder="Inherit default host">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-port">RPC Port Override (0 = Inherit)</label>
+                                <input type="number" id="eda-freecad-port" class="eda-input" min="0" max="65535" value="0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-plugin-port">Plugin Port Override (0 = Inherit)</label>
+                                <input type="number" id="eda-freecad-plugin-port" class="eda-input" min="0" max="65535" value="0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-binary">Custom FreeCADCmd Path</label>
+                                <input type="text" id="eda-freecad-binary" class="eda-input" placeholder="Auto-detect FreeCADCmd">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-tolerance-mm">Print Clearance Tolerance (mm)</label>
+                                <input type="number" id="eda-freecad-tolerance-mm" class="eda-input" min="0.01" max="2.0" step="0.01" value="0.20">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-min-wall-mm">Min Wall Thickness (mm)</label>
+                                <input type="number" id="eda-freecad-min-wall-mm" class="eda-input" min="0.2" max="20.0" step="0.1" value="1.20">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-max-overhang-deg">Max Overhang Angle (deg)</label>
+                                <input type="number" id="eda-freecad-max-overhang-deg" class="eda-input" min="15.0" max="85.0" step="1.0" value="45.0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-linear-defl-mm">Mesh Linear Deflection (mm)</label>
+                                <input type="number" id="eda-freecad-linear-defl-mm" class="eda-input" min="0.005" max="1.0" step="0.005" value="0.05">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-angular-defl-deg">Mesh Angular Deflection (deg)</label>
+                                <input type="number" id="eda-freecad-angular-defl-deg" class="eda-input" min="0.5" max="30.0" step="0.5" value="5.0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-sweep-step-deg">Joint Sweep Step (deg)</label>
+                                <input type="number" id="eda-freecad-sweep-step-deg" class="eda-input" min="0.5" max="45.0" step="0.5" value="5.0">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-render-width">Render Width (px)</label>
+                                <input type="number" id="eda-freecad-render-width" class="eda-input" min="320" max="3840" value="1280">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-render-height">Render Height (px)</label>
+                                <input type="number" id="eda-freecad-render-height" class="eda-input" min="240" max="2160" value="960">
+                            </div>
+                            <div class="eda-field">
+                                <label for="eda-freecad-timeout">Timeout (ms)</label>
+                                <input type="number" id="eda-freecad-timeout" class="eda-input" min="1000" max="600000" step="1000" value="120000">
+                            </div>
+                            <div class="eda-field eda-field-toggle">
+                                <label class="toggle-switch-label" for="eda-freecad-tnp-guard">
+                                    <input type="checkbox" id="eda-freecad-tnp-guard" checked>
+                                    <span class="toggle-switch-slider"></span>
+                                    <span class="toggle-switch-text">Enforce TNP Guard (Reject Face1/Edge1)</span>
+                                </label>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- 3. Recent Tool Bridge Activity Log Table -->
+                <div class="glass-card eda-activity-card">
+                    <div class="card-header">
+                        <h3>Recent Tool Bridge Activity Log (Last 50 Calls)</h3>
+                        <span class="badge badge-cyan" id="eda-recent-calls-count">0 Calls</span>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="agents-table eda-calls-table">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Component</th>
+                                    <th>MCP Tool</th>
+                                    <th>Target Document / Domain</th>
+                                    <th>Duration</th>
+                                    <th>Status</th>
+                                    <th>Diagnostic / Validation Summary</th>
+                                </tr>
+                            </thead>
+                            <tbody id="eda-recent-calls-body">
+                                <tr>
+                                    <td colspan="7" class="eda-empty-row">No EDA, CAD, or CPU accelerator tool invocations recorded yet.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
         </main>
@@ -3671,6 +4186,230 @@ body {
 #claude-main-pct {
     color: var(--text-secondary);
 }
+
+/* ==========================================================================
+   Subpanel 5: Tool Bridges (EDA, CAD & Local CPU Accelerators)
+   ========================================================================== */
+
+#subpanel-bridges {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+#subpanel-bridges.hidden {
+    display: none;
+}
+
+.eda-global-card {
+    padding: 18px 22px;
+    gap: 14px;
+}
+
+.eda-global-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+
+.eda-title-group {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.eda-title-group h2 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.eda-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.eda-feedback-banner {
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.35);
+    color: #34d399;
+    font-size: 0.8rem;
+    padding: 9px 14px;
+    border-radius: 8px;
+}
+
+.eda-form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 12px;
+}
+
+.eda-global-grid {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.eda-field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.eda-field label {
+    font-size: 0.74rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.eda-field-toggle {
+    justify-content: center;
+    padding-top: 6px;
+}
+
+.eda-field-full {
+    grid-column: 1 / -1;
+}
+
+.eda-input,
+.eda-select {
+    background: rgba(0, 0, 0, 0.38);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    padding: 7px 10px;
+    border-radius: 8px;
+    outline: none;
+    transition: border-color 0.2s ease;
+}
+
+.eda-input:focus,
+.eda-select:focus {
+    border-color: var(--cyan-glow);
+}
+
+.eda-components-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+}
+
+@media (max-width: 1180px) {
+    .eda-components-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.eda-component-card {
+    padding: 18px 20px;
+    gap: 14px;
+}
+
+.eda-card-header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.eda-telem-box {
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 12px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.eda-telem-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    font-size: 0.76rem;
+    color: var(--text-secondary);
+}
+
+.eda-telem-meta-row code,
+.eda-telem-last-row code {
+    font-family: var(--font-mono);
+    color: #38bdf8;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 1px 6px;
+    border-radius: 4px;
+}
+
+.eda-telem-counters {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+}
+
+@media (max-width: 640px) {
+    .eda-telem-counters {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.eda-counter-pill {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    padding: 6px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.eda-counter-pill span {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+
+.eda-counter-pill strong {
+    font-family: var(--font-mono);
+    font-size: 0.92rem;
+    color: var(--text-primary);
+}
+
+.text-emerald {
+    color: #34d399 !important;
+}
+
+.text-coral {
+    color: #f87171 !important;
+}
+
+.eda-telem-last-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.76rem;
+    color: var(--text-secondary);
+}
+
+.eda-activity-card {
+    padding: 18px 20px;
+}
+
+.eda-calls-table td {
+    font-size: 0.78rem;
+}
+
+.eda-empty-row {
+    text-align: center;
+    color: var(--text-muted);
+    padding: 20px !important;
+}
+
 )raw_asset";
 
 inline const char* APP_JS = R"raw_asset(//
@@ -4442,6 +5181,9 @@ async function fetchStatus(isManual = false) {
             renderAntigravity(data.antigravity);
             renderCursor(data.cursor);
             renderClaude(data.claude);
+            if (data.eda) {
+                renderToolBridges(data.eda, false);
+            }
             updateCountdowns();
 
             const updatedEl = document.getElementById('last-updated');
@@ -5662,7 +6404,8 @@ function switchToSubpanel(subpanelId) {
         'quotas': document.getElementById('subpanel-quotas'),
         'telemetry': document.getElementById('subpanel-telemetry'),
         'approvals': document.getElementById('subpanel-approvals'),
-        'insights': document.getElementById('subpanel-insights')
+        'insights': document.getElementById('subpanel-insights'),
+        'bridges': document.getElementById('subpanel-bridges')
     };
     Object.keys(subpanels).forEach(key => {
         const el = subpanels[key];
@@ -5689,6 +6432,445 @@ function switchToSubpanel(subpanelId) {
         fetchMobileDevices();
     } else if (subpanelId === 'insights') {
         fetchInsightsTab();
+    } else if (subpanelId === 'bridges') {
+        fetchToolBridgesStatus(false);
+    }
+}
+
+// ==========================================================================
+// Unified EDA, CAD & Local CPU Accelerator Tool Bridges Controller
+// ==========================================================================
+
+let edaFormHydrated = false;
+let edaFormDirty = false;
+
+function edaSetCheck(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.checked = Boolean(val);
+}
+
+function edaSetVal(id, val, fallback = '') {
+    const el = document.getElementById(id);
+    if (el) el.value = (val !== undefined && val !== null) ? String(val) : String(fallback);
+}
+
+function edaGetCheck(id) {
+    const el = document.getElementById(id);
+    return el ? Boolean(el.checked) : false;
+}
+
+function edaGetStr(id, fallback = '') {
+    const el = document.getElementById(id);
+    return el ? el.value.trim() : fallback;
+}
+
+function edaGetInt(id, fallback = 0) {
+    const el = document.getElementById(id);
+    if (!el) return fallback;
+    const n = parseInt(el.value, 10);
+    return Number.isNaN(n) ? fallback : n;
+}
+
+function edaGetFloat(id, fallback = 0.0) {
+    const el = document.getElementById(id);
+    if (!el) return fallback;
+    const n = parseFloat(el.value);
+    return Number.isNaN(n) ? fallback : n;
+}
+
+function hydrateToolBridgesForm(cfg, authConfigured) {
+    if (!cfg || typeof cfg !== 'object') return;
+
+    edaSetCheck('eda-cfg-enabled', cfg.enabled);
+    edaSetCheck('eda-cfg-require-approval', cfg.require_approval_for_exports);
+    edaSetVal('eda-cfg-mode', cfg.mode || 'bidirectional');
+    edaSetVal('eda-cfg-host', cfg.host || '');
+    edaSetVal('eda-cfg-port', cfg.port !== undefined ? cfg.port : 3892);
+    edaSetVal('eda-cfg-plugin-port', cfg.plugin_port !== undefined ? cfg.plugin_port : 3893);
+    edaSetVal('eda-cfg-linux-prefix', cfg.linux_path_prefix || '~/work');
+    edaSetVal('eda-cfg-win-prefix', cfg.windows_path_prefix || 'Z:\\');
+    edaSetVal('eda-cfg-poll-interval', cfg.health_poll_interval_sec !== undefined ? cfg.health_poll_interval_sec : 30);
+
+    const secretInput = document.getElementById('eda-cfg-auth-secret');
+    if (secretInput) {
+        const hasSecret = Boolean(authConfigured || cfg.auth_secret === '***');
+        secretInput.value = hasSecret ? '***' : '';
+        secretInput.placeholder = hasSecret ? '*** (configured — leave *** to preserve)' : 'Enter shared bearer secret';
+    }
+
+    const acc = cfg.accelerators || {};
+    edaSetCheck('eda-acc-enabled', acc.enabled !== undefined ? acc.enabled : true);
+    edaSetVal('eda-acc-sa-iterations', acc.sa_placement_iterations !== undefined ? acc.sa_placement_iterations : 50000);
+    edaSetVal('eda-acc-ripup-passes', acc.autoroute_max_ripup_passes !== undefined ? acc.autoroute_max_ripup_passes : 25);
+    edaSetVal('eda-acc-grid-mm', acc.autoroute_grid_mm !== undefined ? acc.autoroute_grid_mm : 0.25);
+    edaSetVal('eda-acc-copper-oz', acc.default_copper_weight_oz !== undefined ? acc.default_copper_weight_oz : 1.0);
+    edaSetVal('eda-acc-filament', acc.default_filament_material || 'PETG');
+    edaSetVal('eda-acc-gear-angle', acc.default_gear_pressure_angle_deg !== undefined ? acc.default_gear_pressure_angle_deg : 20.0);
+    edaSetCheck('eda-acc-prefer-jlcpcb', acc.prefer_jlcpcb_basic_e_series !== undefined ? acc.prefer_jlcpcb_basic_e_series : true);
+
+    const ez = cfg.easyeda || {};
+    edaSetCheck('eda-easyeda-enabled', ez.enabled !== undefined ? ez.enabled : true);
+    edaSetVal('eda-easyeda-exec-mode', ez.execution_mode || 'auto');
+    edaSetVal('eda-easyeda-projects-dir', ez.projects_dir || '~/work/pcb/easyeda');
+    edaSetVal('eda-easyeda-host', ez.host || '');
+    edaSetVal('eda-easyeda-port', ez.port !== undefined ? ez.port : 0);
+    edaSetVal('eda-easyeda-plugin-port', ez.plugin_port !== undefined ? ez.plugin_port : 0);
+    edaSetVal('eda-easyeda-binary', ez.custom_binary_path || '');
+    edaSetVal('eda-easyeda-min-stock', ez.min_lcsc_stock !== undefined ? ez.min_lcsc_stock : 100);
+    edaSetVal('eda-easyeda-layers', ez.jlcpcb_layer_count !== undefined ? ez.jlcpcb_layer_count : 2);
+    edaSetVal('eda-easyeda-timeout', ez.timeout_ms !== undefined ? ez.timeout_ms : 60000);
+    edaSetCheck('eda-easyeda-prefer-basic', ez.prefer_jlcpcb_basic_parts !== undefined ? ez.prefer_jlcpcb_basic_parts : true);
+    edaSetCheck('eda-easyeda-auto-drc', ez.auto_drc_after_edit !== undefined ? ez.auto_drc_after_edit : true);
+
+    const kc = cfg.kicad || {};
+    edaSetCheck('eda-kicad-enabled', kc.enabled !== undefined ? kc.enabled : true);
+    edaSetVal('eda-kicad-exec-mode', kc.execution_mode || 'auto');
+    edaSetVal('eda-kicad-projects-dir', kc.projects_dir || '~/work/pcb/kicad');
+    edaSetVal('eda-kicad-host', kc.host || '');
+    edaSetVal('eda-kicad-port', kc.port !== undefined ? kc.port : 0);
+    edaSetVal('eda-kicad-plugin-port', kc.plugin_port !== undefined ? kc.plugin_port : 0);
+    edaSetVal('eda-kicad-binary', kc.custom_binary_path || '');
+    edaSetVal('eda-kicad-sym-dir', kc.symbol_lib_dir || '');
+    edaSetVal('eda-kicad-fp-dir', kc.footprint_lib_dir || '');
+    edaSetVal('eda-kicad-grid-mils', kc.schematic_grid_mils !== undefined ? kc.schematic_grid_mils : 50);
+    edaSetVal('eda-kicad-fab-house', kc.fab_target_house || 'jlcpcb');
+    edaSetVal('eda-kicad-timeout', kc.timeout_ms !== undefined ? kc.timeout_ms : 60000);
+    edaSetCheck('eda-kicad-auto-erc', kc.auto_erc_after_edit !== undefined ? kc.auto_erc_after_edit : true);
+    edaSetCheck('eda-kicad-drc-parity', kc.drc_schematic_parity !== undefined ? kc.drc_schematic_parity : true);
+
+    const fc = cfg.freecad || {};
+    edaSetCheck('eda-freecad-enabled', fc.enabled !== undefined ? fc.enabled : true);
+    edaSetVal('eda-freecad-exec-mode', fc.execution_mode || 'auto');
+    edaSetVal('eda-freecad-projects-dir', fc.projects_dir || '~/work/robot/cad');
+    edaSetVal('eda-freecad-host', fc.host || '');
+    edaSetVal('eda-freecad-port', fc.port !== undefined ? fc.port : 0);
+    edaSetVal('eda-freecad-plugin-port', fc.plugin_port !== undefined ? fc.plugin_port : 0);
+    edaSetVal('eda-freecad-binary', fc.custom_binary_path || '');
+    edaSetVal('eda-freecad-tolerance-mm', fc.default_print_tolerance_mm !== undefined ? fc.default_print_tolerance_mm : 0.20);
+    edaSetVal('eda-freecad-min-wall-mm', fc.min_wall_thickness_mm !== undefined ? fc.min_wall_thickness_mm : 1.20);
+    edaSetVal('eda-freecad-max-overhang-deg', fc.max_overhang_deg !== undefined ? fc.max_overhang_deg : 45.0);
+    edaSetVal('eda-freecad-linear-defl-mm', fc.mesh_linear_deflection_mm !== undefined ? fc.mesh_linear_deflection_mm : 0.05);
+    edaSetVal('eda-freecad-angular-defl-deg', fc.mesh_angular_deflection_deg !== undefined ? fc.mesh_angular_deflection_deg : 5.0);
+    edaSetVal('eda-freecad-sweep-step-deg', fc.joint_sweep_step_deg !== undefined ? fc.joint_sweep_step_deg : 5.0);
+    edaSetVal('eda-freecad-render-width', fc.render_width !== undefined ? fc.render_width : 1280);
+    edaSetVal('eda-freecad-render-height', fc.render_height !== undefined ? fc.render_height : 960);
+    edaSetVal('eda-freecad-timeout', fc.timeout_ms !== undefined ? fc.timeout_ms : 120000);
+    edaSetCheck('eda-freecad-tnp-guard', fc.enforce_tnp_guard !== undefined ? fc.enforce_tnp_guard : true);
+}
+
+function collectToolBridgesFormPayload() {
+    return {
+        enabled: edaGetCheck('eda-cfg-enabled'),
+        mode: edaGetStr('eda-cfg-mode', 'bidirectional'),
+        host: edaGetStr('eda-cfg-host', ''),
+        port: edaGetInt('eda-cfg-port', 3892),
+        plugin_port: edaGetInt('eda-cfg-plugin-port', 3893),
+        linux_path_prefix: edaGetStr('eda-cfg-linux-prefix', '~/work'),
+        windows_path_prefix: edaGetStr('eda-cfg-win-prefix', 'Z:\\'),
+        auth_secret: edaGetStr('eda-cfg-auth-secret', ''),
+        health_poll_interval_sec: edaGetInt('eda-cfg-poll-interval', 30),
+        require_approval_for_exports: edaGetCheck('eda-cfg-require-approval'),
+        accelerators: {
+            enabled: edaGetCheck('eda-acc-enabled'),
+            sa_placement_iterations: edaGetInt('eda-acc-sa-iterations', 50000),
+            autoroute_max_ripup_passes: edaGetInt('eda-acc-ripup-passes', 25),
+            autoroute_grid_mm: edaGetFloat('eda-acc-grid-mm', 0.25),
+            default_copper_weight_oz: edaGetFloat('eda-acc-copper-oz', 1.0),
+            default_filament_material: edaGetStr('eda-acc-filament', 'PETG'),
+            default_gear_pressure_angle_deg: edaGetFloat('eda-acc-gear-angle', 20.0),
+            prefer_jlcpcb_basic_e_series: edaGetCheck('eda-acc-prefer-jlcpcb')
+        },
+        easyeda: {
+            enabled: edaGetCheck('eda-easyeda-enabled'),
+            execution_mode: edaGetStr('eda-easyeda-exec-mode', 'auto'),
+            projects_dir: edaGetStr('eda-easyeda-projects-dir', '~/work/pcb/easyeda'),
+            host: edaGetStr('eda-easyeda-host', ''),
+            port: edaGetInt('eda-easyeda-port', 0),
+            plugin_port: edaGetInt('eda-easyeda-plugin-port', 0),
+            custom_binary_path: edaGetStr('eda-easyeda-binary', ''),
+            min_lcsc_stock: edaGetInt('eda-easyeda-min-stock', 100),
+            jlcpcb_layer_count: edaGetInt('eda-easyeda-layers', 2),
+            timeout_ms: edaGetInt('eda-easyeda-timeout', 60000),
+            prefer_jlcpcb_basic_parts: edaGetCheck('eda-easyeda-prefer-basic'),
+            auto_drc_after_edit: edaGetCheck('eda-easyeda-auto-drc')
+        },
+        kicad: {
+            enabled: edaGetCheck('eda-kicad-enabled'),
+            execution_mode: edaGetStr('eda-kicad-exec-mode', 'auto'),
+            projects_dir: edaGetStr('eda-kicad-projects-dir', '~/work/pcb/kicad'),
+            host: edaGetStr('eda-kicad-host', ''),
+            port: edaGetInt('eda-kicad-port', 0),
+            plugin_port: edaGetInt('eda-kicad-plugin-port', 0),
+            custom_binary_path: edaGetStr('eda-kicad-binary', ''),
+            symbol_lib_dir: edaGetStr('eda-kicad-sym-dir', ''),
+            footprint_lib_dir: edaGetStr('eda-kicad-fp-dir', ''),
+            schematic_grid_mils: edaGetInt('eda-kicad-grid-mils', 50),
+            fab_target_house: edaGetStr('eda-kicad-fab-house', 'jlcpcb'),
+            timeout_ms: edaGetInt('eda-kicad-timeout', 60000),
+            auto_erc_after_edit: edaGetCheck('eda-kicad-auto-erc'),
+            drc_schematic_parity: edaGetCheck('eda-kicad-drc-parity')
+        },
+        freecad: {
+            enabled: edaGetCheck('eda-freecad-enabled'),
+            execution_mode: edaGetStr('eda-freecad-exec-mode', 'auto'),
+            projects_dir: edaGetStr('eda-freecad-projects-dir', '~/work/robot/cad'),
+            host: edaGetStr('eda-freecad-host', ''),
+            port: edaGetInt('eda-freecad-port', 0),
+            plugin_port: edaGetInt('eda-freecad-plugin-port', 0),
+            custom_binary_path: edaGetStr('eda-freecad-binary', ''),
+            default_print_tolerance_mm: edaGetFloat('eda-freecad-tolerance-mm', 0.20),
+            min_wall_thickness_mm: edaGetFloat('eda-freecad-min-wall-mm', 1.20),
+            max_overhang_deg: edaGetFloat('eda-freecad-max-overhang-deg', 45.0),
+            mesh_linear_deflection_mm: edaGetFloat('eda-freecad-linear-defl-mm', 0.05),
+            mesh_angular_deflection_deg: edaGetFloat('eda-freecad-angular-defl-deg', 5.0),
+            joint_sweep_step_deg: edaGetFloat('eda-freecad-sweep-step-deg', 5.0),
+            render_width: edaGetInt('eda-freecad-render-width', 1280),
+            render_height: edaGetInt('eda-freecad-render-height', 960),
+            timeout_ms: edaGetInt('eda-freecad-timeout', 120000),
+            enforce_tnp_guard: edaGetCheck('eda-freecad-tnp-guard')
+        }
+    };
+}
+
+function renderToolBridges(eda, forceFormHydrate = false) {
+    if (!eda || typeof eda !== 'object') return;
+
+    // 1. Global status header
+    const statusPill = document.getElementById('eda-status-pill');
+    const statusText = document.getElementById('eda-status-text');
+    const transportBadge = document.getElementById('eda-transport-badge');
+    const latencyPill = document.getElementById('eda-latency-pill');
+    const globalError = document.getElementById('eda-global-error');
+
+    if (statusPill && statusText) {
+        if (!eda.enabled) {
+            statusPill.className = 'status-pill completed';
+            statusText.textContent = 'Local Accelerators Active (Remote Disabled)';
+        } else if (eda.connected) {
+            statusPill.className = 'status-pill running';
+            statusText.textContent = `Connected (${eda.host || '127.0.0.1'}:${eda.port || 3892})`;
+        } else {
+            statusPill.className = 'status-pill failed';
+            statusText.textContent = 'Remote Bridge Offline';
+        }
+    }
+    if (transportBadge) {
+        transportBadge.textContent = `Transport: ${eda.active_transport || 'none'} (${eda.mode || 'bidirectional'})`;
+    }
+    if (latencyPill) {
+        const lat = eda.last_latency_ms;
+        latencyPill.textContent = (lat !== undefined && lat >= 0) ? `RTT: ${lat} ms` : 'RTT: -- ms';
+    }
+    if (globalError) {
+        if (eda.error_message) {
+            globalError.textContent = eda.error_message;
+            globalError.classList.remove('hidden');
+        } else {
+            globalError.classList.add('hidden');
+        }
+    }
+
+    // 2. Hydrate form if initial load or forced (without clobbering active user edits)
+    const panelEl = document.getElementById('subpanel-bridges');
+    const isEditingInsidePanel = panelEl && document.activeElement && panelEl.contains(document.activeElement) &&
+        (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'SELECT');
+    if (eda.config_snapshot && (forceFormHydrate || (!edaFormHydrated && !isEditingInsidePanel) || (!edaFormDirty && !isEditingInsidePanel))) {
+        hydrateToolBridgesForm(eda.config_snapshot, eda.auth_configured);
+        edaFormHydrated = true;
+        if (forceFormHydrate) {
+            edaFormDirty = false;
+        }
+    }
+
+    // 3. Per-component telemetry cards
+    const toolsList = Array.isArray(eda.tools) ? eda.tools : [];
+    const byName = {};
+    toolsList.forEach(t => {
+        if (t && t.name) byName[t.name] = t;
+    });
+
+    ['accelerators', 'easyeda', 'kicad', 'freecad'].forEach(comp => {
+        const info = byName[comp] || {};
+        const stEl = document.getElementById(`eda-telem-${comp}-status`);
+        const epEl = document.getElementById(`eda-telem-${comp}-endpoint`);
+        const verEl = document.getElementById(`eda-telem-${comp}-version`);
+        const docEl = document.getElementById(`eda-telem-${comp}-doc`);
+        const totEl = document.getElementById(`eda-telem-${comp}-total`);
+        const okEl = document.getElementById(`eda-telem-${comp}-success`);
+        const failEl = document.getElementById(`eda-telem-${comp}-failed`);
+        const avgEl = document.getElementById(`eda-telem-${comp}-avg-ms`);
+        const lastEl = document.getElementById(`eda-telem-${comp}-last-ms`);
+        const lastToolEl = document.getElementById(`eda-telem-${comp}-last-tool`);
+        const sumEl = document.getElementById(`eda-telem-${comp}-summary`);
+        const errEl = document.getElementById(`eda-telem-${comp}-error`);
+
+        if (stEl) {
+            if (info.enabled === false) {
+                stEl.className = 'status-pill disconnected';
+                stEl.textContent = 'Disabled';
+            } else if (comp === 'accelerators') {
+                stEl.className = 'status-pill running';
+                stEl.textContent = 'In-Process Ready';
+            } else if (info.plugin_connected) {
+                stEl.className = 'status-pill running';
+                stEl.textContent = 'Live GUI Attached';
+            } else if (info.available) {
+                stEl.className = 'status-pill completed';
+                stEl.textContent = 'CLI Ready';
+            } else {
+                stEl.className = 'status-pill disconnected';
+                stEl.textContent = 'Offline';
+            }
+        }
+
+        if (epEl) {
+            if (comp === 'accelerators') {
+                epEl.textContent = info.resolved_host || 'local (aimon)';
+            } else {
+                const h = info.resolved_host || eda.host || 'unconfigured';
+                const p = info.resolved_port || eda.port || 3892;
+                const pp = info.resolved_plugin_port || eda.plugin_port || 3893;
+                epEl.textContent = `${h}:${p} (plugin :${pp})`;
+            }
+        }
+        if (verEl) verEl.textContent = info.version || (comp === 'accelerators' ? 'builtin-1.0' : '--');
+        if (docEl) docEl.textContent = info.active_document || (comp === 'accelerators' ? '7 C++17 Solvers' : 'None');
+        if (totEl) totEl.textContent = String(info.total_calls || 0);
+        if (okEl) okEl.textContent = String(info.success_calls || 0);
+        if (failEl) failEl.textContent = String(info.failed_calls || 0);
+        if (avgEl) avgEl.textContent = (info.avg_call_duration_ms !== undefined ? Number(info.avg_call_duration_ms).toFixed(1) : '0.0');
+        if (lastEl) lastEl.textContent = (info.last_call_duration_ms !== undefined && info.last_call_duration_ms >= 0) ? String(info.last_call_duration_ms) : '--';
+
+        if (lastToolEl) {
+            if (info.last_tool_called) {
+                const ts = info.last_call_epoch > 0 ? ` (${formatLastSeen(info.last_call_epoch)})` : '';
+                lastToolEl.textContent = `${info.last_tool_called}${ts}`;
+            } else {
+                lastToolEl.textContent = 'None';
+            }
+        }
+        if (sumEl && info.last_validation_summary) {
+            sumEl.textContent = info.last_validation_summary;
+        }
+        if (errEl) {
+            if (info.error_message) {
+                errEl.textContent = info.error_message;
+                errEl.classList.remove('hidden');
+            } else {
+                errEl.classList.add('hidden');
+            }
+        }
+    });
+
+    // 4. Rolling 50-entry recent_calls table
+    const recent = Array.isArray(eda.recent_calls) ? eda.recent_calls : [];
+    const countBadge = document.getElementById('eda-recent-calls-count');
+    if (countBadge) {
+        countBadge.textContent = `${recent.length} Calls`;
+    }
+    const tbody = document.getElementById('eda-recent-calls-body');
+    if (tbody) {
+        if (recent.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" class="eda-empty-row">No EDA, CAD, or CPU accelerator tool invocations recorded yet.</td></tr>';
+        } else {
+            const rows = recent.slice().reverse();
+            tbody.innerHTML = rows.map(c => {
+                const tsStr = c.timestamp_epoch ? formatFullDateTime(c.timestamp_epoch) : '--';
+                const comp = c.component || 'eda';
+                const compBadgeClass = comp === 'accelerators' ? 'badge-cyan' : (comp === 'easyeda' ? 'badge-magenta' : (comp === 'freecad' ? 'badge-amber' : 'badge-cyan'));
+                const statusHtml = c.success
+                    ? '<span class="status-pill running">OK</span>'
+                    : '<span class="status-pill failed">ERROR</span>';
+                return `
+                    <tr>
+                        <td class="duration-counter">${escapeHtml(tsStr)}</td>
+                        <td><span class="badge ${compBadgeClass}">${escapeHtml(comp)}</span></td>
+                        <td><code>${escapeHtml(c.tool_name || '')}</code></td>
+                        <td><code>${escapeHtml(c.target_document || '--')}</code></td>
+                        <td class="duration-counter">${c.duration_ms !== undefined ? c.duration_ms : 0} ms</td>
+                        <td>${statusHtml}</td>
+                        <td>${escapeHtml(c.summary || '')}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+    }
+}
+
+async function fetchToolBridgesStatus(forceFormHydrate = false) {
+    try {
+        const res = await fetch('/api/eda/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderToolBridges(data, forceFormHydrate);
+    } catch (err) {
+        console.warn('Failed to fetch EDA tool bridge status:', err);
+    }
+}
+
+async function saveToolBridgesConfig() {
+    const saveBtn = document.getElementById('btn-eda-save');
+    const feedbackEl = document.getElementById('eda-save-feedback');
+    const errorEl = document.getElementById('eda-global-error');
+    if (saveBtn) saveBtn.textContent = 'Saving...';
+    if (feedbackEl) feedbackEl.classList.add('hidden');
+
+    try {
+        const payload = collectToolBridgesFormPayload();
+        const res = await fetch('/api/eda/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok || data.ok === false) {
+            if (errorEl) {
+                errorEl.textContent = data.error || `Failed to save configuration (HTTP ${res.status})`;
+                errorEl.classList.remove('hidden');
+            }
+            return;
+        }
+        edaFormDirty = false;
+        renderToolBridges(data, true);
+        if (feedbackEl) {
+            feedbackEl.textContent = 'Configuration saved to ~/.config/aimon/config.json and ~/.config/aimon/aimon.cfg.';
+            feedbackEl.classList.remove('hidden');
+        }
+    } catch (err) {
+        if (errorEl) {
+            errorEl.textContent = 'Network error while saving configuration: ' + err.message;
+            errorEl.classList.remove('hidden');
+        }
+    } finally {
+        if (saveBtn) saveBtn.textContent = 'Save Configuration';
+    }
+}
+
+async function probeToolBridges() {
+    const probeBtn = document.getElementById('btn-eda-probe');
+    const feedbackEl = document.getElementById('eda-save-feedback');
+    if (probeBtn) probeBtn.textContent = 'Probing...';
+
+    try {
+        const res = await fetch('/api/eda/probe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        if (res.ok) {
+            const data = await res.json();
+            renderToolBridges(data, false);
+            if (feedbackEl) {
+                feedbackEl.textContent = data.connected
+                    ? `Live bridge probe succeeded (RTT: ${data.last_latency_ms >= 0 ? data.last_latency_ms : 0} ms).`
+                    : 'Probe completed: local CPU accelerators ready; remote Windows bridge not reachable.';
+                feedbackEl.classList.remove('hidden');
+            }
+        }
+    } catch (err) {
+        console.warn('Failed to probe EDA tool bridges:', err);
+    } finally {
+        if (probeBtn) probeBtn.textContent = 'Probe Bridges Now';
     }
 }
 
@@ -5809,7 +6991,7 @@ function switchToMonitor(monitorId) {
 function switchToTab(id) {
     if (!id || id === 'aimon') {
         switchToSubpanel(activeSubpanelId || 'quotas');
-    } else if (id === 'quotas' || id === 'telemetry' || id === 'approvals' || id === 'insights') {
+    } else if (id === 'quotas' || id === 'telemetry' || id === 'approvals' || id === 'insights' || id === 'bridges') {
         switchToSubpanel(id);
     } else {
         switchToMonitor(id);
@@ -5821,7 +7003,7 @@ window.addEventListener('hashchange', () => {
     if (hash) {
         if (hash.startsWith('aimon/')) {
             switchToSubpanel(hash.split('/')[1]);
-        } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights') {
+        } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights' || hash === 'bridges') {
             switchToSubpanel(hash);
         } else {
             switchToMonitor(hash);
@@ -5843,7 +7025,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (hash) {
             if (hash.startsWith('aimon/')) {
                 switchToSubpanel(hash.split('/')[1]);
-            } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights') {
+            } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights' || hash === 'bridges') {
                 switchToSubpanel(hash);
             } else {
                 switchToMonitor(hash);
@@ -5851,6 +7033,27 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     } else {
         switchToSubpanel('quotas');
+    }
+
+    const bridgesPanelEl = document.getElementById('subpanel-bridges');
+    if (bridgesPanelEl) {
+        bridgesPanelEl.addEventListener('input', () => { edaFormDirty = true; });
+        bridgesPanelEl.addEventListener('change', () => { edaFormDirty = true; });
+    }
+
+    const btnEdaProbe = document.getElementById('btn-eda-probe');
+    if (btnEdaProbe) {
+        btnEdaProbe.addEventListener('click', probeToolBridges);
+    }
+
+    const btnEdaReload = document.getElementById('btn-eda-reload');
+    if (btnEdaReload) {
+        btnEdaReload.addEventListener('click', () => fetchToolBridgesStatus(true));
+    }
+
+    const btnEdaSave = document.getElementById('btn-eda-save');
+    if (btnEdaSave) {
+        btnEdaSave.addEventListener('click', saveToolBridgesConfig);
     }
 
     const btnRebuildInsights = document.getElementById('btn-insights-rebuild');
@@ -5960,17 +7163,19 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(fetchSessions, 10000);
     setInterval(fetchMonitors, 15000);
 
-    // Refresh telemetry & approvals periodically when respective tab is active
+    // Refresh telemetry, approvals, insights & bridges periodically when respective subpanel is active
     setInterval(() => {
-        if (activeTabId === 'telemetry') {
+        if (activeSubpanelId === 'telemetry') {
             fetchTelemetryOverview();
             fetchTelemetryTimeseries();
             fetchActivityTimeline();
             fetchTelemetryTools();
-        } else if (activeTabId === 'approvals') {
+        } else if (activeSubpanelId === 'approvals') {
             fetchPendingApprovals();
-        } else if (activeTabId === 'insights') {
+        } else if (activeSubpanelId === 'insights') {
             fetchInsightsTab();
+        } else if (activeSubpanelId === 'bridges') {
+            fetchToolBridgesStatus(false);
         }
     }, 8000);
 

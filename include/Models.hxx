@@ -436,11 +436,138 @@ struct ClaudeStatus {
     }
 };
 
+struct EdaToolCallLogEntry {
+    int64_t timestampEpoch = 0;
+    std::string component;
+    std::string toolName;
+    std::string targetDocument;
+    int durationMs = 0;
+    bool success = true;
+    std::string summary;
+
+    nlohmann::json toJson() const {
+        return {
+            {"timestamp_epoch", timestampEpoch},
+            {"component", component},
+            {"tool_name", toolName},
+            {"target_document", targetDocument},
+            {"duration_ms", durationMs},
+            {"success", success},
+            {"summary", summary}
+        };
+    }
+};
+
+struct EdaToolRuntimeInfo {
+    std::string name;
+    bool enabled = true;
+    std::string resolvedHost;
+    int resolvedPort = 3892;
+    int resolvedPluginPort = 3893;
+    std::string executionMode = "auto";
+    bool available = false;
+    bool pluginConnected = false;
+    std::string binaryPath;
+    std::string version;
+    std::string activeDocument;
+    int lastProbeLatencyMs = -1;
+    uint64_t totalCalls = 0;
+    uint64_t successCalls = 0;
+    uint64_t failedCalls = 0;
+    int lastCallDurationMs = -1;
+    double avgCallDurationMs = 0.0;
+    std::string lastToolCalled;
+    int64_t lastCallEpoch = 0;
+    std::string lastValidationSummary;
+    std::string errorMessage;
+
+    nlohmann::json toJson() const {
+        return {
+            {"name", name},
+            {"enabled", enabled},
+            {"resolved_host", resolvedHost},
+            {"resolved_port", resolvedPort},
+            {"resolved_plugin_port", resolvedPluginPort},
+            {"execution_mode", executionMode},
+            {"available", available},
+            {"plugin_connected", pluginConnected},
+            {"binary_path", binaryPath},
+            {"version", version},
+            {"active_document", activeDocument},
+            {"last_probe_latency_ms", lastProbeLatencyMs},
+            {"total_calls", totalCalls},
+            {"success_calls", successCalls},
+            {"failed_calls", failedCalls},
+            {"last_call_duration_ms", lastCallDurationMs},
+            {"avg_call_duration_ms", avgCallDurationMs},
+            {"last_tool_called", lastToolCalled},
+            {"last_call_epoch", lastCallEpoch},
+            {"last_validation_summary", lastValidationSummary},
+            {"error_message", errorMessage}
+        };
+    }
+};
+
+struct EdaBridgeStatus {
+    bool enabled = false;
+    bool connected = false;
+    std::string mode = "bidirectional";
+    std::string activeTransport = "none";
+    std::string host;
+    int port = 3892;
+    int pluginPort = 3893;
+    bool authConfigured = false;
+    int healthPollIntervalSec = 30;
+    bool requireApprovalForExports = false;
+    std::string linuxPathPrefix;
+    std::string windowsPathPrefix;
+    int64_t lastProbeEpoch = 0;
+    int lastLatencyMs = -1;
+    std::string remotePlatform;
+    std::vector<EdaToolRuntimeInfo> tools;
+    std::vector<EdaToolCallLogEntry> recentCalls;
+    nlohmann::json configSnapshot = nlohmann::json::object();
+    std::string errorMessage;
+
+    nlohmann::json toJson() const {
+        nlohmann::json toolsArr = nlohmann::json::array();
+        for (const auto& t : tools) {
+            toolsArr.push_back(t.toJson());
+        }
+        nlohmann::json recentArr = nlohmann::json::array();
+        for (const auto& c : recentCalls) {
+            recentArr.push_back(c.toJson());
+        }
+        return {
+            {"enabled", enabled},
+            {"connected", connected},
+            {"mode", mode},
+            {"active_transport", activeTransport},
+            {"host", host},
+            {"port", port},
+            {"plugin_port", pluginPort},
+            {"auth_configured", authConfigured},
+            {"health_poll_interval_sec", healthPollIntervalSec},
+            {"require_approval_for_exports", requireApprovalForExports},
+            {"linux_path_prefix", linuxPathPrefix},
+            {"windows_path_prefix", windowsPathPrefix},
+            {"last_probe_epoch", lastProbeEpoch},
+            {"last_latency_ms", lastLatencyMs},
+            {"remote_platform", remotePlatform},
+            {"tools", toolsArr},
+            {"recent_calls", recentArr},
+            {"config_snapshot", configSnapshot},
+            {"error_message", errorMessage}
+        };
+    }
+};
+
 struct AggregateStatus {
     std::chrono::system_clock::time_point lastUpdated;
     AntigravityStatus antigravity;
     CursorStatus cursor;
     ClaudeStatus claude;
+    EdaBridgeStatus eda;
 
     nlohmann::json toJson() const {
         auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -453,7 +580,8 @@ struct AggregateStatus {
             {"last_updated_epoch", epoch},
             {"antigravity", antigravity.toJson()},
             {"cursor", cursor.toJson()},
-            {"claude", claude.toJson()}
+            {"claude", claude.toJson()},
+            {"eda", eda.toJson()}
         };
     }
 };

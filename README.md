@@ -180,13 +180,14 @@ To prevent token exhaustion and eliminate irrelevant context in specialized work
 | Profile | Target Domain | Tools Included |
 | :--- | :--- | :--- |
 | `core` | General development, quota & insights tracking | Quota (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`) and Insights (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`) tools |
+| `eda` | PCB design & 3D robotics CAD (`kicad`, `freecad`, `easyeda`, `pcb`, `cad`, `robot`, `hw-`) | Core + all 36 EDA/CAD & CPU accelerator tools (`eda_calc_*`, `cad_calc_*`, `kicad_*`, `freecad_*`, `easyeda_*`) |
 | `embedded` | Embedded hardware development (`boards`, `embdevenv`) | Core + all `embdevenv_*` tools |
 | `network` | Network monitoring & security (`netmon`, `network`) | Core + `firewall_*`, `lan_*`, `snmp_*` tools |
 | `mesh` | LoRa wireless mesh networking (`meshmon`) | Core + all `meshmon_*` tools |
 | `mail` | Mail access through `alpine-mcp` | Core + all `mail_*` tools |
 | `all` | Full administrative & gateway access | Full unified catalog across all satellites |
 
-`aimon` detects profiles automatically from workspace folder names during MCP client initialization (e.g. `boards` -> `embedded`), or you can explicitly select a profile via URL query parameter:
+`aimon` detects profiles automatically from workspace folder names during MCP client initialization (e.g. `boards` -> `embedded`, `pcb`/`robot` -> `eda`), or you can explicitly select a profile via URL query parameter:
 
 #### Configuring in Cursor (SSE)
 In Cursor **Settings > Features > MCP > Add New Server** (Type: `sse`):
@@ -222,6 +223,65 @@ Once configured, ask your assistant:
 
 ---
 
+## 4. EDA & Robotics CAD Bridge (`EdaBridge`, `EdaAccelerators` & `aimon-eda-bridge`)
+
+`aimon` includes a 100% C++17 AI-assisted hardware design and robotics CAD subsystem exposing **36 MCP tools** under `--profile=eda` (or `--profile=all`):
+- **7 Local C++17 CPU Algorithmic Accelerators (`EdaAccelerators`)**: Runs in-process inside `aimon` for sub-100 ms deterministic synthesis (`eda_calc_schematic_layout`, `eda_calc_pcb_placement`, `eda_calc_pcb_autoroute`, `eda_calc_electrical_synth`, `cad_calc_robot_kinematics_statics`, `cad_calc_mechanism_synth`, `cad_calc_print_orientation_dfm`). Always available even when the remote Windows bridge is offline.
+- **11 EasyEDA Pro Tools**: `easyeda_live_status`, `easyeda_search_library`, `easyeda_inspect_schematic`, `easyeda_edit_schematic`, `easyeda_sync_sch_to_pcb`, `easyeda_inspect_pcb`, `easyeda_edit_pcb`, `easyeda_run_drc`, `easyeda_export_jlcpcb`, `easyeda_invoke_api`, and `easyeda_convert`.
+- **9 KiCad Tools**: `kicad_search_library`, `kicad_inspect_project`, `kicad_edit_schematic`, `kicad_sync_sch_to_pcb`, `kicad_edit_pcb`, `kicad_run_erc`, `kicad_run_drc`, `kicad_export_fab_pack`, and `kicad_export_step`.
+- **9 FreeCAD Robotics & 3D-Printing Tools**: `freecad_live_status`, `freecad_inspect_document`, `freecad_generate_cad`, `freecad_edit_parameters`, `freecad_assemble_joint`, `freecad_analyze_printability`, `freecad_render_view`, `freecad_export_print_files`, and `freecad_invoke_api`.
+
+### Building `aimon-eda-bridge` on Windows (MSVC)
+
+On a Windows 11 workstation with Visual Studio 2022 C++ Build Tools and CMake:
+
+```powershell
+cmake -S tools/eda-bridge -B build/windows-msvc
+cmake --build build/windows-msvc --config Release
+```
+
+Launch the bridge daemon on Windows (sharing the workspace root mapped to `Z:\`):
+
+```powershell
+.\build\windows-msvc\Release\aimon-eda-bridge.exe --listen-host 0.0.0.0 --port 3892 --plugin-port 3893 --secret <shared-secret> --allowed-root Z:\
+```
+
+*(Alternatively, pass `--connect <aimon-host>:3885` for reverse inward registration onto `aimon`'s `TcpGateway`.)*
+
+### Installing the Companion Desktop Plugins on Windows
+
+1. **EasyEDA Pro Extension (`tools/eda-bridge/plugins/easyeda-pro-extension/`)**:
+   - Zip `extension.json` and `index.js` as `aimon-easyeda-bridge.eext` (or load the folder directly in EasyEDA Pro via **Advanced > Extensions > Extension Manager > Import**).
+   - Once enabled, the extension connects automatically to `ws://127.0.0.1:3893`.
+2. **KiCad `pcbnew` Action Plugin (`tools/eda-bridge/plugins/kicad-aimon-bridge/`)**:
+   - Copy `tools/eda-bridge/plugins/kicad-aimon-bridge` into `%APPDATA%\KiCad\8.0\scripting\plugins\kicad-aimon-bridge` (or `9.0`).
+   - In KiCad PCB Editor, click **Tools > External Plugins > Aimon KiCad Live Bridge** to attach to `127.0.0.1:3893`.
+3. **FreeCAD Robotics & 3D-Printing Bridge (`tools/eda-bridge/plugins/freecad-aimon-bridge/`)**:
+   - Copy `tools/eda-bridge/plugins/freecad-aimon-bridge` into `%APPDATA%\FreeCAD\Mod\freecad-aimon-bridge`.
+   - FreeCAD loads `InitGui.py` on startup and connects to `127.0.0.1:3893` (when FreeCAD GUI is closed, `aimon-eda-bridge` automatically falls back to headless `FreeCADCmd.exe`).
+
+### Configuring in `~/.config/aimon/aimon.cfg` (or Web UI `#aimon/bridges`)
+
+Open `http://localhost:3883/#aimon/bridges` (**tool bridges** tab next to **usage insights**) or add the `eda` block in `~/.config/aimon/aimon.cfg`:
+
+```cfg
+eda = {
+    enabled = true;
+    mode = "bidirectional";
+    host = "workstation.local";
+    port = 3892;
+    plugin_port = 3893;
+    linux_path_prefix = "~/work";
+    windows_path_prefix = "Z:\\";
+    accelerators = { enabled = true; sa_placement_iterations = 50000; autoroute_max_ripup_passes = 25; };
+    easyeda      = { enabled = true; execution_mode = "auto"; prefer_jlcpcb_basic_parts = true; };
+    kicad        = { enabled = true; execution_mode = "auto"; schematic_grid_mils = 50; };
+    freecad      = { enabled = true; execution_mode = "auto"; enforce_tnp_guard = true; };
+};
+```
+
+---
+
 ## Project Structure
 
 ```text
@@ -237,15 +297,19 @@ aimon/
 ├── include/
 │   ├── AgentTelemetryDb.hxx       # Rolling SQLite WAL agent telemetry & time-series DB
 │   ├── AntigravityCollector.hxx   # Antigravity local process probe & Connect-RPC client
-│   ├── ConfigManager.hxx          # Configuration manager (~/.config/aimon/config.json)
+│   ├── ConfigManager.hxx          # Configuration manager (~/.config/aimon/aimon.cfg & config.json)
 │   ├── CursorCollector.hxx        # Cursor SQLite & API client
 │   ├── ClaudeCollector.hxx        # Claude Code transcript collector
 │   ├── ClaudeAccount.hxx          # Claude tier detection
 │   ├── ClaudeUsageStore.hxx       # Claude usage rows, cursors, price versions (SQLite)
 │   ├── PriceCatalog.hxx           # Online price catalog (pricing page parser, cache)
 │   ├── DynamicToolRegistry.hxx    # Thread-safe satellite tool registry & routing
+│   ├── EasyEdaConverter.hxx       # Native C++17 EasyEDA JSON to KiCad 8 S-expression converter
+│   ├── EdaAccelerators.hxx        # 7 native C++17 CPU algorithmic accelerators for EDA & CAD
+│   ├── EdaBridge.hxx              # EDA/CAD bridge client, path mapper, and TNP/API guards
 │   ├── HistoryStore.hxx           # SQLite3 time-series diff store (~/.config/aimon/history.db)
 │   ├── InsightEngine.hxx          # Cross-platform usage insights & workflow coaching engine
+│   ├── KiCadSchematicEditor.hxx   # Native C++17 KiCad .kicad_sym/.kicad_sch/.kicad_pcb engine
 │   ├── McpServer.hxx              # JSON-RPC 2.0 stdio & SSE engine with scoped profiling
 │   ├── MobileGateway.hxx          # Action approval latching & mobile pairing engine
 │   ├── Models.hxx                 # Core data structures and metrics
@@ -267,8 +331,12 @@ aimon/
 │   ├── ClaudeUsageStore.cxx       # Store implementation
 │   ├── PriceCatalog.cxx           # Price catalog implementation
 │   ├── DynamicToolRegistry.cxx    # Dynamic tool registry implementation
+│   ├── EasyEdaConverter.cxx       # EasyEDA JSON to KiCad 8 S-expression converter
+│   ├── EdaAccelerators.cxx        # Local C++17 CPU algorithmic solvers for EDA & robotics CAD
+│   ├── EdaBridge.cxx              # EDA/CAD bridge client, path translation, and telemetry
 │   ├── HistoryStore.cxx           # History & usage diff store implementation
 │   ├── InsightEngine.cxx          # Usage insights database, detectors, and dataset export
+│   ├── KiCadSchematicEditor.cxx   # Native C++17 KiCad library/schematic/PCB S-expression engine
 │   ├── Main.cxx                   # Application entrypoint & subcommand dispatch
 │   ├── McpServer.cxx              # MCP tool registration, profiling, and handlers
 │   ├── MobileGateway.cxx          # 128-bit mobile pairing, promise latches, & reaper
@@ -281,20 +349,32 @@ aimon/
 │   └── WebServer.cxx              # Dashboard handler, SSE, REST, & telemetry routes
 ├── test/
 │   ├── TestAgentTelemetryDb.cxx   # Unit tests for SQLite WAL rolling timeseries DB
+│   ├── TestEasyEdaConverterProps.cxx # RapidCheck property tests for EasyEDA & KiCad 50-mil grid
+│   ├── TestEdaBridge.cxx          # Unit tests for EdaBridge path mapper, guards & EdaAccelerators
+│   ├── TestEdaBridgeDaemon.cxx    # End-to-end loopback tests for aimon-eda-bridge & all 36 tools
+│   ├── TestEdaBridgeProps.cxx     # RapidCheck property tests for EdaBridge & EdaAccelerators
+│   ├── TestEdaSurfaces.cxx        # Integration tests for eda MCP profile, /api/eda/* & Web UI
 │   ├── TestGatewayTimeout.cxx     # Unit tests for TcpGateway timeout execution
 │   ├── TestInsightEngine.cxx      # Unit tests for InsightEngine schema, detectors, and exports
 │   ├── TestInsightParserProps.cxx # RapidCheck property & golden tests for wire/prompt parsers
 │   ├── TestInsightSurfaces.cxx    # Integration tests for Insights MCP tools & Web endpoints
+│   ├── TestLibconfigParser.cxx    # Unit tests for libconfig++ & JSON ConfigManager round-trips
 │   ├── TestMobileGateway.cxx      # Unit tests for mobile action approval latching
 │   └── TestWebServerApi.cxx       # Integration tests for WebServer REST & WS routes
+├── tools/
+│   └── eda-bridge/                # Cross-platform C++17 aimon-eda-bridge daemon & GUI plugins
+│       ├── CMakeLists.txt         # Standalone Windows MSVC / POSIX CMake configuration
+│       ├── include/               # ProcessLauncher, ToolDiscovery, EdaRpcServer headers
+│       ├── src/                   # Daemon entrypoint, RPC server, AppPluginRelay (:3893)
+│       └── plugins/               # Companion plugins for EasyEDA Pro, KiCad, and FreeCAD
 ├── third_party/
 │   ├── cpp-httplib/               # Git submodule (https://github.com/yhirose/cpp-httplib)
 │   └── json/                      # Git submodule (https://github.com/nlohmann/json)
 └── web/
     ├── app.js                     # Dashboard dynamics, SVG charts, and tab switching
-    ├── index.html                 # Multi-tab dashboard markup (Quotas, Telemetry, Insights, Approvals)
+    ├── index.html                 # Multi-tab dashboard markup (Quotas, Telemetry, Insights, Tool Bridges, Approvals)
     └── style.css                  # Dark-mode glassmorphic styling and charts
-
+```
 ---
 
 ## License & Copyright

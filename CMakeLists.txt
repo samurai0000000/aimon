@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.15 LANGUAGES CXX)
+project(aimon VERSION 1.0.16 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -87,6 +87,10 @@ set(LIB_SOURCES
     src/WebServer.cxx
     src/NcursesConsole.cxx
     src/InsightEngine.cxx
+    src/EdaAccelerators.cxx
+    src/EasyEdaConverter.cxx
+    src/KiCadSchematicEditor.cxx
+    src/EdaBridge.cxx
 )
 
 add_executable(aimon src/Main.cxx ${LIB_SOURCES})
@@ -300,10 +304,23 @@ if(NOT RAPIDCHECK_LIBRARY)
     message(FATAL_ERROR "RapidCheck library not found (needed by the property tests)")
 endif()
 
+set(AIMON_CPPUTEST_THREADSAFE_INIT "${CMAKE_CURRENT_BINARY_DIR}/cpputest_threadsafe_init.cxx")
+file(WRITE "${AIMON_CPPUTEST_THREADSAFE_INIT}"
+"#include <CppUTest/TestHarness.h>\n"
+"#include <CppUTest/MemoryLeakWarningPlugin.h>\n"
+"namespace {\n"
+"__attribute__((constructor(101))) void aimonInitThreadSafeCppUTest() {\n"
+"    MemoryLeakWarningPlugin::turnOnThreadSafeNewDeleteOverloads();\n"
+"}\n"
+"}\n")
+
 # Helper for the Claude usage test binaries: CppUTest or RapidCheck based, all
 # linked against OpenSSL/SQLite/threads and the sources they exercise.
 function(aimon_add_claude_test name)
     cmake_parse_arguments(T "RAPIDCHECK;PLAIN;LIBCONFIG" "" "SOURCES" ${ARGN})
+    if(NOT T_PLAIN AND NOT T_RAPIDCHECK)
+        list(APPEND T_SOURCES "${AIMON_CPPUTEST_THREADSAFE_INIT}")
+    endif()
     add_executable(${name} ${T_SOURCES})
     target_compile_definitions(${name} PRIVATE
         CPPHTTPLIB_OPENSSL_SUPPORT
@@ -453,3 +470,96 @@ if(CPPUTEST_LIBRARY_DIRS)
     target_link_directories(test_insight_surfaces PRIVATE ${CPPUTEST_LIBRARY_DIRS})
 endif()
 
+add_executable(aimon-eda-bridge
+    tools/eda-bridge/src/Main.cxx
+    tools/eda-bridge/src/ProcessLauncher.cxx
+    tools/eda-bridge/src/ToolDiscovery.cxx
+    tools/eda-bridge/src/EdaRpcServer.cxx
+    src/EasyEdaConverter.cxx
+    src/KiCadSchematicEditor.cxx
+)
+
+target_include_directories(aimon-eda-bridge PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/eda-bridge/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+)
+
+target_link_libraries(aimon-eda-bridge PRIVATE
+    Threads::Threads
+)
+
+aimon_add_claude_test(test_eda_bridge LIBCONFIG
+    SOURCES test/TestEdaBridge.cxx src/EdaBridge.cxx src/EdaAccelerators.cxx
+            src/EasyEdaConverter.cxx src/KiCadSchematicEditor.cxx
+            src/DynamicToolRegistry.cxx src/TcpGateway.cxx
+            src/ConfigManager.cxx src/PathUtils.cxx)
+
+aimon_add_claude_test(test_eda_bridge_props RAPIDCHECK LIBCONFIG
+    SOURCES test/TestEdaBridgeProps.cxx src/EdaBridge.cxx src/EdaAccelerators.cxx
+            src/EasyEdaConverter.cxx src/KiCadSchematicEditor.cxx
+            src/DynamicToolRegistry.cxx src/TcpGateway.cxx
+            src/ConfigManager.cxx src/PathUtils.cxx)
+
+aimon_add_claude_test(test_eda_bridge_daemon LIBCONFIG
+    SOURCES test/TestEdaBridgeDaemon.cxx src/EdaBridge.cxx src/EdaAccelerators.cxx
+            src/EasyEdaConverter.cxx src/KiCadSchematicEditor.cxx
+            tools/eda-bridge/src/ProcessLauncher.cxx
+            tools/eda-bridge/src/ToolDiscovery.cxx
+            tools/eda-bridge/src/EdaRpcServer.cxx
+            src/DynamicToolRegistry.cxx src/TcpGateway.cxx
+            src/ConfigManager.cxx src/PathUtils.cxx)
+
+target_include_directories(test_eda_bridge_daemon PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/eda-bridge/include
+)
+
+aimon_add_claude_test(test_easyeda_converter_props RAPIDCHECK LIBCONFIG
+    SOURCES test/TestEasyEdaConverterProps.cxx src/EasyEdaConverter.cxx
+            src/KiCadSchematicEditor.cxx src/PathUtils.cxx)
+
+add_executable(test_eda_surfaces
+    test/TestEdaSurfaces.cxx
+    tools/eda-bridge/src/ProcessLauncher.cxx
+    tools/eda-bridge/src/ToolDiscovery.cxx
+    tools/eda-bridge/src/EdaRpcServer.cxx
+    ${LIB_SOURCES}
+)
+
+target_compile_definitions(test_eda_surfaces PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+
+target_include_directories(test_eda_surfaces PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/eda-bridge/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+    ${MOSQUITTO_INCLUDE_DIRS}
+    ${CURSES_INCLUDE_DIRS}
+    ${LIBCONFIGPP_INCLUDE_DIRS}
+    ${CPPUTEST_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_eda_surfaces PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    SQLite::SQLite3
+    Threads::Threads
+    ${MOSQUITTO_LIBRARIES}
+    ${CURSES_LIBRARIES}
+    ${LIBCONFIGPP_LIBRARIES}
+    ${CPPUTEST_LIBRARIES}
+)
+
+if(MOSQUITTO_LIBRARY_DIRS)
+    target_link_directories(test_eda_surfaces PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+endif()
+if(LIBCONFIGPP_LIBRARY_DIRS)
+    target_link_directories(test_eda_surfaces PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
+endif()
+if(CPPUTEST_LIBRARY_DIRS)
+    target_link_directories(test_eda_surfaces PRIVATE ${CPPUTEST_LIBRARY_DIRS})
+endif()

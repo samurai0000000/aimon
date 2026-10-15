@@ -13,6 +13,7 @@
 #include "MobileGateway.hxx"
 #include "PathUtils.hxx"
 #include "InsightEngine.hxx"
+#include "EdaBridge.hxx"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -265,7 +266,7 @@ void WebServer::setupRoutes() {
             return httplib::Server::HandlerResponse::Unhandled;
         }
 
-        // Protected mobile, approval, agent, and workspace endpoints require a valid token or UI session
+        // Protected mobile, approval, agent, workspace, and EDA mutation endpoints require a valid token or UI session
         if (req.path == "/api/approvals/pending" ||
             req.path == "/api/approvals/decision" ||
             req.path == "/api/mobile/devices" ||
@@ -273,7 +274,9 @@ void WebServer::setupRoutes() {
             req.path == "/api/agent" ||
             req.path.rfind("/api/agent/", 0) == 0 ||
             req.path == "/api/workspace" ||
-            req.path.rfind("/api/workspace/", 0) == 0) {
+            req.path.rfind("/api/workspace/", 0) == 0 ||
+            req.path == "/api/eda/config" ||
+            req.path == "/api/eda/probe") {
             if (!isValidMobileOrUiRequest(req)) {
                 res.status = 401;
                 res.set_header("Access-Control-Allow-Origin", "*");
@@ -431,7 +434,14 @@ void WebServer::setupRoutes() {
     });
 
     _server->Get("/api/status", [this](const httplib::Request&, httplib::Response& res) {
-        std::string jsonStr = _stateStore.getStatus().toJson().dump(2);
+        AggregateStatus st = _stateStore.getStatus();
+        if (_edaBridge) {
+            st.eda = _edaBridge->getStatus();
+        }
+        if (st.eda.configSnapshot.is_object()) {
+            st.eda.configSnapshot["auth_secret"] = st.eda.authConfigured ? "***" : "";
+        }
+        std::string jsonStr = st.toJson().dump(2);
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_header("Pragma", "no-cache");
         res.set_header("Expires", "0");
@@ -446,7 +456,14 @@ void WebServer::setupRoutes() {
             } catch (...) {
             }
         }
-        std::string jsonStr = _stateStore.getStatus().toJson().dump(2);
+        AggregateStatus st = _stateStore.getStatus();
+        if (_edaBridge) {
+            st.eda = _edaBridge->getStatus();
+        }
+        if (st.eda.configSnapshot.is_object()) {
+            st.eda.configSnapshot["auth_secret"] = st.eda.authConfigured ? "***" : "";
+        }
+        std::string jsonStr = st.toJson().dump(2);
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_header("Pragma", "no-cache");
         res.set_header("Expires", "0");
@@ -2399,6 +2416,105 @@ void WebServer::setupRoutes() {
         std::string telPath = PathUtils::getAimonConfigDir() + "/telemetry.db";
         bool ok = _insightEngine->rebuildFromConfig(histPath, telPath, full);
         res.set_content(nlohmann::json({{"ok", ok}}).dump(), "application/json");
+    });
+
+    // --- Windows EDA/CAD & Local CPU Accelerator Bridge REST API Endpoints ---
+
+    _server->Get("/api/eda/status", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Expires", "0");
+
+        EdaBridgeStatus st = _edaBridge ? _edaBridge->getStatus() : _stateStore.getStatus().eda;
+        if (!st.configSnapshot.is_object()) {
+            EdaBridgeConfig fallbackCfg = _configManager ? _configManager->getConfig().eda : EdaBridgeConfig();
+            st.configSnapshot = fallbackCfg.toJson(true);
+            st.authConfigured = !fallbackCfg.authSecret.empty();
+        }
+        st.configSnapshot["auth_secret"] = st.authConfigured ? "***" : "";
+        res.set_content(st.toJson().dump(2), "application/json");
+    });
+
+    _server->Post("/api/eda/config", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+
+        nlohmann::json body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"ok", false}, {"error", "Malformed JSON configuration body"}}).dump(2),
+                            "application/json");
+            return;
+        }
+
+        EdaBridgeConfig updatedCfg = _edaBridge
+            ? _edaBridge->getConfig()
+            : (_configManager ? _configManager->getConfig().eda : EdaBridgeConfig());
+        updatedCfg.fromJson(body);
+
+        std::string valErr;
+        if (!updatedCfg.validate(valErr)) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"ok", false}, {"error", valErr}}).dump(2), "application/json");
+            return;
+        }
+
+        if (_configManager) {
+            _configManager->getConfig().eda = updatedCfg;
+            _configManager->save();
+            _configManager->save(PathUtils::getDefaultConfigFilePath());
+            _configManager->saveLibConfig(PathUtils::getDefaultLibConfigFilePath());
+        }
+
+        EdaBridgeStatus st;
+        if (_edaBridge) {
+            _edaBridge->setConfig(updatedCfg);
+            st = _edaBridge->getStatus();
+        } else {
+            EdaBridge tempBridge(updatedCfg);
+            st = tempBridge.getStatus();
+        }
+        st.configSnapshot = updatedCfg.toJson(true);
+        st.configSnapshot["auth_secret"] = st.authConfigured ? "***" : "";
+
+        AggregateStatus agg = _stateStore.getStatus();
+        agg.eda = st;
+        _stateStore.update(agg);
+
+        if (_mcpServer) {
+            _mcpServer->notifyToolsListChanged();
+        }
+
+        nlohmann::json out = st.toJson();
+        out["ok"] = true;
+        res.set_content(out.dump(2), "application/json");
+    });
+
+    _server->Post("/api/eda/probe", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+
+        EdaBridgeStatus st = _edaBridge ? _edaBridge->probeNow() : _stateStore.getStatus().eda;
+        if (st.configSnapshot.is_object()) {
+            st.configSnapshot["auth_secret"] = st.authConfigured ? "***" : "";
+        }
+
+        AggregateStatus agg = _stateStore.getStatus();
+        agg.eda = st;
+        _stateStore.update(agg);
+
+        nlohmann::json out = st.toJson();
+        out["ok"] = st.connected;
+        res.set_content(out.dump(2), "application/json");
     });
 }
 

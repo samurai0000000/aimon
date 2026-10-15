@@ -3095,3 +3095,227 @@ body {
 #claude-main-pct {
     color: var(--text-secondary);
 }
+
+/* ==========================================================================
+   Subpanel 5: Tool Bridges (EDA, CAD & Local CPU Accelerators)
+   ========================================================================== */
+
+#subpanel-bridges {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+#subpanel-bridges.hidden {
+    display: none;
+}
+
+.eda-global-card {
+    padding: 18px 22px;
+    gap: 14px;
+}
+
+.eda-global-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+
+.eda-title-group {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.eda-title-group h2 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.eda-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.eda-feedback-banner {
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.35);
+    color: #34d399;
+    font-size: 0.8rem;
+    padding: 9px 14px;
+    border-radius: 8px;
+}
+
+.eda-form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 12px;
+}
+
+.eda-global-grid {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.eda-field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.eda-field label {
+    font-size: 0.74rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.eda-field-toggle {
+    justify-content: center;
+    padding-top: 6px;
+}
+
+.eda-field-full {
+    grid-column: 1 / -1;
+}
+
+.eda-input,
+.eda-select {
+    background: rgba(0, 0, 0, 0.38);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    padding: 7px 10px;
+    border-radius: 8px;
+    outline: none;
+    transition: border-color 0.2s ease;
+}
+
+.eda-input:focus,
+.eda-select:focus {
+    border-color: var(--cyan-glow);
+}
+
+.eda-components-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+}
+
+@media (max-width: 1180px) {
+    .eda-components-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.eda-component-card {
+    padding: 18px 20px;
+    gap: 14px;
+}
+
+.eda-card-header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.eda-telem-box {
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 12px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.eda-telem-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    font-size: 0.76rem;
+    color: var(--text-secondary);
+}
+
+.eda-telem-meta-row code,
+.eda-telem-last-row code {
+    font-family: var(--font-mono);
+    color: #38bdf8;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 1px 6px;
+    border-radius: 4px;
+}
+
+.eda-telem-counters {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+}
+
+@media (max-width: 640px) {
+    .eda-telem-counters {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.eda-counter-pill {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    padding: 6px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.eda-counter-pill span {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+
+.eda-counter-pill strong {
+    font-family: var(--font-mono);
+    font-size: 0.92rem;
+    color: var(--text-primary);
+}
+
+.text-emerald {
+    color: #34d399 !important;
+}
+
+.text-coral {
+    color: #f87171 !important;
+}
+
+.eda-telem-last-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.76rem;
+    color: var(--text-secondary);
+}
+
+.eda-activity-card {
+    padding: 18px 20px;
+}
+
+.eda-calls-table td {
+    font-size: 0.78rem;
+}
+
+.eda-empty-row {
+    text-align: center;
+    color: var(--text-muted);
+    padding: 20px !important;
+}
+

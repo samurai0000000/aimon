@@ -9,6 +9,8 @@
 #include "TcpGateway.hxx"
 #include "TaskRegistry.hxx"
 #include "InsightEngine.hxx"
+#include "EdaBridge.hxx"
+#include "EdaAccelerators.hxx"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -18,6 +20,404 @@
 #include <ctime>
 
 namespace aimon {
+
+namespace {
+
+struct EdaToolDescriptor {
+    const char* name;
+    const char* component; // "accelerators" | "kicad" | "freecad" | "easyeda"
+    const char* description;
+    nlohmann::json properties;
+    std::vector<std::string> required;
+};
+
+std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
+    return {
+        // 1..7: Local CPU Algorithmic Accelerators
+        {
+            "eda_calc_schematic_layout",
+            "accelerators",
+            "Sugiyama layered schematic placement + 50-mil (1.27 mm) A* orthogonal wire router (outputs symbols[] & wires[]).",
+            {
+                {"components", {{"type", "array"}, {"description", "List of schematic components ({ref, lib_id, value, pins[]})"}}},
+                {"nets", {{"type", "array"}, {"description", "List of net connectivity definitions ({name, pins[]})"}}},
+                {"grid_mils", {{"type", "integer"}, {"description", "Grid spacing in mils (default: 50)"}}}
+            },
+            {}
+        },
+        {
+            "eda_calc_pcb_placement",
+            "accelerators",
+            "Simulated annealing + HPWL force-directed non-overlapping PCB floorplanner (outputs placements[] with zero courtyard overlap).",
+            {
+                {"board", {{"type", "object"}, {"description", "Board dimensions ({width_mm, height_mm, clearance_mm})"}}},
+                {"components", {{"type", "array"}, {"description", "Footprints to place ({ref, width_mm, height_mm, fixed, x_mm, y_mm})"}}},
+                {"nets", {{"type", "array"}, {"description", "Netlist connections for HPWL wirelength minimization"}}}
+            },
+            {}
+        },
+        {
+            "eda_calc_pcb_autoroute",
+            "accelerators",
+            "PathFinder negotiated-congestion multi-layer 45-degree A* PCB trace & via router (outputs tracks[] & vias[]).",
+            {
+                {"board", {{"type", "object"}, {"description", "Board outline and routing grid settings"}}},
+                {"nets", {{"type", "array"}, {"description", "Nets with pad coordinates ({name, width_mm, clearance_mm, pads[]})"}}},
+                {"obstacles", {{"type", "array"}, {"description", "Keepout or obstacle rectangles"}}}
+            },
+            {}
+        },
+        {
+            "eda_calc_electrical_synth",
+            "accelerators",
+            "E24/E96/JLCPCB-Basic divider/filter solver, IPC-2152 trace/via sizing, microstrip impedance & power/thermal budget.",
+            {
+                {"mode", {{"type", "string"}, {"description", "Solver mode: voltage_divider, rc_filter, trace_ipc2152, microstrip_z0, or power_budget"}}},
+                {"vin", {{"type", "number"}, {"description", "Input voltage (V)"}}},
+                {"vout_target", {{"type", "number"}, {"description", "Target output voltage (V)"}}},
+                {"cutoff_hz", {{"type", "number"}, {"description", "Target filter cutoff frequency (Hz)"}}},
+                {"current_a", {{"type", "number"}, {"description", "Trace current in Amperes (A)"}}}
+            },
+            {}
+        },
+        {
+            "cad_calc_robot_kinematics_statics",
+            "accelerators",
+            "DH/URDF forward/inverse kinematics, gravity/payload joint torque budget, servo safety factor & CoM support-polygon margin.",
+            {
+                {"joints", {{"type", "array"}, {"description", "Kinematic chain joint definitions ({name, a_mm, d_mm, alpha_deg, theta_deg, mass_kg, stall_torque_nm})"}}},
+                {"payload_kg", {{"type", "number"}, {"description", "End-effector payload mass (kg)"}}},
+                {"target_xyz_mm", {{"type", "array"}, {"description", "Optional IK target [x, y, z] in mm"}}},
+                {"support_polygon_mm", {{"type", "array"}, {"description", "Support polygon 2D vertices [[x, y], ...]"}}}
+            },
+            {}
+        },
+        {
+            "cad_calc_mechanism_synth",
+            "accelerators",
+            "Analytical involute gears, planetary sets (Zs + 2*Zp = Zr), GT2/HTD timing pulleys, 25T/24T servo splines & Grashof 4-bar linkages.",
+            {
+                {"mechanism_type", {{"type", "string"}, {"description", "Mechanism type: spur_gear, planetary, timing_pulley, servo_horn_spline, or four_bar"}}},
+                {"module_mm", {{"type", "number"}, {"description", "Gear module in mm"}}},
+                {"teeth_pinion", {{"type", "integer"}, {"description", "Pinion or sun gear tooth count"}}},
+                {"teeth_gear", {{"type", "integer"}, {"description", "Driven gear or planet tooth count"}}},
+                {"links_mm", {{"type", "array"}, {"description", "Four-bar link lengths [ground, crank, coupler, rocker] in mm"}}}
+            },
+            {}
+        },
+        {
+            "cad_calc_print_orientation_dfm",
+            "accelerators",
+            "Spherical FDM build-orientation optimizer + anisotropic Z-layer tensile/bending stress, buckling & overhang analyzer.",
+            {
+                {"bbox_mm", {{"type", "array"}, {"description", "Part bounding box [x_mm, y_mm, z_mm]"}}},
+                {"load_vector_n", {{"type", "array"}, {"description", "Principal mechanical load vector [fx, fy, fz] in Newtons"}}},
+                {"cross_section_mm2", {{"type", "number"}, {"description", "Critical cross-sectional area in mm^2"}}},
+                {"material", {{"type", "string"}, {"description", "Filament material: PLA, PETG, ABS, ASA, or PA-CF"}}}
+            },
+            {}
+        },
+        // 8..16: KiCad Tools (frog)
+        {
+            "kicad_search_library",
+            "kicad",
+            "Search KiCad .kicad_sym symbol libraries and .kicad_mod footprint libraries (returns lib_id, pin offsets, pad sizes).",
+            {
+                {"query", {{"type", "string"}, {"description", "Symbol or footprint search substring"}}},
+                {"symbol_lib_dir", {{"type", "string"}, {"description", "Optional symbol library directory path"}}},
+                {"footprint_lib_dir", {{"type", "string"}, {"description", "Optional footprint library directory path"}}}
+            },
+            {"query"}
+        },
+        {
+            "kicad_inspect_project",
+            "kicad",
+            "Inspect .kicad_sch / .kicad_pcb components, pins, nets, board outline, footprints, and unrouted nets.",
+            {
+                {"schematic_path", {{"type", "string"}, {"description", "Path to .kicad_sch file"}}},
+                {"pcb_path", {{"type", "string"}, {"description", "Path to .kicad_pcb file"}}}
+            },
+            {}
+        },
+        {
+            "kicad_edit_schematic",
+            "kicad",
+            "Create or modify .kicad_sch symbols, power ports, net labels, and 50-mil grid-snapped orthogonal wires + auto-ERC.",
+            {
+                {"schematic_path", {{"type", "string"}, {"description", "Target .kicad_sch path"}}},
+                {"operations", {{"type", "array"}, {"description", "List of schematic edit operations (add_component, add_wire, add_label, add_power_port)"}}},
+                {"symbols", {{"type", "array"}, {"description", "Optional symbol placements directly from eda_calc_schematic_layout"}}},
+                {"wires", {{"type", "array"}, {"description", "Optional wire segments directly from eda_calc_schematic_layout"}}}
+            },
+            {"schematic_path"}
+        },
+        {
+            "kicad_sync_sch_to_pcb",
+            "kicad",
+            "Synchronize schematic netlist and .kicad_mod footprints from .kicad_sch into .kicad_pcb.",
+            {
+                {"schematic_path", {{"type", "string"}, {"description", "Source .kicad_sch file path"}}},
+                {"pcb_path", {{"type", "string"}, {"description", "Target .kicad_pcb file path"}}}
+            },
+            {"schematic_path", "pcb_path"}
+        },
+        {
+            "kicad_edit_pcb",
+            "kicad",
+            "Draw Edge.Cuts outline, place/rotate/flip footprints, add copper pour zones, and route tracks/vias in .kicad_pcb.",
+            {
+                {"pcb_path", {{"type", "string"}, {"description", "Target .kicad_pcb file path"}}},
+                {"outline", {{"type", "object"}, {"description", "Board outline specification ({x_mm, y_mm, width_mm, height_mm})"}}},
+                {"placements", {{"type", "array"}, {"description", "Component placements ({ref, x_mm, y_mm, rotation_deg, layer})"}}},
+                {"tracks", {{"type", "array"}, {"description", "PCB trace segments ({net, layer, width_mm, x1_mm, y1_mm, x2_mm, y2_mm})"}}},
+                {"vias", {{"type", "array"}, {"description", "PCB vias ({net, x_mm, y_mm, size_mm, drill_mm})"}}},
+                {"zones", {{"type", "array"}, {"description", "Copper pour zones ({net, layer, x_mm, y_mm, width_mm, height_mm})"}}}
+            },
+            {"pcb_path"}
+        },
+        {
+            "kicad_run_erc",
+            "kicad",
+            "Run KiCad Schematic Electrical Rules Check (kicad-cli sch erc) and return structured JSON violations.",
+            {
+                {"schematic_path", {{"type", "string"}, {"description", "Path to .kicad_sch file"}}}
+            },
+            {"schematic_path"}
+        },
+        {
+            "kicad_run_drc",
+            "kicad",
+            "Run KiCad PCB Design Rules Check (kicad-cli pcb drc) with optional --schematic-parity.",
+            {
+                {"pcb_path", {{"type", "string"}, {"description", "Path to .kicad_pcb file"}}},
+                {"schematic_parity", {{"type", "boolean"}, {"description", "Check schematic-to-PCB parity (default: true)"}}}
+            },
+            {"pcb_path"}
+        },
+        {
+            "kicad_export_fab_pack",
+            "kicad",
+            "Export turnkey Gerbers, Excellon drill files, pick-and-place .pos/CPL, and BOM CSV.",
+            {
+                {"pcb_path", {{"type", "string"}, {"description", "Path to .kicad_pcb file"}}},
+                {"schematic_path", {{"type", "string"}, {"description", "Optional path to .kicad_sch file for BOM export"}}},
+                {"output_dir", {{"type", "string"}, {"description", "Output directory for fabrication package"}}}
+            },
+            {"pcb_path", "output_dir"}
+        },
+        {
+            "kicad_export_step",
+            "kicad",
+            "Export 3D .step PCB assembly model (can be imported directly into FreeCAD robot enclosures).",
+            {
+                {"pcb_path", {{"type", "string"}, {"description", "Path to .kicad_pcb file"}}},
+                {"output_path", {{"type", "string"}, {"description", "Target .step file path"}}}
+            },
+            {"pcb_path", "output_path"}
+        },
+        // 17..25: FreeCAD Robotics & 3D-Printing Tools (frog)
+        {
+            "freecad_live_status",
+            "freecad",
+            "Check live FreeCAD GUI attachment on AppPluginRelay (:3893), active .FCStd document, and available workbenches.",
+            nlohmann::json::object(),
+            {}
+        },
+        {
+            "freecad_inspect_document",
+            "freecad",
+            "Inspect FreeCAD bodies, Spreadsheet parameters, bounding boxes, CoM, inertia tensor, hole axes, and LCS frames.",
+            {
+                {"document_path", {{"type", "string"}, {"description", "Optional path to .FCStd document"}}}
+            },
+            {}
+        },
+        {
+            "freecad_generate_cad",
+            "freecad",
+            "Author or modify parametric 3D robot bodies, joints, brackets, and gears in live FreeCAD GUI or .FCStd/.step (guarded by TNP & sandbox checks).",
+            {
+                {"document_path", {{"type", "string"}, {"description", "Target .FCStd or .step path"}}},
+                {"script", {{"type", "string"}, {"description", "CSG / Part / PartDesign Python script (must not reference Face1..N, Edge1..N, Vertex1..N)"}}},
+                {"primitives", {{"type", "array"}, {"description", "Declarative 3D primitive/feature list"}}}
+            },
+            {}
+        },
+        {
+            "freecad_edit_parameters",
+            "freecad",
+            "Tune parametric Spreadsheet dimensions, joint clearances, and 3D-print tolerances and recompute the model.",
+            {
+                {"document_path", {{"type", "string"}, {"description", "Path to .FCStd document"}}},
+                {"parameters", {{"type", "object"}, {"description", "Key-value map of parameter names to updated values"}}}
+            },
+            {"parameters"}
+        },
+        {
+            "freecad_assemble_joint",
+            "freecad",
+            "Assemble robot links/PCBs along joint axes and sweep [min_deg..max_deg] for 3D collision and clearance verification.",
+            {
+                {"document_path", {{"type", "string"}, {"description", "Path to .FCStd assembly document"}}},
+                {"parent_body", {{"type", "string"}, {"description", "Parent link/body name"}}},
+                {"child_body", {{"type", "string"}, {"description", "Child link/body name"}}},
+                {"min_deg", {{"type", "number"}, {"description", "Minimum joint sweep angle (deg)"}}},
+                {"max_deg", {{"type", "number"}, {"description", "Maximum joint sweep angle (deg)"}}},
+                {"step_deg", {{"type", "number"}, {"description", "Sweep angular step (deg)"}}}
+            },
+            {}
+        },
+        {
+            "freecad_analyze_printability",
+            "freecad",
+            "Validate 3D-printability (manifold watertightness, non-manifold edges, minimum wall thickness, overhang angles).",
+            {
+                {"document_path", {{"type", "string"}, {"description", "Path to .FCStd or mesh file"}}},
+                {"min_wall_thickness_mm", {{"type", "number"}, {"description", "Minimum required wall thickness in mm"}}},
+                {"max_overhang_deg", {{"type", "number"}, {"description", "Maximum unsupported overhang angle in degrees"}}}
+            },
+            {}
+        },
+        {
+            "freecad_render_view",
+            "freecad",
+            "Render multi-angle (Isometric, Front, Top, Right) PNG snapshots for visual AI shape review.",
+            {
+                {"document_path", {{"type", "string"}, {"description", "Optional path to .FCStd document"}}},
+                {"output_dir", {{"type", "string"}, {"description", "Directory to write rendered PNG images"}}},
+                {"views", {{"type", "array"}, {"description", "View angles to render (e.g. ['Isometric', 'Front', 'Top', 'Right'])"}}}
+            },
+            {}
+        },
+        {
+            "freecad_export_print_files",
+            "freecad",
+            "Export slicer-ready .stl, .3mf, .step, and robot URDF mass/CoM/inertia metadata.",
+            {
+                {"document_path", {{"type", "string"}, {"description", "Source .FCStd document path"}}},
+                {"output_dir", {{"type", "string"}, {"description", "Target export directory"}}},
+                {"formats", {{"type", "array"}, {"description", "Export formats (['stl', '3mf', 'step', 'urdf'])"}}}
+            },
+            {"output_dir"}
+        },
+        {
+            "freecad_invoke_api",
+            "freecad",
+            "Invoke whitelisted FreeCAD workbench/module operations (FreeCAD, Part, PartDesign, Sketcher, Mesh, Spreadsheet, TechDraw, Import).",
+            {
+                {"module", {{"type", "string"}, {"description", "Whitelisted FreeCAD module name"}}},
+                {"method", {{"type", "string"}, {"description", "Method name within the module"}}},
+                {"args", {{"type", "array"}, {"description", "Positional arguments for the method"}}}
+            },
+            {"module", "method"}
+        },
+        // 26..36: EasyEDA Pro Tools (frog) + EasyEDA Converter
+        {
+            "easyeda_live_status",
+            "easyeda",
+            "Check live EasyEDA Pro desktop extension attachment on AppPluginRelay (:3893) and active project/document.",
+            nlohmann::json::object(),
+            {}
+        },
+        {
+            "easyeda_search_library",
+            "easyeda",
+            "Search LCSC / EasyEDA component catalog (Cxxxxxx part numbers, JLCPCB Basic/Extended tier, live stock).",
+            {
+                {"query", {{"type", "string"}, {"description", "Component or LCSC C-number search query"}}},
+                {"prefer_basic", {{"type", "boolean"}, {"description", "Prefer JLCPCB Basic library parts"}}}
+            },
+            {"query"}
+        },
+        {
+            "easyeda_inspect_schematic",
+            "easyeda",
+            "Read live schematic components, wires, pins, and netlist from EasyEDA Pro.",
+            {
+                {"schematic_path", {{"type", "string"}, {"description", "Optional schematic file path fallback"}}}
+            },
+            {}
+        },
+        {
+            "easyeda_edit_schematic",
+            "easyeda",
+            "Place components, draw orthogonal wires, and add net labels in live EasyEDA Pro schematic.",
+            {
+                {"operations", {{"type", "array"}, {"description", "Schematic primitive operations"}}},
+                {"symbols", {{"type", "array"}, {"description", "Component placements"}}},
+                {"wires", {{"type", "array"}, {"description", "Wire segments"}}}
+            },
+            {}
+        },
+        {
+            "easyeda_sync_sch_to_pcb",
+            "easyeda",
+            "Synchronize schematic changes, footprints, and netlist into the EasyEDA Pro PCB document.",
+            nlohmann::json::object(),
+            {}
+        },
+        {
+            "easyeda_inspect_pcb",
+            "easyeda",
+            "Inspect EasyEDA Pro PCB board outline, component placements, pad coordinates, tracks, and unrouted nets.",
+            nlohmann::json::object(),
+            {}
+        },
+        {
+            "easyeda_edit_pcb",
+            "easyeda",
+            "Draw board outline, move/rotate/flip footprints, add copper pours, and route tracks/vias in EasyEDA Pro.",
+            {
+                {"outline", {{"type", "object"}, {"description", "Board outline dimensions"}}},
+                {"placements", {{"type", "array"}, {"description", "Component placement updates"}}},
+                {"tracks", {{"type", "array"}, {"description", "PCB trace segments"}}},
+                {"vias", {{"type", "array"}, {"description", "PCB vias"}}},
+                {"zones", {{"type", "array"}, {"description", "Copper pour regions"}}}
+            },
+            {}
+        },
+        {
+            "easyeda_run_drc",
+            "easyeda",
+            "Run live Schematic ERC or PCB DRC inside EasyEDA Pro and return structured violations.",
+            {
+                {"target", {{"type", "string"}, {"description", "Check target: pcb (default) or schematic"}}}
+            },
+            {}
+        },
+        {
+            "easyeda_export_jlcpcb",
+            "easyeda",
+            "Export turnkey JLCPCB Gerber ZIP, BOM CSV, Pick-and-Place CPL CSV, and Specctra .dsn into the workspace directory.",
+            {
+                {"output_dir", {{"type", "string"}, {"description", "Sandboxed output directory for JLCPCB manufacturing files"}}}
+            },
+            {"output_dir"}
+        },
+        {
+            "easyeda_invoke_api",
+            "easyeda",
+            "Invoke whitelisted eda.<module>.<method> API calls inside EasyEDA Pro (eda.sch_*, eda.pcb_*, eda.lib_*, eda.dmt_*, eda.drc_*, eda.sys_Document*).",
+            {
+                {"api_path", {{"type", "string"}, {"description", "Whitelisted API path (e.g. eda.sch_PrimitiveComponent.getAll)"}}},
+                {"args", {{"type", "array"}, {"description", "Arguments array"}}}
+            },
+            {"api_path"}
+        },
+        {
+            "easyeda_convert",
+            "easyeda",
+            "Convert EasyEDA JSON schematic/PCB files on disk into KiCad 8 .kicad_sch/.kicad_pcb S-expressions on a 50-mil grid.",
+            {
+                {"input_path", {{"type", "string"}, {"description", "Source EasyEDA JSON file path"}}},
+                {"output_path", {{"type", "string"}, {"description", "Target KiCad 8 .kicad_sch or .kicad_pcb file path"}}}
+            },
+            {"input_path", "output_path"}
+        }
+    };
+}
+
+} // anonymous namespace
 
 McpServer::McpServer(StateStore& stateStore,
                      DynamicToolRegistry* dynamicRegistry,
@@ -39,7 +439,40 @@ void McpServer::notifyToolsListChanged() {
     }
 }
 
+bool McpServer::isEdaTool(const std::string& toolName) {
+    if (EdaAccelerators::isAcceleratorTool(toolName)) {
+        return true;
+    }
+    return (toolName.rfind("kicad_", 0) == 0 ||
+            toolName.rfind("freecad_", 0) == 0 ||
+            toolName.rfind("easyeda_", 0) == 0);
+}
+
+bool McpServer::isEdaToolEnabledInConfig(const std::string& toolName) const {
+    EdaBridgeConfig cfg = _edaBridge ? _edaBridge->getConfig() : EdaBridgeConfig();
+    if (EdaAccelerators::isAcceleratorTool(toolName)) {
+        return cfg.accelerators.enabled;
+    }
+    if (!cfg.enabled) {
+        return false;
+    }
+    if (toolName.rfind("kicad_", 0) == 0) {
+        return cfg.kicad.enabled;
+    }
+    if (toolName.rfind("freecad_", 0) == 0) {
+        return cfg.freecad.enabled;
+    }
+    if (toolName.rfind("easyeda_", 0) == 0) {
+        return cfg.easyeda.enabled;
+    }
+    return false;
+}
+
 bool McpServer::isToolAllowedInProfile(const std::string& toolName, const std::string& profile) {
+    if (toolName == "eda_bridge_status") {
+        return false;
+    }
+
     if (profile.empty() || profile == "all") {
         return true;
     }
@@ -79,6 +512,10 @@ bool McpServer::isToolAllowedInProfile(const std::string& toolName, const std::s
         return (toolName.rfind("mail_", 0) == 0);
     }
 
+    if (profile == "eda") {
+        return isEdaTool(toolName);
+    }
+
     return true;
 }
 
@@ -89,6 +526,16 @@ std::string McpServer::detectProfileFromWorkspace(const std::string& ws) {
 
     std::string lower = ws;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    if (lower.find("kicad") != std::string::npos ||
+        lower.find("freecad") != std::string::npos ||
+        lower.find("easyeda") != std::string::npos ||
+        lower.find("pcb") != std::string::npos ||
+        lower.find("cad") != std::string::npos ||
+        lower.find("robot") != std::string::npos ||
+        lower.find("hw-") != std::string::npos) {
+        return "eda";
+    }
 
     if (lower.find("amba-virt") != std::string::npos ||
         lower.find("robohero") != std::string::npos ||
@@ -296,13 +743,39 @@ nlohmann::json McpServer::handleToolsList(const nlohmann::json& id, const std::s
         }}
     });
 
-    // 3. Dynamic Satellite Tools filtered by active profile
+    // 3. EDA/CAD & Local CPU Accelerator Tools (36 tools, filtered by profile & component config)
+    for (const auto& desc : getEdaToolDescriptors()) {
+        std::string tName(desc.name);
+        if (!isToolAllowedInProfile(tName, profile)) {
+            continue;
+        }
+        if (!isEdaToolEnabledInConfig(tName)) {
+            continue;
+        }
+        nlohmann::json schema = {
+            {"type", "object"},
+            {"properties", desc.properties}
+        };
+        if (!desc.required.empty()) {
+            schema["required"] = desc.required;
+        }
+        toolsArray.push_back({
+            {"name", tName},
+            {"description", desc.description},
+            {"inputSchema", schema}
+        });
+    }
+
+    // 4. Dynamic Satellite Tools filtered by active profile (excluding EDA tools handled above)
     if (profile != "core" && _dynamicRegistry) {
         nlohmann::json dynTools = _dynamicRegistry->getToolsListJson();
         if (dynTools.is_array()) {
             for (const auto& dt : dynTools) {
                 if (dt.contains("name") && dt["name"].is_string()) {
                     std::string tName = dt["name"].get<std::string>();
+                    if (isEdaTool(tName) || tName == "eda_bridge_status") {
+                        continue;
+                    }
                     if (isToolAllowedInProfile(tName, profile)) {
                         toolsArray.push_back(dt);
                     }
@@ -330,6 +803,43 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
             {"error", {
                 {"code", -32601},
                 {"message", "Tool '" + toolName + "' is not available under active profile '" + profile + "'"}
+            }}
+        };
+    }
+
+    if (isEdaTool(toolName)) {
+        if (!isEdaToolEnabledInConfig(toolName)) {
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"error", {
+                    {"code", -32601},
+                    {"message", "Tool '" + toolName + "' is disabled in EdaBridgeConfig"}
+                }}
+            };
+        }
+
+        nlohmann::json args = params.value("arguments", nlohmann::json::object());
+        nlohmann::json edaRes;
+        if (_edaBridge) {
+            edaRes = _edaBridge->callTool(toolName, args);
+        } else {
+            EdaBridge fallbackBridge;
+            edaRes = fallbackBridge.callTool(toolName, args);
+        }
+
+        bool isErr = edaRes.is_object() && !edaRes.value("ok", true);
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", id},
+            {"result", {
+                {"isError", isErr},
+                {"content", {
+                    {
+                        {"type", "text"},
+                        {"text", edaRes.dump(2)}
+                    }
+                }}
             }}
         };
     }

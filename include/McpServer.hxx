@@ -17,6 +17,7 @@ namespace aimon {
 class DynamicToolRegistry;
 class TcpGateway;
 class InsightEngine;
+class EdaBridge;
 
 class McpServer {
 public:
@@ -30,6 +31,8 @@ public:
     void setDynamicRegistry(DynamicToolRegistry* reg) { _dynamicRegistry = reg; }
     void setTcpGateway(TcpGateway* gw) { _tcpGateway = gw; }
     void setInsightEngine(InsightEngine* engine) { _insightEngine = engine; }
+    void setEdaBridge(EdaBridge* edaBridge) { _edaBridge = edaBridge; }
+    EdaBridge* getEdaBridge() const { return _edaBridge; }
     void setNotificationBroadcaster(std::function<void(const std::string&)> broadcaster) {
         _notificationBroadcaster = broadcaster;
     }
@@ -37,6 +40,7 @@ public:
     const std::string& getDefaultProfile() const { return _defaultProfile; }
     void notifyToolsListChanged();
 
+    static bool isEdaTool(const std::string& toolName);
     static bool isToolAllowedInProfile(const std::string& toolName, const std::string& profile);
     static std::string detectProfileFromWorkspace(const std::string& workspacePath);
 
@@ -44,6 +48,7 @@ private:
     nlohmann::json handleInitialize(const nlohmann::json& id, const nlohmann::json& params);
     nlohmann::json handleToolsList(const nlohmann::json& id, const std::string& profile);
     nlohmann::json handleToolsCall(const nlohmann::json& id, const nlohmann::json& params, const std::string& profile);
+    bool isEdaToolEnabledInConfig(const std::string& toolName) const;
 
     std::string formatAntigravityStatus(const AntigravityStatus& ag);
     std::string formatCursorStatus(const CursorStatus& cr);
@@ -54,6 +59,7 @@ private:
     DynamicToolRegistry* _dynamicRegistry = nullptr;
     TcpGateway* _tcpGateway = nullptr;
     InsightEngine* _insightEngine = nullptr;
+    EdaBridge* _edaBridge = nullptr;
     std::function<void(const std::string&)> _notificationBroadcaster;
     std::string _defaultProfile = "all";
 };

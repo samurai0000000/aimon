@@ -1,0 +1,23 @@
+{
+  "name": "aimon-easyeda-pro-bridge",
+  "uuid": "8d4c91f2a70e4c6b9b24e31f6a82d901",
+  "displayName": "Aimon AI EDA Bridge",
+  "description": "Connects EasyEDA Pro Desktop to aimon-eda-bridge over local loopback WebSocket (127.0.0.1:3893)",
+  "version": "1.0.0",
+  "publisher": "Charles Chiou",
+  "license": "Proprietary",
+  "engines": {
+    "eda": "^2.2.0"
+  },
+  "entry": "./index.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "headerMenus": [
+    {
+      "id": "aimonBridgeMenu",
+      "title": "Aimon AI Bridge",
+      "registerFn": "toggleAimonBridge"
+    }
+  ]
+}
