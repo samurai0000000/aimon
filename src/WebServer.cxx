@@ -31,6 +31,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <algorithm>
+#include <set>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 namespace fs = std::filesystem;
 
@@ -86,6 +91,7 @@ WebServer::WebServer(StateStore& stateStore, HistoryStore& historyStore,
       _onRefresh(onRefresh),
       _mcpServer(mcpServer),
       _tcpGateway(tcpGateway),
+      _mobileGateway(&MobileGateway::getInstance()),
       _endpointsEnabled(config.endpointsEnabled),
       _server(std::make_unique<httplib::Server>()) {
 }
@@ -118,37 +124,50 @@ std::string WebServer::createUiSession() {
     return token;
 }
 
-bool WebServer::isValidUiSession(const httplib::Request& req) const {
-    // 1. Allow internal hooks and mobile companion clients
-    if (req.has_header("User-Agent")) {
-        std::string ua = req.get_header_value("User-Agent");
-        if (ua.find("aimon-hook") != std::string::npos ||
-            ua.find("aimon-mobile") != std::string::npos) {
-            return true;
+std::string WebServer::extractMobileToken(const httplib::Request& req) {
+    if (req.has_header("X-Mobile-Token")) {
+        std::string token = req.get_header_value("X-Mobile-Token");
+        while (!token.empty() && (token.back() == '\r' || token.back() == '\n' || token.back() == ' ')) {
+            token.pop_back();
         }
-        std::string lowerUa = ua;
-        for (char &c : lowerUa) c = tolower(c);
-        if (lowerUa.find("curl/") != std::string::npos ||
-            lowerUa.find("python") != std::string::npos ||
-            lowerUa.find("wget/") != std::string::npos ||
-            lowerUa.find("httpie") != std::string::npos ||
-            lowerUa.find("aiohttp") != std::string::npos ||
-            lowerUa.find("go-http-client") != std::string::npos) {
-            return false;
+        if (!token.empty()) {
+            return token;
         }
-    } else {
+    }
+    if (req.has_header("Authorization")) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.size() > 7) {
+            std::string prefix = auth.substr(0, 7);
+            for (char &c : prefix) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            if (prefix == "bearer ") {
+                std::string token = auth.substr(7);
+                size_t first = token.find_first_not_of(" \t\r\n");
+                if (first != std::string::npos) {
+                    size_t last = token.find_last_not_of(" \t\r\n");
+                    return token.substr(first, last - first + 1);
+                }
+            }
+        }
+    }
+    return "";
+}
+
+bool WebServer::isValidMobileToken(const httplib::Request& req) const {
+    std::string token = extractMobileToken(req);
+    if (token.empty() || !_mobileGateway) {
         return false;
     }
+    return _mobileGateway->validateToken(token);
+}
 
-    // 2. Allow requests with valid mobile authentication tokens
-    if (req.has_header("X-Mobile-Token")) {
-        std::string outDev;
-        if (MobileGateway::getInstance().authenticate(req.get_header_value("X-Mobile-Token"), outDev)) {
-            return true;
-        }
-    }
+bool WebServer::isLoopbackRequest(const httplib::Request& req) {
+    return req.remote_addr == "127.0.0.1" ||
+           req.remote_addr == "::1" ||
+           req.remote_addr == "::ffff:127.0.0.1";
+}
 
-    // 3. Extract session token
+bool WebServer::isValidUiSession(const httplib::Request& req) const {
+    // 1. Check explicit Web UI session token via header or cookie
     std::string token;
     if (req.has_header("X-UI-Session")) {
         token = req.get_header_value("X-UI-Session");
@@ -162,21 +181,35 @@ bool WebServer::isValidUiSession(const httplib::Request& req) const {
         }
     }
 
-    if (token.empty()) {
-        return false;
+    if (!token.empty()) {
+        std::lock_guard<std::mutex> lock(_sessionMutex);
+        auto it = _uiSessions.find(token);
+        if (it != _uiSessions.end()) {
+            time_t now = time(nullptr);
+            if (now - it->second < 86400 * 7) {
+                return true;
+            }
+        }
     }
 
-    // 4. Verify token exists and is fresh
-    std::lock_guard<std::mutex> lock(_sessionMutex);
-    auto it = _uiSessions.find(token);
-    if (it != _uiSessions.end()) {
-        time_t now = time(nullptr);
-        if (now - it->second < 86400 * 7) {
+    // 2. Allow requests with valid paired mobile authentication tokens
+    if (isValidMobileToken(req)) {
+        return true;
+    }
+
+    // 3. Allow internal telemetry hook
+    if (req.has_header("User-Agent")) {
+        std::string ua = req.get_header_value("User-Agent");
+        if (ua.find("aimon-hook") != std::string::npos && isLoopbackRequest(req)) {
             return true;
         }
     }
 
     return false;
+}
+
+bool WebServer::isValidMobileOrUiRequest(const httplib::Request& req) const {
+    return isValidMobileToken(req) || isValidUiSession(req);
 }
 
 std::string WebServer::getMcpHintForPath(const std::string& path, const std::string& body) {
@@ -189,23 +222,88 @@ std::string WebServer::getMcpHintForPath(const std::string& path, const std::str
 
 void WebServer::setupRoutes() {
     // Connect MobileGateway broadcast callback to broadcast SSE events
-    MobileGateway::getInstance().setBroadcastCallback([this](const std::string& type, const nlohmann::json& payload) {
-        nlohmann::json evt;
-        evt["type"] = type;
-        evt["payload"] = payload;
-        broadcastSseNotification(evt.dump());
-    });
+    if (_mobileGateway) {
+        _mobileGateway->setBroadcastCallback([this](const std::string& type, const nlohmann::json& payload) {
+            nlohmann::json evt;
+            evt["type"] = type;
+            evt["payload"] = payload;
+            broadcastSseNotification(evt.dump());
+        });
+    }
 
-    // Gate REST API endpoints if disabled by configuration, unless request is from an authenticated Web UI session
-    if (!_endpointsEnabled) {
-        _server->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+    // Enforce authentication on mobile, approval, agent, and workspace routes,
+    // and gate direct REST API endpoints when disabled by configuration.
+    _server->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        if (req.method == "OPTIONS") {
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+
+        // Pairing endpoint exchanges a one-time pairing secret for a token
+        if (req.path == "/api/mobile/pair") {
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+
+        // QR generation requires authenticated Web UI session or loopback
+        if (req.path == "/api/mobile/qr") {
+            if (!isValidUiSession(req) && !isLoopbackRequest(req)) {
+                res.status = 401;
+                res.set_header("Access-Control-Allow-Origin", "*");
+                res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+
+        // Local CLI hooks on loopback or authenticated mobile/UI clients may submit/poll approval requests
+        if (req.path == "/api/approvals/request" || req.path == "/api/approvals/status") {
+            if (!isLoopbackRequest(req) && !isValidMobileOrUiRequest(req)) {
+                res.status = 401;
+                res.set_header("Access-Control-Allow-Origin", "*");
+                res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+
+        // Protected mobile, approval, agent, and workspace endpoints require a valid token or UI session
+        if (req.path == "/api/approvals/pending" ||
+            req.path == "/api/approvals/decision" ||
+            req.path == "/api/mobile/devices" ||
+            req.path == "/api/mobile/revoke" ||
+            req.path == "/api/agent" ||
+            req.path.rfind("/api/agent/", 0) == 0 ||
+            req.path == "/api/workspace" ||
+            req.path.rfind("/api/workspace/", 0) == 0) {
+            if (!isValidMobileOrUiRequest(req)) {
+                res.status = 401;
+                res.set_header("Access-Control-Allow-Origin", "*");
+                res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+
+        // Mobile SSE push stream requires a valid mobile token or UI session
+        if (req.path == "/sse") {
+            std::string profile;
+            if (req.has_param("profile")) {
+                profile = req.get_param_value("profile");
+            } else if (req.has_header("X-Aimon-Profile")) {
+                profile = req.get_header_value("X-Aimon-Profile");
+            }
+            if (profile == "mobile" && !isValidMobileOrUiRequest(req)) {
+                res.status = 401;
+                res.set_header("Access-Control-Allow-Origin", "*");
+                res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+
+        if (!_endpointsEnabled) {
             if (req.path == "/api/monitors" ||
                 req.path == "/api/status" ||
-                req.path.rfind("/api/approvals", 0) == 0 ||
                 req.path.rfind("/api/telemetry", 0) == 0 ||
-                req.path.rfind("/api/mobile", 0) == 0 ||
-                req.path.rfind("/api/agent", 0) == 0 ||
-                req.path.rfind("/api/workspace", 0) == 0 ||
                 req.path.rfind("/api/v1/insights", 0) == 0) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
@@ -222,9 +320,9 @@ void WebServer::setupRoutes() {
                     return httplib::Server::HandlerResponse::Handled;
                 }
             }
-            return httplib::Server::HandlerResponse::Unhandled;
-        });
-    }
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
 
 
     auto serveFileOrFallback = [](const std::string& diskPath,
@@ -552,27 +650,56 @@ void WebServer::setupRoutes() {
 
     // --- Action Approval Endpoints ---
 
-    _server->Post("/api/approvals/request", [](const httplib::Request& req, httplib::Response& res) {
+    _server->Post("/api/approvals/request", [this](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isLoopbackRequest(req) && !isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
         try {
             nlohmann::json body = nlohmann::json::parse(req.body);
-            std::string agentType = body.value("agent_type", "antigravity");
-            std::string toolName = body.value("tool_name", "run_command");
+            std::string agentType = body.value("agent_type", body.value("agent", "antigravity"));
+            std::string toolName = body.value("tool_name", body.value("action_type", "run_command"));
             std::string workspace = body.value("workspace", "");
             nlohmann::json toolArgs = body.value("tool_args", nlohmann::json::object());
+            if (body.contains("command") && !toolArgs.contains("CommandLine")) {
+                toolArgs["CommandLine"] = body["command"];
+            }
+            if (body.contains("details") && toolArgs.empty() && body["details"].is_object()) {
+                toolArgs = body["details"];
+            }
             std::string reason = body.value("reason", "");
             int timeoutSec = body.value("timeout_seconds", 120);
+            bool waitSync = body.value("wait", !body.contains("action_type") && !body.value("async", false));
 
-            std::string approvalId = MobileGateway::getInstance().submitApprovalRequest(
+            MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+            std::string approvalId = gw.submitApprovalRequest(
                 agentType, toolName, workspace, toolArgs, reason, timeoutSec);
 
+            if (!waitSync) {
+                nlohmann::json resp;
+                resp["id"] = approvalId;
+                resp["request_id"] = approvalId;
+                resp["approval_id"] = approvalId;
+                resp["status"] = "pending";
+                resp["verdict"] = "PENDING";
+                res.set_content(resp.dump(2), "application/json");
+                return;
+            }
+
             // Block and wait for mobile / UI approval
-            ApprovalVerdict verdict = MobileGateway::getInstance().waitForApproval(approvalId, timeoutSec);
+            ApprovalVerdict verdict = gw.waitForApproval(approvalId, timeoutSec);
             std::string verdictStr = (verdict == ApprovalVerdict::APPROVED) ? "APPROVED" :
                                      (verdict == ApprovalVerdict::DENIED) ? "DENIED" : "TIMED_OUT";
+            std::string statusStr = (verdict == ApprovalVerdict::APPROVED) ? "approved" :
+                                    (verdict == ApprovalVerdict::DENIED) ? "denied" : "expired";
 
             nlohmann::json resp;
+            resp["id"] = approvalId;
+            resp["request_id"] = approvalId;
             resp["approval_id"] = approvalId;
+            resp["status"] = statusStr;
             resp["verdict"] = verdictStr;
             res.set_content(resp.dump(2), "application/json");
         } catch (const std::exception& e) {
@@ -581,20 +708,51 @@ void WebServer::setupRoutes() {
         }
     });
 
-    _server->Post("/api/approvals/decision", [](const httplib::Request& req, httplib::Response& res) {
+    _server->Get("/api/approvals/status", [this](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isLoopbackRequest(req) && !isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        std::string id;
+        if (req.has_param("id")) {
+            id = req.get_param_value("id");
+        } else if (req.has_param("approval_id")) {
+            id = req.get_param_value("approval_id");
+        } else if (req.has_param("request_id")) {
+            id = req.get_param_value("request_id");
+        }
+        if (id.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Missing approval id\"}", "application/json");
+            return;
+        }
+        MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+        auto st = gw.getApprovalStatus(id);
+        res.set_content(st.dump(2), "application/json");
+    });
+
+    _server->Post("/api/approvals/decision", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
         try {
             nlohmann::json body = nlohmann::json::parse(req.body);
-            std::string approvalId = body.value("approval_id", "");
+            std::string approvalId = body.value("approval_id", body.value("id", ""));
             std::string decision = body.value("decision", "deny");
 
             std::string lower = decision;
-            for (char &c : lower) c = tolower(c);
+            for (char &c : lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 
             ApprovalVerdict verdict = (lower == "allow" || lower == "approve" || lower == "approved")
                 ? ApprovalVerdict::APPROVED : ApprovalVerdict::DENIED;
 
-            bool resolved = MobileGateway::getInstance().resolveApproval(approvalId, verdict);
+            MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+            bool resolved = gw.resolveApproval(approvalId, verdict);
             nlohmann::json resp;
             resp["approval_id"] = approvalId;
             resp["resolved"] = resolved;
@@ -605,18 +763,30 @@ void WebServer::setupRoutes() {
         }
     });
 
-    _server->Get("/api/approvals/pending", [](const httplib::Request&, httplib::Response& res) {
+    _server->Get("/api/approvals/pending", [this](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        auto pending = MobileGateway::getInstance().listPendingApprovals();
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+        auto pending = gw.listPendingApprovals();
         nlohmann::json arr = pending;
         res.set_content(arr.dump(2), "application/json");
     });
 
     // --- Mobile Gateway & Pairing Endpoints ---
 
-    _server->Get("/api/mobile/qr", [](const httplib::Request&, httplib::Response& res) {
+    _server->Get("/api/mobile/qr", [this](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        std::string secret = MobileGateway::getInstance().createPairingSecret(300);
+        if (!isValidUiSession(req) && !isLoopbackRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+        std::string secret = gw.createPairingSecret(300);
         std::string lanIp = getPrimaryLanIp();
 
         nlohmann::json resp;
@@ -628,7 +798,7 @@ void WebServer::setupRoutes() {
         res.set_content(resp.dump(2), "application/json");
     });
 
-    _server->Post("/api/mobile/pair", [](const httplib::Request& req, httplib::Response& res) {
+    _server->Post("/api/mobile/pair", [this](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         try {
             nlohmann::json body = nlohmann::json::parse(req.body);
@@ -636,11 +806,14 @@ void WebServer::setupRoutes() {
             std::string deviceId = body.value("device_id", "");
             std::string deviceName = body.value("device_name", "");
 
+            MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
             std::string token;
-            if (MobileGateway::getInstance().pairDevice(secret, deviceId, deviceName, token)) {
+            if (gw.pairDevice(secret, deviceId, deviceName, token)) {
+                std::string resolvedDevId = deviceId;
+                gw.authenticate(token, resolvedDevId);
                 nlohmann::json resp;
                 resp["token"] = token;
-                resp["device_id"] = deviceId;
+                resp["device_id"] = resolvedDevId;
                 resp["status"] = "paired";
                 res.set_content(resp.dump(2), "application/json");
             } else {
@@ -653,9 +826,15 @@ void WebServer::setupRoutes() {
         }
     });
 
-    _server->Get("/api/mobile/devices", [](const httplib::Request&, httplib::Response& res) {
+    _server->Get("/api/mobile/devices", [this](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        auto devs = MobileGateway::getInstance().listDevices();
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+        auto devs = gw.listDevices();
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& d : devs) {
             arr.push_back({
@@ -668,12 +847,18 @@ void WebServer::setupRoutes() {
         res.set_content(arr.dump(2), "application/json");
     });
 
-    _server->Post("/api/mobile/revoke", [](const httplib::Request& req, httplib::Response& res) {
+    _server->Post("/api/mobile/revoke", [this](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
         try {
             nlohmann::json body = nlohmann::json::parse(req.body);
             std::string deviceId = body.value("device_id", "");
-            MobileGateway::getInstance().revokeDevice(deviceId);
+            MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+            gw.revokeDevice(deviceId);
             res.set_content("{\"status\":\"revoked\"}", "application/json");
         } catch (const std::exception& e) {
             res.status = 400;
@@ -683,78 +868,232 @@ void WebServer::setupRoutes() {
 
     // --- Zero-Python Native Antimatter Agent & Workspace Bridge Endpoints ---
 
-    auto handleAgentAvailable = [](const httplib::Request&, httplib::Response& res) {
+    auto getWorkspaceRoot = []() -> fs::path {
+        const char* envWs = std::getenv("AIMON_WORKSPACE_ROOT");
+        if (envWs && *envWs) {
+            return fs::path(envWs);
+        }
+        return fs::current_path();
+    };
+
+    auto getIdeBrainDir = []() -> std::string {
+        const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
+        if (envIde && *envIde) {
+            return std::string(envIde);
+        }
+        return PathUtils::expandHome("~/.gemini/antigravity-ide/brain");
+    };
+
+    auto getCliBrainDir = []() -> std::string {
+        const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
+        if (envCli && *envCli) {
+            return std::string(envCli);
+        }
+        return PathUtils::expandHome("~/.gemini/antigravity-cli/brain");
+    };
+
+    auto getCliPresenceDir = []() -> std::string {
+        const char* envPres = std::getenv("AIMON_CLI_PRESENCE_DIR");
+        if (envPres && *envPres) {
+            return std::string(envPres);
+        }
+        return PathUtils::expandHome("~/.gemini/antigravity-cli/presence");
+    };
+
+    auto stripUserRequestTags = [](const std::string& raw) -> std::string {
+        std::string text = raw;
+        auto startTag = text.find("<USER_REQUEST>");
+        auto endTag = text.find("</USER_REQUEST>");
+        if (startTag != std::string::npos && endTag != std::string::npos && endTag >= startTag + 14) {
+            text = text.substr(startTag + 14, endTag - (startTag + 14));
+        }
+        auto first = text.find_first_not_of(" \n\r\t");
+        if (first == std::string::npos) {
+            return "";
+        }
+        auto last = text.find_last_not_of(" \n\r\t");
+        return text.substr(first, last - first + 1);
+    };
+
+    auto handleAgentAvailable = [getWorkspaceRoot](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        std::string wsRoot = getWorkspaceRoot().string();
         nlohmann::json resp;
         resp["agents"] = nlohmann::json::array({
             {
                 {"id", "antigravity"},
                 {"name", "Google Antigravity"},
                 {"status", "online"},
-                {"workspaceRoot", fs::current_path().string()}
+                {"workspaceRoot", wsRoot}
             }
         });
-        resp["allowed_workspaces"] = nlohmann::json::array({fs::current_path().string()});
-        resp["current_workspace"] = fs::current_path().string();
+        resp["allowed_workspaces"] = nlohmann::json::array({wsRoot});
+        resp["current_workspace"] = wsRoot;
         res.set_content(resp.dump(2), "application/json");
     };
     _server->Get("/api/agent/available", handleAgentAvailable);
     _server->Get("/api/agent/agents", handleAgentAvailable);
 
-    auto handleAgentConversations = [](const httplib::Request&, httplib::Response& res) {
+    auto handleAgentConversations = [getIdeBrainDir, getCliBrainDir, getCliPresenceDir, stripUserRequestTags](
+                                        const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        std::string brainPath = PathUtils::expandHome("~/.gemini/antigravity-ide/brain");
-        nlohmann::json conversations = nlohmann::json::array();
-        if (fs::exists(brainPath) && fs::is_directory(brainPath)) {
-            for (const auto& entry : fs::directory_iterator(brainPath)) {
-                if (!entry.is_directory()) continue;
+        size_t limit = 50;
+        if (req.has_param("limit")) {
+            try {
+                int parsed = std::stoi(req.get_param_value("limit"));
+                if (parsed > 0) {
+                    limit = static_cast<size_t>(parsed);
+                }
+            } catch (...) {}
+        }
+
+        struct ConvEntry {
+            std::string id;
+            std::string title;
+            std::string source;
+            uint64_t timestamp = 0;
+            bool active = false;
+        };
+
+        std::vector<ConvEntry> collected;
+        std::string presenceDir = getCliPresenceDir();
+        uint64_t nowSec = static_cast<uint64_t>(std::time(nullptr));
+
+        auto scanRoot = [&](const std::string& rootPath, const std::string& sourceLabel) {
+            if (rootPath.empty() || !fs::exists(rootPath) || !fs::is_directory(rootPath)) {
+                return;
+            }
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator(rootPath, ec)) {
+                if (ec || !entry.is_directory()) continue;
                 std::string id = entry.path().filename().string();
-                if (id == "tempmediaStorage") continue;
+                if (id.empty() || id[0] == '.' || id == "tempmediaStorage") continue;
+
                 fs::path transcriptPath = entry.path() / ".system_generated" / "logs" / "transcript.jsonl";
-                if (fs::exists(transcriptPath)) {
+                fs::path taskMdPath = entry.path() / "task.md";
+                bool hasTranscript = fs::exists(transcriptPath);
+                bool hasTaskMd = fs::exists(taskMdPath);
+                if (!hasTranscript && !hasTaskMd) continue;
+
+                uint64_t ts = 0;
+                try {
+                    auto ftime = hasTranscript ? fs::last_write_time(transcriptPath)
+                                               : fs::last_write_time(entry.path());
+                    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+                    );
+                    auto secs = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
+                    if (secs > 0) {
+                        ts = static_cast<uint64_t>(secs);
+                    }
+                } catch (...) {}
+
+                std::string title;
+                if (hasTaskMd) {
+                    std::ifstream tf(taskMdPath);
+                    std::string tline;
+                    while (std::getline(tf, tline)) {
+                        auto first = tline.find_first_not_of(" \t\r\n");
+                        if (first == std::string::npos) continue;
+                        if (tline.compare(first, 2, "# ") == 0) {
+                            title = tline.substr(first + 2);
+                            auto last = title.find_last_not_of(" \t\r\n");
+                            if (last != std::string::npos) {
+                                title.erase(last + 1);
+                            }
+                            if (title.rfind("Task:", 0) == 0 || title.rfind("Plan:", 0) == 0) {
+                                auto afterColon = title.find_first_not_of(" \t", 5);
+                                if (afterColon != std::string::npos) {
+                                    title = title.substr(afterColon);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                bool isInternalSubagent = false;
+                if (title.empty() && hasTranscript) {
                     std::ifstream f(transcriptPath);
                     std::string line;
-                    std::string title = "Conversation " + id.substr(0, std::min<size_t>(8, id.length()));
-                    uint64_t ts = 0;
-                    try {
-                        auto ftime = fs::last_write_time(transcriptPath);
-                        auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                            ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
-                        );
-                        ts = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
-                    } catch (...) {}
-
-                    if (std::getline(f, line)) {
+                    int scannedLines = 0;
+                    while (std::getline(f, line) && scannedLines < 25) {
+                        ++scannedLines;
+                        if (line.empty()) continue;
                         try {
-                            auto j = nlohmann::json::parse(line);
-                            if (j.contains("content")) {
-                                std::string content = j["content"];
-                                auto startTag = content.find("<USER_REQUEST>");
-                                auto endTag = content.find("</USER_REQUEST>");
-                                if (startTag != std::string::npos && endTag != std::string::npos) {
-                                    title = content.substr(startTag + 14, endTag - (startTag + 14));
-                                    auto firstNotSpace = title.find_first_not_of(" \n\r\t");
-                                    if (firstNotSpace != std::string::npos) {
-                                        title.erase(0, firstNotSpace);
-                                        auto lastNotSpace = title.find_last_not_of(" \n\r\t");
-                                        if (lastNotSpace != std::string::npos) {
-                                            title.erase(lastNotSpace + 1);
-                                        }
+                            auto j = nlohmann::json::parse(line, nullptr, false);
+                            if (j.is_discarded() || !j.is_object()) continue;
+                            std::string stype = j.value("type", "");
+                            if (scannedLines == 1 && stype == "SYSTEM_MESSAGE" && !hasTaskMd) {
+                                isInternalSubagent = true;
+                                break;
+                            }
+                            if (stype == "USER_INPUT" || (scannedLines == 1 && j.contains("content"))) {
+                                std::string content = j.value("content", "");
+                                std::string clean = stripUserRequestTags(content);
+                                if (!clean.empty()) {
+                                    auto nlPos = clean.find_first_of("\r\n");
+                                    if (nlPos != std::string::npos) {
+                                        clean = clean.substr(0, nlPos);
                                     }
-                                    if (title.length() > 60) title = title.substr(0, 57) + "...";
+                                    title = clean;
+                                    if (stype == "USER_INPUT") {
+                                        break;
+                                    }
                                 }
                             }
                         } catch (...) {}
                     }
-                    conversations.push_back({
-                        {"id", id},
-                        {"title", title},
-                        {"timestamp", ts}
-                    });
-                    if (conversations.size() >= 30) break;
                 }
+                if (isInternalSubagent) {
+                    continue;
+                }
+
+                if (title.empty()) {
+                    title = "Conversation " + id.substr(0, std::min<size_t>(8, id.length()));
+                } else if (title.length() > 80) {
+                    title = title.substr(0, 77) + "...";
+                }
+
+                bool isActive = false;
+                if (!presenceDir.empty() && fs::exists(fs::path(presenceDir) / (id + ".lock"))) {
+                    isActive = true;
+                } else if (ts > 0 && nowSec >= ts && (nowSec - ts) < 120) {
+                    isActive = true;
+                }
+
+                ConvEntry ce;
+                ce.id = id;
+                ce.title = title;
+                ce.source = sourceLabel;
+                ce.timestamp = ts;
+                ce.active = isActive;
+                collected.push_back(std::move(ce));
             }
+        };
+
+        scanRoot(getIdeBrainDir(), "ide");
+        scanRoot(getCliBrainDir(), "cli");
+
+        std::sort(collected.begin(), collected.end(), [](const ConvEntry& a, const ConvEntry& b) {
+            if (a.timestamp != b.timestamp) {
+                return a.timestamp > b.timestamp;
+            }
+            return a.id > b.id;
+        });
+
+        nlohmann::json conversations = nlohmann::json::array();
+        size_t count = std::min(collected.size(), limit);
+        for (size_t i = 0; i < count; ++i) {
+            conversations.push_back({
+                {"id", collected[i].id},
+                {"title", collected[i].title},
+                {"source", collected[i].source},
+                {"timestamp", collected[i].timestamp},
+                {"active", collected[i].active}
+            });
         }
+
         nlohmann::json resp;
         resp["conversations"] = conversations;
         res.set_content(resp.dump(2), "application/json");
@@ -762,15 +1101,342 @@ void WebServer::setupRoutes() {
     _server->Get("/api/agent/conversations", handleAgentConversations);
     _server->Get("/api/agent/history", handleAgentConversations);
 
-    _server->Get("/api/agent/transcript", [](const httplib::Request& req, httplib::Response& res) {
+    struct LsEndpoint {
+        int port = 0;
+        std::string csrf;
+        bool isPreferredWorkspace = false;
+    };
+
+    auto discoverLsEndpoints = []() -> std::vector<LsEndpoint> {
+        std::vector<LsEndpoint> endpoints;
+
+        auto addEndpoint = [&](int port, const std::string& csrf, bool preferred = false) {
+            if (port <= 0 || port > 65535 || csrf.empty()) return;
+            for (auto& ep : endpoints) {
+                if (ep.port == port && ep.csrf == csrf) {
+                    if (preferred) ep.isPreferredWorkspace = true;
+                    return;
+                }
+            }
+            endpoints.push_back({port, csrf, preferred});
+        };
+
+        const char* envLsPort = std::getenv("AGY_LS_PORT");
+        const char* envLsCsrf = std::getenv("AGY_LS_CSRF_TOKEN");
+        const char* envAgAddr = std::getenv("ANTIGRAVITY_LS_ADDRESS");
+        const char* envAgCsrf = std::getenv("ANTIGRAVITY_CSRF_TOKEN");
+        std::string fallbackCsrf = (envLsCsrf && *envLsCsrf) ? envLsCsrf :
+                                   ((envAgCsrf && *envAgCsrf) ? envAgCsrf : "");
+        if (envLsPort && *envLsPort) {
+            try {
+                addEndpoint(std::stoi(envLsPort), fallbackCsrf, true);
+            } catch (...) {}
+        }
+        if (envAgAddr && *envAgAddr) {
+            std::string addr(envAgAddr);
+            auto colon = addr.rfind(':');
+            if (colon != std::string::npos) {
+                try {
+                    addEndpoint(std::stoi(addr.substr(colon + 1)), fallbackCsrf, true);
+                } catch (...) {}
+            }
+        }
+
+        if (endpoints.empty() && fs::exists("/proc")) {
+            std::vector<pid_t> pids;
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator("/proc", ec)) {
+                if (ec || !entry.is_directory()) continue;
+                std::string dname = entry.path().filename().string();
+                if (!dname.empty() && std::all_of(dname.begin(), dname.end(), ::isdigit)) {
+                    try { pids.push_back(std::stoi(dname)); } catch (...) {}
+                }
+            }
+            std::sort(pids.begin(), pids.end(), std::greater<pid_t>());
+
+            for (pid_t pid : pids) {
+                std::ifstream envFile("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
+                if (!envFile.is_open()) continue;
+                std::string envContent((std::istreambuf_iterator<char>(envFile)),
+                                       std::istreambuf_iterator<char>());
+                if (envContent.find("ANTIGRAVITY_LS_ADDRESS=") == std::string::npos) continue;
+                std::string lsAddr;
+                std::string lsCsrf;
+                size_t pos = 0;
+                while (pos < envContent.size()) {
+                    std::string item = envContent.c_str() + pos;
+                    if (item.rfind("ANTIGRAVITY_LS_ADDRESS=", 0) == 0) {
+                        lsAddr = item.substr(23);
+                    } else if (item.rfind("ANTIGRAVITY_CSRF_TOKEN=", 0) == 0) {
+                        lsCsrf = item.substr(23);
+                    }
+                    pos += item.length() + 1;
+                }
+                if (!lsAddr.empty() && !lsCsrf.empty()) {
+                    auto colon = lsAddr.rfind(':');
+                    if (colon != std::string::npos) {
+                        bool preferred = false;
+                        std::error_code cwdEc;
+                        auto cwdPath = fs::read_symlink("/proc/" + std::to_string(pid) + "/cwd", cwdEc);
+                        if (!cwdEc && cwdPath.string().find("aimon") != std::string::npos) {
+                            preferred = true;
+                        }
+                        try {
+                            addEndpoint(std::stoi(lsAddr.substr(colon + 1)), lsCsrf, preferred);
+                        } catch (...) {}
+                    }
+                }
+            }
+
+            auto findPortsForPid = [](pid_t pid) -> std::vector<int> {
+                std::vector<int> ports;
+                std::set<std::string> inodes;
+                std::string fdDir = "/proc/" + std::to_string(pid) + "/fd";
+                std::error_code fdEc;
+                if (!fs::exists(fdDir, fdEc)) return ports;
+                for (const auto& fdEntry : fs::directory_iterator(fdDir, fdEc)) {
+                    if (fdEc) break;
+                    std::error_code symEc;
+                    if (fs::is_symlink(fdEntry.path(), symEc)) {
+                        std::string target = fs::read_symlink(fdEntry.path(), symEc).string();
+                        if (!symEc && target.rfind("socket:[", 0) == 0 && target.size() > 9) {
+                            inodes.insert(target.substr(8, target.size() - 9));
+                        }
+                    }
+                }
+                if (inodes.empty()) return ports;
+
+                auto scanNetFile = [&](const std::string& netPath) {
+                    std::ifstream nf(netPath);
+                    std::string line;
+                    std::getline(nf, line);
+                    while (std::getline(nf, line)) {
+                        std::istringstream ss(line);
+                        std::string sl, localAddr, remAddr, state, txRx, trTm, retrnsmt, uid, timeout, inode;
+                        if (ss >> sl >> localAddr >> remAddr >> state >> txRx >> trTm >> retrnsmt >> uid >> timeout >> inode) {
+                            if (state == "0A" && inodes.count(inode)) {
+                                auto colon = localAddr.find(':');
+                                if (colon != std::string::npos) {
+                                    try {
+                                        int p = std::stoi(localAddr.substr(colon + 1), nullptr, 16);
+                                        if (p > 0) ports.push_back(p);
+                                    } catch (...) {}
+                                }
+                            }
+                        }
+                    }
+                };
+                scanNetFile("/proc/net/tcp");
+                scanNetFile("/proc/net/tcp6");
+                return ports;
+            };
+
+            for (pid_t pid : pids) {
+                std::ifstream cmdFile("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
+                if (!cmdFile.is_open()) continue;
+                std::string cmdContent((std::istreambuf_iterator<char>(cmdFile)),
+                                       std::istreambuf_iterator<char>());
+                if (cmdContent.find("language_server") == std::string::npos) continue;
+
+                std::string csrf;
+                std::string workspaceId;
+                size_t pos = 0;
+                while (pos < cmdContent.size()) {
+                    std::string arg = cmdContent.c_str() + pos;
+                    if (arg == "--csrf_token" && (pos + arg.length() + 1) < cmdContent.size()) {
+                        csrf = cmdContent.c_str() + pos + arg.length() + 1;
+                    } else if (arg == "--workspace_id" && (pos + arg.length() + 1) < cmdContent.size()) {
+                        workspaceId = cmdContent.c_str() + pos + arg.length() + 1;
+                    }
+                    pos += arg.length() + 1;
+                }
+                if (csrf.empty()) csrf = fallbackCsrf;
+                if (csrf.empty()) continue;
+
+                bool preferred = (workspaceId.find("aimon") != std::string::npos);
+                for (int p : findPortsForPid(pid)) {
+                    addEndpoint(p, csrf, preferred);
+                }
+            }
+        }
+
+        std::stable_sort(endpoints.begin(), endpoints.end(), [](const LsEndpoint& a, const LsEndpoint& b) {
+            return a.isPreferredWorkspace > b.isPreferredWorkspace;
+        });
+        return endpoints;
+    };
+
+    auto lastRpcEndpoint = std::make_shared<std::pair<int, std::string>>(0, "");
+    auto lastRpcMutex = std::make_shared<std::mutex>();
+
+    _server->Get("/api/agent/transcript", [getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex](
+                                              const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string id = req.get_param_value("id");
-        if (id.empty()) {
-            id = "27b5c273-5f2a-4215-a5a2-28211761228f";
+        if (id.empty() || id.find("..") != std::string::npos || id.find('/') != std::string::npos) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Missing or invalid conversation id\"}", "application/json");
+            return;
         }
-        std::string brainPath = PathUtils::expandHome("~/.gemini/antigravity-ide/brain");
-        fs::path transcriptPath = fs::path(brainPath) / id / ".system_generated" / "logs" / "transcript.jsonl";
-        if (!fs::exists(transcriptPath)) {
+
+        int sinceIndex = -1;
+        if (req.has_param("since")) {
+            try {
+                sinceIndex = std::stoi(req.get_param_value("since"));
+            } catch (...) {
+                sinceIndex = -1;
+            }
+        }
+
+        fs::path idePath = fs::path(getIdeBrainDir()) / id / ".system_generated" / "logs" / "transcript.jsonl";
+        fs::path cliPath = fs::path(getCliBrainDir()) / id / ".system_generated" / "logs" / "transcript.jsonl";
+        fs::path transcriptPath;
+        std::string source = "ide";
+
+        if (fs::exists(idePath) && fs::exists(cliPath)) {
+            try {
+                if (fs::last_write_time(cliPath) >= fs::last_write_time(idePath)) {
+                    transcriptPath = cliPath;
+                    source = "cli";
+                } else {
+                    transcriptPath = idePath;
+                    source = "ide";
+                }
+            } catch (...) {
+                transcriptPath = cliPath;
+                source = "cli";
+            }
+        } else if (fs::exists(cliPath)) {
+            transcriptPath = cliPath;
+            source = "cli";
+        } else if (fs::exists(idePath)) {
+            transcriptPath = idePath;
+            source = "ide";
+        } else {
+            // Fallback: check live in-memory trajectory via ConnectRPC GetCascadeTrajectory
+            nlohmann::json liveSteps = nlohmann::json::array();
+            int liveTotalSteps = 0;
+            bool foundInMemory = false;
+
+            auto tryProbeRpcTrajectory = [&](int port, const std::string& csrf) -> bool {
+                if (port <= 0 || port > 65535 || csrf.empty()) return false;
+                try {
+                    httplib::Client cli("127.0.0.1", port);
+                    cli.set_connection_timeout(0, 400000);
+                    cli.set_read_timeout(1, 0);
+                    httplib::Headers hdrs = {
+                        {"Content-Type", "application/json"},
+                        {"x-codeium-csrf-token", csrf}
+                    };
+                    auto rpcRes = cli.Post(
+                        "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory",
+                        hdrs,
+                        nlohmann::json({{"cascadeId", id}}).dump(),
+                        "application/json"
+                    );
+                    if (rpcRes && rpcRes->status == 200) {
+                        auto tj = nlohmann::json::parse(rpcRes->body, nullptr, false);
+                        if (!tj.is_discarded() && tj.contains("trajectory") && tj["trajectory"].is_object()) {
+                            const auto& rawSteps = tj["trajectory"].value("steps", nlohmann::json::array());
+                            int idx = 0;
+                            for (const auto& rs : rawSteps) {
+                                int stepIdx = idx++;
+                                liveTotalSteps = std::max(liveTotalSteps, stepIdx + 1);
+                                if (sinceIndex >= 0 && stepIdx <= sinceIndex) continue;
+                                std::string stType = rs.value("type", "");
+                                if (stType == "CORTEX_STEP_TYPE_USER_INPUT" && rs.contains("userInput")) {
+                                    std::string uText = rs["userInput"].value("userResponse", "");
+                                    if (uText.empty() && rs["userInput"].contains("items") && rs["userInput"]["items"].is_array() && !rs["userInput"]["items"].empty()) {
+                                        uText = rs["userInput"]["items"][0].value("text", "");
+                                    }
+                                    liveSteps.push_back({
+                                        {"index", stepIdx},
+                                        {"stepIndex", stepIdx},
+                                        {"type", "USER_INPUT"},
+                                        {"text", uText},
+                                        {"userInput", uText},
+                                        {"step", {{"case", "userInput"}, {"value", uText}}}
+                                    });
+                                } else if (stType == "CORTEX_STEP_TYPE_PLANNER_RESPONSE" && rs.contains("plannerResponse")) {
+                                    std::string pText = rs["plannerResponse"].value("modifiedResponse", rs["plannerResponse"].value("response", ""));
+                                    std::string pThink = rs["plannerResponse"].value("thinking", "");
+                                    liveSteps.push_back({
+                                        {"index", stepIdx},
+                                        {"stepIndex", stepIdx},
+                                        {"type", "PLANNER_RESPONSE"},
+                                        {"thinking", pThink},
+                                        {"plannerResponse", pThink},
+                                        {"text", pText},
+                                        {"tool_calls", nlohmann::json::array()},
+                                        {"step", {{"case", !pText.empty() ? "text" : "plannerResponse"}, {"value", !pText.empty() ? pText : pThink}}}
+                                    });
+                                } else if (stType == "CORTEX_STEP_TYPE_ERROR_MESSAGE" && rs.contains("errorMessage")) {
+                                    std::string errText = "Agent execution error";
+                                    if (rs["errorMessage"].contains("error") && rs["errorMessage"]["error"].is_object()) {
+                                        errText = rs["errorMessage"]["error"].value("shortError",
+                                                  rs["errorMessage"]["error"].value("userErrorMessage", errText));
+                                    }
+                                    liveSteps.push_back({
+                                        {"index", stepIdx},
+                                        {"stepIndex", stepIdx},
+                                        {"type", "ERROR_MESSAGE"},
+                                        {"text", errText},
+                                        {"step", {{"case", "errorMessage"}, {"value", errText}}}
+                                    });
+                                }
+                            }
+                            return true;
+                        }
+                    }
+                } catch (...) {}
+                return false;
+            };
+
+            const char* envLsPort = std::getenv("AGY_LS_PORT");
+            const char* envLsCsrf = std::getenv("AGY_LS_CSRF_TOKEN");
+            if (envLsPort && *envLsPort && envLsCsrf && *envLsCsrf) {
+                try {
+                    if (tryProbeRpcTrajectory(std::stoi(envLsPort), envLsCsrf)) {
+                        foundInMemory = true;
+                    }
+                } catch (...) {}
+            }
+            if (!foundInMemory) {
+                int cachedPort = 0;
+                std::string cachedCsrf;
+                {
+                    std::lock_guard<std::mutex> lk(*lastRpcMutex);
+                    cachedPort = lastRpcEndpoint->first;
+                    cachedCsrf = lastRpcEndpoint->second;
+                }
+                if (cachedPort > 0 && !cachedCsrf.empty()) {
+                    if (tryProbeRpcTrajectory(cachedPort, cachedCsrf)) {
+                        foundInMemory = true;
+                    }
+                }
+            }
+            if (!foundInMemory) {
+                for (const auto& ep : discoverLsEndpoints()) {
+                    if (tryProbeRpcTrajectory(ep.port, ep.csrf)) {
+                        std::lock_guard<std::mutex> lk(*lastRpcMutex);
+                        *lastRpcEndpoint = {ep.port, ep.csrf};
+                        foundInMemory = true;
+                        break;
+                    }
+                }
+            }
+
+            if (foundInMemory) {
+                nlohmann::json resp;
+                resp["conversationId"] = id;
+                resp["source"] = "live";
+                resp["model"] = "gemini-2.5-pro";
+                resp["stepCount"] = liveTotalSteps;
+                resp["steps"] = liveSteps;
+                res.set_content(resp.dump(2), "application/json");
+                return;
+            }
+
             res.status = 404;
             res.set_content("{\"error\":\"Conversation transcript not found\"}", "application/json");
             return;
@@ -779,121 +1445,490 @@ void WebServer::setupRoutes() {
         std::ifstream f(transcriptPath);
         std::string line;
         nlohmann::json steps = nlohmann::json::array();
-        int idx = 0;
-        while (std::getline(f, line) && steps.size() < 100) {
+        int lineNum = 0;
+        int totalStepCount = 0;
+
+        while (std::getline(f, line)) {
             if (line.empty()) continue;
             try {
-                auto j = nlohmann::json::parse(line);
+                auto j = nlohmann::json::parse(line, nullptr, false);
+                if (j.is_discarded() || !j.is_object()) continue;
+
+                int stepIdx = j.value("step_index", lineNum);
+                ++lineNum;
+                totalStepCount = std::max(totalStepCount, stepIdx + 1);
+
+                if (sinceIndex >= 0 && stepIdx <= sinceIndex) {
+                    continue;
+                }
+
                 std::string type = j.value("type", "");
                 std::string content = j.value("content", "");
-                if (type == "USER_INPUT") {
-                    auto startTag = content.find("<USER_REQUEST>");
-                    auto endTag = content.find("</USER_REQUEST>");
-                    std::string clean = content;
-                    if (startTag != std::string::npos && endTag != std::string::npos) {
-                        clean = content.substr(startTag + 14, endTag - (startTag + 14));
-                        auto first = clean.find_first_not_of(" \n\r\t");
-                        if (first != std::string::npos) {
-                            clean.erase(0, first);
-                            auto last = clean.find_last_not_of(" \n\r\t");
-                            if (last != std::string::npos) clean.erase(last + 1);
+                std::string thinking = j.value("thinking", "");
+                std::string createdAt = j.value("created_at", "");
+
+                nlohmann::json parsedToolCalls = nlohmann::json::array();
+                if (j.contains("tool_calls") && j["tool_calls"].is_array()) {
+                    for (const auto& tc : j["tool_calls"]) {
+                        if (!tc.is_object()) continue;
+                        std::string toolName = tc.value("name", "tool");
+                        nlohmann::json argsObj = nlohmann::json::object();
+                        if (tc.contains("arguments") && tc["arguments"].is_object()) {
+                            argsObj = tc["arguments"];
+                        } else if (tc.contains("args") && tc["args"].is_object()) {
+                            argsObj = tc["args"];
                         }
+
+                        auto unquoteStr = [](const std::string& s) -> std::string {
+                            if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
+                                return s.substr(1, s.size() - 2);
+                            }
+                            return s;
+                        };
+
+                        std::string toolAction = tc.value("toolAction", "");
+                        if (toolAction.empty() && argsObj.contains("toolAction") && argsObj["toolAction"].is_string()) {
+                            toolAction = unquoteStr(argsObj["toolAction"].get<std::string>());
+                        }
+                        std::string toolSummary = tc.value("toolSummary", "");
+                        if (toolSummary.empty() && argsObj.contains("toolSummary") && argsObj["toolSummary"].is_string()) {
+                            toolSummary = unquoteStr(argsObj["toolSummary"].get<std::string>());
+                        }
+                        std::string cmd;
+                        if (argsObj.contains("CommandLine") && argsObj["CommandLine"].is_string()) {
+                            cmd = unquoteStr(argsObj["CommandLine"].get<std::string>());
+                        }
+
+                        parsedToolCalls.push_back({
+                            {"name", toolName},
+                            {"toolAction", toolAction},
+                            {"toolSummary", toolSummary},
+                            {"command", cmd},
+                            {"arguments", argsObj}
+                        });
                     }
+                }
+
+                if (type == "USER_INPUT") {
+                    std::string clean = stripUserRequestTags(content);
                     steps.push_back({
-                        {"index", idx++},
+                        {"index", stepIdx},
+                        {"stepIndex", stepIdx},
+                        {"type", "USER_INPUT"},
+                        {"text", clean},
+                        {"userInput", clean},
+                        {"createdAt", createdAt},
                         {"step", {
                             {"case", "userInput"},
                             {"value", clean}
                         }}
                     });
                 } else if (type == "PLANNER_RESPONSE") {
+                    std::string displayValue = !content.empty() ? content : thinking;
                     steps.push_back({
-                        {"index", idx++},
+                        {"index", stepIdx},
+                        {"stepIndex", stepIdx},
+                        {"type", "PLANNER_RESPONSE"},
+                        {"thinking", thinking},
+                        {"plannerResponse", thinking},
+                        {"text", content},
+                        {"tool_calls", parsedToolCalls},
+                        {"createdAt", createdAt},
                         {"step", {
-                            {"case", "plannerResponse"},
-                            {"value", content}
+                            {"case", !content.empty() ? "text" : "plannerResponse"},
+                            {"value", displayValue}
                         }}
                     });
-                } else if (j.contains("tool_calls")) {
-                    for (const auto& tc : j["tool_calls"]) {
-                        std::string toolName = tc.value("name", "tool");
-                        std::string cmd = "";
-                        if (tc.contains("args") && tc["args"].contains("CommandLine")) {
-                            cmd = tc["args"]["CommandLine"];
-                        }
-                        steps.push_back({
-                            {"index", idx++},
-                            {"step", {
-                                {"case", "toolCall"},
-                                {"tool", toolName},
-                                {"command", cmd}
-                            }}
-                        });
-                    }
+                } else if (type == "ERROR_MESSAGE") {
+                    std::string errText = !content.empty() ? content : j.value("error", "Agent execution error");
+                    steps.push_back({
+                        {"index", stepIdx},
+                        {"stepIndex", stepIdx},
+                        {"type", "ERROR_MESSAGE"},
+                        {"text", errText},
+                        {"createdAt", createdAt},
+                        {"step", {
+                            {"case", "errorMessage"},
+                            {"value", errText}
+                        }}
+                    });
+                } else if (!parsedToolCalls.empty()) {
+                    std::string firstTool = parsedToolCalls[0].value("name", "tool");
+                    std::string firstCmd = parsedToolCalls[0].value("command", "");
+                    steps.push_back({
+                        {"index", stepIdx},
+                        {"stepIndex", stepIdx},
+                        {"type", type.empty() ? "TOOL_CALL" : type},
+                        {"thinking", thinking},
+                        {"text", content},
+                        {"tool_calls", parsedToolCalls},
+                        {"createdAt", createdAt},
+                        {"step", {
+                            {"case", "toolCall"},
+                            {"tool", firstTool},
+                            {"command", firstCmd}
+                        }}
+                    });
                 }
             } catch (...) {}
         }
 
         nlohmann::json resp;
         resp["conversationId"] = id;
+        resp["source"] = source;
         resp["model"] = "gemini-2.5-pro";
-        resp["stepCount"] = steps.size();
+        resp["stepCount"] = totalStepCount;
         resp["steps"] = steps;
         res.set_content(resp.dump(2), "application/json");
     });
 
-    _server->Post("/api/agent/prompt", [](const httplib::Request& req, httplib::Response& res) {
+    _server->Post("/api/agent/prompt", [discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        nlohmann::json j;
         try {
-            auto j = nlohmann::json::parse(req.body);
-            std::string text = j.value("text", "");
-            std::string agentId = j.value("agentId", "antigravity");
-            std::string cid = j.value("conversationId", "27b5c273-5f2a-4215-a5a2-28211761228f");
-
-            std::string responseText;
-            std::string lower = text;
-            for (char &c : lower) c = tolower(c);
-            if (lower.find("time") != std::string::npos || lower.find("date") != std::string::npos) {
-                time_t now = time(nullptr);
-                struct tm* localTm = localtime(&now);
-                char timeBuf[64];
-                strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S %Z", localTm);
-                responseText = "The current time is " + std::string(timeBuf) + ". Google Antigravity and Aimon services are active.";
-            } else if (lower.find("hello") != std::string::npos || lower.find("hi") != std::string::npos) {
-                responseText = "Hello! I am Google Antigravity connected to your Aimon workspace. All daemon services and companion bridges are fully operational.";
-            } else if (lower.find("status") != std::string::npos || lower.find("quota") != std::string::npos) {
-                responseText = "Aimon telemetry and quotas are active. Total credits: 200,000. All satellite monitors (meshmon, netmon, embdevenv, snmp) are connected.";
-            } else {
-                responseText = "Acknowledged: \"" + text + "\". Google Antigravity is active and monitoring workspace tasks.";
-            }
-
-            nlohmann::json resp;
-            resp["status"] = "ok";
-            resp["agentId"] = agentId;
-            resp["conversationId"] = cid;
-            resp["response"] = responseText;
-            resp["steps"] = nlohmann::json::array({
-                {
-                    {"case", "text"},
-                    {"value", responseText}
-                }
-            });
-            res.set_content(resp.dump(2), "application/json");
+            j = nlohmann::json::parse(req.body);
         } catch (const std::exception& e) {
             res.status = 400;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+            res.set_content(nlohmann::json({{"status", "error"}, {"error", e.what()}}).dump(), "application/json");
+            return;
         }
+
+        std::string text = j.value("text", j.value("prompt", ""));
+        std::string agentId = j.value("agentId", "antigravity");
+        std::string cid = j.value("conversationId", "");
+        if (text.empty()) {
+            res.status = 400;
+            res.set_content("{\"status\":\"error\",\"error\":\"Prompt text cannot be empty\"}", "application/json");
+            return;
+        }
+
+        std::string agyBin = PathUtils::expandHome("~/.local/bin/agy");
+        const char* envAgyBin = std::getenv("AIMON_AGY_BIN");
+        if (envAgyBin && *envAgyBin) {
+            agyBin = envAgyBin;
+        }
+        if (!fs::exists(agyBin) || access(agyBin.c_str(), X_OK) != 0) {
+            res.status = 503;
+            res.set_content(nlohmann::json({
+                {"status", "error"},
+                {"error", "Antigravity CLI binary (agy) is not available or not executable at " + agyBin}
+            }).dump(2), "application/json");
+            return;
+        }
+
+        std::vector<LsEndpoint> endpoints = discoverLsEndpoints();
+
+        if (endpoints.empty()) {
+            res.status = 503;
+            res.set_content(nlohmann::json({
+                {"status", "error"},
+                {"error", "No active Antigravity language server or agy agent session found"}
+            }).dump(2), "application/json");
+            return;
+        }
+
+        // 3. Attempt direct ConnectRPC dispatch with conversation ownership verification
+        auto sendRpcCascadeMessage = [&](const LsEndpoint& ep, const std::string& targetCid, std::string& outBody) -> bool {
+            try {
+                httplib::Client cli("127.0.0.1", ep.port);
+                cli.set_connection_timeout(1, 0);
+                cli.set_read_timeout(5, 0);
+                httplib::Headers hdrs = {
+                    {"Content-Type", "application/json"},
+                    {"x-codeium-csrf-token", ep.csrf}
+                };
+                nlohmann::json payload = {
+                    {"cascadeId", targetCid},
+                    {"items", nlohmann::json::array({{{"text", text}}})},
+                    {"cascadeConfig", {
+                        {"plannerConfig", {
+                            {"planModel", "MODEL_PLACEHOLDER_M322"}
+                        }}
+                    }}
+                };
+                auto rpcRes = cli.Post(
+                    "/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage",
+                    hdrs,
+                    payload.dump(),
+                    "application/json"
+                );
+                if (rpcRes && rpcRes->status == 200) {
+                    outBody = rpcRes->body;
+                    std::lock_guard<std::mutex> lk(*lastRpcMutex);
+                    *lastRpcEndpoint = {ep.port, ep.csrf};
+                    return true;
+                }
+            } catch (...) {}
+            return false;
+        };
+
+        auto startRpcNewCascade = [&](const LsEndpoint& ep, std::string& outNewCid) -> bool {
+            try {
+                httplib::Client cli("127.0.0.1", ep.port);
+                cli.set_connection_timeout(1, 0);
+                cli.set_read_timeout(5, 0);
+                httplib::Headers hdrs = {
+                    {"Content-Type", "application/json"},
+                    {"x-codeium-csrf-token", ep.csrf}
+                };
+                nlohmann::json payload = {
+                    {"source", "CORTEX_TRAJECTORY_SOURCE_CLI"}
+                };
+                auto rpcRes = cli.Post(
+                    "/exa.language_server_pb.LanguageServerService/StartCascade",
+                    hdrs,
+                    payload.dump(),
+                    "application/json"
+                );
+                if (rpcRes && rpcRes->status == 200) {
+                    auto sj = nlohmann::json::parse(rpcRes->body, nullptr, false);
+                    if (!sj.is_discarded() && sj.is_object() && sj.contains("cascadeId") && sj["cascadeId"].is_string()) {
+                        outNewCid = sj["cascadeId"].get<std::string>();
+                        return !outNewCid.empty();
+                    }
+                }
+            } catch (...) {}
+            return false;
+        };
+
+        auto endpointOwnsConversation = [&](const LsEndpoint& ep, const std::string& targetCid, bool& outEndpointReachable) -> bool {
+            outEndpointReachable = false;
+            try {
+                httplib::Client cli("127.0.0.1", ep.port);
+                cli.set_connection_timeout(0, 500000);
+                cli.set_read_timeout(2, 0);
+                httplib::Headers hdrs = {
+                    {"Content-Type", "application/json"},
+                    {"x-codeium-csrf-token", ep.csrf}
+                };
+                auto metaRes = cli.Post(
+                    "/exa.language_server_pb.LanguageServerService/GetConversationMetadata",
+                    hdrs,
+                    nlohmann::json({{"conversationId", targetCid}}).dump(),
+                    "application/json"
+                );
+                if (metaRes && metaRes->status == 200) {
+                    outEndpointReachable = true;
+                    auto mj = nlohmann::json::parse(metaRes->body, nullptr, false);
+                    if (!mj.is_discarded() && mj.is_object() && mj.contains("metadata")) {
+                        return true;
+                    }
+                }
+                auto allRes = cli.Post(
+                    "/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories",
+                    hdrs,
+                    "{}",
+                    "application/json"
+                );
+                if (allRes && allRes->status == 200) {
+                    outEndpointReachable = true;
+                    auto aj = nlohmann::json::parse(allRes->body, nullptr, false);
+                    if (!aj.is_discarded() && aj.is_object() &&
+                        aj.contains("trajectorySummaries") && aj["trajectorySummaries"].is_object() &&
+                        aj["trajectorySummaries"].contains(targetCid)) {
+                        return true;
+                    }
+                }
+            } catch (...) {}
+            return false;
+        };
+
+        if (!cid.empty() && cid != "new") {
+            const LsEndpoint* firstReachableEp = nullptr;
+            for (const auto& ep : endpoints) {
+                bool reachable = false;
+                if (endpointOwnsConversation(ep, cid, reachable)) {
+                    std::string rpcOut;
+                    if (sendRpcCascadeMessage(ep, cid, rpcOut)) {
+                        nlohmann::json resp;
+                        resp["status"] = "dispatched";
+                        resp["agentId"] = agentId;
+                        resp["conversationId"] = cid;
+                        resp["output"] = rpcOut;
+                        res.set_content(resp.dump(2), "application/json");
+                        return;
+                    }
+                }
+                if (reachable && !firstReachableEp) {
+                    firstReachableEp = &ep;
+                }
+            }
+            // If cid was an archived conversation not loaded in any live server, start a new cascade on the primary reachable server
+            if (firstReachableEp != nullptr) {
+                std::string newCid;
+                std::string rpcOut;
+                if (startRpcNewCascade(*firstReachableEp, newCid) &&
+                    sendRpcCascadeMessage(*firstReachableEp, newCid, rpcOut)) {
+                    nlohmann::json resp;
+                    resp["status"] = "dispatched";
+                    resp["agentId"] = agentId;
+                    resp["conversationId"] = newCid;
+                    resp["output"] = rpcOut;
+                    res.set_content(resp.dump(2), "application/json");
+                    return;
+                }
+            }
+        } else {
+            for (const auto& ep : endpoints) {
+                std::string newCid;
+                std::string rpcOut;
+                if (startRpcNewCascade(ep, newCid) && sendRpcCascadeMessage(ep, newCid, rpcOut)) {
+                    nlohmann::json resp;
+                    resp["status"] = "dispatched";
+                    resp["agentId"] = agentId;
+                    resp["conversationId"] = newCid;
+                    resp["output"] = rpcOut;
+                    res.set_content(resp.dump(2), "application/json");
+                    return;
+                }
+            }
+        }
+
+        // 4. Fallback: invoke agy agentapi CLI binary
+        auto runAgyCommand = [&](const LsEndpoint& ep, int& outExitCode, std::string& outOutput) -> bool {
+            int pipeFd[2];
+            if (pipe(pipeFd) != 0) {
+                return false;
+            }
+            pid_t child = fork();
+            if (child < 0) {
+                close(pipeFd[0]);
+                close(pipeFd[1]);
+                return false;
+            }
+            if (child == 0) {
+                close(pipeFd[0]);
+                dup2(pipeFd[1], STDOUT_FILENO);
+                dup2(pipeFd[1], STDERR_FILENO);
+                close(pipeFd[1]);
+
+                std::string portStr = std::to_string(ep.port);
+                std::string lsAddr = "localhost:" + portStr;
+                unsetenv("ANTIGRAVITY_CONVERSATION_ID");
+                setenv("AGY_LS_PORT", portStr.c_str(), 1);
+                setenv("AGY_LS_CSRF_TOKEN", ep.csrf.c_str(), 1);
+                setenv("ANTIGRAVITY_LS_ADDRESS", lsAddr.c_str(), 1);
+                setenv("ANTIGRAVITY_CSRF_TOKEN", ep.csrf.c_str(), 1);
+                setenv("ANTIGRAVITY_PROJECT_ID", "default-cli-project", 1);
+
+                std::vector<char*> argv;
+                argv.push_back(const_cast<char*>(agyBin.c_str()));
+                argv.push_back(const_cast<char*>("agentapi"));
+                if (cid.empty() || cid == "new") {
+                    argv.push_back(const_cast<char*>("new-conversation"));
+                    argv.push_back(const_cast<char*>(text.c_str()));
+                } else {
+                    argv.push_back(const_cast<char*>("send-message"));
+                    argv.push_back(const_cast<char*>(cid.c_str()));
+                    argv.push_back(const_cast<char*>(text.c_str()));
+                }
+                argv.push_back(nullptr);
+
+                execv(agyBin.c_str(), argv.data());
+                _exit(127);
+            }
+
+            close(pipeFd[1]);
+            outOutput.clear();
+            char buf[1024];
+            ssize_t n;
+            while ((n = read(pipeFd[0], buf, sizeof(buf))) > 0) {
+                outOutput.append(buf, static_cast<size_t>(n));
+            }
+            close(pipeFd[0]);
+
+            int status = 0;
+            int waitedMs = 0;
+            while (waitedMs < 10000) {
+                pid_t w = waitpid(child, &status, WNOHANG);
+                if (w == child) {
+                    outExitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                waitedMs += 25;
+            }
+            kill(child, SIGKILL);
+            waitpid(child, &status, 0);
+            outExitCode = -1;
+            return false;
+        };
+
+        std::string lastError = "Failed to dispatch prompt via agy agentapi";
+        for (const auto& ep : endpoints) {
+            int exitCode = -1;
+            std::string output;
+            if (!runAgyCommand(ep, exitCode, output)) {
+                lastError = "agy agentapi execution timed out or failed to spawn";
+                continue;
+            }
+
+            nlohmann::json parsedOut = nlohmann::json::parse(output, nullptr, false);
+            bool hasJsonError = (!parsedOut.is_discarded() && parsedOut.is_object() &&
+                                 parsedOut.contains("error") && !parsedOut["error"].is_null() &&
+                                 (!parsedOut["error"].is_string() || !parsedOut["error"].get<std::string>().empty()));
+
+            if (exitCode == 0 && !hasJsonError) {
+                std::string resolvedCid = (cid == "new") ? "" : cid;
+                if (!parsedOut.is_discarded() && parsedOut.is_object()) {
+                    if (parsedOut.contains("conversationId") && parsedOut["conversationId"].is_string()) {
+                        resolvedCid = parsedOut["conversationId"].get<std::string>();
+                    } else if (parsedOut.contains("response") && parsedOut["response"].is_object()) {
+                        const auto& rObj = parsedOut["response"];
+                        if (rObj.contains("conversationId") && rObj["conversationId"].is_string()) {
+                            resolvedCid = rObj["conversationId"].get<std::string>();
+                        } else if (rObj.contains("cascadeId") && rObj["cascadeId"].is_string()) {
+                            resolvedCid = rObj["cascadeId"].get<std::string>();
+                        } else if (rObj.contains("newConversation") && rObj["newConversation"].is_object()) {
+                            const auto& nc = rObj["newConversation"];
+                            if (nc.contains("conversationId") && nc["conversationId"].is_string()) {
+                                resolvedCid = nc["conversationId"].get<std::string>();
+                            }
+                        }
+                    }
+                }
+
+                nlohmann::json resp;
+                resp["status"] = "dispatched";
+                resp["agentId"] = agentId;
+                resp["conversationId"] = resolvedCid;
+                resp["output"] = output;
+                res.set_content(resp.dump(2), "application/json");
+                return;
+            }
+
+            if (hasJsonError && parsedOut["error"].is_string()) {
+                lastError = parsedOut["error"].get<std::string>();
+            } else if (!output.empty()) {
+                lastError = output;
+            } else {
+                lastError = "agy exited with code " + std::to_string(exitCode);
+            }
+        }
+
+        res.status = 503;
+        res.set_content(nlohmann::json({
+            {"status", "error"},
+            {"error", lastError}
+        }).dump(2), "application/json");
     });
 
-    _server->Get("/api/agent/artifacts", [](const httplib::Request& req, httplib::Response& res) {
+    _server->Get("/api/agent/artifacts", [getIdeBrainDir, getCliBrainDir](
+                                             const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string id = req.get_param_value("id");
-        if (id.empty()) id = "27b5c273-5f2a-4215-a5a2-28211761228f";
-        std::string brainPath = PathUtils::expandHome("~/.gemini/antigravity-ide/brain");
-        fs::path dir = fs::path(brainPath) / id;
+        if (id.empty() || id.find("..") != std::string::npos || id.find('/') != std::string::npos) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Missing or invalid conversation id\"}", "application/json");
+            return;
+        }
+
         nlohmann::json artifacts = nlohmann::json::array();
-        if (fs::exists(dir) && fs::is_directory(dir)) {
-            for (const auto& entry : fs::directory_iterator(dir)) {
+        auto scanArtifactsDir = [&](const fs::path& dir) {
+            if (!fs::exists(dir) || !fs::is_directory(dir)) return;
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator(dir, ec)) {
+                if (ec) break;
                 if (entry.is_regular_file() && entry.path().extension() == ".md") {
                     artifacts.push_back({
                         {"name", entry.path().filename().string()},
@@ -902,52 +1937,96 @@ void WebServer::setupRoutes() {
                     });
                 }
             }
-        }
+        };
+        scanArtifactsDir(fs::path(getIdeBrainDir()) / id);
+        scanArtifactsDir(fs::path(getCliBrainDir()) / id);
+
         nlohmann::json resp;
         resp["artifacts"] = artifacts;
         res.set_content(resp.dump(2), "application/json");
     });
 
-    _server->Get("/api/workspace/tree", [](const httplib::Request&, httplib::Response& res) {
+    _server->Get("/api/workspace/tree", [getWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        fs::path root = fs::current_path();
-        nlohmann::json tree = nlohmann::json::array();
-        try {
-            for (const auto& entry : fs::directory_iterator(root)) {
+        fs::path root = getWorkspaceRoot();
+        std::string relSubPath = req.get_param_value("path");
+        if (relSubPath.find("..") != std::string::npos) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Invalid path traversal\"}", "application/json");
+            return;
+        }
+
+        fs::path startDir = relSubPath.empty() ? root : (root / relSubPath);
+        if (!fs::exists(startDir) || !fs::is_directory(startDir)) {
+            res.status = 404;
+            res.set_content("{\"error\":\"Directory not found\"}", "application/json");
+            return;
+        }
+
+        auto isSkippedDir = [](const std::string& name) -> bool {
+            if (name.empty() || name[0] == '.') return true;
+            return name == "build" || name == "node_modules" ||
+                   name == "third_party" || name == "__pycache__";
+        };
+
+        std::function<nlohmann::json(const fs::path&, int)> buildTree;
+        buildTree = [&](const fs::path& dirPath, int depth) -> nlohmann::json {
+            nlohmann::json nodes = nlohmann::json::array();
+            if (depth > 6) {
+                return nodes;
+            }
+            std::error_code ec;
+            std::vector<fs::directory_entry> entries;
+            for (const auto& entry : fs::directory_iterator(dirPath, ec)) {
+                if (ec) break;
+                entries.push_back(entry);
+            }
+            std::sort(entries.begin(), entries.end(), [](const fs::directory_entry& a, const fs::directory_entry& b) {
+                bool aDir = a.is_directory();
+                bool bDir = b.is_directory();
+                if (aDir != bDir) return aDir > bDir;
+                return a.path().filename().string() < b.path().filename().string();
+            });
+
+            for (const auto& entry : entries) {
                 std::string fname = entry.path().filename().string();
-                if (fname[0] == '.' || fname == "build" || fname == "third_party") continue;
-                bool isDir = entry.is_directory();
+                if (isSkippedDir(fname)) continue;
+
+                std::error_code typeEc;
+                bool isDir = entry.is_directory(typeEc);
+                uint64_t fsize = 0;
+                if (!isDir && entry.is_regular_file(typeEc)) {
+                    std::error_code sizeEc;
+                    fsize = static_cast<uint64_t>(entry.file_size(sizeEc));
+                }
+
                 nlohmann::json node;
                 node["name"] = fname;
-                node["path"] = fs::relative(entry.path(), root).string();
+                node["path"] = fs::relative(entry.path(), root, typeEc).string();
                 node["isDir"] = isDir;
-                if (isDir) {
-                    nlohmann::json children = nlohmann::json::array();
-                    for (const auto& sub : fs::directory_iterator(entry.path())) {
-                        std::string subname = sub.path().filename().string();
-                        if (subname[0] == '.') continue;
-                        children.push_back({
-                            {"name", subname},
-                            {"path", fs::relative(sub.path(), root).string()},
-                            {"isDir", sub.is_directory()}
-                        });
-                    }
-                    node["children"] = children;
+                node["size"] = fsize;
+                if (isDir && depth < 6) {
+                    node["children"] = buildTree(entry.path(), depth + 1);
                 }
-                tree.push_back(node);
+                nodes.push_back(std::move(node));
             }
+            return nodes;
+        };
+
+        try {
+            nlohmann::json tree = buildTree(startDir, 1);
+            nlohmann::json resp;
+            resp["workspace"] = root.string();
+            resp["path"] = relSubPath;
+            resp["tree"] = tree;
+            res.set_content(resp.dump(2), "application/json");
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-            return;
         }
-        nlohmann::json resp;
-        resp["workspace"] = root.string();
-        resp["tree"] = tree;
-        res.set_content(resp.dump(2), "application/json");
     });
 
-    _server->Get("/api/workspace/file", [](const httplib::Request& req, httplib::Response& res) {
+    _server->Get("/api/workspace/file", [getWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string relPath = req.get_param_value("path");
         if (relPath.empty() || relPath.find("..") != std::string::npos) {
@@ -955,7 +2034,7 @@ void WebServer::setupRoutes() {
             res.set_content("{\"error\":\"Invalid path\"}", "application/json");
             return;
         }
-        fs::path target = fs::current_path() / relPath;
+        fs::path target = getWorkspaceRoot() / relPath;
         if (!fs::exists(target) || fs::is_directory(target)) {
             res.status = 404;
             res.set_content("{\"error\":\"File not found\"}", "application/json");
@@ -971,7 +2050,7 @@ void WebServer::setupRoutes() {
         res.set_content(resp.dump(2), "application/json");
     });
 
-    _server->Post("/api/workspace/file", [](const httplib::Request& req, httplib::Response& res) {
+    _server->Post("/api/workspace/file", [getWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         try {
             auto j = nlohmann::json::parse(req.body);
@@ -982,7 +2061,7 @@ void WebServer::setupRoutes() {
                 res.set_content("{\"error\":\"Invalid path\"}", "application/json");
                 return;
             }
-            fs::path target = fs::current_path() / relPath;
+            fs::path target = getWorkspaceRoot() / relPath;
             std::ofstream f(target, std::ios::trunc);
             if (!f.is_open()) {
                 res.status = 500;

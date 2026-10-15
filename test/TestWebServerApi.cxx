@@ -140,21 +140,23 @@ int main() {
     assert(resPair && resPair->status == 200);
     json pairResp = json::parse(resPair->body);
     assert(pairResp.contains("token"));
+    std::string mobileToken = pairResp["token"];
+    httplib::Headers mobileAuthHeaders = {{"X-Mobile-Token", mobileToken}};
 
-    auto resDevs = client.Get("/api/mobile/devices");
+    auto resDevs = client.Get("/api/mobile/devices", mobileAuthHeaders);
     assert(resDevs && resDevs->status == 200);
     json devs = json::parse(resDevs->body);
     assert(devs.size() == 1);
 
     // 5. Action Approval Request & Asynchronous Decision API
-    std::thread approverThread([]() {
+    std::thread approverThread([mobileAuthHeaders]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         httplib::Client mobileClient("http://127.0.0.1:3899");
         mobileClient.set_connection_timeout(2, 0);
         mobileClient.set_read_timeout(5, 0);
 
         // Poll pending
-        auto resPending = mobileClient.Get("/api/approvals/pending");
+        auto resPending = mobileClient.Get("/api/approvals/pending", mobileAuthHeaders);
         assert(resPending && resPending->status == 200);
         json pendingList = json::parse(resPending->body);
         assert(!pendingList.empty());
@@ -165,7 +167,7 @@ int main() {
             {"approval_id", approvalId},
             {"decision", "allow"}
         };
-        auto resDec = mobileClient.Post("/api/approvals/decision", decBody.dump(), "application/json");
+        auto resDec = mobileClient.Post("/api/approvals/decision", mobileAuthHeaders, decBody.dump(), "application/json");
         assert(resDec && resDec->status == 200);
     });
 

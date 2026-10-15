@@ -299,7 +299,7 @@ int main(int argc, char* argv[]) {
     int64_t lastInsightRebuildEpoch = 0;
 
     AgentTelemetryDb::getInstance().open();
-    MobileGateway::getInstance().init();
+    MobileGateway::getInstance().init(PathUtils::getAimonConfigDir() + "/mobile_devices.json");
 
 
     AntigravityCollector agCollector(cfg.antigravity);

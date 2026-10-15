@@ -51,8 +51,14 @@ class MobileGateway {
 public:
     static MobileGateway &getInstance();
 
+    MobileGateway();
+    ~MobileGateway();
+
     bool init(const std::string &storagePath = "");
     void shutdown();
+
+    bool loadSessions();
+    bool saveSessions();
 
     // Pairing & Authentication
     std::string createPairingSecret(int validitySeconds = 300);
@@ -60,9 +66,34 @@ public:
                     const std::string &deviceId,
                     const std::string &deviceName,
                     std::string &outToken);
+    bool verifyPairingCode(const std::string &pairingSecret,
+                           const std::string &deviceId,
+                           const std::string &deviceName,
+                           std::string &outToken) {
+        return pairDevice(pairingSecret, deviceId, deviceName, outToken);
+    }
+    std::string verifyPairingCode(const std::string &pairingSecret,
+                                  const std::string &deviceName = "Android Client",
+                                  const std::string &deviceId = "") {
+        std::string token;
+        if (pairDevice(pairingSecret, deviceId, deviceName, token)) {
+            return token;
+        }
+        return "";
+    }
     bool authenticate(const std::string &token, std::string &outDeviceId);
+    bool validateToken(const std::string &token) {
+        std::string devId;
+        return authenticate(token, devId);
+    }
+    bool validateToken(const std::string &token, std::string &outDeviceId) {
+        return authenticate(token, outDeviceId);
+    }
     void revokeDevice(const std::string &deviceId);
     std::vector<MobileSession> listDevices();
+    std::vector<MobileSession> getPairedDevices() {
+        return listDevices();
+    }
 
     // Action Approvals
     std::string submitApprovalRequest(const std::string &agentType,
@@ -74,6 +105,13 @@ public:
     ApprovalVerdict waitForApproval(const std::string &approvalId, int timeoutSeconds = 120);
     bool resolveApproval(const std::string &approvalId, ApprovalVerdict verdict);
     std::vector<nlohmann::json> listPendingApprovals();
+    std::vector<nlohmann::json> getPendingApprovals() {
+        return listPendingApprovals();
+    }
+    nlohmann::json getPendingApprovalsJson() {
+        return nlohmann::json(listPendingApprovals());
+    }
+    nlohmann::json getApprovalStatus(const std::string &approvalId);
 
     // Notification / WS Broadcast Dispatcher Callback
     using BroadcastCallback = std::function<void(const std::string &type, const nlohmann::json &payload)>;
@@ -81,19 +119,21 @@ public:
     void broadcastWsMessage(const std::string &type, const nlohmann::json &payload);
 
 private:
-    MobileGateway();
-    ~MobileGateway();
     MobileGateway(const MobileGateway &) = delete;
     MobileGateway &operator=(const MobileGateway &) = delete;
 
+    bool loadSessionsLocked();
+    bool saveSessionsLocked();
     std::string generateRandomHex(size_t byteCount);
 
     std::mutex _mutex;
+    std::string _storagePath;
     std::string _lastGeneratedSecret;
     time_t _lastGeneratedExpires = 0;
     std::map<std::string, time_t> _pairingSecrets;
     std::map<std::string, MobileSession> _sessions;
     std::map<std::string, std::shared_ptr<ApprovalRequest>> _pendingApprovals;
+    std::map<std::string, ApprovalVerdict> _resolvedApprovals;
     BroadcastCallback _broadcastCb;
 };
 

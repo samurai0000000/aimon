@@ -31,6 +31,7 @@ namespace aimon {
 class McpServer;
 class TcpGateway;
 class InsightEngine;
+class MobileGateway;
 
 struct SseSession {
     std::string id;
@@ -59,6 +60,10 @@ public:
         _insightEngine = engine;
     }
 
+    void setMobileGateway(MobileGateway* gateway) {
+        _mobileGateway = gateway;
+    }
+
     int getPort() const {
         return _config.port;
     }
@@ -68,6 +73,10 @@ private:
 
     std::string createUiSession();
     bool isValidUiSession(const httplib::Request& req) const;
+    bool isValidMobileToken(const httplib::Request& req) const;
+    bool isValidMobileOrUiRequest(const httplib::Request& req) const;
+    static std::string extractMobileToken(const httplib::Request& req);
+    static bool isLoopbackRequest(const httplib::Request& req);
     static std::string getMcpHintForPath(const std::string& path, const std::string& body);
 
     StateStore& _stateStore;
@@ -77,6 +86,7 @@ private:
     McpServer* _mcpServer = nullptr;
     TcpGateway* _tcpGateway = nullptr;
     InsightEngine* _insightEngine = nullptr;
+    MobileGateway* _mobileGateway = nullptr;
 
     bool _endpointsEnabled = false;
     mutable std::mutex _sessionMutex;

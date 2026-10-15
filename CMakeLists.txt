@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.14 LANGUAGES CXX)
+project(aimon VERSION 1.0.15 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -158,24 +158,47 @@ target_link_libraries(test_agent_telemetry_db PRIVATE
     Threads::Threads
 )
 
+find_library(RAPIDCHECK_LIBRARY rapidcheck)
+if(NOT RAPIDCHECK_LIBRARY)
+    message(FATAL_ERROR "RapidCheck library not found (needed by the property tests)")
+endif()
+
 add_executable(test_mobile_gateway
     test/TestMobileGateway.cxx
-    src/MobileGateway.cxx
-    src/AgentTelemetryDb.cxx
-    src/PathUtils.cxx
+    ${LIB_SOURCES}
 )
+
+target_compile_definitions(test_mobile_gateway PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 
 target_include_directories(test_mobile_gateway PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include
+    ${MOSQUITTO_INCLUDE_DIRS}
+    ${CURSES_INCLUDE_DIRS}
+    ${LIBCONFIGPP_INCLUDE_DIRS}
 )
 
 target_link_libraries(test_mobile_gateway PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
     SQLite::SQLite3
     Threads::Threads
+    ${MOSQUITTO_LIBRARIES}
+    ${CURSES_LIBRARIES}
+    ${LIBCONFIGPP_LIBRARIES}
+    ${RAPIDCHECK_LIBRARY}
 )
+
+if(MOSQUITTO_LIBRARY_DIRS)
+    target_link_directories(test_mobile_gateway PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+endif()
+
+if(LIBCONFIGPP_LIBRARY_DIRS)
+    target_link_directories(test_mobile_gateway PRIVATE ${LIBCONFIGPP_LIBRARY_DIRS})
+endif()
 
 add_executable(test_web_server_api
     test/TestWebServerApi.cxx
