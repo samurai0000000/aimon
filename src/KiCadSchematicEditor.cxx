@@ -1405,6 +1405,8 @@ nlohmann::json KiCadSchematicEditor::inspectFile(const nlohmann::json& arguments
                 {"rel_y", pad.relY},
                 {"size_x", pad.sizeX},
                 {"size_y", pad.sizeY},
+                {"drill", pad.drill},
+                {"layer", pad.layer},
                 {"net_code", pad.netCode},
                 {"net", pad.netName}
             });
@@ -1467,6 +1469,16 @@ nlohmann::json KiCadSchematicEditor::inspectFile(const nlohmann::json& arguments
         holeArr.push_back({{"x", h.x}, {"y", h.y}, {"drill", h.drill}, {"pad", h.pad}});
     }
 
+    nlohmann::json outlineLinesArr = nlohmann::json::array();
+    for (const auto& ln : outline) {
+        outlineLinesArr.push_back({
+            {"x1", ln.x1},
+            {"y1", ln.y1},
+            {"x2", ln.x2},
+            {"y2", ln.y2}
+        });
+    }
+
     std::vector<std::string> unrouted = computeUnroutedNets(footprints, tracks, zones);
 
     return {
@@ -1489,7 +1501,8 @@ nlohmann::json KiCadSchematicEditor::inspectFile(const nlohmann::json& arguments
         {"board_outline", {
             {"width_mm", outlineW},
             {"height_mm", outlineH},
-            {"segments", outline.size()}
+            {"segments", outline.size()},
+            {"lines", outlineLinesArr}
         }},
         {"footprints", fpArr},
         {"tracks", trkArr},
@@ -1581,6 +1594,9 @@ nlohmann::json KiCadSchematicEditor::applySchematicEdits(const nlohmann::json& a
 
     if (arguments.contains("add_components") && arguments["add_components"].is_array()) {
         processCompArray(arguments["add_components"]);
+    }
+    if (arguments.contains("components") && arguments["components"].is_array()) {
+        processCompArray(arguments["components"]);
     }
     if (arguments.contains("symbols") && arguments["symbols"].is_array()) {
         processCompArray(arguments["symbols"]);
@@ -1685,13 +1701,21 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
         pcbPath = p.string();
     }
 
+    if (schSexp.empty() && schPath.empty() &&
+        (arguments.contains("components") || arguments.contains("add_components") || arguments.contains("symbols"))) {
+        nlohmann::json inlineSch = applySchematicEdits(arguments);
+        if (inlineSch.value("ok", false)) {
+            schSexp = inlineSch.value("sexp", "");
+        }
+    }
+
     nlohmann::json schInspect;
     if (!schSexp.empty()) {
         schInspect = inspectFile({{"sexp", schSexp}});
     } else if (!schPath.empty()) {
         schInspect = inspectFile({{"file_path", schPath}});
     } else {
-        return {{"ok", false}, {"error", "kicad_sync_sch_to_pcb requires 'schematic_path' or 'schematic_sexp'"}};
+        return {{"ok", false}, {"error", "kicad_sync_sch_to_pcb requires 'schematic_path', 'schematic_sexp', or 'components'"}};
     }
 
     if (!schInspect.value("ok", false)) {
@@ -1703,6 +1727,10 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
     std::map<std::string, int> codeByNet;
     std::vector<PcbOutlineLine> outline;
     double outlineW = 60.0, outlineH = 45.0;
+    if (arguments.contains("board_outline") && arguments["board_outline"].is_object()) {
+        outlineW = arguments["board_outline"].value("width_mm", outlineW);
+        outlineH = arguments["board_outline"].value("height_mm", outlineH);
+    }
     std::vector<PcbFootprintModel> footprints;
     std::vector<PcbTrackModel> tracks;
     std::vector<PcbViaModel> vias;
@@ -1846,6 +1874,7 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
         ofs.close();
     }
 
+    nlohmann::json pcbSummary = inspectFile({{"sexp", pcbSexp}});
     std::vector<std::string> unrouted = computeUnroutedNets(footprints, tracks, zones);
     return {
         {"ok", true},
@@ -1853,6 +1882,11 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
         {"pcb_path", pcbPath},
         {"synced_components", syncedCount},
         {"footprints_count", footprints.size()},
+        {"footprints", pcbSummary.value("footprints", nlohmann::json::array())},
+        {"board_outline", pcbSummary.value("board_outline", nlohmann::json::object())},
+        {"tracks", pcbSummary.value("tracks", nlohmann::json::array())},
+        {"vias", pcbSummary.value("vias", nlohmann::json::array())},
+        {"zones", pcbSummary.value("zones", nlohmann::json::array())},
         {"nets_count", schInspect["nets"].size()},
         {"nets", schInspect["nets"]},
         {"unrouted_nets_count", unrouted.size()},
@@ -1949,6 +1983,38 @@ nlohmann::json KiCadSchematicEditor::applyPcbEdits(const nlohmann::json& argumen
             std::string val = item.value("value", ref);
             std::string lcsc = item.value("lcsc", "");
 
+            auto applyItemPinNets = [&](PcbFootprintModel& targetFp) {
+                if (item.contains("pin_nets") && item["pin_nets"].is_object()) {
+                    for (auto pit = item["pin_nets"].begin(); pit != item["pin_nets"].end(); ++pit) {
+                        std::string pNum = pit.key();
+                        std::string pNet = pit.value().is_string() ? pit.value().get<std::string>() : "";
+                        if (!pNet.empty()) {
+                            for (auto& pad : targetFp.pads) {
+                                if (pad.number == pNum) {
+                                    pad.netName = pNet;
+                                    pad.netCode = ensureNetCode(pNet);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (item.contains("pins") && item["pins"].is_array()) {
+                    for (const auto& pinObj : item["pins"]) {
+                        if (!pinObj.is_object()) continue;
+                        std::string pNum = pinObj.value("number", pinObj.value("pin", ""));
+                        std::string pNet = pinObj.value("net", "");
+                        if (!pNum.empty() && !pNet.empty()) {
+                            for (auto& pad : targetFp.pads) {
+                                if (pad.number == pNum) {
+                                    pad.netName = pNet;
+                                    pad.netCode = ensureNetCode(pNet);
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
             auto it = std::find_if(footprints.begin(), footprints.end(), [&](const PcbFootprintModel& f) {
                 return f.reference == ref;
             });
@@ -1964,6 +2030,7 @@ nlohmann::json KiCadSchematicEditor::applyPcbEdits(const nlohmann::json& argumen
                 for (auto& pad : it->pads) {
                     if (pad.type == "smd") pad.layer = layer;
                 }
+                applyItemPinNets(*it);
             } else {
                 PcbFootprintModel fp;
                 fp.reference = ref;
@@ -1985,7 +2052,8 @@ nlohmann::json KiCadSchematicEditor::applyPcbEdits(const nlohmann::json& argumen
                         pad.relY = pObj.value("dy", pObj.value("rel_y", 0.0));
                         pad.sizeX = pObj.value("size_x", 0.8);
                         pad.sizeY = pObj.value("size_y", 0.8);
-                        pad.layer = layer;
+                        pad.drill = pObj.value("drill_mm", pObj.value("drill", 0.0));
+                        pad.layer = pObj.value("layer", (pad.type == "smd") ? layer : "*.Cu");
                         pad.netName = pObj.value("net", "");
                         pad.netCode = ensureNetCode(pad.netName);
                         fp.pads.push_back(pad);
@@ -1994,6 +2062,7 @@ nlohmann::json KiCadSchematicEditor::applyPcbEdits(const nlohmann::json& argumen
                 if (fp.pads.empty()) {
                     fp.pads = defaultPadsForFootprint(fpLib, layer);
                 }
+                applyItemPinNets(fp);
                 footprints.push_back(fp);
             }
         }

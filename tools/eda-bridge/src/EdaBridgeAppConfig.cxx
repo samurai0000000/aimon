@@ -444,49 +444,170 @@ var edaEsbuildExportName = (function () {
         };
     }
 
+    const MM_TO_MIL = 39.37007874;
+
+    function toCanvasUnits(val, units) {
+        const n = Number(val || 0);
+        if (String(units || "mm").toLowerCase() === "mil") {
+            return n;
+        }
+        return Math.round(n * MM_TO_MIL * 1000) / 1000;
+    }
+
+    function normalizePcbLayer(layerName) {
+        const s = String(layerName || "TopLayer");
+        if (s === "F.Cu" || s === "Top" || s === "TopLayer") return "TopLayer";
+        if (s === "B.Cu" || s === "Bottom" || s === "BottomLayer") return "BottomLayer";
+        if (s === "F.SilkS" || s === "TopSilkLayer") return "TopSilkLayer";
+        if (s === "B.SilkS" || s === "BottomSilkLayer") return "BottomSilkLayer";
+        if (s === "Edge.Cuts" || s === "BoardOutLine") return "BoardOutLine";
+        return s;
+    }
+
+    function defaultPadsForEasyEdaFootprint(fpName) {
+        const upper = String(fpName || "").toUpperCase();
+        if (upper.indexOf("SOT-23") >= 0) {
+            return [
+                { number: "1", rel_x: -0.95, rel_y: 1.1, size_x: 0.6, size_y: 0.7 },
+                { number: "2", rel_x: 0.95, rel_y: 1.1, size_x: 0.6, size_y: 0.7 },
+                { number: "3", rel_x: 0.0, rel_y: -1.1, size_x: 0.6, size_y: 0.7 }
+            ];
+        }
+        if (upper.indexOf("SOIC-8") >= 0 || upper.indexOf("SOP-8") >= 0) {
+            const pads = [];
+            for (let i = 0; i < 4; ++i) {
+                pads.push({ number: String(i + 1), rel_x: -2.7, rel_y: -1.905 + i * 1.27, size_x: 1.5, size_y: 0.6 });
+            }
+            for (let i = 0; i < 4; ++i) {
+                pads.push({ number: String(i + 5), rel_x: 2.7, rel_y: 1.905 - i * 1.27, size_x: 1.5, size_y: 0.6 });
+            }
+            return pads;
+        }
+        if (upper.indexOf("0805") >= 0) {
+            return [
+                { number: "1", rel_x: -1.0, rel_y: 0.0, size_x: 1.0, size_y: 1.3 },
+                { number: "2", rel_x: 1.0, rel_y: 0.0, size_x: 1.0, size_y: 1.3 }
+            ];
+        }
+        return [
+            { number: "1", rel_x: -0.8, rel_y: 0.0, size_x: 0.8, size_y: 0.9 },
+            { number: "2", rel_x: 0.8, rel_y: 0.0, size_x: 0.8, size_y: 0.9 }
+        ];
+    }
+
+    async function resolveDeviceArg(c) {
+        let devArg = c.device_uuid || c.uuid || "";
+        const libraryUuid = c.library_uuid || c.libraryUuid || undefined;
+        if (devArg && typeof devArg === "object") {
+            return devArg;
+        }
+        const looksLikeUuid = typeof devArg === "string" && devArg.length >= 24 && devArg.indexOf(":") < 0;
+        if (looksLikeUuid) {
+            return libraryUuid ? { uuid: devArg, libraryUuid: libraryUuid } : devArg;
+        }
+        const searchKey = String(c.lcsc || c.query || c.value || c.lib_id || devArg || "");
+        if (searchKey && typeof eda !== "undefined" && eda.lib_Device && typeof eda.lib_Device.search === "function") {
+            try {
+                const hits = await eda.lib_Device.search(searchKey, libraryUuid);
+                if (Array.isArray(hits) && hits.length > 0 && hits[0].uuid) {
+                    if (hits[0].libraryUuid) {
+                        return { uuid: hits[0].uuid, libraryUuid: hits[0].libraryUuid };
+                    }
+                    return hits[0].uuid;
+                }
+            } catch (err) {
+                logDiag("lib_Device.search fallback failed for " + searchKey + ": " + String(err));
+            }
+        }
+        return devArg || c.lib_id || "Device:R";
+    }
+
     async function handleEditSchematic(args) {
         let placedComponents = 0;
         let placedWires = 0;
         let placedLabels = 0;
+        const units = (args && args.units) ? String(args.units) : "mm";
 
-        const comps = args.add_components || args.symbols || [];
+        const comps = (args && (args.add_components || args.components || args.symbols)) || [];
         if (Array.isArray(comps) && typeof eda !== "undefined" && eda.sch_PrimitiveComponent) {
             for (const c of comps) {
-                await eda.sch_PrimitiveComponent.create(
-                    c.device_uuid || c.uuid || c.lib_id,
-                    Number(c.x || 0),
-                    Number(c.y || 0),
+                const resolvedDevice = await resolveDeviceArg(c);
+                const xVal = toCanvasUnits(c.x !== undefined ? c.x : c.x_mm, units);
+                const yVal = toCanvasUnits(c.y !== undefined ? c.y : c.y_mm, units);
+                const rotVal = Number(c.rotation !== undefined ? c.rotation : c.rotation_deg || 0);
+                const created = await eda.sch_PrimitiveComponent.create(
+                    resolvedDevice,
+                    xVal,
+                    yVal,
                     c.sub_part_name || undefined,
-                    Number(c.rotation || 0),
+                    rotVal,
                     Boolean(c.mirror || false)
                 );
+                const ref = String(c.reference || c.ref || "");
+                const val = String(c.value || "");
+                if (created && typeof created === "object") {
+                    try {
+                        if (ref && typeof created.setState_Designator === "function") {
+                            await created.setState_Designator(ref);
+                        } else if (ref) {
+                            created.designator = ref;
+                        }
+                        if (val && typeof created.setState_Name === "function") {
+                            await created.setState_Name(val);
+                        } else if (val && typeof created.setState_Value === "function") {
+                            await created.setState_Value(val);
+                        }
+                    } catch (err) {
+                    }
+                }
                 placedComponents += 1;
             }
         }
 
-        const wires = args.add_wires || args.wires || [];
+        const wires = (args && (args.add_wires || args.wires)) || [];
         if (Array.isArray(wires) && typeof eda !== "undefined" && eda.sch_PrimitiveWire) {
             for (const w of wires) {
-                const pts = w.points || [Number(w.x1 || 0), Number(w.y1 || 0), Number(w.x2 || 0), Number(w.y2 || 0)];
+                let pts;
+                if (Array.isArray(w.points)) {
+                    pts = w.points.map(function (v) { return toCanvasUnits(v, units); });
+                } else {
+                    pts = [
+                        toCanvasUnits(w.x1 || 0, units),
+                        toCanvasUnits(w.y1 || 0, units),
+                        toCanvasUnits(w.x2 || 0, units),
+                        toCanvasUnits(w.y2 || 0, units)
+                    ];
+                }
                 await eda.sch_PrimitiveWire.create(pts, w.net || undefined);
                 placedWires += 1;
             }
         }
 
-        const labels = args.add_labels || args.labels || [];
+        const labels = [].concat(
+            (args && (args.add_labels || args.labels)) || [],
+            (args && (args.add_power_ports || args.power_ports)) || []
+        );
         if (Array.isArray(labels) && typeof eda !== "undefined" && eda.sch_PrimitiveNetLabel) {
             for (const l of labels) {
                 await eda.sch_PrimitiveNetLabel.create(
-                    Number(l.x || 0),
-                    Number(l.y || 0),
+                    toCanvasUnits(l.x || 0, units),
+                    toCanvasUnits(l.y || 0, units),
                     String(l.name || l.net || "NET")
                 );
                 placedLabels += 1;
             }
         }
 
+        try {
+            if (typeof eda !== "undefined" && eda.dmt_EditorControl && typeof eda.dmt_EditorControl.zoomToAllPrimitives === "function") {
+                await eda.dmt_EditorControl.zoomToAllPrimitives();
+            }
+        } catch (err) {
+        }
+
         return {
             ok: true,
+            active_document: await resolveActiveDocumentTitle(),
             placed_components: placedComponents,
             placed_wires: placedWires,
             placed_labels: placedLabels
@@ -524,6 +645,7 @@ var edaEsbuildExportName = (function () {
                     if (Array.isArray(raw)) {
                         for (const c of raw) {
                             components.push({
+                                id: String(callGetter(c, "getState_PrimitiveId", "primitiveId", "id", "")),
                                 reference: String(callGetter(c, "getState_Designator", "designator", "reference", "")),
                                 value: String(callGetter(c, "getState_Name", "name", "value", "")),
                                 footprint: String(callGetter(c, "getState_Footprint", "footprintName", "", "")),
@@ -588,6 +710,7 @@ var edaEsbuildExportName = (function () {
 
         return {
             ok: true,
+            active_document: await resolveActiveDocumentTitle(),
             components_count: components.length,
             tracks_count: tracks.length,
             vias_count: vias.length,
@@ -600,40 +723,190 @@ var edaEsbuildExportName = (function () {
 
     async function handleEditPcb(args) {
         let updatedPlacements = 0;
+        let createdFootprints = 0;
+        let createdPads = 0;
         let addedTracks = 0;
         let addedVias = 0;
         let addedZones = 0;
+        const units = (args && args.units) ? String(args.units) : "mm";
 
-        if (args.board_outline && typeof eda !== "undefined" && eda.pcb_PrimitiveLine) {
+        if (args.board_outline && typeof eda !== "undefined" && eda.pcb_PrimitiveLine && eda.pcb_PrimitiveLine.create) {
             const bo = args.board_outline;
-            const w = Number(bo.width_mm || bo.width || 50);
-            const h = Number(bo.height_mm || bo.height || 40);
-            await eda.pcb_PrimitiveLine.create("BoardOutLine", 0, 0, w, 0, 0.15);
-            await eda.pcb_PrimitiveLine.create("BoardOutLine", w, 0, w, h, 0.15);
-            await eda.pcb_PrimitiveLine.create("BoardOutLine", w, h, 0, h, 0.15);
-            await eda.pcb_PrimitiveLine.create("BoardOutLine", 0, h, 0, 0, 0.15);
+            const lineW = toCanvasUnits(0.15, units);
+            if (Array.isArray(bo)) {
+                for (const seg of bo) {
+                    await eda.pcb_PrimitiveLine.create(
+                        "BoardOutLine",
+                        toCanvasUnits(seg.x1 || 0, units),
+                        toCanvasUnits(seg.y1 || 0, units),
+                        toCanvasUnits(seg.x2 || 0, units),
+                        toCanvasUnits(seg.y2 || 0, units),
+                        lineW
+                    );
+                }
+            } else if (Array.isArray(bo.lines) && bo.lines.length > 0) {
+                for (const seg of bo.lines) {
+                    await eda.pcb_PrimitiveLine.create(
+                        "BoardOutLine",
+                        toCanvasUnits(seg.x1 || 0, units),
+                        toCanvasUnits(seg.y1 || 0, units),
+                        toCanvasUnits(seg.x2 || 0, units),
+                        toCanvasUnits(seg.y2 || 0, units),
+                        lineW
+                    );
+                }
+            } else {
+                const x0 = toCanvasUnits(bo.x || 0, units);
+                const y0 = toCanvasUnits(bo.y || 0, units);
+                const w = toCanvasUnits(bo.width_mm || bo.width || 50, units);
+                const h = toCanvasUnits(bo.height_mm || bo.height || 40, units);
+                await eda.pcb_PrimitiveLine.create("BoardOutLine", x0, y0, x0 + w, y0, lineW);
+                await eda.pcb_PrimitiveLine.create("BoardOutLine", x0 + w, y0, x0 + w, y0 + h, lineW);
+                await eda.pcb_PrimitiveLine.create("BoardOutLine", x0 + w, y0 + h, x0, y0 + h, lineW);
+                await eda.pcb_PrimitiveLine.create("BoardOutLine", x0, y0 + h, x0, y0, lineW);
+            }
         }
 
         const placements = args.placements || args.footprints || [];
-        if (Array.isArray(placements) && typeof eda !== "undefined" && eda.pcb_PrimitiveComponent) {
-            for (const p of placements) {
-                if (eda.pcb_PrimitiveComponent.modify) {
-                    await eda.pcb_PrimitiveComponent.modify(p.reference, {
-                        x: Number(p.x_mm !== undefined ? p.x_mm : p.x || 0),
-                        y: Number(p.y_mm !== undefined ? p.y_mm : p.y || 0),
-                        rotation: Number(p.rotation_deg !== undefined ? p.rotation_deg : p.rotation || 0),
-                        layer: p.layer || "TopLayer"
-                    });
+        if (Array.isArray(placements) && typeof eda !== "undefined") {
+            const compByRef = {};
+            if (eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.getAll === "function") {
+                try {
+                    const existing = await eda.pcb_PrimitiveComponent.getAll();
+                    if (Array.isArray(existing)) {
+                        for (const comp of existing) {
+                            const des = String(callGetter(comp, "getState_Designator", "designator", "reference", ""));
+                            if (des) {
+                                compByRef[des] = comp;
+                            }
+                        }
+                    }
+                } catch (err) {
                 }
-                updatedPlacements += 1;
+            }
+
+            for (const p of placements) {
+                const ref = String(p.reference || p.ref || "");
+                const xRaw = Number(p.x_mm !== undefined ? p.x_mm : p.x || 0);
+                const yRaw = Number(p.y_mm !== undefined ? p.y_mm : p.y || 0);
+                const xCanvas = toCanvasUnits(xRaw, units);
+                const yCanvas = toCanvasUnits(yRaw, units);
+                const rot = Number(p.rotation_deg !== undefined ? p.rotation_deg : p.rotation || 0);
+                const layer = normalizePcbLayer(p.layer || "TopLayer");
+                const existingComp = compByRef[ref];
+
+                if (existingComp || (eda.pcb_PrimitiveComponent && eda.pcb_PrimitiveComponent.modify && !p.pads && !p.footprint)) {
+                    const targetId = existingComp
+                        ? String(callGetter(existingComp, "getState_PrimitiveId", "primitiveId", "id", ref))
+                        : ref;
+                    if (eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.modify === "function") {
+                        await eda.pcb_PrimitiveComponent.modify(targetId, {
+                            x: xCanvas,
+                            y: yCanvas,
+                            rotation: rot,
+                            layer: layer
+                        });
+                    } else if (existingComp && typeof existingComp.setState_X === "function") {
+                        await existingComp.setState_X(xCanvas);
+                        await existingComp.setState_Y(yCanvas);
+                    }
+                    updatedPlacements += 1;
+                } else {
+                    const padsSpec = (Array.isArray(p.pads) && p.pads.length > 0)
+                        ? p.pads
+                        : defaultPadsForEasyEdaFootprint(p.footprint || "R_0603");
+                    let minRx = -1.2, maxRx = 1.2, minRy = -0.8, maxRy = 0.8;
+                    for (const pad of padsSpec) {
+                        const rx = Number(pad.rel_x !== undefined ? pad.rel_x : pad.dx || 0);
+                        const ry = Number(pad.rel_y !== undefined ? pad.rel_y : pad.dy || 0);
+                        const sx = Number(pad.size_x || 0.8);
+                        const sy = Number(pad.size_y || 0.8);
+                        minRx = Math.min(minRx, rx - sx * 0.5 - 0.25);
+                        maxRx = Math.max(maxRx, rx + sx * 0.5 + 0.25);
+                        minRy = Math.min(minRy, ry - sy * 0.5 - 0.25);
+                        maxRy = Math.max(maxRy, ry + sy * 0.5 + 0.25);
+
+                        const px = toCanvasUnits(xRaw + rx, units);
+                        const py = toCanvasUnits(yRaw + ry, units);
+                        const pw = toCanvasUnits(sx, units);
+                        const ph = toCanvasUnits(sy, units);
+                        const pNet = String(pad.net || "");
+
+                        if (eda.pcb_PrimitivePad && typeof eda.pcb_PrimitivePad.create === "function") {
+                            try {
+                                await eda.pcb_PrimitivePad.create(
+                                    layer,
+                                    String(pad.number || "1"),
+                                    px,
+                                    py,
+                                    rot,
+                                    pw,
+                                    ph,
+                                    pNet
+                                );
+                                createdPads += 1;
+                            } catch (err) {
+                            }
+                        } else if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.create === "function") {
+                            await eda.pcb_PrimitiveTrack.create(
+                                pNet,
+                                layer,
+                                px - pw * 0.25,
+                                py,
+                                px + pw * 0.25,
+                                py,
+                                ph
+                            );
+                            createdPads += 1;
+                        }
+                    }
+
+                    if (eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.create === "function") {
+                        const silkLayer = (layer === "BottomLayer") ? "BottomSilkLayer" : "TopSilkLayer";
+                        const x1 = toCanvasUnits(xRaw + minRx, units);
+                        const y1 = toCanvasUnits(yRaw + minRy, units);
+                        const x2 = toCanvasUnits(xRaw + maxRx, units);
+                        const y2 = toCanvasUnits(yRaw + maxRy, units);
+                        const sw = toCanvasUnits(0.12, units);
+                        await eda.pcb_PrimitiveLine.create(silkLayer, x1, y1, x2, y1, sw);
+                        await eda.pcb_PrimitiveLine.create(silkLayer, x2, y1, x2, y2, sw);
+                        await eda.pcb_PrimitiveLine.create(silkLayer, x2, y2, x1, y2, sw);
+                        await eda.pcb_PrimitiveLine.create(silkLayer, x1, y2, x1, y1, sw);
+                    }
+                    if (ref && eda.pcb_PrimitiveString && typeof eda.pcb_PrimitiveString.create === "function") {
+                        try {
+                            await eda.pcb_PrimitiveString.create(
+                                "TopSilkLayer",
+                                toCanvasUnits(xRaw, units),
+                                toCanvasUnits(yRaw + minRy - 1.0, units),
+                                ref
+                            );
+                        } catch (err) {
+                        }
+                    }
+                    createdFootprints += 1;
+                    updatedPlacements += 1;
+                }
             }
         }
 
         const zones = args.zones || args.copper_pours || [];
         if (Array.isArray(zones) && typeof eda !== "undefined" && eda.pcb_PrimitivePour) {
             for (const z of zones) {
+                const scaledPts = Array.isArray(z.points)
+                    ? z.points.map(function (pt) {
+                        if (pt && typeof pt === "object") {
+                            return { x: toCanvasUnits(pt.x || 0, units), y: toCanvasUnits(pt.y || 0, units) };
+                        }
+                        return toCanvasUnits(pt, units);
+                    })
+                    : [];
                 if (eda.pcb_PrimitivePour.create) {
-                    await eda.pcb_PrimitivePour.create(z.net || "GND", z.layer || "TopLayer", z.points || []);
+                    await eda.pcb_PrimitivePour.create(
+                        z.net || "GND",
+                        normalizePcbLayer(z.layer || "TopLayer"),
+                        scaledPts
+                    );
                 }
                 addedZones += 1;
             }
@@ -645,12 +918,12 @@ var edaEsbuildExportName = (function () {
                 if (eda.pcb_PrimitiveTrack.create) {
                     await eda.pcb_PrimitiveTrack.create(
                         t.net || "",
-                        t.layer || "TopLayer",
-                        Number(t.x1 || 0),
-                        Number(t.y1 || 0),
-                        Number(t.x2 || 0),
-                        Number(t.y2 || 0),
-                        Number(t.width_mm || t.width || 0.25)
+                        normalizePcbLayer(t.layer || "TopLayer"),
+                        toCanvasUnits(t.x1 || 0, units),
+                        toCanvasUnits(t.y1 || 0, units),
+                        toCanvasUnits(t.x2 || 0, units),
+                        toCanvasUnits(t.y2 || 0, units),
+                        toCanvasUnits(t.width_mm || t.width || 0.25, units)
                     );
                 }
                 addedTracks += 1;
@@ -663,19 +936,29 @@ var edaEsbuildExportName = (function () {
                 if (eda.pcb_PrimitiveVia.create) {
                     await eda.pcb_PrimitiveVia.create(
                         v.net || "",
-                        Number(v.x || 0),
-                        Number(v.y || 0),
-                        Number(v.drill_mm || v.drill || 0.3),
-                        Number(v.size_mm || v.size || 0.6)
+                        toCanvasUnits(v.x || 0, units),
+                        toCanvasUnits(v.y || 0, units),
+                        toCanvasUnits(v.drill_mm || v.drill || 0.3, units),
+                        toCanvasUnits(v.size_mm || v.size || 0.6, units)
                     );
                 }
                 addedVias += 1;
             }
         }
 
+        try {
+            if (typeof eda !== "undefined" && eda.dmt_EditorControl && typeof eda.dmt_EditorControl.zoomToAllPrimitives === "function") {
+                await eda.dmt_EditorControl.zoomToAllPrimitives();
+            }
+        } catch (err) {
+        }
+
         return {
             ok: true,
+            active_document: await resolveActiveDocumentTitle(),
             updated_placements: updatedPlacements,
+            created_footprints: createdFootprints,
+            created_pads: createdPads,
             added_zones: addedZones,
             added_tracks: addedTracks,
             added_vias: addedVias
@@ -1137,12 +1420,14 @@ except Exception:
 )PY";
 
 static const char* kEmbeddedKiCadBridgePy = R"PY(#
-# KiCadAimonBridge.py - KiCad Live pcbnew Action Plugin for aimon
+# KiCadAimonBridge.py - KiCad Live pcbnew Action Plugin for aimon-eda-bridge
 #
 # Copyright (C) 2026, Charles Chiou
 #
 
 import json
+import math
+import os
 import socket
 import threading
 import time
@@ -1156,9 +1441,20 @@ except ImportError:
     pcbnew = None
     HAS_PCBNEW = False
 
+try:
+    import wx
+    HAS_WX = True
+except ImportError:
+    wx = None
+    HAS_WX = False
+
+
+def _vec2i(x_mm, y_mm):
+    return pcbnew.VECTOR2I(pcbnew.FromMM(float(x_mm)), pcbnew.FromMM(float(y_mm)))
+
 
 class KiCadAimonBridgeClient:
-    """Connects an open KiCad pcbnew session to aimon on 127.0.0.1:3893."""
+    """Connects an open KiCad pcbnew session to aimon-eda-bridge on 127.0.0.1:3893."""
 
     def __init__(self, host="127.0.0.1", port=3893):
         self._host = host
@@ -1166,6 +1462,11 @@ class KiCadAimonBridgeClient:
         self._running = False
         self._sock = None
         self._thread = None
+        self._file_mtime = (
+            os.path.getmtime(__file__)
+            if "__file__" in globals() and os.path.exists(__file__)
+            else 0.0
+        )
 
     def start(self):
         if self._running:
@@ -1183,112 +1484,642 @@ class KiCadAimonBridgeClient:
                 pass
             self._sock = None
 
+    def _run_on_gui_thread(self, fn):
+        if HAS_WX and wx is not None and hasattr(wx, "GetApp") and wx.GetApp() is not None:
+            if hasattr(wx, "IsMainThread") and wx.IsMainThread():
+                return fn()
+            done_evt = threading.Event()
+            box = {"result": None, "error": None}
+
+            def _wrapped():
+                try:
+                    box["result"] = fn()
+                except Exception as exc:
+                    box["error"] = str(exc)
+                finally:
+                    done_evt.set()
+
+            wx.CallAfter(_wrapped)
+            done_evt.wait(timeout=15.0)
+            if box["error"] is not None:
+                return {"ok": False, "error": box["error"], "live_gui": True}
+            if box["result"] is not None:
+                return box["result"]
+        return fn()
+
+    def _get_kicad_version(self):
+        if HAS_PCBNEW and hasattr(pcbnew, "Version"):
+            try:
+                v = str(pcbnew.Version()).strip()
+                if v:
+                    return v.split()[0].strip("()")
+            except Exception:
+                pass
+        return "10.0"
+
     def _get_active_board_name(self):
         if HAS_PCBNEW and hasattr(pcbnew, "GetBoard"):
-            board = pcbnew.GetBoard()
-            if board is not None and hasattr(board, "GetFileName"):
-                return str(board.GetFileName() or "live_board.kicad_pcb")
-        return "live_board.kicad_pcb"
+            try:
+                board = pcbnew.GetBoard()
+                if board is not None and hasattr(board, "GetFileName"):
+                    fn = board.GetFileName()
+                    return str(fn) if fn else ""
+            except Exception:
+                pass
+        return ""
+
+    def _default_pads_for_footprint(self, fp_name, layer_name="F.Cu"):
+        fp_upper = str(fp_name).upper()
+        if "SOT-23" in fp_upper:
+            return [
+                {"number": "1", "type": "smd", "shape": "rect", "rel_x": -0.95, "rel_y": 1.1, "size_x": 0.6, "size_y": 0.7, "layer": layer_name},
+                {"number": "2", "type": "smd", "shape": "rect", "rel_x": 0.95, "rel_y": 1.1, "size_x": 0.6, "size_y": 0.7, "layer": layer_name},
+                {"number": "3", "type": "smd", "shape": "rect", "rel_x": 0.0, "rel_y": -1.1, "size_x": 0.6, "size_y": 0.7, "layer": layer_name},
+            ]
+        if "SOIC-8" in fp_upper or "SOP-8" in fp_upper:
+            pads = []
+            for i in range(4):
+                ry = -1.905 + i * 1.27
+                pads.append({"number": str(i + 1), "type": "smd", "shape": "rect", "rel_x": -2.7, "rel_y": ry, "size_x": 1.5, "size_y": 0.6, "layer": layer_name})
+            for i in range(4):
+                ry = 1.905 - i * 1.27
+                pads.append({"number": str(i + 5), "type": "smd", "shape": "rect", "rel_x": 2.7, "rel_y": ry, "size_x": 1.5, "size_y": 0.6, "layer": layer_name})
+            return pads
+        if "PINHEADER" in fp_upper or "CONN_01X02" in fp_upper:
+            return [
+                {"number": "1", "type": "thru_hole", "shape": "rect", "rel_x": 0.0, "rel_y": -1.27, "size_x": 1.7, "size_y": 1.7, "drill": 1.0, "layer": "*.Cu"},
+                {"number": "2", "type": "thru_hole", "shape": "circle", "rel_x": 0.0, "rel_y": 1.27, "size_x": 1.7, "size_y": 1.7, "drill": 1.0, "layer": "*.Cu"},
+            ]
+        if "0805" in fp_upper:
+            return [
+                {"number": "1", "type": "smd", "shape": "rect", "rel_x": -1.0, "rel_y": 0.0, "size_x": 1.0, "size_y": 1.3, "layer": layer_name},
+                {"number": "2", "type": "smd", "shape": "rect", "rel_x": 1.0, "rel_y": 0.0, "size_x": 1.0, "size_y": 1.3, "layer": layer_name},
+            ]
+        return [
+            {"number": "1", "type": "smd", "shape": "rect", "rel_x": -0.8, "rel_y": 0.0, "size_x": 0.8, "size_y": 0.9, "layer": layer_name},
+            {"number": "2", "type": "smd", "shape": "rect", "rel_x": 0.8, "rel_y": 0.0, "size_x": 0.8, "size_y": 0.9, "layer": layer_name},
+        ]
 
     def _inspect_live_board(self):
-        footprints = []
-        tracks = []
-        if HAS_PCBNEW and hasattr(pcbnew, "GetBoard"):
-            board = pcbnew.GetBoard()
-            if board is not None:
-                for fp in board.GetFootprints():
-                    pos = fp.GetPosition()
-                    footprints.append({
-                        "reference": fp.GetReference(),
-                        "value": fp.GetValue(),
-                        "x": pcbnew.ToMM(pos.x),
-                        "y": pcbnew.ToMM(pos.y),
-                        "rotation": fp.GetOrientationDegrees(),
-                        "layer": board.GetLayerName(fp.GetLayer())
-                    })
-                for trk in board.GetTracks():
-                    start = trk.GetStart()
-                    end = trk.GetEnd()
-                    tracks.append({
-                        "net": trk.GetNetname(),
-                        "x1": pcbnew.ToMM(start.x),
-                        "y1": pcbnew.ToMM(start.y),
-                        "x2": pcbnew.ToMM(end.x),
-                        "y2": pcbnew.ToMM(end.y),
-                        "width": pcbnew.ToMM(trk.GetWidth()),
-                        "layer": board.GetLayerName(trk.GetLayer())
-                    })
-        return {
-            "ok": True,
-            "live_gui": True,
-            "active_document": self._get_active_board_name(),
-            "footprints_count": len(footprints),
-            "tracks_count": len(tracks),
-            "footprints": footprints,
-            "tracks": tracks
-        }
+        def _do_inspect():
+            footprints = []
+            tracks = []
+            vias = []
+            outline_segments = 0
+            if HAS_PCBNEW and hasattr(pcbnew, "GetBoard"):
+                board = pcbnew.GetBoard()
+                if board is not None:
+                    for fp in board.GetFootprints():
+                        pos = fp.GetPosition()
+                        pads = []
+                        if hasattr(fp, "Pads"):
+                            for pad in fp.Pads():
+                                ppos = pad.GetPosition()
+                                pads.append({
+                                    "number": pad.GetNumber() if hasattr(pad, "GetNumber") else "1",
+                                    "x": pcbnew.ToMM(ppos.x),
+                                    "y": pcbnew.ToMM(ppos.y),
+                                    "net": pad.GetNetname() if hasattr(pad, "GetNetname") else ""
+                                })
+                        footprints.append({
+                            "reference": fp.GetReference(),
+                            "value": fp.GetValue(),
+                            "x": pcbnew.ToMM(pos.x),
+                            "y": pcbnew.ToMM(pos.y),
+                            "rotation": fp.GetOrientationDegrees(),
+                            "layer": board.GetLayerName(fp.GetLayer()) if hasattr(board, "GetLayerName") else "F.Cu",
+                            "pads": pads
+                        })
+                    for trk in board.GetTracks():
+                        if hasattr(pcbnew, "PCB_VIA") and isinstance(trk, pcbnew.PCB_VIA):
+                            vpos = trk.GetPosition()
+                            vias.append({
+                                "net": trk.GetNetname() if hasattr(trk, "GetNetname") else "",
+                                "x": pcbnew.ToMM(vpos.x),
+                                "y": pcbnew.ToMM(vpos.y),
+                                "size": pcbnew.ToMM(trk.GetWidth()) if hasattr(trk, "GetWidth") else 0.6
+                            })
+                        else:
+                            start = trk.GetStart()
+                            end = trk.GetEnd()
+                            tracks.append({
+                                "net": trk.GetNetname() if hasattr(trk, "GetNetname") else "",
+                                "x1": pcbnew.ToMM(start.x),
+                                "y1": pcbnew.ToMM(start.y),
+                                "x2": pcbnew.ToMM(end.x),
+                                "y2": pcbnew.ToMM(end.y),
+                                "width": pcbnew.ToMM(trk.GetWidth()),
+                                "layer": board.GetLayerName(trk.GetLayer()) if hasattr(board, "GetLayerName") else "F.Cu"
+                            })
+                    if hasattr(board, "GetDrawings"):
+                        edge_layer = getattr(pcbnew, "Edge_Cuts", 44)
+                        for drw in board.GetDrawings():
+                            if hasattr(drw, "GetLayer") and drw.GetLayer() == edge_layer:
+                                outline_segments += 1
+            return {
+                "ok": True,
+                "live_gui": True,
+                "active_document": self._get_active_board_name(),
+                "footprints_count": len(footprints),
+                "tracks_count": len(tracks),
+                "vias_count": len(vias),
+                "outline_segments": outline_segments,
+                "footprints": footprints,
+                "tracks": tracks,
+                "vias": vias
+            }
+
+        return self._run_on_gui_thread(_do_inspect)
 
     def _apply_live_pcb_edits(self, args):
-        updated = 0
-        if HAS_PCBNEW and hasattr(pcbnew, "GetBoard"):
+        def _do_edits():
+            created_footprints = 0
+            updated_footprints = 0
+            created_pads = 0
+            created_tracks = 0
+            created_vias = 0
+            created_outline_segments = 0
+            registered_nets = 0
+
+            if not (HAS_PCBNEW and hasattr(pcbnew, "GetBoard")):
+                return {"ok": False, "error": "pcbnew.GetBoard() is not available"}
+
             board = pcbnew.GetBoard()
-            if board is not None:
-                placements = args.get("placements") or args.get("footprints") or []
-                fp_by_ref = {fp.GetReference(): fp for fp in board.GetFootprints()}
-                for item in placements:
-                    ref = item.get("reference") or item.get("ref")
-                    if ref in fp_by_ref:
-                        fp = fp_by_ref[ref]
-                        x_mm = float(item.get("x_mm", item.get("x", 0.0)))
-                        y_mm = float(item.get("y_mm", item.get("y", 0.0)))
-                        rot_deg = float(item.get("rotation_deg", item.get("rotation", 0.0)))
-                        fp.SetPosition(pcbnew.VECTOR2I(pcbnew.FromMM(x_mm), pcbnew.FromMM(y_mm)))
-                        fp.SetOrientationDegrees(rot_deg)
-                        updated += 1
-                if hasattr(pcbnew, "ZONE_FILLER"):
-                    filler = pcbnew.ZONE_FILLER(board)
-                    filler.Fill(board.Zones())
-                if hasattr(pcbnew, "Refresh"):
-                    pcbnew.Refresh()
+            if board is None:
+                return {"ok": False, "error": "No active PCB board in pcbnew"}
+
+            if args.get("clear_existing", False) or args.get("clear_board", False):
+                for fp in list(board.GetFootprints()):
+                    board.Remove(fp)
+                for trk in list(board.GetTracks()):
+                    board.Remove(trk)
+                if hasattr(board, "GetDrawings"):
+                    for drw in list(board.GetDrawings()):
+                        board.Remove(drw)
+
+            net_cache = {}
+            if hasattr(board, "GetNetInfo"):
+                try:
+                    net_info = board.GetNetInfo()
+                    if hasattr(net_info, "NetsByName"):
+                        for k, v in net_info.NetsByName().items():
+                            net_cache[str(k)] = v
+                except Exception:
+                    pass
+
+            def ensure_net(net_name):
+                nonlocal registered_nets
+                name = str(net_name or "").strip()
+                if not name:
+                    return None
+                if name in net_cache:
+                    return net_cache[name]
+                if hasattr(board, "FindNet"):
+                    try:
+                        found = board.FindNet(name)
+                        if found is not None:
+                            net_cache[name] = found
+                            return found
+                    except Exception:
+                        pass
+                if hasattr(pcbnew, "NETINFO_ITEM"):
+                    ni = pcbnew.NETINFO_ITEM(board, name)
+                    board.Add(ni)
+                    net_cache[name] = ni
+                    registered_nets += 1
+                    return ni
+                return None
+
+            for net_obj in (args.get("nets") or []):
+                if isinstance(net_obj, dict):
+                    ensure_net(net_obj.get("name", ""))
+                elif isinstance(net_obj, str):
+                    ensure_net(net_obj)
+
+            # 1. Board Outline on Edge.Cuts
+            bo = args.get("board_outline")
+            outline_lines = []
+            if isinstance(bo, dict):
+                if isinstance(bo.get("lines"), list) and len(bo["lines"]) > 0:
+                    outline_lines = bo["lines"]
+                else:
+                    x0 = float(bo.get("x", 0.0))
+                    y0 = float(bo.get("y", 0.0))
+                    w = float(bo.get("width_mm", bo.get("width", 0.0)))
+                    h = float(bo.get("height_mm", bo.get("height", 0.0)))
+                    if w > 0.0 and h > 0.0:
+                        outline_lines = [
+                            {"x1": x0, "y1": y0, "x2": x0 + w, "y2": y0},
+                            {"x1": x0 + w, "y1": y0, "x2": x0 + w, "y2": y0 + h},
+                            {"x1": x0 + w, "y1": y0 + h, "x2": x0, "y2": y0 + h},
+                            {"x1": x0, "y1": y0 + h, "x2": x0, "y2": y0},
+                        ]
+            elif isinstance(bo, list):
+                outline_lines = bo
+
+            if outline_lines and hasattr(pcbnew, "PCB_SHAPE"):
+                edge_layer = getattr(pcbnew, "Edge_Cuts", 44)
+                if hasattr(board, "GetDrawings"):
+                    for drw in list(board.GetDrawings()):
+                        if hasattr(drw, "GetLayer") and drw.GetLayer() == edge_layer:
+                            board.Remove(drw)
+                for ln in outline_lines:
+                    if not isinstance(ln, dict):
+                        continue
+                    seg = pcbnew.PCB_SHAPE(board)
+                    if hasattr(pcbnew, "SHAPE_T_SEGMENT") and hasattr(seg, "SetShape"):
+                        seg.SetShape(pcbnew.SHAPE_T_SEGMENT)
+                    seg.SetLayer(edge_layer)
+                    seg.SetStart(_vec2i(ln.get("x1", 0.0), ln.get("y1", 0.0)))
+                    seg.SetEnd(_vec2i(ln.get("x2", 0.0), ln.get("y2", 0.0)))
+                    if hasattr(seg, "SetWidth"):
+                        seg.SetWidth(pcbnew.FromMM(float(ln.get("width_mm", 0.15))))
+                    board.Add(seg)
+                    created_outline_segments += 1
+
+            # 2. Footprints & Pads
+            placements = args.get("footprints") or args.get("placements") or []
+            fp_by_ref = {fp.GetReference(): fp for fp in board.GetFootprints()}
+
+            for item in placements:
+                if not isinstance(item, dict):
+                    continue
+                ref = str(item.get("reference") or item.get("ref") or "").strip()
+                if not ref:
+                    continue
+                val = str(item.get("value", ref))
+                fp_lib = str(item.get("footprint", "Resistor_SMD:R_0603_1608Metric"))
+                x_mm = float(item.get("x_mm", item.get("x", 0.0)))
+                y_mm = float(item.get("y_mm", item.get("y", 0.0)))
+                rot_deg = float(item.get("rotation_deg", item.get("rotation", 0.0)))
+                layer_name = str(item.get("layer", "F.Cu"))
+                cu_layer = getattr(pcbnew, "B_Cu", 31) if layer_name == "B.Cu" else getattr(pcbnew, "F_Cu", 0)
+                silk_layer = getattr(pcbnew, "B_SilkS", 36) if layer_name == "B.Cu" else getattr(pcbnew, "F_SilkS", 37)
+
+                existing_fp = fp_by_ref.get(ref)
+                existing_has_pads = False
+                if existing_fp is not None and hasattr(existing_fp, "Pads"):
+                    try:
+                        existing_has_pads = len(list(existing_fp.Pads())) > 0
+                    except Exception:
+                        existing_has_pads = True
+
+                if existing_fp is not None and existing_has_pads:
+                    existing_fp.SetPosition(_vec2i(x_mm, y_mm))
+                    existing_fp.SetOrientationDegrees(rot_deg)
+                    if "value" in item and hasattr(existing_fp, "SetValue"):
+                        existing_fp.SetValue(val)
+                    if hasattr(existing_fp, "Pads"):
+                        pad_net_lookup = {}
+                        for p_spec in (item.get("pads") or []):
+                            if isinstance(p_spec, dict) and p_spec.get("net"):
+                                pad_net_lookup[str(p_spec.get("number", ""))] = str(p_spec.get("net"))
+                        if isinstance(item.get("pin_nets"), dict):
+                            for pk, pv in item["pin_nets"].items():
+                                pad_net_lookup[str(pk)] = str(pv)
+                        for pad in existing_fp.Pads():
+                            pnum = str(pad.GetNumber()) if hasattr(pad, "GetNumber") else ""
+                            if pnum in pad_net_lookup:
+                                ni = ensure_net(pad_net_lookup[pnum])
+                                if ni is not None and hasattr(pad, "SetNet"):
+                                    pad.SetNet(ni)
+                    updated_footprints += 1
+                elif hasattr(pcbnew, "FOOTPRINT"):
+                    if existing_fp is not None:
+                        board.Remove(existing_fp)
+                    fp = pcbnew.FOOTPRINT(board)
+                    fp.SetReference(ref)
+                    fp.SetValue(val)
+                    if hasattr(fp, "SetFPID") and hasattr(pcbnew, "LIB_ID"):
+                        try:
+                            fp.SetFPID(pcbnew.LIB_ID(fp_lib))
+                        except Exception:
+                            pass
+                    if hasattr(fp, "SetLayer"):
+                        fp.SetLayer(cu_layer)
+                    fp.SetPosition(_vec2i(x_mm, y_mm))
+
+                    pads_spec = item.get("pads")
+                    if not isinstance(pads_spec, list) or len(pads_spec) == 0:
+                        pads_spec = self._default_pads_for_footprint(fp_lib, layer_name)
+
+                    pin_nets_map = {}
+                    if isinstance(item.get("pin_nets"), dict):
+                        for pk, pv in item["pin_nets"].items():
+                            pin_nets_map[str(pk)] = str(pv)
+                    if isinstance(item.get("pins"), list):
+                        for pin_obj in item["pins"]:
+                            if isinstance(pin_obj, dict) and pin_obj.get("net"):
+                                pin_nets_map[str(pin_obj.get("number", pin_obj.get("pin", "")))] = str(pin_obj["net"])
+
+                    min_rx, max_rx = -1.2, 1.2
+                    min_ry, max_ry = -0.8, 0.8
+
+                    for p_spec in pads_spec:
+                        if not isinstance(p_spec, dict) or not hasattr(pcbnew, "PAD"):
+                            continue
+                        pad = pcbnew.PAD(fp)
+                        p_num = str(p_spec.get("number", "1"))
+                        if hasattr(pad, "SetNumber"):
+                            pad.SetNumber(p_num)
+                        if hasattr(pad, "SetName"):
+                            pad.SetName(p_num)
+
+                        p_type = str(p_spec.get("type", "smd")).lower()
+                        drill_mm = float(p_spec.get("drill", p_spec.get("drill_mm", 0.0)))
+                        if "np" in p_type:
+                            if hasattr(pad, "SetAttribute"):
+                                pad.SetAttribute(getattr(pcbnew, "PAD_ATTRIB_NPTH", 3))
+                        elif "thru" in p_type or "tht" in p_type or drill_mm > 0.0:
+                            if hasattr(pad, "SetAttribute"):
+                                pad.SetAttribute(getattr(pcbnew, "PAD_ATTRIB_PTH", 0))
+                            if drill_mm <= 0.0:
+                                drill_mm = 0.8
+                        else:
+                            if hasattr(pad, "SetAttribute"):
+                                pad.SetAttribute(getattr(pcbnew, "PAD_ATTRIB_SMD", 1))
+
+                        p_shape = str(p_spec.get("shape", "rect")).lower()
+                        if hasattr(pad, "SetShape"):
+                            if p_shape == "circle":
+                                pad.SetShape(getattr(pcbnew, "PAD_SHAPE_CIRCLE", 0))
+                            elif p_shape == "oval":
+                                pad.SetShape(getattr(pcbnew, "PAD_SHAPE_OVAL", 2))
+                            elif p_shape == "roundrect":
+                                pad.SetShape(getattr(pcbnew, "PAD_SHAPE_ROUNDRECT", 4))
+                            else:
+                                pad.SetShape(getattr(pcbnew, "PAD_SHAPE_RECT", 1))
+
+                        sx = float(p_spec.get("size_x", 0.8))
+                        sy = float(p_spec.get("size_y", 0.8))
+                        if hasattr(pad, "SetSize"):
+                            pad.SetSize(_vec2i(sx, sy))
+                        if drill_mm > 0.0 and hasattr(pad, "SetDrillSize"):
+                            pad.SetDrillSize(_vec2i(drill_mm, drill_mm))
+
+                        rx = float(p_spec.get("rel_x", p_spec.get("dx", 0.0)))
+                        ry = float(p_spec.get("rel_y", p_spec.get("dy", 0.0)))
+                        min_rx = min(min_rx, rx - sx * 0.5 - 0.25)
+                        max_rx = max(max_rx, rx + sx * 0.5 + 0.25)
+                        min_ry = min(min_ry, ry - sy * 0.5 - 0.25)
+                        max_ry = max(max_ry, ry + sy * 0.5 + 0.25)
+
+                        if hasattr(pad, "SetPos0"):
+                            pad.SetPos0(_vec2i(rx, ry))
+                        pad.SetPosition(_vec2i(x_mm + rx, y_mm + ry))
+
+                        if hasattr(pcbnew, "LSET") and hasattr(pad, "SetLayerSet"):
+                            if "thru" in p_type or "np" in p_type or drill_mm > 0.0:
+                                lset = pcbnew.LSET.AllCuMask() if hasattr(pcbnew.LSET, "AllCuMask") else pcbnew.LSET()
+                                if hasattr(lset, "AddLayer"):
+                                    lset.AddLayer(getattr(pcbnew, "F_Cu", 0))
+                                    lset.AddLayer(getattr(pcbnew, "B_Cu", 31))
+                                    if hasattr(pcbnew, "F_Mask"):
+                                        lset.AddLayer(pcbnew.F_Mask)
+                                    if hasattr(pcbnew, "B_Mask"):
+                                        lset.AddLayer(pcbnew.B_Mask)
+                                pad.SetLayerSet(lset)
+                            else:
+                                lset = pcbnew.LSET()
+                                if hasattr(lset, "AddLayer"):
+                                    lset.AddLayer(cu_layer)
+                                    if layer_name == "B.Cu":
+                                        if hasattr(pcbnew, "B_Paste"):
+                                            lset.AddLayer(pcbnew.B_Paste)
+                                        if hasattr(pcbnew, "B_Mask"):
+                                            lset.AddLayer(pcbnew.B_Mask)
+                                    else:
+                                        if hasattr(pcbnew, "F_Paste"):
+                                            lset.AddLayer(pcbnew.F_Paste)
+                                        if hasattr(pcbnew, "F_Mask"):
+                                            lset.AddLayer(pcbnew.F_Mask)
+                                pad.SetLayerSet(lset)
+
+                        net_name = str(p_spec.get("net") or pin_nets_map.get(p_num, ""))
+                        if net_name:
+                            ni = ensure_net(net_name)
+                            if ni is not None and hasattr(pad, "SetNet"):
+                                pad.SetNet(ni)
+
+                        fp.Add(pad)
+                        created_pads += 1
+
+                    if hasattr(pcbnew, "PCB_SHAPE"):
+                        try:
+                            body_rect = pcbnew.PCB_SHAPE(fp)
+                            if hasattr(pcbnew, "SHAPE_T_RECT") and hasattr(body_rect, "SetShape"):
+                                body_rect.SetShape(pcbnew.SHAPE_T_RECT)
+                            body_rect.SetLayer(silk_layer)
+                            if hasattr(body_rect, "SetStart0") and hasattr(body_rect, "SetEnd0"):
+                                body_rect.SetStart0(_vec2i(min_rx, min_ry))
+                                body_rect.SetEnd0(_vec2i(max_rx, max_ry))
+                            body_rect.SetStart(_vec2i(x_mm + min_rx, y_mm + min_ry))
+                            body_rect.SetEnd(_vec2i(x_mm + max_rx, y_mm + max_ry))
+                            if hasattr(body_rect, "SetWidth"):
+                                body_rect.SetWidth(pcbnew.FromMM(0.12))
+                            fp.Add(body_rect)
+                        except Exception:
+                            pass
+
+                    try:
+                        if hasattr(fp, "Reference"):
+                            ref_item = fp.Reference()
+                            if hasattr(ref_item, "SetPos0"):
+                                ref_item.SetPos0(_vec2i(0.0, min_ry - 1.0))
+                            ref_item.SetPosition(_vec2i(x_mm, y_mm + min_ry - 1.0))
+                        if hasattr(fp, "Value"):
+                            val_item = fp.Value()
+                            if hasattr(val_item, "SetPos0"):
+                                val_item.SetPos0(_vec2i(0.0, max_ry + 1.0))
+                            val_item.SetPosition(_vec2i(x_mm, y_mm + max_ry + 1.0))
+                    except Exception:
+                        pass
+
+                    fp.SetOrientationDegrees(rot_deg)
+                    board.Add(fp)
+                    fp_by_ref[ref] = fp
+                    created_footprints += 1
+
+            # 3. Copper Tracks
+            tracks_spec = args.get("tracks") or args.get("add_tracks") or []
+            if tracks_spec and hasattr(pcbnew, "PCB_TRACK"):
+                for t_spec in tracks_spec:
+                    if not isinstance(t_spec, dict):
+                        continue
+                    trk = pcbnew.PCB_TRACK(board)
+                    trk.SetStart(_vec2i(t_spec.get("x1", 0.0), t_spec.get("y1", 0.0)))
+                    trk.SetEnd(_vec2i(t_spec.get("x2", 0.0), t_spec.get("y2", 0.0)))
+                    trk.SetWidth(pcbnew.FromMM(float(t_spec.get("width", t_spec.get("width_mm", 0.25)))))
+                    t_layer = str(t_spec.get("layer", "F.Cu"))
+                    trk.SetLayer(getattr(pcbnew, "B_Cu", 31) if t_layer == "B.Cu" else getattr(pcbnew, "F_Cu", 0))
+                    t_net = str(t_spec.get("net", ""))
+                    if t_net:
+                        ni = ensure_net(t_net)
+                        if ni is not None and hasattr(trk, "SetNet"):
+                            trk.SetNet(ni)
+                    board.Add(trk)
+                    created_tracks += 1
+
+            # 4. Vias
+            vias_spec = args.get("vias") or args.get("add_vias") or []
+            if vias_spec and hasattr(pcbnew, "PCB_VIA"):
+                for v_spec in vias_spec:
+                    if not isinstance(v_spec, dict):
+                        continue
+                    via = pcbnew.PCB_VIA(board)
+                    via.SetPosition(_vec2i(v_spec.get("x", 0.0), v_spec.get("y", 0.0)))
+                    v_size = float(v_spec.get("size", v_spec.get("size_mm", 0.6)))
+                    v_drill = float(v_spec.get("drill", v_spec.get("drill_mm", 0.3)))
+                    if hasattr(via, "SetWidth"):
+                        try:
+                            via.SetWidth(pcbnew.FromMM(v_size))
+                        except Exception:
+                            pass
+                    if hasattr(via, "SetDrill"):
+                        try:
+                            via.SetDrill(pcbnew.FromMM(v_drill))
+                        except Exception:
+                            pass
+                    v_net = str(v_spec.get("net", ""))
+                    if v_net:
+                        ni = ensure_net(v_net)
+                        if ni is not None and hasattr(via, "SetNet"):
+                            via.SetNet(ni)
+                    board.Add(via)
+                    created_vias += 1
+
+            if hasattr(board, "BuildListOfNets"):
+                try:
+                    board.BuildListOfNets()
+                except Exception:
+                    pass
+
+            if hasattr(pcbnew, "ZONE_FILLER") and hasattr(board, "Zones"):
+                try:
+                    zones = board.Zones()
+                    if zones:
+                        filler = pcbnew.ZONE_FILLER(board)
+                        filler.Fill(zones)
+                except Exception:
+                    pass
+
+            if hasattr(pcbnew, "Refresh"):
+                pcbnew.Refresh()
+
+            return {
+                "ok": True,
+                "live_gui": True,
+                "active_document": self._get_active_board_name(),
+                "created_footprints": created_footprints,
+                "updated_footprints": updated_footprints,
+                "created_pads": created_pads,
+                "created_tracks": created_tracks,
+                "created_vias": created_vias,
+                "created_outline_segments": created_outline_segments,
+                "registered_nets": registered_nets
+            }
+
+        return self._run_on_gui_thread(_do_edits)
+
+    def _run_live_drc(self):
+        info = self._inspect_live_board()
+        if not info.get("ok"):
+            return info
+        pads_by_net = {}
+        for fp in info.get("footprints", []):
+            for pad in fp.get("pads", []):
+                net = pad.get("net", "")
+                if net:
+                    pads_by_net.setdefault(net, []).append((fp.get("reference", ""), pad.get("number", "")))
+        tracks_by_net = set()
+        for trk in info.get("tracks", []):
+            net = trk.get("net", "")
+            if net:
+                tracks_by_net.add(net)
+        unconnected = []
+        for net, pad_list in pads_by_net.items():
+            if len(pad_list) >= 2 and net not in tracks_by_net:
+                unconnected.append(net)
         return {
             "ok": True,
             "live_gui": True,
-            "updated_footprints": updated
+            "active_document": info.get("active_document", ""),
+            "violation_count": 0,
+            "unconnected_count": len(unconnected),
+            "violations": [],
+            "unconnected_items": unconnected
         }
 
+    def _maybe_hot_reload(self):
+        try:
+            if "__file__" in globals() and os.path.exists(__file__):
+                cur_mtime = os.path.getmtime(__file__)
+                if getattr(self, "_file_mtime", 0.0) != cur_mtime:
+                    self._file_mtime = cur_mtime
+                    with open(__file__, "r", encoding="utf-8") as f:
+                        src = f.read()
+                    ns = {"__file__": __file__, "_AIMON_HOT_RELOAD": True}
+                    exec(compile(src, __file__, "exec"), ns)
+                    if "KiCadAimonBridgeClient" in ns:
+                        self.__class__ = ns["KiCadAimonBridgeClient"]
+        except Exception:
+            pass
+
     def _handle_call(self, tool_name, args):
+        self._maybe_hot_reload()
         if tool_name == "kicad_inspect_project":
             return self._inspect_live_board()
         if tool_name in ("kicad_edit_pcb", "kicad_sync_sch_to_pcb"):
             return self._apply_live_pcb_edits(args)
-        return {"ok": True, "tool": tool_name, "live_gui": True}
+        if tool_name == "kicad_run_drc":
+            return self._run_live_drc()
+        return {"ok": True, "tool": tool_name, "live_gui": True, "active_document": self._get_active_board_name()}
 
     def _run_loop(self):
         while self._running:
             try:
                 sock = socket.create_connection((self._host, self._port), timeout=5.0)
-                sock.settimeout(None)
+                sock.settimeout(2.0)
                 self._sock = sock
+                last_doc = self._get_active_board_name()
                 reg = {
                     "jsonrpc": "2.0",
                     "id": "kicad-reg-1",
                     "method": "plugin/register",
                     "params": {
                         "app": "kicad",
-                        "version": BRIDGE_VERSION,
+                        "version": self._get_kicad_version(),
                         "bridge_version": BRIDGE_VERSION,
-                        "app_version": "8.0",
-                        "active_document": self._get_active_board_name()
+                        "app_version": self._get_kicad_version(),
+                        "active_document": last_doc
                     }
                 }
                 sock.sendall((json.dumps(reg) + "\n").encode("utf-8"))
 
                 buf = b""
                 while self._running:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
+                    try:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    except socket.timeout:
+                        cur_doc = self._get_active_board_name()
+                        if cur_doc != last_doc:
+                            last_doc = cur_doc
+                            status_msg = {
+                                "jsonrpc": "2.0",
+                                "id": "kicad-status",
+                                "method": "plugin/status",
+                                "params": {
+                                    "app": "kicad",
+                                    "active_document": cur_doc,
+                                    "version": self._get_kicad_version()
+                                }
+                            }
+                            sock.sendall((json.dumps(status_msg) + "\n").encode("utf-8"))
+                        continue
+
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         line_str = line.decode("utf-8", errors="replace").strip()
@@ -1307,19 +2138,28 @@ class KiCadAimonBridgeClient:
                 time.sleep(2.0)
 
 
+_GLOBAL_CLIENT = None
+
+
+def ensure_bridge_started():
+    global _GLOBAL_CLIENT
+    if _GLOBAL_CLIENT is None:
+        _GLOBAL_CLIENT = KiCadAimonBridgeClient()
+    _GLOBAL_CLIENT.start()
+    return _GLOBAL_CLIENT
+
+
 if HAS_PCBNEW:
     class KiCadAimonBridgePlugin(pcbnew.ActionPlugin):
         def defaults(self):
             self.name = "Aimon AI Live PCB Bridge"
             self.category = "AI Automation"
-            self.description = "Connects KiCad PCB Editor to aimon on 127.0.0.1:3893"
+            self.description = "Connects KiCad PCB Editor to aimon-eda-bridge on 127.0.0.1:3893"
             self.show_toolbar_button = True
-            self._client = None
+            self._client = ensure_bridge_started()
 
         def Run(self):
-            if self._client is None:
-                self._client = KiCadAimonBridgeClient()
-                self._client.start()
+            self._client = ensure_bridge_started()
 else:
     class KiCadAimonBridgePlugin:
         def register(self):
@@ -1341,7 +2181,7 @@ except Exception:
 )PY";
 
 static const char* kEmbeddedFreeCadBridgePy = R"PY(#
-# AimonFreeCadBridge.py - FreeCAD Robotics & 3D-Printing Bridge for aimon
+# AimonFreeCadBridge.py - FreeCAD Robotics & 3D-Printing Bridge for aimon-eda-bridge
 #
 # Copyright (C) 2026, Charles Chiou
 #
@@ -1349,6 +2189,7 @@ static const char* kEmbeddedFreeCadBridgePy = R"PY(#
 import json
 import math
 import os
+import queue
 import socket
 import threading
 import time
@@ -1358,17 +2199,36 @@ BRIDGE_VERSION = "__AIMON_VERSION__"
 try:
     import FreeCAD
     import Part
-    import Mesh
     HAS_FREECAD = True
 except ImportError:
     FreeCAD = None
     Part = None
-    Mesh = None
     HAS_FREECAD = False
+
+try:
+    import Mesh
+except ImportError:
+    Mesh = None
+
+try:
+    import FreeCADGui
+    HAS_FREECAD_GUI = True
+except ImportError:
+    FreeCADGui = None
+    HAS_FREECAD_GUI = False
+
+QtCore = None
+for _qt_pkg in ("PySide6", "PySide2"):
+    try:
+        QtCore = __import__(_qt_pkg + ".QtCore", fromlist=["QtCore"])
+        break
+    except ImportError:
+        pass
 
 
 ALLOWED_FREECAD_MODULES = {
     "FreeCAD",
+    "FreeCADGui",
     "Part",
     "PartDesign",
     "Sketcher",
@@ -1380,8 +2240,21 @@ ALLOWED_FREECAD_MODULES = {
 }
 
 
+def _normalize_rgb(color_seq):
+    if not isinstance(color_seq, (list, tuple)) or len(color_seq) < 3:
+        return (0.25, 0.58, 0.88)
+    r, g, b = float(color_seq[0]), float(color_seq[1]), float(color_seq[2])
+    if max(r, g, b) > 1.0:
+        return (
+            max(0.0, min(1.0, r / 255.0)),
+            max(0.0, min(1.0, g / 255.0)),
+            max(0.0, min(1.0, b / 255.0)),
+        )
+    return (max(0.0, min(1.0, r)), max(0.0, min(1.0, g)), max(0.0, min(1.0, b)))
+
+
 class AimonFreeCadBridgeClient:
-    """Connects FreeCAD GUI or headless FreeCADCmd to aimon on 127.0.0.1:3893."""
+    """Connects FreeCAD GUI or headless FreeCADCmd to aimon-eda-bridge on 127.0.0.1:3893."""
 
     def __init__(self, host="127.0.0.1", port=3893):
         self._host = host
@@ -1389,10 +2262,59 @@ class AimonFreeCadBridgeClient:
         self._running = False
         self._sock = None
         self._thread = None
+        self._gui_queue = queue.Queue()
+        self._gui_timer = None
+        self._gui_pump_active = False
+
+    def _setup_gui_pump(self):
+        if QtCore is None or self._gui_timer is not None:
+            return
+        try:
+            app = QtCore.QCoreApplication.instance()
+            if app is not None:
+                self._gui_timer = QtCore.QTimer(app)
+                self._gui_timer.setInterval(25)
+                self._gui_timer.timeout.connect(self._drain_gui_queue)
+                self._gui_timer.start()
+                self._gui_pump_active = True
+        except Exception:
+            self._gui_pump_active = False
+
+    def _drain_gui_queue(self):
+        while True:
+            try:
+                item = self._gui_queue.get_nowait()
+            except queue.Empty:
+                break
+            fn, done_evt, box = item
+            if done_evt.is_set():
+                continue
+            try:
+                box["started"] = True
+                box["result"] = fn()
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                done_evt.set()
+
+    def _run_on_gui_thread(self, fn):
+        if not self._gui_pump_active or threading.current_thread() is threading.main_thread():
+            return fn()
+        done_evt = threading.Event()
+        box = {"started": False, "result": None, "error": None}
+        self._gui_queue.put((fn, done_evt, box))
+        if not done_evt.wait(timeout=0.4) and not box["started"]:
+            done_evt.set()
+            return fn()
+        done_evt.wait(timeout=15.0)
+        if box["error"] is not None:
+            raise box["error"]
+        return box["result"]
 
     def start(self):
         if self._running:
             return
+        self._setup_gui_pump()
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -1406,141 +2328,606 @@ class AimonFreeCadBridgeClient:
                 pass
             self._sock = None
 
+    def _get_freecad_version(self):
+        if HAS_FREECAD and hasattr(FreeCAD, "Version"):
+            try:
+                v = FreeCAD.Version()
+                if isinstance(v, (list, tuple)) and len(v) >= 3:
+                    return f"{v[0]}.{v[1]}.{v[2]}"
+            except Exception:
+                pass
+        return "1.1.3"
+
     def _active_doc_name(self):
-        if HAS_FREECAD and FreeCAD.ActiveDocument is not None:
-            return str(FreeCAD.ActiveDocument.Name)
-        return "RobotAssembly.FCStd"
+        if HAS_FREECAD and getattr(FreeCAD, "ActiveDocument", None) is not None:
+            try:
+                doc = FreeCAD.ActiveDocument
+                return str(getattr(doc, "Label", "") or getattr(doc, "Name", "") or "")
+            except Exception:
+                pass
+        return ""
 
-    def dispatch_tool(self, tool_name, args):
-        if tool_name == "freecad_live_status":
-            return {
-                "ok": True,
-                "plugin_connected": True,
-                "has_freecad_runtime": HAS_FREECAD,
-                "active_document": self._active_doc_name(),
-                "workbenches": sorted(ALLOWED_FREECAD_MODULES),
-            }
+    def _refresh_gui_viewport(self, view_mode="Isometric", fit_all=True):
+        if not HAS_FREECAD_GUI or FreeCADGui is None:
+            return
+        try:
+            gui_doc = getattr(FreeCADGui, "ActiveDocument", None)
+            if gui_doc is not None and hasattr(gui_doc, "ActiveView"):
+                view = gui_doc.ActiveView
+                if view is not None:
+                    vmode = str(view_mode or "Isometric").lower()
+                    if vmode == "isometric" and hasattr(view, "viewIsometric"):
+                        view.viewIsometric()
+                    elif vmode == "front" and hasattr(view, "viewFront"):
+                        view.viewFront()
+                    elif vmode == "top" and hasattr(view, "viewTop"):
+                        view.viewTop()
+                    elif vmode == "right" and hasattr(view, "viewRight"):
+                        view.viewRight()
+                    if fit_all and hasattr(view, "fitAll"):
+                        view.fitAll()
+            if fit_all and hasattr(FreeCADGui, "SendMsgToMainWindow"):
+                FreeCADGui.SendMsgToMainWindow("ViewFit")
+            if hasattr(FreeCADGui, "updateGui"):
+                FreeCADGui.updateGui()
+        except Exception:
+            pass
 
-        if tool_name == "freecad_inspect_document":
-            bodies = []
-            if HAS_FREECAD and FreeCAD.ActiveDocument is not None:
-                for obj in FreeCAD.ActiveDocument.Objects:
-                    if hasattr(obj, "Shape") and obj.Shape is not None:
-                        bb = obj.Shape.BoundBox
-                        bodies.append({
-                            "name": obj.Name,
-                            "label": obj.Label,
-                            "volume_mm3": float(obj.Shape.Volume),
-                            "watertight": bool(obj.Shape.isClosed()),
-                            "bounding_box": {
-                                "x_min": bb.XMin, "y_min": bb.YMin, "z_min": bb.ZMin,
-                                "x_max": bb.XMax, "y_max": bb.YMax, "z_max": bb.ZMax,
-                            },
-                        })
-            return {
-                "ok": True,
-                "active_document": self._active_doc_name(),
-                "bodies": bodies,
-            }
+    def _build_shape_from_spec(self, spec):
+        stype = str(spec.get("type", spec.get("shape_type", ""))).lower().strip()
+        if not stype:
+            if "teeth" in spec or "module_mm" in spec:
+                stype = "spur_gear"
+            elif "arm_length_mm" in spec:
+                stype = "servo_horn"
+            elif "flange_height_mm" in spec:
+                stype = "mounting_bracket"
+            else:
+                stype = "box"
 
-        if tool_name == "freecad_generate_cad":
-            body_name = str(args.get("body_name", "RobotLink"))
-            length_mm = float(args.get("length_mm", 45.0))
-            width_mm = float(args.get("width_mm", 28.0))
-            height_mm = float(args.get("height_mm", 18.0))
-            if HAS_FREECAD:
-                doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("RobotCad")
-                box = Part.makeBox(length_mm, width_mm, height_mm)
-                feature = doc.addObject("Part::Feature", body_name)
-                feature.Shape = box
-                doc.recompute()
+        length_mm = float(spec.get("length_mm", spec.get("length", 45.0)))
+        width_mm = float(spec.get("width_mm", spec.get("width", 28.0)))
+        height_mm = float(spec.get("height_mm", spec.get("height", spec.get("thickness_mm", 18.0))))
+        radius_mm = float(spec.get("radius_mm", spec.get("radius", spec.get("outer_diameter_mm", 20.0) * 0.5)))
+
+        if stype == "cylinder":
+            shape = Part.makeCylinder(max(0.5, radius_mm), max(0.5, height_mm))
+        elif stype in ("hollow_cylinder", "tube", "pipe", "bushing"):
+            outer_r = float(spec.get("outer_radius_mm", spec.get("outer_diameter_mm", radius_mm * 2.0) * 0.5))
+            inner_r = float(spec.get("inner_radius_mm", spec.get("bore_diameter_mm", spec.get("inner_diameter_mm", outer_r)) * 0.5))
+            outer_cyl = Part.makeCylinder(max(1.0, outer_r), max(0.5, height_mm))
+            if 0.1 < inner_r < outer_r:
+                inner_cyl = Part.makeCylinder(inner_r, max(0.5, height_mm) + 2.0, FreeCAD.Vector(0, 0, -1.0))
+                shape = outer_cyl.cut(inner_cyl)
+            else:
+                shape = outer_cyl
+        elif stype == "cone":
+            r1 = float(spec.get("radius1_mm", radius_mm))
+            r2 = float(spec.get("radius2_mm", radius_mm * 0.5))
+            shape = Part.makeCone(max(0.1, r1), max(0.0, r2), max(0.5, height_mm))
+        elif stype == "sphere":
+            shape = Part.makeSphere(max(0.5, radius_mm))
+        elif stype == "torus":
+            r1 = float(spec.get("radius1_mm", max(2.0, radius_mm)))
+            r2 = float(spec.get("radius2_mm", max(0.5, radius_mm * 0.25)))
+            shape = Part.makeTorus(r1, r2)
+        elif stype in ("spur_gear", "gear", "gear_blank"):
+            module_mm = max(0.4, float(spec.get("module_mm", 1.5)))
+            teeth = max(6, int(spec.get("teeth", 16)))
+            thickness = max(1.0, float(spec.get("thickness_mm", spec.get("height_mm", 6.0))))
+            bore_d = float(spec.get("bore_diameter_mm", 5.0))
+            pitch_r = (module_mm * teeth) * 0.5
+            root_r = max(1.5, pitch_r - 1.25 * module_mm)
+            tip_r = pitch_r + module_mm
+            tooth_thick = max(0.6, math.pi * module_mm * 0.48)
+            tooth_len = max(0.8, tip_r - root_r + 0.4 * module_mm)
+
+            shape = Part.makeCylinder(root_r, thickness)
+            for i in range(teeth):
+                ang = (360.0 / teeth) * i
+                t_box = Part.makeBox(tooth_len, tooth_thick, thickness, FreeCAD.Vector(root_r - 0.2 * module_mm, -tooth_thick * 0.5, 0.0))
+                t_box.rotate(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 0, 1), ang)
+                shape = shape.fuse(t_box)
+
+            hub_d = float(spec.get("hub_diameter_mm", 0.0))
+            hub_h = float(spec.get("hub_height_mm", thickness + 3.0))
+            if hub_d > bore_d + 1.0:
+                hub = Part.makeCylinder(hub_d * 0.5, hub_h)
+                shape = shape.fuse(hub)
+
+            if bore_d > 0.2:
+                bore = Part.makeCylinder(bore_d * 0.5, max(thickness, hub_h) + 2.0, FreeCAD.Vector(0, 0, -1.0))
+                shape = shape.cut(bore)
+        elif stype in ("servo_horn", "link", "robot_link", "arm"):
+            arm_len = max(10.0, float(spec.get("arm_length_mm", spec.get("length_mm", 45.0))))
+            thickness = max(1.5, float(spec.get("thickness_mm", spec.get("height_mm", 4.0))))
+            r_root = max(3.0, float(spec.get("root_radius_mm", 7.0)))
+            r_tip = max(2.0, float(spec.get("tip_radius_mm", 4.5)))
+            bore_root = float(spec.get("bore_diameter_mm", 5.0))
+            bore_tip = float(spec.get("tip_bore_diameter_mm", 2.6))
+
+            c1 = Part.makeCylinder(r_root, thickness)
+            c2 = Part.makeCylinder(r_tip, thickness, FreeCAD.Vector(arm_len, 0.0, 0.0))
+            web_w = max(2.0, min(r_root, r_tip) * 1.5)
+            web = Part.makeBox(arm_len, web_w, thickness, FreeCAD.Vector(0.0, -web_w * 0.5, 0.0))
+            shape = c1.fuse(web).fuse(c2)
+            if bore_root > 0.2:
+                shape = shape.cut(Part.makeCylinder(bore_root * 0.5, thickness + 2.0, FreeCAD.Vector(0.0, 0.0, -1.0)))
+            if bore_tip > 0.2:
+                shape = shape.cut(Part.makeCylinder(bore_tip * 0.5, thickness + 2.0, FreeCAD.Vector(arm_len, 0.0, -1.0)))
+        elif stype in ("mounting_bracket", "bracket", "u_bracket"):
+            wall = max(1.2, float(spec.get("wall_thickness_mm", 3.0)))
+            bore_d = float(spec.get("bore_diameter_mm", 6.0))
+            outer = Part.makeBox(length_mm, width_mm, height_mm)
+            if length_mm > wall * 2.2 and height_mm > wall * 1.2:
+                inner_cut = Part.makeBox(
+                    length_mm - wall * 2.0,
+                    width_mm + 2.0,
+                    height_mm - wall,
+                    FreeCAD.Vector(wall, -1.0, wall),
+                )
+                shape = outer.cut(inner_cut)
+            else:
+                shape = outer
+            if bore_d > 0.2:
+                bore_cyl = Part.makeCylinder(
+                    bore_d * 0.5,
+                    length_mm + 4.0,
+                    FreeCAD.Vector(-2.0, width_mm * 0.5, height_mm * 0.6),
+                    FreeCAD.Vector(1.0, 0.0, 0.0),
+                )
+                shape = shape.cut(bore_cyl)
+        else:
+            shape = Part.makeBox(max(0.5, length_mm), max(0.5, width_mm), max(0.5, height_mm))
+            wall_mm = float(spec.get("wall_thickness_mm", 0.0))
+            bore_mm = float(spec.get("bore_diameter_mm", 0.0))
+            if wall_mm > 0.5 and length_mm > wall_mm * 2.5 and width_mm > wall_mm * 2.5 and height_mm > wall_mm:
+                pocket = Part.makeBox(
+                    length_mm - wall_mm * 2.0,
+                    width_mm - wall_mm * 2.0,
+                    height_mm,
+                    FreeCAD.Vector(wall_mm, wall_mm, wall_mm),
+                )
+                shape = shape.cut(pocket)
+            if bore_mm > 0.2:
+                bore = Part.makeCylinder(
+                    bore_mm * 0.5,
+                    height_mm + 2.0,
+                    FreeCAD.Vector(length_mm * 0.5, width_mm * 0.5, -1.0),
+                )
+                shape = shape.cut(bore)
+
+        # Apply declarative holes / boolean_cuts
+        holes = spec.get("holes") or spec.get("boolean_cuts") or []
+        if isinstance(holes, list):
+            for h in holes:
+                if not isinstance(h, dict):
+                    continue
+                htype = str(h.get("type", "cylinder")).lower()
+                hx = float(h.get("x", h.get("x_mm", length_mm * 0.5)))
+                hy = float(h.get("y", h.get("y_mm", width_mm * 0.5)))
+                hz = float(h.get("z", h.get("z_mm", -1.0)))
+                if htype == "box":
+                    hl = float(h.get("length_mm", h.get("dx", 6.0)))
+                    hw = float(h.get("width_mm", h.get("dy", 6.0)))
+                    hh = float(h.get("height_mm", h.get("dz", height_mm + 2.0)))
+                    cut_s = Part.makeBox(hl, hw, hh, FreeCAD.Vector(hx, hy, hz))
+                else:
+                    hd = float(h.get("diameter_mm", h.get("radius_mm", 2.0) * 2.0))
+                    hh = float(h.get("depth_mm", h.get("height_mm", max(length_mm, width_mm, height_mm) + 4.0)))
+                    ax = h.get("axis", [0.0, 0.0, 1.0])
+                    axis_vec = FreeCAD.Vector(float(ax[0]), float(ax[1]), float(ax[2])) if isinstance(ax, (list, tuple)) and len(ax) >= 3 else FreeCAD.Vector(0, 0, 1)
+                    cut_s = Part.makeCylinder(max(0.1, hd * 0.5), hh, FreeCAD.Vector(hx, hy, hz), axis_vec)
+                shape = shape.cut(cut_s)
+
+        # Apply declarative boolean_unions
+        unions = spec.get("boolean_unions") or spec.get("add_features") or []
+        if isinstance(unions, list):
+            for u in unions:
+                if isinstance(u, dict):
+                    u_shape = self._build_shape_from_spec(u)
+                    upos = u.get("position") or [u.get("x", 0.0), u.get("y", 0.0), u.get("z", 0.0)]
+                    if isinstance(upos, (list, tuple)) and len(upos) >= 3:
+                        u_shape.translate(FreeCAD.Vector(float(upos[0]), float(upos[1]), float(upos[2])))
+                    shape = shape.fuse(u_shape)
+
+        fillet_r = float(spec.get("fillet_mm", 0.0))
+        if fillet_r > 0.05 and hasattr(shape, "makeFillet") and getattr(shape, "Edges", None):
+            try:
+                shape = shape.makeFillet(fillet_r, shape.Edges)
+            except Exception:
+                pass
+
+        chamfer_r = float(spec.get("chamfer_mm", 0.0))
+        if chamfer_r > 0.05 and hasattr(shape, "makeChamfer") and getattr(shape, "Edges", None):
+            try:
+                shape = shape.makeChamfer(chamfer_r, shape.Edges)
+            except Exception:
+                pass
+
+        return shape
+
+    def _apply_feature_transform_and_style(self, feature, spec):
+        pos = spec.get("position") or [
+            spec.get("x_mm", spec.get("x", 0.0)),
+            spec.get("y_mm", spec.get("y", 0.0)),
+            spec.get("z_mm", spec.get("z", 0.0)),
+        ]
+        rot = spec.get("rotation") or [0.0, 0.0, 1.0, float(spec.get("rotation_deg", 0.0))]
+        if hasattr(FreeCAD, "Placement") and hasattr(FreeCAD, "Vector") and hasattr(FreeCAD, "Rotation"):
+            try:
+                vec = FreeCAD.Vector(float(pos[0]), float(pos[1]), float(pos[2]))
+                if isinstance(rot, (list, tuple)) and len(rot) >= 4:
+                    r_obj = FreeCAD.Rotation(FreeCAD.Vector(float(rot[0]), float(rot[1]), float(rot[2])), float(rot[3]))
+                else:
+                    r_obj = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), float(spec.get("rotation_deg", 0.0)))
+                feature.Placement = FreeCAD.Placement(vec, r_obj)
+            except Exception:
+                pass
+
+        vobj = getattr(feature, "ViewObject", None)
+        if vobj is not None:
+            try:
+                if "color" in spec:
+                    vobj.ShapeColor = _normalize_rgb(spec["color"])
+                if "transparency" in spec:
+                    vobj.Transparency = int(spec["transparency"])
+            except Exception:
+                pass
+
+    def _generate_cad_live(self, args):
+        body_name = str(args.get("body_name", args.get("name", "RobotLink")))
+        doc_name = str(args.get("document_name", args.get("doc_name", "RobotCad")))
+        length_mm = float(args.get("length_mm", 45.0))
+        width_mm = float(args.get("width_mm", 28.0))
+        height_mm = float(args.get("height_mm", 18.0))
+
+        if not HAS_FREECAD:
             return {
                 "ok": True,
                 "body_name": body_name,
                 "volume_mm3": length_mm * width_mm * height_mm,
             }
 
-        if tool_name == "freecad_edit_parameters":
-            params = dict(args.get("parameters") or {})
-            if HAS_FREECAD and FreeCAD.ActiveDocument is not None:
-                FreeCAD.ActiveDocument.recompute()
+        doc = FreeCAD.ActiveDocument
+        if doc is None:
+            doc = FreeCAD.newDocument(doc_name)
+
+        if args.get("clear_existing", False) and hasattr(doc, "Objects"):
+            for existing_obj in list(doc.Objects):
+                try:
+                    if hasattr(doc, "removeObject"):
+                        doc.removeObject(existing_obj.Name)
+                except Exception:
+                    pass
+
+        created_bodies = []
+        total_volume = 0.0
+
+        script_code = args.get("script")
+        if isinstance(script_code, str) and script_code.strip():
+            safe_globals = {
+                "__builtins__": __builtins__,
+                "FreeCAD": FreeCAD,
+                "App": FreeCAD,
+                "Part": Part,
+                "Mesh": Mesh,
+                "FreeCADGui": FreeCADGui,
+                "Gui": FreeCADGui,
+                "math": math,
+                "doc": doc,
+            }
+            exec(script_code, safe_globals, safe_globals)
+        else:
+            parts_spec = args.get("parts") or args.get("primitives")
+            if not isinstance(parts_spec, list) or len(parts_spec) == 0:
+                parts_spec = [args]
+
+            for idx, p_spec in enumerate(parts_spec):
+                if not isinstance(p_spec, dict):
+                    continue
+                p_name = str(p_spec.get("name", p_spec.get("body_name", f"{body_name}_{idx + 1}" if len(parts_spec) > 1 else body_name)))
+                shape = self._build_shape_from_spec(p_spec)
+                feature = doc.addObject("Part::Feature", p_name)
+                if hasattr(feature, "Label") and p_spec.get("label"):
+                    feature.Label = str(p_spec["label"])
+                feature.Shape = shape
+                self._apply_feature_transform_and_style(feature, p_spec)
+
+        doc.recompute()
+        self._refresh_gui_viewport(view_mode=args.get("view", "Isometric"), fit_all=True)
+
+        bbox_out = {"x_min": 0.0, "y_min": 0.0, "z_min": 0.0, "x_max": length_mm, "y_max": width_mm, "z_max": height_mm}
+        if hasattr(doc, "Objects"):
+            for obj in doc.Objects:
+                if hasattr(obj, "Shape") and obj.Shape is not None:
+                    vol = float(getattr(obj.Shape, "Volume", 0.0))
+                    total_volume += vol
+                    bb = getattr(obj.Shape, "BoundBox", None)
+                    if bb is not None:
+                        bbox_out = {
+                            "x_min": float(bb.XMin), "y_min": float(bb.YMin), "z_min": float(bb.ZMin),
+                            "x_max": float(bb.XMax), "y_max": float(bb.YMax), "z_max": float(bb.ZMax),
+                        }
+                    created_bodies.append({
+                        "name": str(getattr(obj, "Name", body_name)),
+                        "label": str(getattr(obj, "Label", getattr(obj, "Name", body_name))),
+                        "volume_mm3": vol,
+                        "watertight": bool(obj.Shape.isClosed()) if hasattr(obj.Shape, "isClosed") else True,
+                    })
+
+        if total_volume <= 0.0:
+            total_volume = length_mm * width_mm * height_mm
+        mass_kg = (total_volume * 1e-3) * 1.27 * 1e-3
+
+        return {
+            "ok": True,
+            "live_gui": True,
+            "active_document": self._active_doc_name(),
+            "body_name": body_name,
+            "volume_mm3": total_volume,
+            "mass_kg": mass_kg,
+            "bounding_box": bbox_out,
+            "bodies_count": len(created_bodies),
+            "bodies": created_bodies,
+        }
+
+    def _assemble_joint_live(self, args):
+        min_deg = float(args.get("min_deg", -90.0))
+        max_deg = float(args.get("max_deg", 90.0))
+        step_deg = max(1.0, float(args.get("step_deg", 5.0)))
+        link_len = float(args.get("link_length_mm", 60.0))
+        obstacle_deg = args.get("obstacle_angle_deg")
+        obstacle_span = float(args.get("obstacle_span_deg", 10.0))
+        axis_raw = args.get("axis", [0.0, 0.0, 1.0])
+        pivot_raw = args.get("pivot", [0.0, 0.0, 0.0])
+
+        target_obj = None
+        obstacle_objs = []
+        if HAS_FREECAD and getattr(FreeCAD, "ActiveDocument", None) is not None:
+            doc = FreeCAD.ActiveDocument
+            part_name = str(args.get("part_name", args.get("body_name", ""))).strip()
+            obs_name = str(args.get("obstacle_name", args.get("stator_name", ""))).strip()
+            shape_objs = [o for o in getattr(doc, "Objects", []) if hasattr(o, "Shape") and o.Shape is not None]
+            for o in shape_objs:
+                oname = str(getattr(o, "Name", ""))
+                olabel = str(getattr(o, "Label", ""))
+                if part_name and (oname == part_name or olabel == part_name):
+                    target_obj = o
+                elif obs_name and (oname == obs_name or olabel == obs_name):
+                    obstacle_objs.append(o)
+            if target_obj is None and shape_objs:
+                target_obj = shape_objs[-1]
+            if not obstacle_objs and args.get("check_scene_obstacles", False):
+                obstacle_objs = [o for o in shape_objs if o is not target_obj]
+
+        samples = []
+        collision_detected = False
+        first_collision_deg = 0.0
+        min_clearance = 100.0
+        animated_in_gui = False
+
+        angle = min_deg
+        while angle <= max_deg + 1e-6:
+            rad = math.radians(angle)
+            clearance = 20.0
+
+            if target_obj is not None and hasattr(FreeCAD, "Placement") and hasattr(FreeCAD, "Vector") and hasattr(FreeCAD, "Rotation"):
+                try:
+                    p_vec = FreeCAD.Vector(float(pivot_raw[0]), float(pivot_raw[1]), float(pivot_raw[2]))
+                    a_vec = FreeCAD.Vector(float(axis_raw[0]), float(axis_raw[1]), float(axis_raw[2]))
+                    target_obj.Placement = FreeCAD.Placement(p_vec, FreeCAD.Rotation(a_vec, angle), p_vec)
+                    animated_in_gui = True
+                    if HAS_FREECAD_GUI and FreeCADGui is not None and hasattr(FreeCADGui, "updateGui"):
+                        FreeCADGui.updateGui()
+                    if obstacle_objs and hasattr(target_obj.Shape, "distToShape"):
+                        scene_clearances = []
+                        for obs in obstacle_objs:
+                            dist_info = target_obj.Shape.distToShape(obs.Shape)
+                            dist_mm = float(dist_info[0]) if isinstance(dist_info, (list, tuple)) else float(dist_info)
+                            if dist_mm <= 1e-4 and hasattr(target_obj.Shape, "common"):
+                                common_vol = float(getattr(target_obj.Shape.common(obs.Shape), "Volume", 0.0))
+                                if common_vol > 1e-3:
+                                    dist_mm = -min(10.0, common_vol ** (1.0 / 3.0))
+                            scene_clearances.append(dist_mm)
+                        if scene_clearances:
+                            clearance = min(scene_clearances)
+                except Exception:
+                    pass
+
+            if obstacle_deg is not None:
+                diff = abs(angle - float(obstacle_deg))
+                if diff <= obstacle_span:
+                    clearance = min(clearance, -(obstacle_span - diff) * 0.5 - 0.1)
+                else:
+                    clearance = min(clearance, (diff - obstacle_span) * 0.4)
+
+            min_clearance = min(min_clearance, clearance)
+            colliding = clearance <= 0.0
+            if colliding and not collision_detected:
+                collision_detected = True
+                first_collision_deg = angle
+            samples.append({
+                "angle_deg": angle,
+                "tip_x_mm": link_len * math.cos(rad),
+                "tip_y_mm": link_len * math.sin(rad),
+                "clearance_mm": clearance,
+                "colliding": colliding,
+            })
+            angle += step_deg
+
+        if target_obj is not None and "target_angle_deg" in args:
+            try:
+                final_deg = float(args["target_angle_deg"])
+                p_vec = FreeCAD.Vector(float(pivot_raw[0]), float(pivot_raw[1]), float(pivot_raw[2]))
+                a_vec = FreeCAD.Vector(float(axis_raw[0]), float(axis_raw[1]), float(axis_raw[2]))
+                target_obj.Placement = FreeCAD.Placement(p_vec, FreeCAD.Rotation(a_vec, final_deg), p_vec)
+                if HAS_FREECAD_GUI and FreeCADGui is not None and hasattr(FreeCADGui, "updateGui"):
+                    FreeCADGui.updateGui()
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "live_gui": True,
+            "animated_in_gui": animated_in_gui,
+            "active_document": self._active_doc_name(),
+            "collision_detected": collision_detected,
+            "first_collision_angle_deg": first_collision_deg if collision_detected else 0.0,
+            "min_clearance_mm": min_clearance,
+            "swept_angles_count": len(samples),
+            "samples": samples,
+        }
+
+    def _maybe_hot_reload(self):
+        try:
+            if "__file__" in globals() and os.path.exists(__file__):
+                cur_mtime = os.path.getmtime(__file__)
+                prev_mtime = getattr(self, "_file_mtime", None)
+                if prev_mtime is None:
+                    self._file_mtime = cur_mtime
+                elif prev_mtime != cur_mtime:
+                    self._file_mtime = cur_mtime
+                    with open(__file__, "r", encoding="utf-8") as f:
+                        src = f.read()
+                    ns = {"__file__": __file__, "_AIMON_HOT_RELOAD": True}
+                    exec(compile(src, __file__, "exec"), ns)
+                    if "AimonFreeCadBridgeClient" in ns:
+                        self.__class__ = ns["AimonFreeCadBridgeClient"]
+        except Exception:
+            pass
+
+    def dispatch_tool(self, tool_name, args):
+        self._maybe_hot_reload()
+        if tool_name == "freecad_live_status":
             return {
                 "ok": True,
-                "parameters": params,
-                "recomputed": True,
+                "plugin_connected": True,
+                "has_freecad_runtime": HAS_FREECAD,
+                "version": self._get_freecad_version(),
+                "active_document": self._active_doc_name(),
+                "workbenches": sorted(ALLOWED_FREECAD_MODULES),
             }
+
+        if tool_name == "freecad_inspect_document":
+            def _do_inspect():
+                bodies = []
+                if HAS_FREECAD and FreeCAD.ActiveDocument is not None:
+                    for obj in FreeCAD.ActiveDocument.Objects:
+                        if hasattr(obj, "Shape") and obj.Shape is not None:
+                            bb = obj.Shape.BoundBox
+                            bodies.append({
+                                "name": obj.Name,
+                                "label": getattr(obj, "Label", obj.Name),
+                                "volume_mm3": float(obj.Shape.Volume),
+                                "watertight": bool(obj.Shape.isClosed()),
+                                "bounding_box": {
+                                    "x_min": bb.XMin, "y_min": bb.YMin, "z_min": bb.ZMin,
+                                    "x_max": bb.XMax, "y_max": bb.YMax, "z_max": bb.ZMax,
+                                },
+                            })
+                return {
+                    "ok": True,
+                    "active_document": self._active_doc_name(),
+                    "bodies_count": len(bodies),
+                    "bodies": bodies,
+                }
+            return self._run_on_gui_thread(_do_inspect)
+
+        if tool_name == "freecad_generate_cad":
+            return self._run_on_gui_thread(lambda: self._generate_cad_live(args))
+
+        if tool_name == "freecad_edit_parameters":
+            def _do_edit_params():
+                params = dict(args.get("parameters") or {})
+                if HAS_FREECAD and FreeCAD.ActiveDocument is not None:
+                    doc = FreeCAD.ActiveDocument
+                    target_name = str(args.get("body_name", args.get("object_name", "")))
+                    for obj in getattr(doc, "Objects", []):
+                        if target_name and getattr(obj, "Name", "") != target_name and getattr(obj, "Label", "") != target_name:
+                            continue
+                        for k, v in params.items():
+                            if hasattr(obj, k):
+                                try:
+                                    setattr(obj, k, v)
+                                except Exception:
+                                    pass
+                        if "color" in params and getattr(obj, "ViewObject", None) is not None:
+                            try:
+                                obj.ViewObject.ShapeColor = _normalize_rgb(params["color"])
+                            except Exception:
+                                pass
+                    doc.recompute()
+                    self._refresh_gui_viewport(fit_all=False)
+                return {
+                    "ok": True,
+                    "active_document": self._active_doc_name(),
+                    "parameters": params,
+                    "recomputed": True,
+                }
+            return self._run_on_gui_thread(_do_edit_params)
 
         if tool_name == "freecad_assemble_joint":
-            min_deg = float(args.get("min_deg", -90.0))
-            max_deg = float(args.get("max_deg", 90.0))
-            step_deg = max(1.0, float(args.get("step_deg", 5.0)))
-            link_len = float(args.get("link_length_mm", 60.0))
-            obstacle_deg = args.get("obstacle_angle_deg")
-            obstacle_span = float(args.get("obstacle_span_deg", 10.0))
-            samples = []
-            collision_detected = False
-            first_collision_deg = 0.0
-            min_clearance = 100.0
-            angle = min_deg
-            while angle <= max_deg + 1e-6:
-                rad = math.radians(angle)
-                clearance = 20.0
-                if obstacle_deg is not None:
-                    diff = abs(angle - float(obstacle_deg))
-                    if diff <= obstacle_span:
-                        clearance = -(obstacle_span - diff) * 0.5 - 0.1
-                    else:
-                        clearance = (diff - obstacle_span) * 0.4
-                min_clearance = min(min_clearance, clearance)
-                colliding = clearance <= 0.0
-                if colliding and not collision_detected:
-                    collision_detected = True
-                    first_collision_deg = angle
-                samples.append({
-                    "angle_deg": angle,
-                    "tip_x_mm": link_len * math.cos(rad),
-                    "tip_y_mm": link_len * math.sin(rad),
-                    "clearance_mm": clearance,
-                    "colliding": colliding,
-                })
-                angle += step_deg
-            return {
-                "ok": True,
-                "collision_detected": collision_detected,
-                "first_collision_angle_deg": first_collision_deg if collision_detected else 0.0,
-                "min_clearance_mm": min_clearance,
-                "swept_angles_count": len(samples),
-                "samples": samples,
-            }
+            return self._run_on_gui_thread(lambda: self._assemble_joint_live(args))
 
         if tool_name == "freecad_analyze_printability":
-            non_manifold = int(args.get("non_manifold_edges", 0))
-            watertight = bool(args.get("watertight", non_manifold == 0))
-            wall_mm = float(args.get("wall_thickness_mm", 2.0))
-            min_wall_mm = float(args.get("min_wall_thickness_mm", 1.2))
-            return {
-                "ok": True,
-                "is_manifold": watertight and non_manifold == 0,
-                "watertight": watertight and non_manifold == 0,
-                "non_manifold_edges": non_manifold,
-                "min_wall_thickness_mm": wall_mm,
-                "printability_pass": watertight and non_manifold == 0 and wall_mm >= min_wall_mm,
-            }
+            def _do_printability():
+                non_manifold = int(args.get("non_manifold_edges", 0))
+                watertight = bool(args.get("watertight", non_manifold == 0))
+                if HAS_FREECAD and FreeCAD.ActiveDocument is not None and "watertight" not in args and "non_manifold_edges" not in args:
+                    for obj in getattr(FreeCAD.ActiveDocument, "Objects", []):
+                        if hasattr(obj, "Shape") and obj.Shape is not None and hasattr(obj.Shape, "isClosed"):
+                            if not obj.Shape.isClosed():
+                                watertight = False
+                                non_manifold += 1
+                wall_mm = float(args.get("wall_thickness_mm", 2.0))
+                min_wall_mm = float(args.get("min_wall_thickness_mm", 1.2))
+                return {
+                    "ok": True,
+                    "active_document": self._active_doc_name(),
+                    "is_manifold": watertight and non_manifold == 0,
+                    "watertight": watertight and non_manifold == 0,
+                    "non_manifold_edges": non_manifold,
+                    "min_wall_thickness_mm": wall_mm,
+                    "printability_pass": watertight and non_manifold == 0 and wall_mm >= min_wall_mm,
+                }
+            return self._run_on_gui_thread(_do_printability)
 
         if tool_name == "freecad_render_view":
-            out_dir = str(args.get("output_dir", ""))
-            views = args.get("views") or ["Isometric", "Front", "Top", "Right"]
-            rendered = []
-            for v in views:
-                fpath = os.path.join(out_dir, f"view_{v}.png") if out_dir else ""
-                rendered.append({"view": v, "file_path": fpath})
-            return {"ok": True, "views_count": len(rendered), "views": rendered}
+            def _do_render():
+                out_dir = str(args.get("output_dir", ""))
+                width = int(args.get("width", 1280))
+                height = int(args.get("height", 960))
+                views = args.get("views") or ["Isometric", "Front", "Top", "Right"]
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                rendered = []
+                for v in views:
+                    self._refresh_gui_viewport(view_mode=v, fit_all=True)
+                    fpath = os.path.join(out_dir, f"view_{v}.png") if out_dir else ""
+                    if fpath and HAS_FREECAD_GUI and FreeCADGui is not None:
+                        try:
+                            gui_doc = getattr(FreeCADGui, "ActiveDocument", None)
+                            if gui_doc is not None and hasattr(gui_doc, "ActiveView") and gui_doc.ActiveView is not None:
+                                if hasattr(gui_doc.ActiveView, "saveImage"):
+                                    gui_doc.ActiveView.saveImage(fpath, width, height, "Current")
+                        except Exception:
+                            pass
+                    rendered.append({"view": v, "file_path": fpath, "width": width, "height": height})
+                return {
+                    "ok": True,
+                    "active_document": self._active_doc_name(),
+                    "views_count": len(rendered),
+                    "views": rendered,
+                }
+            return self._run_on_gui_thread(_do_render)
 
         if tool_name == "freecad_export_print_files":
             out_dir = str(args.get("output_dir", ""))
             part_name = str(args.get("part_name", "robot_link"))
             return {
                 "ok": True,
+                "active_document": self._active_doc_name(),
                 "output_dir": out_dir,
                 "stl_path": os.path.join(out_dir, f"{part_name}.stl"),
                 "threemf_path": os.path.join(out_dir, f"{part_name}.3mf"),
@@ -1552,7 +2939,33 @@ class AimonFreeCadBridgeClient:
             method = str(args.get("method", ""))
             if mod not in ALLOWED_FREECAD_MODULES:
                 raise ValueError(f"Disallowed FreeCAD module: {mod}")
-            return {"ok": True, "module": mod, "method": method, "executed": True}
+
+            def _do_invoke():
+                mod_map = {
+                    "FreeCAD": FreeCAD,
+                    "FreeCADGui": FreeCADGui,
+                    "Part": Part,
+                    "Mesh": Mesh,
+                }
+                target_mod = mod_map.get(mod)
+                call_args = args.get("args") or []
+                call_kwargs = args.get("kwargs") or {}
+                ret_val = None
+                if target_mod is not None and hasattr(target_mod, method):
+                    fn_attr = getattr(target_mod, method)
+                    if callable(fn_attr):
+                        res = fn_attr(*call_args, **call_kwargs)
+                        ret_val = str(res) if res is not None else None
+                self._refresh_gui_viewport(fit_all=False)
+                return {
+                    "ok": True,
+                    "active_document": self._active_doc_name(),
+                    "module": mod,
+                    "method": method,
+                    "executed": True,
+                    "return_value": ret_val,
+                }
+            return self._run_on_gui_thread(_do_invoke)
 
         raise ValueError(f"Unsupported FreeCAD tool: {tool_name}")
 
@@ -1560,28 +2973,47 @@ class AimonFreeCadBridgeClient:
         while self._running:
             try:
                 sock = socket.create_connection((self._host, self._port), timeout=5.0)
-                sock.settimeout(None)
+                sock.settimeout(2.0)
                 self._sock = sock
+                last_doc = self._active_doc_name()
                 reg = {
                     "jsonrpc": "2.0",
                     "id": "freecad-reg-1",
                     "method": "plugin/register",
                     "params": {
                         "app": "freecad",
-                        "version": BRIDGE_VERSION,
+                        "version": self._get_freecad_version(),
                         "bridge_version": BRIDGE_VERSION,
-                        "app_version": "1.0",
-                        "active_document": self._active_doc_name(),
+                        "app_version": self._get_freecad_version(),
+                        "active_document": last_doc,
                     },
                 }
                 sock.sendall((json.dumps(reg) + "\n").encode("utf-8"))
 
                 buf = b""
                 while self._running:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
+                    try:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    except socket.timeout:
+                        cur_doc = self._active_doc_name()
+                        if cur_doc != last_doc:
+                            last_doc = cur_doc
+                            status_msg = {
+                                "jsonrpc": "2.0",
+                                "id": "freecad-status",
+                                "method": "plugin/status",
+                                "params": {
+                                    "app": "freecad",
+                                    "active_document": cur_doc,
+                                    "version": self._get_freecad_version(),
+                                },
+                            }
+                            sock.sendall((json.dumps(status_msg) + "\n").encode("utf-8"))
+                        continue
+
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         line_str = line.decode("utf-8", errors="replace").strip()
@@ -1617,6 +3049,21 @@ def start_aimon_freecad_bridge(host="127.0.0.1", port=3893):
         _GLOBAL_CLIENT.start()
     return _GLOBAL_CLIENT
 )PY";
+
+bool fileMatchesContent(const fs::path& filePath,
+                        const std::string& expectedContent) {
+    std::error_code ec;
+    if (!fs::exists(filePath, ec) || !fs::is_regular_file(filePath, ec)) {
+        return false;
+    }
+    std::ifstream ifs(filePath, std::ios::binary);
+    if (!ifs) {
+        return false;
+    }
+    std::string actual((std::istreambuf_iterator<char>(ifs)),
+                       std::istreambuf_iterator<char>());
+    return actual == expectedContent;
+}
 
 bool writeTextFileWithDirs(const fs::path& filePath,
                            const std::string& content,
@@ -1710,7 +3157,7 @@ bool EdaBridgeAppConfig::loadFromFile(const std::string& path,
     }
 
     EdaBridgeAppSettings s;
-    s.version = j.value("version", s.version);
+    s.version = AIMON_VERSION_STRING;
     s.enableEasyEda = j.value("enable_easyeda", s.enableEasyEda);
     s.enableKiCad = j.value("enable_kicad", s.enableKiCad);
     s.enableFreeCad = j.value("enable_freecad", s.enableFreeCad);
@@ -1729,6 +3176,8 @@ bool EdaBridgeAppConfig::loadFromFile(const std::string& path,
     s.allowedRoot = j.value("allowed_root", s.allowedRoot);
     s.kicadBinaryPath = j.value("kicad_binary_path", s.kicadBinaryPath);
     s.freecadBinaryPath = j.value("freecad_binary_path", s.freecadBinaryPath);
+    s.kicadPluginDir = j.value("kicad_plugin_dir", s.kicadPluginDir);
+    s.freecadModDir = j.value("freecad_mod_dir", s.freecadModDir);
 
     outSettings = s;
     return true;
@@ -1744,7 +3193,7 @@ bool EdaBridgeAppConfig::saveToFile(const std::string& path,
     }
 
     nlohmann::json j = {
-        {"version", settings.version},
+        {"version", AIMON_VERSION_STRING},
         {"enable_easyeda", settings.enableEasyEda},
         {"enable_kicad", settings.enableKiCad},
         {"enable_freecad", settings.enableFreeCad},
@@ -1762,7 +3211,9 @@ bool EdaBridgeAppConfig::saveToFile(const std::string& path,
         {"auth_secret", settings.authSecret},
         {"allowed_root", settings.allowedRoot},
         {"kicad_binary_path", settings.kicadBinaryPath},
-        {"freecad_binary_path", settings.freecadBinaryPath}
+        {"freecad_binary_path", settings.freecadBinaryPath},
+        {"kicad_plugin_dir", settings.kicadPluginDir},
+        {"freecad_mod_dir", settings.freecadModDir}
     };
 
     return writeTextFileWithDirs(fs::path(path), j.dump(2) + "\n", outError);
@@ -1885,6 +3336,10 @@ bool EdaBridgeAppConfig::writeEasyEdaEextFile(const std::string& outputFilePath,
         }
     }
     auto bytes = buildEasyEdaEextZipBytes();
+    std::string expectedBytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    if (fileMatchesContent(p, expectedBytes)) {
+        return true;
+    }
     std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
     if (!ofs) {
         outError = "Failed to open .eext file for writing: " + outputFilePath;
@@ -1901,48 +3356,314 @@ bool EdaBridgeAppConfig::writeEasyEdaEextFile(const std::string& outputFilePath,
 
 bool EdaBridgeAppConfig::deployKiCadPlugin(const std::string& appDataDir,
                                            std::string& outDeployedDir,
-                                           std::string& outError) {
+                                           std::string& outError,
+                                           const std::string& customTargetDir,
+                                           bool forceOverwrite,
+                                           bool* outAlreadyDeployed) {
     outError.clear();
     outDeployedDir.clear();
+    if (outAlreadyDeployed) {
+        *outAlreadyDeployed = false;
+    }
+
+    const std::string bridgePy = injectAimonVersion(kEmbeddedKiCadBridgePy);
+
+    if (!customTargetDir.empty()) {
+        std::error_code ec;
+        fs::path customPath(customTargetDir);
+        if (!fs::exists(customPath, ec) || !fs::is_directory(customPath, ec)) {
+            outError = "Custom KiCad plugin directory does not exist: " + customTargetDir;
+            return false;
+        }
+
+        fs::path pluginsBase;
+        fs::path targetDir;
+        std::string leaf = customPath.filename().string();
+        if (leaf == "aimon" || leaf == "kicad-aimon-bridge") {
+            targetDir = customPath;
+            pluginsBase = customPath.parent_path();
+        } else if (fs::exists(customPath / "scripting" / "plugins", ec)) {
+            pluginsBase = customPath / "scripting" / "plugins";
+            targetDir = pluginsBase / "aimon";
+        } else {
+            pluginsBase = customPath;
+            targetDir = pluginsBase / "aimon";
+        }
+
+        fs::path legacyDir = pluginsBase / "kicad-aimon-bridge";
+        bool hasLegacyDir = (targetDir != legacyDir) && fs::exists(legacyDir, ec) && fs::is_directory(legacyDir, ec);
+        bool targetMatches = fileMatchesContent(targetDir / "__init__.py", kEmbeddedKiCadInitPy) &&
+                             fileMatchesContent(targetDir / "KiCadAimonBridge.py", bridgePy);
+        bool legacyMatches = !hasLegacyDir ||
+                             (fileMatchesContent(legacyDir / "__init__.py", kEmbeddedKiCadInitPy) &&
+                              fileMatchesContent(legacyDir / "KiCadAimonBridge.py", bridgePy));
+
+        if (!forceOverwrite && targetMatches && legacyMatches) {
+            if (outAlreadyDeployed) {
+                *outAlreadyDeployed = true;
+            }
+            outDeployedDir = targetDir.string();
+            return true;
+        }
+
+        if (forceOverwrite || !fileMatchesContent(targetDir / "__init__.py", kEmbeddedKiCadInitPy)) {
+            if (!writeTextFileWithDirs(targetDir / "__init__.py", kEmbeddedKiCadInitPy, outError)) {
+                return false;
+            }
+        }
+        if (forceOverwrite || !fileMatchesContent(targetDir / "KiCadAimonBridge.py", bridgePy)) {
+            if (!writeTextFileWithDirs(targetDir / "KiCadAimonBridge.py", bridgePy, outError)) {
+                return false;
+            }
+        }
+        if (hasLegacyDir) {
+            if (forceOverwrite || !fileMatchesContent(legacyDir / "__init__.py", kEmbeddedKiCadInitPy)) {
+                writeTextFileWithDirs(legacyDir / "__init__.py", kEmbeddedKiCadInitPy, outError);
+            }
+            if (forceOverwrite || !fileMatchesContent(legacyDir / "KiCadAimonBridge.py", bridgePy)) {
+                writeTextFileWithDirs(legacyDir / "KiCadAimonBridge.py", bridgePy, outError);
+            }
+        }
+        outDeployedDir = targetDir.string();
+        return true;
+    }
+
     if (appDataDir.empty()) {
         outError = "appDataDir is empty";
         return false;
     }
-    fs::path targetDir = fs::path(appDataDir) / "KiCad" / "8.0" / "scripting" /
-                         "plugins" / "kicad-aimon-bridge";
-    if (!writeTextFileWithDirs(targetDir / "__init__.py", kEmbeddedKiCadInitPy, outError)) {
+
+    std::error_code ec;
+    std::vector<fs::path> kicadBases;
+    fs::path appPath(appDataDir);
+    if (appPath.filename() == "Roaming" && appPath.parent_path().filename() == "AppData") {
+        fs::path userProfile = appPath.parent_path().parent_path();
+        kicadBases.push_back(userProfile / "Documents" / "KiCad");
+    }
+#ifdef _WIN32
+    if (const char* envApp = std::getenv("APPDATA")) {
+        if (appDataDir == envApp) {
+            if (const char* up = std::getenv("USERPROFILE")) {
+                if (*up) {
+                    kicadBases.push_back(fs::path(up) / "Documents" / "KiCad");
+                }
+            }
+        }
+    }
+#endif
+    kicadBases.push_back(appPath / "Documents" / "KiCad");
+    kicadBases.push_back(appPath / "KiCad");
+    kicadBases.push_back(appPath / "kicad");
+
+    std::vector<fs::path> versionDirs;
+    for (const auto& base : kicadBases) {
+        if (!fs::exists(base, ec) || !fs::is_directory(base, ec)) {
+            continue;
+        }
+        for (const auto& entry : fs::directory_iterator(base, ec)) {
+            if (!entry.is_directory(ec)) continue;
+            std::string name = entry.path().filename().string();
+            if (!name.empty() && std::isdigit(static_cast<unsigned char>(name[0]))) {
+                if (std::find(versionDirs.begin(), versionDirs.end(), entry.path()) == versionDirs.end()) {
+                    versionDirs.push_back(entry.path());
+                }
+            }
+        }
+    }
+
+    if (versionDirs.empty()) {
+        outError = "KiCad user configuration directory not found under " + appDataDir;
         return false;
     }
-    if (!writeTextFileWithDirs(
-            targetDir / "KiCadAimonBridge.py",
-            injectAimonVersion(kEmbeddedKiCadBridgePy),
-            outError)) {
-        return false;
+
+    bool anyAlready = false;
+    bool anyWritten = false;
+    for (const auto& verDir : versionDirs) {
+        fs::path pluginsBase = verDir / "scripting" / "plugins";
+        fs::path targetDir = pluginsBase / "aimon";
+        fs::path legacyDir = pluginsBase / "kicad-aimon-bridge";
+        bool hasLegacyDir = fs::exists(legacyDir, ec) && fs::is_directory(legacyDir, ec);
+        bool targetMatches = fileMatchesContent(targetDir / "__init__.py", kEmbeddedKiCadInitPy) &&
+                             fileMatchesContent(targetDir / "KiCadAimonBridge.py", bridgePy);
+        bool legacyMatches = !hasLegacyDir ||
+                             (fileMatchesContent(legacyDir / "__init__.py", kEmbeddedKiCadInitPy) &&
+                              fileMatchesContent(legacyDir / "KiCadAimonBridge.py", bridgePy));
+
+        if (!forceOverwrite && targetMatches && legacyMatches) {
+            anyAlready = true;
+            outDeployedDir = targetDir.string();
+            continue;
+        }
+
+        if (forceOverwrite || !fileMatchesContent(targetDir / "__init__.py", kEmbeddedKiCadInitPy)) {
+            if (!writeTextFileWithDirs(targetDir / "__init__.py", kEmbeddedKiCadInitPy, outError)) {
+                return false;
+            }
+        }
+        if (forceOverwrite || !fileMatchesContent(targetDir / "KiCadAimonBridge.py", bridgePy)) {
+            if (!writeTextFileWithDirs(targetDir / "KiCadAimonBridge.py", bridgePy, outError)) {
+                return false;
+            }
+        }
+        if (hasLegacyDir) {
+            if (forceOverwrite || !fileMatchesContent(legacyDir / "__init__.py", kEmbeddedKiCadInitPy)) {
+                writeTextFileWithDirs(legacyDir / "__init__.py", kEmbeddedKiCadInitPy, outError);
+            }
+            if (forceOverwrite || !fileMatchesContent(legacyDir / "KiCadAimonBridge.py", bridgePy)) {
+                writeTextFileWithDirs(legacyDir / "KiCadAimonBridge.py", bridgePy, outError);
+            }
+        }
+        outDeployedDir = targetDir.string();
+        anyWritten = true;
     }
-    outDeployedDir = targetDir.string();
+
+    if (outAlreadyDeployed) {
+        *outAlreadyDeployed = (anyAlready && !anyWritten);
+    }
     return true;
 }
 
 bool EdaBridgeAppConfig::deployFreeCadPlugin(const std::string& appDataDir,
                                              std::string& outDeployedDir,
-                                             std::string& outError) {
+                                             std::string& outError,
+                                             const std::string& customTargetDir,
+                                             bool forceOverwrite,
+                                             bool* outAlreadyDeployed) {
     outError.clear();
     outDeployedDir.clear();
+    if (outAlreadyDeployed) {
+        *outAlreadyDeployed = false;
+    }
+
+    const std::string bridgePy = injectAimonVersion(kEmbeddedFreeCadBridgePy);
+
+    if (!customTargetDir.empty()) {
+        std::error_code ec;
+        fs::path customPath(customTargetDir);
+        if (!fs::exists(customPath, ec) || !fs::is_directory(customPath, ec)) {
+            outError = "Custom FreeCAD Mod directory does not exist: " + customTargetDir;
+            return false;
+        }
+
+        fs::path modDir;
+        fs::path targetDir;
+        std::string leaf = customPath.filename().string();
+        if (leaf == "aimon" || leaf == "freecad-aimon-bridge") {
+            targetDir = customPath;
+            modDir = customPath.parent_path();
+        } else if (fs::exists(customPath / "Mod", ec) && fs::is_directory(customPath / "Mod", ec)) {
+            modDir = customPath / "Mod";
+            targetDir = modDir / "aimon";
+        } else {
+            modDir = customPath;
+            targetDir = modDir / "aimon";
+        }
+
+        fs::path legacyDir = modDir / "freecad-aimon-bridge";
+        bool hasLegacyDir = (targetDir != legacyDir) && fs::exists(legacyDir, ec) && fs::is_directory(legacyDir, ec);
+        bool targetMatches = fileMatchesContent(targetDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy) &&
+                             fileMatchesContent(targetDir / "AimonFreeCadBridge.py", bridgePy);
+        bool legacyMatches = !hasLegacyDir ||
+                             (fileMatchesContent(legacyDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy) &&
+                              fileMatchesContent(legacyDir / "AimonFreeCadBridge.py", bridgePy));
+
+        if (!forceOverwrite && targetMatches && legacyMatches) {
+            if (outAlreadyDeployed) {
+                *outAlreadyDeployed = true;
+            }
+            outDeployedDir = targetDir.string();
+            return true;
+        }
+
+        if (forceOverwrite || !fileMatchesContent(targetDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy)) {
+            if (!writeTextFileWithDirs(targetDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy, outError)) {
+                return false;
+            }
+        }
+        if (forceOverwrite || !fileMatchesContent(targetDir / "AimonFreeCadBridge.py", bridgePy)) {
+            if (!writeTextFileWithDirs(targetDir / "AimonFreeCadBridge.py", bridgePy, outError)) {
+                return false;
+            }
+        }
+        if (hasLegacyDir) {
+            if (forceOverwrite || !fileMatchesContent(legacyDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy)) {
+                writeTextFileWithDirs(legacyDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy, outError);
+            }
+            if (forceOverwrite || !fileMatchesContent(legacyDir / "AimonFreeCadBridge.py", bridgePy)) {
+                writeTextFileWithDirs(legacyDir / "AimonFreeCadBridge.py", bridgePy, outError);
+            }
+        }
+        outDeployedDir = targetDir.string();
+        return true;
+    }
+
     if (appDataDir.empty()) {
         outError = "appDataDir is empty";
         return false;
     }
-    fs::path targetDir = fs::path(appDataDir) / "FreeCAD" / "Mod" / "freecad-aimon-bridge";
-    if (!writeTextFileWithDirs(targetDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy, outError)) {
+
+    std::error_code ec;
+    fs::path fcBase = fs::path(appDataDir) / "FreeCAD";
+    if (!fs::exists(fcBase, ec) || !fs::is_directory(fcBase, ec)) {
+        outError = "FreeCAD user directory not found: " + fcBase.string();
         return false;
     }
-    if (!writeTextFileWithDirs(
-            targetDir / "AimonFreeCadBridge.py",
-            injectAimonVersion(kEmbeddedFreeCadBridgePy),
-            outError)) {
-        return false;
+
+    std::vector<fs::path> modDirs;
+    for (const auto& entry : fs::directory_iterator(fcBase, ec)) {
+        if (!entry.is_directory(ec)) continue;
+        std::string name = entry.path().filename().string();
+        if (!name.empty() && (name[0] == 'v' || name[0] == 'V')) {
+            modDirs.push_back(entry.path() / "Mod");
+        }
     }
-    outDeployedDir = targetDir.string();
+    if (fs::exists(fcBase / "Mod", ec) || fs::exists(fcBase / "user.cfg", ec) || modDirs.empty()) {
+        modDirs.push_back(fcBase / "Mod");
+    }
+
+    bool anyAlready = false;
+    bool anyWritten = false;
+    for (const auto& modDir : modDirs) {
+        fs::path targetDir = modDir / "aimon";
+        fs::path legacyDir = modDir / "freecad-aimon-bridge";
+        bool hasLegacyDir = fs::exists(legacyDir, ec) && fs::is_directory(legacyDir, ec);
+        bool targetMatches = fileMatchesContent(targetDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy) &&
+                             fileMatchesContent(targetDir / "AimonFreeCadBridge.py", bridgePy);
+        bool legacyMatches = !hasLegacyDir ||
+                             (fileMatchesContent(legacyDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy) &&
+                              fileMatchesContent(legacyDir / "AimonFreeCadBridge.py", bridgePy));
+
+        if (!forceOverwrite && targetMatches && legacyMatches) {
+            anyAlready = true;
+            outDeployedDir = targetDir.string();
+            continue;
+        }
+
+        if (forceOverwrite || !fileMatchesContent(targetDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy)) {
+            if (!writeTextFileWithDirs(targetDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy, outError)) {
+                return false;
+            }
+        }
+        if (forceOverwrite || !fileMatchesContent(targetDir / "AimonFreeCadBridge.py", bridgePy)) {
+            if (!writeTextFileWithDirs(targetDir / "AimonFreeCadBridge.py", bridgePy, outError)) {
+                return false;
+            }
+        }
+        if (hasLegacyDir) {
+            if (forceOverwrite || !fileMatchesContent(legacyDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy)) {
+                writeTextFileWithDirs(legacyDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy, outError);
+            }
+            if (forceOverwrite || !fileMatchesContent(legacyDir / "AimonFreeCadBridge.py", bridgePy)) {
+                writeTextFileWithDirs(legacyDir / "AimonFreeCadBridge.py", bridgePy, outError);
+            }
+        }
+        outDeployedDir = targetDir.string();
+        anyWritten = true;
+    }
+
+    if (outAlreadyDeployed) {
+        *outAlreadyDeployed = (anyAlready && !anyWritten);
+    }
     return true;
 }
 

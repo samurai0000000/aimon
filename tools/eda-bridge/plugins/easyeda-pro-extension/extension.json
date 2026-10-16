@@ -3,7 +3,7 @@
   "uuid": "8d4c91f2a70e4c6b9b24e31f6a821100",
   "displayName": "Aimon AI EDA Bridge",
   "description": "Connects EasyEDA Pro Desktop to aimon-eda-bridge over local loopback WebSocket (127.0.0.1:3893)",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "publisher": "Charles Chiou",
   "engines": {
     "eda": "^2.2.0"

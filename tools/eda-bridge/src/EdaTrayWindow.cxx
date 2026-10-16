@@ -394,7 +394,8 @@ void EdaTrayWindow::buildUi() {
         "padding: 3px 10px; font-size: 11px; font-weight: 700;"
     );
 
-    QLabel* verLbl = new QLabel(QString("v%1").arg(QString::fromStdString(_settings.version)), this);
+    _settings.version = AIMON_VERSION_STRING;
+    QLabel* verLbl = new QLabel(QString("v%1").arg(QString::fromUtf8(AIMON_VERSION_STRING)), this);
     verLbl->setStyleSheet(
         "background-color: rgba(56, 189, 248, 0.12); color: #38bdf8; "
         "border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 10px; "
@@ -1076,6 +1077,7 @@ void EdaTrayWindow::applyRuntimeToggles() {
     _server.setBridgeEnabled("kicad", _settings.enableKiCad);
     _server.setBridgeEnabled("freecad", _settings.enableFreeCad);
     _server.setDisallowExports(_settings.disallowExports);
+    _server.setAllowedRoot(_settings.allowedRoot);
 
     _syncingUi = true;
     if (_actTrayEasyEda) _actTrayEasyEda->setChecked(_settings.enableEasyEda);
@@ -1717,23 +1719,78 @@ void EdaTrayWindow::onDeployPluginsClicked() {
     std::string fcDir;
     std::string err1;
     std::string err2;
-    const bool okKc = EdaBridgeAppConfig::deployKiCadPlugin(appData, kcDir, err1);
-    const bool okFc = EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir, err2);
+    bool kcAlready = false;
+    bool fcAlready = false;
+
+    bool okKc = EdaBridgeAppConfig::deployKiCadPlugin(
+        appData, kcDir, err1, _settings.kicadPluginDir, false, &kcAlready
+    );
+    if (!okKc) {
+        QString chosenKc = QFileDialog::getExistingDirectory(
+            this,
+            "KiCad Plugin Directory Not Found — Select KiCad 'scripting/plugins' Folder",
+            QString::fromStdString(appData)
+        );
+        if (!chosenKc.isEmpty()) {
+            _settings.kicadPluginDir = chosenKc.toStdString();
+            std::string saveErr;
+            EdaBridgeAppConfig::saveToFile(_configFilePath, _settings, saveErr);
+            okKc = EdaBridgeAppConfig::deployKiCadPlugin(
+                appData, kcDir, err1, _settings.kicadPluginDir, false, &kcAlready
+            );
+        }
+    }
+
+    bool okFc = EdaBridgeAppConfig::deployFreeCadPlugin(
+        appData, fcDir, err2, _settings.freecadModDir, false, &fcAlready
+    );
+    if (!okFc) {
+        QString chosenFc = QFileDialog::getExistingDirectory(
+            this,
+            "FreeCAD Mod Directory Not Found — Select FreeCAD 'Mod' Folder",
+            QString::fromStdString(appData)
+        );
+        if (!chosenFc.isEmpty()) {
+            _settings.freecadModDir = chosenFc.toStdString();
+            std::string saveErr;
+            EdaBridgeAppConfig::saveToFile(_configFilePath, _settings, saveErr);
+            okFc = EdaBridgeAppConfig::deployFreeCadPlugin(
+                appData, fcDir, err2, _settings.freecadModDir, false, &fcAlready
+            );
+        }
+    }
 
     fs::path eextPath = fs::path(_configFilePath).parent_path() / "aimon-easyeda-bridge.eext";
     std::string err3;
     const bool okEe = EdaBridgeAppConfig::writeEasyEdaEextFile(eextPath.string(), err3);
 
+    const std::string kcStatus = !okKc
+        ? ("Error: " + err1)
+        : (kcAlready ? ("Already deployed (not overwritten): " + kcDir)
+                     : ("Deployed to " + kcDir));
+    const std::string fcStatus = !okFc
+        ? ("Error: " + err2)
+        : (fcAlready ? ("Already deployed (not overwritten): " + fcDir)
+                     : ("Deployed to " + fcDir));
+
+    if (_lblSettingsStatus) {
+        _lblSettingsStatus->setText(
+            QString("KiCad: %1 | FreeCAD: %2")
+                .arg(QString::fromStdString(kcStatus))
+                .arg(QString::fromStdString(fcStatus))
+        );
+    }
+
     if (okKc && okFc && okEe) {
         QMessageBox::information(
             this,
-            "aimon — Companion Plugins Deployed",
-            QString("Successfully deployed companion plugins:\n\n"
+            "aimon — Companion Plugins Status",
+            QString("Companion plugins status:\n\n"
                     "• KiCad Plugin:\n  %1\n\n"
                     "• FreeCAD Plugin:\n  %2\n\n"
                     "• EasyEDA Pro Extension:\n  %3")
-                .arg(QString::fromStdString(kcDir))
-                .arg(QString::fromStdString(fcDir))
+                .arg(QString::fromStdString(kcStatus))
+                .arg(QString::fromStdString(fcStatus))
                 .arg(QString::fromStdString(eextPath.string()))
         );
     } else {
@@ -1741,8 +1798,8 @@ void EdaTrayWindow::onDeployPluginsClicked() {
             this,
             "aimon — Plugin Deployment Warning",
             QString("Plugin deployment reported issues:\nKiCad: %1\nFreeCAD: %2\nEasyEDA: %3")
-                .arg(QString::fromStdString(okKc ? "OK" : err1))
-                .arg(QString::fromStdString(okFc ? "OK" : err2))
+                .arg(QString::fromStdString(kcStatus))
+                .arg(QString::fromStdString(fcStatus))
                 .arg(QString::fromStdString(okEe ? "OK" : err3))
         );
     }

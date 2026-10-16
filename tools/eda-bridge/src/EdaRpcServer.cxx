@@ -334,6 +334,16 @@ bool EdaRpcServer::constantTimeEquals(const std::string& a, const std::string& b
     return diff == 0u;
 }
 
+void EdaRpcServer::setAllowedRoot(const std::string& root) {
+    std::lock_guard<std::mutex> lock(_allowedRootMutex);
+    _options.allowedRoot = root;
+}
+
+std::string EdaRpcServer::allowedRoot() const {
+    std::lock_guard<std::mutex> lock(_allowedRootMutex);
+    return _options.allowedRoot;
+}
+
 bool EdaRpcServer::validateSandboxPath(const std::string& pathStr, std::string& outError) const {
     outError.clear();
     if (pathStr.empty()) {
@@ -359,21 +369,45 @@ bool EdaRpcServer::validateSandboxPath(const std::string& pathStr, std::string& 
         pos = next + 1;
     }
 
-    if (!_options.allowedRoot.empty()) {
-        std::string rootNorm = fs::path(_options.allowedRoot).lexically_normal().string();
+    std::string candNorm = fs::path(norm).lexically_normal().string();
+    std::replace(candNorm.begin(), candNorm.end(), '\\', '/');
+    while (candNorm.size() > 1 && candNorm.back() == '/') {
+        candNorm.pop_back();
+    }
+
+    // Allow paths inside the parent directory of any currently connected plugin's activeDocument
+    {
+        std::lock_guard<std::mutex> lock(_pluginsMutex);
+        for (const auto& kv : _pluginSessions) {
+            if (!kv.second->active.load() || kv.second->activeDocument.empty()) continue;
+            std::string activeNorm = kv.second->activeDocument;
+            std::replace(activeNorm.begin(), activeNorm.end(), '\\', '/');
+            fs::path docPath(activeNorm);
+            if (docPath.has_parent_path()) {
+                std::string docDirNorm = docPath.parent_path().lexically_normal().string();
+                std::replace(docDirNorm.begin(), docDirNorm.end(), '\\', '/');
+                while (docDirNorm.size() > 1 && docDirNorm.back() == '/') {
+                    docDirNorm.pop_back();
+                }
+                if (!docDirNorm.empty() && docDirNorm != "." && docDirNorm != "/" &&
+                    candNorm.rfind(docDirNorm, 0) == 0 &&
+                    (candNorm.size() == docDirNorm.size() || candNorm[docDirNorm.size()] == '/')) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    const std::string currentRoot = allowedRoot();
+    if (!currentRoot.empty()) {
+        std::string rootNorm = fs::path(currentRoot).lexically_normal().string();
         std::replace(rootNorm.begin(), rootNorm.end(), '\\', '/');
         while (rootNorm.size() > 1 && rootNorm.back() == '/') {
             rootNorm.pop_back();
         }
 
-        std::string candNorm = fs::path(norm).lexically_normal().string();
-        std::replace(candNorm.begin(), candNorm.end(), '\\', '/');
-        while (candNorm.size() > 1 && candNorm.back() == '/') {
-            candNorm.pop_back();
-        }
-
         if (candNorm.rfind(rootNorm, 0) != 0) {
-            outError = "Path '" + pathStr + "' is outside allowed root '" + _options.allowedRoot + "'";
+            outError = "Path '" + pathStr + "' is outside allowed root '" + currentRoot + "'";
             return false;
         }
         if (candNorm.size() > rootNorm.size() && candNorm[rootNorm.size()] != '/') {
@@ -1212,6 +1246,14 @@ bool EdaRpcServer::callPlugin(const std::string& app,
         return false;
     }
     outResult = pending->result;
+    if (outResult.is_object() && outResult.contains("active_document") &&
+        outResult["active_document"].is_string()) {
+        std::string newDoc = outResult["active_document"].get<std::string>();
+        if (!newDoc.empty()) {
+            std::lock_guard<std::mutex> lock(_pluginsMutex);
+            target->activeDocument = newDoc;
+        }
+    }
     return true;
 }
 
@@ -1481,7 +1523,13 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
     }
 
     if (toolName == "kicad_inspect_project") {
-        if (isPluginConnected("kicad") && args.value("prefer_live_gui", false)) {
+        bool hasPathOrSexp = !args.value("project_path",
+                              args.value("file_path",
+                              args.value("schematic_path",
+                              args.value("pcb_path",
+                              args.value("path",
+                              args.value("sexp", "")))))).empty();
+        if (isPluginConnected("kicad") && (args.value("prefer_live_gui", false) || !hasPathOrSexp)) {
             nlohmann::json plugRes;
             std::string plugErr;
             if (callPlugin("kicad", toolName, args, plugRes, plugErr, timeoutMs)) {
@@ -1508,9 +1556,17 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
     if (toolName == "kicad_sync_sch_to_pcb") {
         nlohmann::json res = KiCadSchematicEditor::syncSchematicToPcb(args);
         if (res.value("ok", false) && isPluginConnected("kicad")) {
+            nlohmann::json pluginArgs = args;
+            if (res.contains("footprints")) pluginArgs["footprints"] = res["footprints"];
+            if (res.contains("tracks")) pluginArgs["tracks"] = res["tracks"];
+            if (res.contains("vias")) pluginArgs["vias"] = res["vias"];
+            if (res.contains("zones")) pluginArgs["zones"] = res["zones"];
+            if (!pluginArgs.contains("board_outline") && res.contains("board_outline")) {
+                pluginArgs["board_outline"] = res["board_outline"];
+            }
             nlohmann::json plugRes;
             std::string plugErr;
-            if (callPlugin("kicad", toolName, args, plugRes, plugErr, timeoutMs)) {
+            if (callPlugin("kicad", toolName, pluginArgs, plugRes, plugErr, timeoutMs)) {
                 res["live_gui_synced"] = true;
                 res["plugin_response"] = plugRes;
             }
@@ -1521,9 +1577,17 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
     if (toolName == "kicad_edit_pcb") {
         nlohmann::json res = KiCadSchematicEditor::applyPcbEdits(args);
         if (res.value("ok", false) && isPluginConnected("kicad")) {
+            nlohmann::json pluginArgs = args;
+            if (res.contains("footprints")) pluginArgs["footprints"] = res["footprints"];
+            if (res.contains("tracks")) pluginArgs["tracks"] = res["tracks"];
+            if (res.contains("vias")) pluginArgs["vias"] = res["vias"];
+            if (res.contains("zones")) pluginArgs["zones"] = res["zones"];
+            if (!pluginArgs.contains("board_outline") && res.contains("board_outline")) {
+                pluginArgs["board_outline"] = res["board_outline"];
+            }
             nlohmann::json plugRes;
             std::string plugErr;
-            if (callPlugin("kicad", toolName, args, plugRes, plugErr, timeoutMs)) {
+            if (callPlugin("kicad", toolName, pluginArgs, plugRes, plugErr, timeoutMs)) {
                 res["live_gui_refreshed"] = true;
                 res["plugin_response"] = plugRes;
             }
@@ -1596,7 +1660,14 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
     if (toolName == "kicad_run_drc") {
         std::string pcbPath = args.value("pcb_path", args.value("file_path", args.value("path", "")));
         bool parity = args.value("schematic_parity", true);
-        if (!_options.kicadBinaryPath.empty() && fs::exists(_options.kicadBinaryPath)) {
+        if (isPluginConnected("kicad") && (pcbPath.empty() || args.value("prefer_live_gui", false))) {
+            nlohmann::json plugRes;
+            std::string plugErr;
+            if (callPlugin("kicad", toolName, args, plugRes, plugErr, timeoutMs)) {
+                return plugRes;
+            }
+        }
+        if (!_options.kicadBinaryPath.empty() && fs::exists(_options.kicadBinaryPath) && !pcbPath.empty()) {
             std::string reportPath = pcbPath + ".drc.json";
             std::vector<std::string> cliArgs = {"pcb", "drc", "--format", "json"};
             if (parity) cliArgs.push_back("--schematic-parity");
@@ -1934,7 +2005,7 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
     }
 
     if (toolName == "freecad_assemble_joint") {
-        if (pluginConn && args.value("prefer_live_gui", false)) {
+        if (pluginConn && args.value("prefer_live_gui", true)) {
             nlohmann::json plugRes;
             std::string plugErr;
             if (callPlugin("freecad", toolName, args, plugRes, plugErr, timeoutMs)) {
@@ -2013,7 +2084,7 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
     }
 
     if (toolName == "freecad_analyze_printability") {
-        if (pluginConn && args.value("prefer_live_gui", false)) {
+        if (pluginConn && args.value("prefer_live_gui", true)) {
             nlohmann::json plugRes;
             std::string plugErr;
             if (callPlugin("freecad", toolName, args, plugRes, plugErr, timeoutMs)) {
@@ -2058,7 +2129,7 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
     }
 
     if (toolName == "freecad_render_view") {
-        if (pluginConn && args.value("prefer_live_gui", false)) {
+        if (pluginConn && args.value("prefer_live_gui", true)) {
             nlohmann::json plugRes;
             std::string plugErr;
             if (callPlugin("freecad", toolName, args, plugRes, plugErr, timeoutMs)) {

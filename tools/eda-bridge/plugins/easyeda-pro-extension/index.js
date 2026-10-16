@@ -7,7 +7,7 @@
 var edaEsbuildExportName = (function () {
     "use strict";
 
-    const BRIDGE_VERSION = "1.1.0";
+    const BRIDGE_VERSION = "1.1.1";
     const DEFAULT_WS_URL = "ws://127.0.0.1:3893";
     const HEARTBEAT_INTERVAL_MS = 10000;
     const ALLOWED_PREFIXES = [
@@ -225,49 +225,170 @@ var edaEsbuildExportName = (function () {
         };
     }
 
+    const MM_TO_MIL = 39.37007874;
+
+    function toCanvasUnits(val, units) {
+        const n = Number(val || 0);
+        if (String(units || "mm").toLowerCase() === "mil") {
+            return n;
+        }
+        return Math.round(n * MM_TO_MIL * 1000) / 1000;
+    }
+
+    function normalizePcbLayer(layerName) {
+        const s = String(layerName || "TopLayer");
+        if (s === "F.Cu" || s === "Top" || s === "TopLayer") return "TopLayer";
+        if (s === "B.Cu" || s === "Bottom" || s === "BottomLayer") return "BottomLayer";
+        if (s === "F.SilkS" || s === "TopSilkLayer") return "TopSilkLayer";
+        if (s === "B.SilkS" || s === "BottomSilkLayer") return "BottomSilkLayer";
+        if (s === "Edge.Cuts" || s === "BoardOutLine") return "BoardOutLine";
+        return s;
+    }
+
+    function defaultPadsForEasyEdaFootprint(fpName) {
+        const upper = String(fpName || "").toUpperCase();
+        if (upper.indexOf("SOT-23") >= 0) {
+            return [
+                { number: "1", rel_x: -0.95, rel_y: 1.1, size_x: 0.6, size_y: 0.7 },
+                { number: "2", rel_x: 0.95, rel_y: 1.1, size_x: 0.6, size_y: 0.7 },
+                { number: "3", rel_x: 0.0, rel_y: -1.1, size_x: 0.6, size_y: 0.7 }
+            ];
+        }
+        if (upper.indexOf("SOIC-8") >= 0 || upper.indexOf("SOP-8") >= 0) {
+            const pads = [];
+            for (let i = 0; i < 4; ++i) {
+                pads.push({ number: String(i + 1), rel_x: -2.7, rel_y: -1.905 + i * 1.27, size_x: 1.5, size_y: 0.6 });
+            }
+            for (let i = 0; i < 4; ++i) {
+                pads.push({ number: String(i + 5), rel_x: 2.7, rel_y: 1.905 - i * 1.27, size_x: 1.5, size_y: 0.6 });
+            }
+            return pads;
+        }
+        if (upper.indexOf("0805") >= 0) {
+            return [
+                { number: "1", rel_x: -1.0, rel_y: 0.0, size_x: 1.0, size_y: 1.3 },
+                { number: "2", rel_x: 1.0, rel_y: 0.0, size_x: 1.0, size_y: 1.3 }
+            ];
+        }
+        return [
+            { number: "1", rel_x: -0.8, rel_y: 0.0, size_x: 0.8, size_y: 0.9 },
+            { number: "2", rel_x: 0.8, rel_y: 0.0, size_x: 0.8, size_y: 0.9 }
+        ];
+    }
+
+    async function resolveDeviceArg(c) {
+        let devArg = c.device_uuid || c.uuid || "";
+        const libraryUuid = c.library_uuid || c.libraryUuid || undefined;
+        if (devArg && typeof devArg === "object") {
+            return devArg;
+        }
+        const looksLikeUuid = typeof devArg === "string" && devArg.length >= 24 && devArg.indexOf(":") < 0;
+        if (looksLikeUuid) {
+            return libraryUuid ? { uuid: devArg, libraryUuid: libraryUuid } : devArg;
+        }
+        const searchKey = String(c.lcsc || c.query || c.value || c.lib_id || devArg || "");
+        if (searchKey && typeof eda !== "undefined" && eda.lib_Device && typeof eda.lib_Device.search === "function") {
+            try {
+                const hits = await eda.lib_Device.search(searchKey, libraryUuid);
+                if (Array.isArray(hits) && hits.length > 0 && hits[0].uuid) {
+                    if (hits[0].libraryUuid) {
+                        return { uuid: hits[0].uuid, libraryUuid: hits[0].libraryUuid };
+                    }
+                    return hits[0].uuid;
+                }
+            } catch (err) {
+                logDiag("lib_Device.search fallback failed for " + searchKey + ": " + String(err));
+            }
+        }
+        return devArg || c.lib_id || "Device:R";
+    }
+
     async function handleEditSchematic(args) {
         let placedComponents = 0;
         let placedWires = 0;
         let placedLabels = 0;
+        const units = (args && args.units) ? String(args.units) : "mm";
 
-        const comps = args.add_components || args.symbols || [];
+        const comps = (args && (args.add_components || args.components || args.symbols)) || [];
         if (Array.isArray(comps) && typeof eda !== "undefined" && eda.sch_PrimitiveComponent) {
             for (const c of comps) {
-                await eda.sch_PrimitiveComponent.create(
-                    c.device_uuid || c.uuid || c.lib_id,
-                    Number(c.x || 0),
-                    Number(c.y || 0),
+                const resolvedDevice = await resolveDeviceArg(c);
+                const xVal = toCanvasUnits(c.x !== undefined ? c.x : c.x_mm, units);
+                const yVal = toCanvasUnits(c.y !== undefined ? c.y : c.y_mm, units);
+                const rotVal = Number(c.rotation !== undefined ? c.rotation : c.rotation_deg || 0);
+                const created = await eda.sch_PrimitiveComponent.create(
+                    resolvedDevice,
+                    xVal,
+                    yVal,
                     c.sub_part_name || undefined,
-                    Number(c.rotation || 0),
+                    rotVal,
                     Boolean(c.mirror || false)
                 );
+                const ref = String(c.reference || c.ref || "");
+                const val = String(c.value || "");
+                if (created && typeof created === "object") {
+                    try {
+                        if (ref && typeof created.setState_Designator === "function") {
+                            await created.setState_Designator(ref);
+                        } else if (ref) {
+                            created.designator = ref;
+                        }
+                        if (val && typeof created.setState_Name === "function") {
+                            await created.setState_Name(val);
+                        } else if (val && typeof created.setState_Value === "function") {
+                            await created.setState_Value(val);
+                        }
+                    } catch (err) {
+                    }
+                }
                 placedComponents += 1;
             }
         }
 
-        const wires = args.add_wires || args.wires || [];
+        const wires = (args && (args.add_wires || args.wires)) || [];
         if (Array.isArray(wires) && typeof eda !== "undefined" && eda.sch_PrimitiveWire) {
             for (const w of wires) {
-                const pts = w.points || [Number(w.x1 || 0), Number(w.y1 || 0), Number(w.x2 || 0), Number(w.y2 || 0)];
+                let pts;
+                if (Array.isArray(w.points)) {
+                    pts = w.points.map(function (v) { return toCanvasUnits(v, units); });
+                } else {
+                    pts = [
+                        toCanvasUnits(w.x1 || 0, units),
+                        toCanvasUnits(w.y1 || 0, units),
+                        toCanvasUnits(w.x2 || 0, units),
+                        toCanvasUnits(w.y2 || 0, units)
+                    ];
+                }
                 await eda.sch_PrimitiveWire.create(pts, w.net || undefined);
                 placedWires += 1;
             }
         }
 
-        const labels = args.add_labels || args.labels || [];
+        const labels = [].concat(
+            (args && (args.add_labels || args.labels)) || [],
+            (args && (args.add_power_ports || args.power_ports)) || []
+        );
         if (Array.isArray(labels) && typeof eda !== "undefined" && eda.sch_PrimitiveNetLabel) {
             for (const l of labels) {
                 await eda.sch_PrimitiveNetLabel.create(
-                    Number(l.x || 0),
-                    Number(l.y || 0),
+                    toCanvasUnits(l.x || 0, units),
+                    toCanvasUnits(l.y || 0, units),
                     String(l.name || l.net || "NET")
                 );
                 placedLabels += 1;
             }
         }
 
+        try {
+            if (typeof eda !== "undefined" && eda.dmt_EditorControl && typeof eda.dmt_EditorControl.zoomToAllPrimitives === "function") {
+                await eda.dmt_EditorControl.zoomToAllPrimitives();
+            }
+        } catch (err) {
+        }
+
         return {
             ok: true,
+            active_document: await resolveActiveDocumentTitle(),
             placed_components: placedComponents,
             placed_wires: placedWires,
             placed_labels: placedLabels
@@ -305,6 +426,7 @@ var edaEsbuildExportName = (function () {
                     if (Array.isArray(raw)) {
                         for (const c of raw) {
                             components.push({
+                                id: String(callGetter(c, "getState_PrimitiveId", "primitiveId", "id", "")),
                                 reference: String(callGetter(c, "getState_Designator", "designator", "reference", "")),
                                 value: String(callGetter(c, "getState_Name", "name", "value", "")),
                                 footprint: String(callGetter(c, "getState_Footprint", "footprintName", "", "")),
@@ -369,6 +491,7 @@ var edaEsbuildExportName = (function () {
 
         return {
             ok: true,
+            active_document: await resolveActiveDocumentTitle(),
             components_count: components.length,
             tracks_count: tracks.length,
             vias_count: vias.length,
@@ -381,40 +504,190 @@ var edaEsbuildExportName = (function () {
 
     async function handleEditPcb(args) {
         let updatedPlacements = 0;
+        let createdFootprints = 0;
+        let createdPads = 0;
         let addedTracks = 0;
         let addedVias = 0;
         let addedZones = 0;
+        const units = (args && args.units) ? String(args.units) : "mm";
 
-        if (args.board_outline && typeof eda !== "undefined" && eda.pcb_PrimitiveLine) {
+        if (args.board_outline && typeof eda !== "undefined" && eda.pcb_PrimitiveLine && eda.pcb_PrimitiveLine.create) {
             const bo = args.board_outline;
-            const w = Number(bo.width_mm || bo.width || 50);
-            const h = Number(bo.height_mm || bo.height || 40);
-            await eda.pcb_PrimitiveLine.create("BoardOutLine", 0, 0, w, 0, 0.15);
-            await eda.pcb_PrimitiveLine.create("BoardOutLine", w, 0, w, h, 0.15);
-            await eda.pcb_PrimitiveLine.create("BoardOutLine", w, h, 0, h, 0.15);
-            await eda.pcb_PrimitiveLine.create("BoardOutLine", 0, h, 0, 0, 0.15);
+            const lineW = toCanvasUnits(0.15, units);
+            if (Array.isArray(bo)) {
+                for (const seg of bo) {
+                    await eda.pcb_PrimitiveLine.create(
+                        "BoardOutLine",
+                        toCanvasUnits(seg.x1 || 0, units),
+                        toCanvasUnits(seg.y1 || 0, units),
+                        toCanvasUnits(seg.x2 || 0, units),
+                        toCanvasUnits(seg.y2 || 0, units),
+                        lineW
+                    );
+                }
+            } else if (Array.isArray(bo.lines) && bo.lines.length > 0) {
+                for (const seg of bo.lines) {
+                    await eda.pcb_PrimitiveLine.create(
+                        "BoardOutLine",
+                        toCanvasUnits(seg.x1 || 0, units),
+                        toCanvasUnits(seg.y1 || 0, units),
+                        toCanvasUnits(seg.x2 || 0, units),
+                        toCanvasUnits(seg.y2 || 0, units),
+                        lineW
+                    );
+                }
+            } else {
+                const x0 = toCanvasUnits(bo.x || 0, units);
+                const y0 = toCanvasUnits(bo.y || 0, units);
+                const w = toCanvasUnits(bo.width_mm || bo.width || 50, units);
+                const h = toCanvasUnits(bo.height_mm || bo.height || 40, units);
+                await eda.pcb_PrimitiveLine.create("BoardOutLine", x0, y0, x0 + w, y0, lineW);
+                await eda.pcb_PrimitiveLine.create("BoardOutLine", x0 + w, y0, x0 + w, y0 + h, lineW);
+                await eda.pcb_PrimitiveLine.create("BoardOutLine", x0 + w, y0 + h, x0, y0 + h, lineW);
+                await eda.pcb_PrimitiveLine.create("BoardOutLine", x0, y0 + h, x0, y0, lineW);
+            }
         }
 
         const placements = args.placements || args.footprints || [];
-        if (Array.isArray(placements) && typeof eda !== "undefined" && eda.pcb_PrimitiveComponent) {
-            for (const p of placements) {
-                if (eda.pcb_PrimitiveComponent.modify) {
-                    await eda.pcb_PrimitiveComponent.modify(p.reference, {
-                        x: Number(p.x_mm !== undefined ? p.x_mm : p.x || 0),
-                        y: Number(p.y_mm !== undefined ? p.y_mm : p.y || 0),
-                        rotation: Number(p.rotation_deg !== undefined ? p.rotation_deg : p.rotation || 0),
-                        layer: p.layer || "TopLayer"
-                    });
+        if (Array.isArray(placements) && typeof eda !== "undefined") {
+            const compByRef = {};
+            if (eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.getAll === "function") {
+                try {
+                    const existing = await eda.pcb_PrimitiveComponent.getAll();
+                    if (Array.isArray(existing)) {
+                        for (const comp of existing) {
+                            const des = String(callGetter(comp, "getState_Designator", "designator", "reference", ""));
+                            if (des) {
+                                compByRef[des] = comp;
+                            }
+                        }
+                    }
+                } catch (err) {
                 }
-                updatedPlacements += 1;
+            }
+
+            for (const p of placements) {
+                const ref = String(p.reference || p.ref || "");
+                const xRaw = Number(p.x_mm !== undefined ? p.x_mm : p.x || 0);
+                const yRaw = Number(p.y_mm !== undefined ? p.y_mm : p.y || 0);
+                const xCanvas = toCanvasUnits(xRaw, units);
+                const yCanvas = toCanvasUnits(yRaw, units);
+                const rot = Number(p.rotation_deg !== undefined ? p.rotation_deg : p.rotation || 0);
+                const layer = normalizePcbLayer(p.layer || "TopLayer");
+                const existingComp = compByRef[ref];
+
+                if (existingComp || (eda.pcb_PrimitiveComponent && eda.pcb_PrimitiveComponent.modify && !p.pads && !p.footprint)) {
+                    const targetId = existingComp
+                        ? String(callGetter(existingComp, "getState_PrimitiveId", "primitiveId", "id", ref))
+                        : ref;
+                    if (eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.modify === "function") {
+                        await eda.pcb_PrimitiveComponent.modify(targetId, {
+                            x: xCanvas,
+                            y: yCanvas,
+                            rotation: rot,
+                            layer: layer
+                        });
+                    } else if (existingComp && typeof existingComp.setState_X === "function") {
+                        await existingComp.setState_X(xCanvas);
+                        await existingComp.setState_Y(yCanvas);
+                    }
+                    updatedPlacements += 1;
+                } else {
+                    const padsSpec = (Array.isArray(p.pads) && p.pads.length > 0)
+                        ? p.pads
+                        : defaultPadsForEasyEdaFootprint(p.footprint || "R_0603");
+                    let minRx = -1.2, maxRx = 1.2, minRy = -0.8, maxRy = 0.8;
+                    for (const pad of padsSpec) {
+                        const rx = Number(pad.rel_x !== undefined ? pad.rel_x : pad.dx || 0);
+                        const ry = Number(pad.rel_y !== undefined ? pad.rel_y : pad.dy || 0);
+                        const sx = Number(pad.size_x || 0.8);
+                        const sy = Number(pad.size_y || 0.8);
+                        minRx = Math.min(minRx, rx - sx * 0.5 - 0.25);
+                        maxRx = Math.max(maxRx, rx + sx * 0.5 + 0.25);
+                        minRy = Math.min(minRy, ry - sy * 0.5 - 0.25);
+                        maxRy = Math.max(maxRy, ry + sy * 0.5 + 0.25);
+
+                        const px = toCanvasUnits(xRaw + rx, units);
+                        const py = toCanvasUnits(yRaw + ry, units);
+                        const pw = toCanvasUnits(sx, units);
+                        const ph = toCanvasUnits(sy, units);
+                        const pNet = String(pad.net || "");
+
+                        if (eda.pcb_PrimitivePad && typeof eda.pcb_PrimitivePad.create === "function") {
+                            try {
+                                await eda.pcb_PrimitivePad.create(
+                                    layer,
+                                    String(pad.number || "1"),
+                                    px,
+                                    py,
+                                    rot,
+                                    pw,
+                                    ph,
+                                    pNet
+                                );
+                                createdPads += 1;
+                            } catch (err) {
+                            }
+                        } else if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.create === "function") {
+                            await eda.pcb_PrimitiveTrack.create(
+                                pNet,
+                                layer,
+                                px - pw * 0.25,
+                                py,
+                                px + pw * 0.25,
+                                py,
+                                ph
+                            );
+                            createdPads += 1;
+                        }
+                    }
+
+                    if (eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.create === "function") {
+                        const silkLayer = (layer === "BottomLayer") ? "BottomSilkLayer" : "TopSilkLayer";
+                        const x1 = toCanvasUnits(xRaw + minRx, units);
+                        const y1 = toCanvasUnits(yRaw + minRy, units);
+                        const x2 = toCanvasUnits(xRaw + maxRx, units);
+                        const y2 = toCanvasUnits(yRaw + maxRy, units);
+                        const sw = toCanvasUnits(0.12, units);
+                        await eda.pcb_PrimitiveLine.create(silkLayer, x1, y1, x2, y1, sw);
+                        await eda.pcb_PrimitiveLine.create(silkLayer, x2, y1, x2, y2, sw);
+                        await eda.pcb_PrimitiveLine.create(silkLayer, x2, y2, x1, y2, sw);
+                        await eda.pcb_PrimitiveLine.create(silkLayer, x1, y2, x1, y1, sw);
+                    }
+                    if (ref && eda.pcb_PrimitiveString && typeof eda.pcb_PrimitiveString.create === "function") {
+                        try {
+                            await eda.pcb_PrimitiveString.create(
+                                "TopSilkLayer",
+                                toCanvasUnits(xRaw, units),
+                                toCanvasUnits(yRaw + minRy - 1.0, units),
+                                ref
+                            );
+                        } catch (err) {
+                        }
+                    }
+                    createdFootprints += 1;
+                    updatedPlacements += 1;
+                }
             }
         }
 
         const zones = args.zones || args.copper_pours || [];
         if (Array.isArray(zones) && typeof eda !== "undefined" && eda.pcb_PrimitivePour) {
             for (const z of zones) {
+                const scaledPts = Array.isArray(z.points)
+                    ? z.points.map(function (pt) {
+                        if (pt && typeof pt === "object") {
+                            return { x: toCanvasUnits(pt.x || 0, units), y: toCanvasUnits(pt.y || 0, units) };
+                        }
+                        return toCanvasUnits(pt, units);
+                    })
+                    : [];
                 if (eda.pcb_PrimitivePour.create) {
-                    await eda.pcb_PrimitivePour.create(z.net || "GND", z.layer || "TopLayer", z.points || []);
+                    await eda.pcb_PrimitivePour.create(
+                        z.net || "GND",
+                        normalizePcbLayer(z.layer || "TopLayer"),
+                        scaledPts
+                    );
                 }
                 addedZones += 1;
             }
@@ -426,12 +699,12 @@ var edaEsbuildExportName = (function () {
                 if (eda.pcb_PrimitiveTrack.create) {
                     await eda.pcb_PrimitiveTrack.create(
                         t.net || "",
-                        t.layer || "TopLayer",
-                        Number(t.x1 || 0),
-                        Number(t.y1 || 0),
-                        Number(t.x2 || 0),
-                        Number(t.y2 || 0),
-                        Number(t.width_mm || t.width || 0.25)
+                        normalizePcbLayer(t.layer || "TopLayer"),
+                        toCanvasUnits(t.x1 || 0, units),
+                        toCanvasUnits(t.y1 || 0, units),
+                        toCanvasUnits(t.x2 || 0, units),
+                        toCanvasUnits(t.y2 || 0, units),
+                        toCanvasUnits(t.width_mm || t.width || 0.25, units)
                     );
                 }
                 addedTracks += 1;
@@ -444,19 +717,29 @@ var edaEsbuildExportName = (function () {
                 if (eda.pcb_PrimitiveVia.create) {
                     await eda.pcb_PrimitiveVia.create(
                         v.net || "",
-                        Number(v.x || 0),
-                        Number(v.y || 0),
-                        Number(v.drill_mm || v.drill || 0.3),
-                        Number(v.size_mm || v.size || 0.6)
+                        toCanvasUnits(v.x || 0, units),
+                        toCanvasUnits(v.y || 0, units),
+                        toCanvasUnits(v.drill_mm || v.drill || 0.3, units),
+                        toCanvasUnits(v.size_mm || v.size || 0.6, units)
                     );
                 }
                 addedVias += 1;
             }
         }
 
+        try {
+            if (typeof eda !== "undefined" && eda.dmt_EditorControl && typeof eda.dmt_EditorControl.zoomToAllPrimitives === "function") {
+                await eda.dmt_EditorControl.zoomToAllPrimitives();
+            }
+        } catch (err) {
+        }
+
         return {
             ok: true,
+            active_document: await resolveActiveDocumentTitle(),
             updated_placements: updatedPlacements,
+            created_footprints: createdFootprints,
+            created_pads: createdPads,
             added_zones: addedZones,
             added_tracks: addedTracks,
             added_vias: addedVias

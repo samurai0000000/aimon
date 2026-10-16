@@ -77,12 +77,31 @@ DiscoveredToolInfo ToolDiscovery::discoverKiCad(const std::string& customBinaryP
     if (bin.empty()) {
         std::vector<std::string> candidates = {
 #ifdef _WIN32
-            "C:\\Program Files\\KiCad\\8.0\\bin\\kicad-cli.exe",
+            "C:\\Program Files\\KiCad\\10.0\\bin\\kicad-cli.exe",
             "C:\\Program Files\\KiCad\\9.0\\bin\\kicad-cli.exe",
+            "C:\\Program Files\\KiCad\\8.0\\bin\\kicad-cli.exe",
 #endif
             "/usr/bin/kicad-cli",
             "/usr/local/bin/kicad-cli"
         };
+#ifdef _WIN32
+        std::vector<fs::path> winRoots = {"C:\\Program Files\\KiCad"};
+        if (const char* localApp = std::getenv("LOCALAPPDATA")) {
+            if (*localApp) {
+                winRoots.push_back(fs::path(localApp) / "Programs" / "KiCad");
+            }
+        }
+        for (const auto& root : winRoots) {
+            std::error_code ec;
+            if (fs::exists(root, ec) && fs::is_directory(root, ec)) {
+                for (const auto& entry : fs::directory_iterator(root, ec)) {
+                    if (entry.is_directory(ec)) {
+                        candidates.push_back((entry.path() / "bin" / "kicad-cli.exe").string());
+                    }
+                }
+            }
+        }
+#endif
         for (const auto& c : candidates) {
             std::error_code ec;
             if (fs::exists(c, ec)) {
@@ -124,6 +143,8 @@ DiscoveredToolInfo ToolDiscovery::discoverFreeCad(const std::string& customBinar
     if (bin.empty()) {
         std::vector<std::string> candidates = {
 #ifdef _WIN32
+            "C:\\Program Files\\FreeCAD 1.1\\bin\\FreeCADCmd.exe",
+            "C:\\Program Files\\FreeCAD 1.1\\bin\\freecadcmd.exe",
             "C:\\Program Files\\FreeCAD 1.0\\bin\\FreeCADCmd.exe",
             "C:\\Program Files\\FreeCAD 0.21\\bin\\FreeCADCmd.exe",
 #endif
@@ -131,6 +152,27 @@ DiscoveredToolInfo ToolDiscovery::discoverFreeCad(const std::string& customBinar
             "/usr/bin/freecadcmd",
             "/usr/local/bin/FreeCADCmd"
         };
+#ifdef _WIN32
+        std::vector<fs::path> winProgDirs = {"C:\\Program Files"};
+        if (const char* localApp = std::getenv("LOCALAPPDATA")) {
+            if (*localApp) {
+                winProgDirs.push_back(fs::path(localApp) / "Programs");
+            }
+        }
+        for (const auto& progDir : winProgDirs) {
+            std::error_code ec;
+            if (fs::exists(progDir, ec) && fs::is_directory(progDir, ec)) {
+                for (const auto& entry : fs::directory_iterator(progDir, ec)) {
+                    if (!entry.is_directory(ec)) continue;
+                    std::string dname = entry.path().filename().string();
+                    if (dname.rfind("FreeCAD", 0) == 0) {
+                        candidates.push_back((entry.path() / "bin" / "FreeCADCmd.exe").string());
+                        candidates.push_back((entry.path() / "bin" / "freecadcmd.exe").string());
+                    }
+                }
+            }
+        }
+#endif
         for (const auto& c : candidates) {
             std::error_code ec;
             if (fs::exists(c, ec)) {

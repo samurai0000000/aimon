@@ -80,6 +80,8 @@ public:
     bool isBridgeEnabled(const std::string& app) const;
     void setDisallowExports(bool disallow);
     bool isDisallowExports() const;
+    void setAllowedRoot(const std::string& root);
+    std::string allowedRoot() const;
 
     bool isPluginConnected(const std::string& app) const;
 
@@ -129,6 +131,7 @@ private:
     nlohmann::json handleEasyEdaTool(const std::string& toolName, const nlohmann::json& args);
 
     EdaRpcServerOptions _options;
+    mutable std::mutex _allowedRootMutex;
     DiscoveredToolInfo _kicadInfo;
     DiscoveredToolInfo _freecadInfo;
     DiscoveredToolInfo _easyedaInfo;

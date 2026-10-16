@@ -750,9 +750,12 @@ TEST_GROUP(EdaBridge_UnifiedAppConfigAndToggles) {
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOptions) {
     CHECK_FALSE(EdaBridgeAppConfig::defaultConfigFilePath().empty());
+    CHECK_EQUAL("", EdaBridgeAppSettings().allowedRoot);
+    CHECK_EQUAL("", EdaBridgeAppSettings().kicadPluginDir);
+    CHECK_EQUAL("", EdaBridgeAppSettings().freecadModDir);
 
     EdaBridgeAppSettings orig;
-    orig.version = "1.0.16";
+    orig.version = "1.0.0"; // Stale config version on disk must never overwrite binary version
     orig.enableEasyEda = false;
     orig.enableKiCad = true;
     orig.enableFreeCad = false;
@@ -771,6 +774,8 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     orig.allowedRoot = _ws;
     orig.kicadBinaryPath = "/usr/bin/kicad-cli";
     orig.freecadBinaryPath = "/usr/bin/freecadcmd";
+    orig.kicadPluginDir = _ws + "/custom_kicad_plugins";
+    orig.freecadModDir = _ws + "/custom_freecad_mod";
 
     std::string cfgFile = _ws + "/sub/aimon-settings.json";
     std::string err;
@@ -781,7 +786,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     EdaBridgeAppSettings loaded;
     CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgFile, loaded, err));
     CHECK_TRUE(err.empty());
-    CHECK_EQUAL(orig.version, loaded.version);
+    STRCMP_EQUAL("1.1.1", loaded.version.c_str());
     CHECK_EQUAL(orig.enableEasyEda, loaded.enableEasyEda);
     CHECK_EQUAL(orig.enableKiCad, loaded.enableKiCad);
     CHECK_EQUAL(orig.enableFreeCad, loaded.enableFreeCad);
@@ -800,6 +805,8 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     CHECK_EQUAL(orig.allowedRoot, loaded.allowedRoot);
     CHECK_EQUAL(orig.kicadBinaryPath, loaded.kicadBinaryPath);
     CHECK_EQUAL(orig.freecadBinaryPath, loaded.freecadBinaryPath);
+    CHECK_EQUAL(orig.kicadPluginDir, loaded.kicadPluginDir);
+    CHECK_EQUAL(orig.freecadModDir, loaded.freecadModDir);
 
     EdaRpcServerOptions srvOpts = EdaBridgeAppConfig::toServerOptions(loaded);
     CHECK_EQUAL(loaded.listenHost, srvOpts.listenHost);
@@ -827,7 +834,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeployment) {
-    CHECK_EQUAL("1.1.0", EdaBridgeAppSettings().version);
+    CHECK_EQUAL("1.1.1", EdaBridgeAppSettings().version);
 
     std::vector<uint8_t> zipBytes = EdaBridgeAppConfig::buildEasyEdaEextZipBytes();
     CHECK_TRUE(zipBytes.size() > 512);
@@ -844,7 +851,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(zipView.find("edaEsbuildExportName") != std::string::npos);
     CHECK_TRUE(zipView.find("eda.sys_WebSocket") != std::string::npos);
     CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
-    CHECK_TRUE(zipView.find("1.1.0") != std::string::npos);
+    CHECK_TRUE(zipView.find("1.1.1") != std::string::npos);
     CHECK_TRUE(zipView.find("8d4c91f2a70e4c6b9b24e31f6a821100") != std::string::npos);
     // PK\x05\x06 End of Central Directory signature
     CHECK_TRUE(zipView.find(std::string("PK\x05\x06", 4)) != std::string::npos);
@@ -856,29 +863,106 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(fs::exists(eextPath));
     CHECK_EQUAL(zipBytes.size(), static_cast<size_t>(fs::file_size(eextPath)));
 
+    // 1. Verify no phantom directories are created when FreeCAD / KiCad user folders do not exist
+    std::string emptyAppData = _ws + "/empty_appdata";
+    fs::create_directories(emptyAppData);
     std::string kcDir;
-    CHECK_TRUE(EdaBridgeAppConfig::deployKiCadPlugin(_ws + "/appdata", kcDir, err));
+    std::string fcDir;
+    bool kcAlready = false;
+    bool fcAlready = false;
+    CHECK_FALSE(EdaBridgeAppConfig::deployKiCadPlugin(emptyAppData, kcDir, err, "", false, &kcAlready));
+    CHECK_FALSE(err.empty());
+    CHECK_FALSE(fs::exists(emptyAppData + "/KiCad"));
+    CHECK_FALSE(fs::exists(emptyAppData + "/kicad"));
+
+    CHECK_FALSE(EdaBridgeAppConfig::deployFreeCadPlugin(emptyAppData, fcDir, err, "", false, &fcAlready));
+    CHECK_FALSE(err.empty());
+    CHECK_FALSE(fs::exists(emptyAppData + "/FreeCAD"));
+
+    // 2. Create realistic KiCad 10.0 and FreeCAD v1-1 directories on disk and deploy
+    std::string appData = _ws + "/appdata";
+    fs::create_directories(appData + "/KiCad/10.0/scripting/plugins");
+    fs::create_directories(appData + "/FreeCAD/v1-1/Mod");
+
+    kcAlready = true;
+    CHECK_TRUE(EdaBridgeAppConfig::deployKiCadPlugin(appData, kcDir, err, "", false, &kcAlready));
     CHECK_TRUE(err.empty());
+    CHECK_FALSE(kcAlready);
     CHECK_TRUE(fs::exists(kcDir + "/__init__.py"));
     CHECK_TRUE(fs::exists(kcDir + "/KiCadAimonBridge.py"));
     {
         std::ifstream kcIfs(kcDir + "/KiCadAimonBridge.py");
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(kcContent.find("1.1.0") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.1") != std::string::npos);
     }
 
-    std::string fcDir;
-    CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(_ws + "/appdata", fcDir, err));
+    fcAlready = true;
+    CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir, err, "", false, &fcAlready));
     CHECK_TRUE(err.empty());
+    CHECK_FALSE(fcAlready);
     CHECK_TRUE(fs::exists(fcDir + "/InitGui.py"));
     CHECK_TRUE(fs::exists(fcDir + "/AimonFreeCadBridge.py"));
     {
         std::ifstream fcIfs(fcDir + "/AimonFreeCadBridge.py");
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(fcContent.find("1.1.0") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.1") != std::string::npos);
     }
+
+    // 3a. Re-run when destination files are identical -> do NOT overwrite (alreadyDeployed == true)
+    std::string kcDir2;
+    std::string fcDir2;
+    CHECK_TRUE(EdaBridgeAppConfig::deployKiCadPlugin(appData, kcDir2, err, "", false, &kcAlready));
+    CHECK_TRUE(kcAlready);
+    CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir2, err, "", false, &fcAlready));
+    CHECK_TRUE(fcAlready);
+
+    // 3b. Modify existing deployed files so source and destination differ -> must replace with current embedded content!
+    {
+        std::ofstream kcOfs(kcDir + "/KiCadAimonBridge.py", std::ios::trunc);
+        kcOfs << "# OUTDATED_VERSION_1_1_0\nBRIDGE_VERSION = \"1.1.0\"\n";
+    }
+    {
+        std::ofstream fcOfs(fcDir + "/AimonFreeCadBridge.py", std::ios::trunc);
+        fcOfs << "# OUTDATED_VERSION_1_1_0\nBRIDGE_VERSION = \"1.1.0\"\n";
+    }
+
+    CHECK_TRUE(EdaBridgeAppConfig::deployKiCadPlugin(appData, kcDir2, err, "", false, &kcAlready));
+    CHECK_FALSE(kcAlready);
+    {
+        std::ifstream kcIfs(kcDir + "/KiCadAimonBridge.py");
+        std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
+                              std::istreambuf_iterator<char>());
+        CHECK_TRUE(kcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.1") != std::string::npos);
+    }
+
+    CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir2, err, "", false, &fcAlready));
+    CHECK_FALSE(fcAlready);
+    {
+        std::ifstream fcIfs(fcDir + "/AimonFreeCadBridge.py");
+        std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
+                              std::istreambuf_iterator<char>());
+        CHECK_TRUE(fcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.1") != std::string::npos);
+    }
+
+    // 4. Test customTargetDir (simulating QFileDialog user selection)
+    std::string customKc = _ws + "/user_chosen_kicad_plugins";
+    std::string customFc = _ws + "/user_chosen_freecad_mod";
+    fs::create_directories(customKc);
+    fs::create_directories(customFc);
+
+    std::string customKcOut;
+    std::string customFcOut;
+    CHECK_TRUE(EdaBridgeAppConfig::deployKiCadPlugin(emptyAppData, customKcOut, err, customKc, false, &kcAlready));
+    CHECK_FALSE(kcAlready);
+    CHECK_TRUE(fs::exists(customKcOut + "/KiCadAimonBridge.py"));
+
+    CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(emptyAppData, customFcOut, err, customFc, false, &fcAlready));
+    CHECK_FALSE(fcAlready);
+    CHECK_TRUE(fs::exists(customFcOut + "/AimonFreeCadBridge.py"));
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnforcement) {
@@ -891,11 +975,66 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnfo
     EdaRpcServer srv(opts);
     CHECK_TRUE(srv.start());
 
+    // Verify dynamic setAllowedRoot updates sandbox validation live at runtime
+    CHECK_EQUAL(_ws, srv.allowedRoot());
+    std::string sbErr;
+    CHECK_FALSE(srv.validateSandboxPath("/tmp/outside_allowed_root/file.kicad_pcb", sbErr));
+    srv.setAllowedRoot("/tmp/outside_allowed_root");
+    CHECK_EQUAL("/tmp/outside_allowed_root", srv.allowedRoot());
+    CHECK_TRUE(srv.validateSandboxPath("/tmp/outside_allowed_root/file.kicad_pcb", sbErr));
+    srv.setAllowedRoot(_ws);
+
     CHECK_TRUE(srv.isBridgeEnabled("easyeda"));
     CHECK_TRUE(srv.isBridgeEnabled("kicad"));
     CHECK_TRUE(srv.isBridgeEnabled("freecad"));
     CHECK_FALSE(srv.isDisallowExports());
     CHECK_EQUAL(30, static_cast<int>(srv.enabledRemoteToolDescriptors().size()));
+
+    // Verify plugin/status dynamically updates active_document in eda/status
+    {
+        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        CHECK_TRUE(sock >= 0);
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(srv.boundPluginPort()));
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        CHECK_EQUAL(0, ::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)));
+
+        nlohmann::json regReq = {
+            {"jsonrpc", "2.0"},
+            {"id", "kc-reg-1"},
+            {"method", "plugin/register"},
+            {"params", {{"app", "kicad"}, {"version", "10.0"}, {"active_document", "initial.kicad_pcb"}}}
+        };
+        std::string line = regReq.dump() + "\n";
+        ::send(sock, line.data(), line.size(), 0);
+        char rbuf[1024];
+        ssize_t n = ::recv(sock, rbuf, sizeof(rbuf) - 1, 0);
+        CHECK_TRUE(n > 0);
+
+        nlohmann::json stReq = {
+            {"jsonrpc", "2.0"},
+            {"id", "kc-st-1"},
+            {"method", "plugin/status"},
+            {"params", {{"app", "kicad"}, {"version", "10.0"}, {"active_document", "/opt/live_proj/updated.kicad_pcb"}}}
+        };
+        line = stReq.dump() + "\n";
+        ::send(sock, line.data(), line.size(), 0);
+        n = ::recv(sock, rbuf, sizeof(rbuf) - 1, 0);
+        CHECK_TRUE(n > 0);
+
+        nlohmann::json statusPayload = srv.buildStatusPayload();
+        std::string kcActiveDoc;
+        for (const auto& t : statusPayload["tools"]) {
+            if (t.value("name", "") == "kicad") {
+                kcActiveDoc = t.value("active_document", "");
+            }
+        }
+        CHECK_EQUAL("/opt/live_proj/updated.kicad_pcb", kcActiveDoc);
+        // Also verify validateSandboxPath automatically allows parent dir of connected plugin's activeDocument
+        CHECK_TRUE(srv.validateSandboxPath("/opt/live_proj/sub/board.kicad_pcb", sbErr));
+        ::close(sock);
+    }
 
     // Disable EasyEDA bridge: 11 easyeda_* tools removed -> 19 tools remain
     srv.setBridgeEnabled("easyeda", false);
@@ -1123,6 +1262,439 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, LiveHttpQuotaClientAndTrayTooltipForm
     AimonQuotaSnapshot badSnap;
     CHECK_FALSE(EdaBridgeAppConfig::parseQuotaSnapshotJson("not-json", badSnap, parseErr));
     CHECK_FALSE(parseErr.empty());
+}
+
+TEST(EdaBridge_UnifiedAppConfigAndToggles, LiveGuiPluginCanvasEnrichmentAndPythonPluginVerification) {
+    // 1. Verify pure in-memory KiCadSchematicEditor::syncSchematicToPcb and applyPcbEdits with pin_nets
+    nlohmann::json memSync = KiCadSchematicEditor::syncSchematicToPcb({
+        {"components", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "ESP32"}, {"footprint", "Package_SO:SOIC-8"}, {"x_mm", 20.0}, {"y_mm", 15.0}},
+            {{"reference", "R1"}, {"value", "10k"}, {"footprint", "Resistor_SMD:R_0603_1608Metric"},
+             {"pins", nlohmann::json::array({{{"number", "1"}, {"net", "VCC_3V3"}}, {{"number", "2"}, {"net", "GND"}}})}}
+        })},
+        {"board_outline", {{"width_mm", 50.0}, {"height_mm", 35.0}}}
+    });
+    CHECK_TRUE(memSync.value("ok", false));
+    CHECK_EQUAL(2, memSync.value("synced_components", 0));
+    CHECK_TRUE(memSync.contains("footprints"));
+    CHECK_EQUAL(2, static_cast<int>(memSync["footprints"].size()));
+    CHECK_TRUE(memSync["footprints"][0].contains("pads"));
+    CHECK_EQUAL(8, static_cast<int>(memSync["footprints"][0]["pads"].size()));
+    CHECK_TRUE(memSync.contains("board_outline"));
+    CHECK_EQUAL(4, static_cast<int>(memSync["board_outline"]["lines"].size()));
+
+    nlohmann::json memEdit = KiCadSchematicEditor::applyPcbEdits({
+        {"board_outline", {{"width_mm", 45.0}, {"height_mm", 30.0}}},
+        {"placements", nlohmann::json::array({
+            {{"reference", "R1"}, {"value", "4.7k"}, {"footprint", "Resistor_SMD:R_0603_1608Metric"},
+             {"x_mm", 12.0}, {"y_mm", 10.0}, {"pin_nets", {{"1", "I2C_SDA"}, {"2", "VCC_3V3"}}}},
+            {{"reference", "J1"}, {"value", "Conn_01x04"}, {"footprint", "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical"},
+             {"x_mm", 5.0}, {"y_mm", 15.0}, {"pins", nlohmann::json::array({{{"number", "1"}, {"net", "VCC_3V3"}}, {{"number", "2"}, {"net", "I2C_SDA"}}})}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"x1", 5.0}, {"y1", 12.54}, {"x2", 11.2}, {"y2", 10.0}, {"width_mm", 0.25}, {"layer", "F.Cu"}, {"net", "I2C_SDA"}}
+        })},
+        {"vias", nlohmann::json::array({
+            {{"x", 11.2}, {"y", 10.0}, {"size_mm", 0.6}, {"drill_mm", 0.3}, {"net", "I2C_SDA"}}
+        })}
+    });
+    CHECK_TRUE(memEdit.value("ok", false));
+    CHECK_EQUAL(2, static_cast<int>(memEdit["footprints"].size()));
+    CHECK_EQUAL(1, static_cast<int>(memEdit["tracks"].size()));
+    CHECK_EQUAL(1, static_cast<int>(memEdit["vias"].size()));
+    CHECK_EQUAL("I2C_SDA", memEdit["footprints"][0]["pads"][0].value("net", ""));
+    CHECK_TRUE(memEdit["footprints"][1]["pads"][0].value("drill", 0.0) > 0.5);
+
+    // 2. Verify EdaRpcServer enriches KiCad plugin calls and forwards FreeCAD live GUI calls
+    EdaRpcServerOptions opts;
+    opts.listenHost = "127.0.0.1";
+    opts.port = 0;
+    opts.pluginPort = 0;
+    opts.allowedRoot = _ws;
+
+    EdaRpcServer srv(opts);
+    CHECK_TRUE(srv.start());
+
+    std::atomic<bool> stopPlugins{false};
+    nlohmann::json lastKicadSyncParams;
+    nlohmann::json lastKicadEditParams;
+    std::atomic<int> kicadInspectCalls{0};
+    std::atomic<int> freecadJointCalls{0};
+    std::atomic<int> freecadPrintCalls{0};
+    std::atomic<int> freecadRenderCalls{0};
+
+    auto runMockPlugin = [&](const std::string& appName, std::atomic<bool>& readyFlag) {
+        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(srv.boundPluginPort()));
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+            readyFlag.store(true);
+            return;
+        }
+        nlohmann::json reg = {
+            {"jsonrpc", "2.0"},
+            {"id", appName + "-reg"},
+            {"method", "plugin/register"},
+            {"params", {{"app", appName}, {"version", "1.1.1"}, {"active_document", "live_" + appName}}}
+        };
+        std::string regLine = reg.dump() + "\n";
+        ::send(sock, regLine.data(), regLine.size(), 0);
+        char rbuf[65536];
+        ::recv(sock, rbuf, sizeof(rbuf) - 1, 0);
+        readyFlag.store(true);
+
+        std::string accum;
+        while (!stopPlugins.load()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(sock, &rfds);
+            struct timeval tv{};
+            tv.tv_sec = 0;
+            tv.tv_usec = 30000;
+            int sel = ::select(sock + 1, &rfds, nullptr, nullptr, &tv);
+            if (sel <= 0) continue;
+            ssize_t n = ::recv(sock, rbuf, sizeof(rbuf) - 1, 0);
+            if (n <= 0) break;
+            accum.append(rbuf, static_cast<size_t>(n));
+            size_t nl = 0;
+            while ((nl = accum.find('\n')) != std::string::npos) {
+                std::string line = accum.substr(0, nl);
+                accum.erase(0, nl + 1);
+                auto req = nlohmann::json::parse(line, nullptr, false);
+                if (req.is_discarded()) continue;
+                std::string method = req.value("method", "");
+                nlohmann::json params = req.value("params", nlohmann::json::object());
+                std::string toolName = (method == "tools/call")
+                    ? params.value("name", "")
+                    : method;
+                nlohmann::json toolArgs = (method == "tools/call" && params.contains("arguments"))
+                    ? params["arguments"]
+                    : params;
+                if (toolName == "kicad_inspect_project") {
+                    kicadInspectCalls.fetch_add(1);
+                } else if (toolName == "kicad_sync_sch_to_pcb") {
+                    lastKicadSyncParams = toolArgs;
+                } else if (toolName == "kicad_edit_pcb") {
+                    lastKicadEditParams = toolArgs;
+                } else if (toolName == "freecad_assemble_joint") {
+                    freecadJointCalls.fetch_add(1);
+                } else if (toolName == "freecad_analyze_printability") {
+                    freecadPrintCalls.fetch_add(1);
+                } else if (toolName == "freecad_render_view") {
+                    freecadRenderCalls.fetch_add(1);
+                }
+                nlohmann::json resp = {
+                    {"jsonrpc", "2.0"},
+                    {"id", req["id"]},
+                    {"result", {{"ok", true}, {"live_plugin_handled", toolName}}}
+                };
+                std::string out = resp.dump() + "\n";
+                ::send(sock, out.data(), out.size(), 0);
+            }
+        }
+        ::close(sock);
+    };
+
+    std::atomic<bool> kcReady{false}, fcReady{false};
+    std::thread kcThr(runMockPlugin, "kicad", std::ref(kcReady));
+    std::thread fcThr(runMockPlugin, "freecad", std::ref(fcReady));
+    struct PluginThrGuard {
+        std::atomic<bool>& stopFlag;
+        EdaRpcServer& srvRef;
+        std::thread& t1;
+        std::thread& t2;
+        ~PluginThrGuard() {
+            stopFlag.store(true);
+            srvRef.stop();
+            if (t1.joinable()) t1.join();
+            if (t2.joinable()) t2.join();
+        }
+    } thrGuard{stopPlugins, srv, kcThr, fcThr};
+
+    for (int i = 0; i < 50 && (!kcReady.load() || !fcReady.load()); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    for (int i = 0; i < 30 && (!srv.isPluginConnected("kicad") || !srv.isPluginConnected("freecad")); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK_TRUE(srv.isPluginConnected("kicad"));
+    CHECK_TRUE(srv.isPluginConnected("freecad"));
+
+    // KiCad inspect without file path forwards to live plugin
+    nlohmann::json kcInsp = srv.dispatchToolCall("kicad_inspect_project", nlohmann::json::object());
+    CHECK_TRUE(kcInsp.value("ok", false));
+    CHECK_EQUAL(1, kicadInspectCalls.load());
+
+    // KiCad sync without pcb_path synthesizes footprints + pads and forwards to live plugin
+    nlohmann::json kcSync = srv.dispatchToolCall("kicad_sync_sch_to_pcb", {
+        {"components", nlohmann::json::array({
+            {{"reference", "R1"}, {"value", "10k"}, {"footprint", "Resistor_SMD:R_0603_1608Metric"},
+             {"pins", nlohmann::json::array({{{"number", "1"}, {"net", "VCC"}}, {{"number", "2"}, {"net", "GND"}}})}}
+        })}
+    });
+    CHECK_TRUE(kcSync.value("ok", false));
+    CHECK_TRUE(lastKicadSyncParams.contains("footprints"));
+    CHECK_EQUAL(1, static_cast<int>(lastKicadSyncParams["footprints"].size()));
+    CHECK_EQUAL(2, static_cast<int>(lastKicadSyncParams["footprints"][0]["pads"].size()));
+
+    // KiCad edit_pcb without pcb_path synthesizes footprints + pads + tracks + vias and forwards to live plugin
+    nlohmann::json kcEdit = srv.dispatchToolCall("kicad_edit_pcb", {
+        {"board_outline", {{"width_mm", 40.0}, {"height_mm", 25.0}}},
+        {"placements", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "BMI270"}, {"footprint", "Package_SO:SOIC-8"}, {"x_mm", 18.0}, {"y_mm", 12.0}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"x1", 10.0}, {"y1", 10.0}, {"x2", 18.0}, {"y2", 12.0}, {"width_mm", 0.25}, {"layer", "F.Cu"}, {"net", "SDA"}}
+        })}
+    });
+    CHECK_TRUE(kcEdit.value("ok", false));
+    CHECK_TRUE(lastKicadEditParams.contains("footprints"));
+    CHECK_EQUAL(1, static_cast<int>(lastKicadEditParams["footprints"].size()));
+    CHECK_EQUAL(8, static_cast<int>(lastKicadEditParams["footprints"][0]["pads"].size()));
+    CHECK_EQUAL(1, static_cast<int>(lastKicadEditParams["tracks"].size()));
+
+    // FreeCAD live GUI forwarding by default when plugin is connected
+    CHECK_TRUE(srv.dispatchToolCall("freecad_assemble_joint", {{"min_deg", -45.0}, {"max_deg", 45.0}}).value("ok", false));
+    CHECK_EQUAL(1, freecadJointCalls.load());
+    CHECK_TRUE(srv.dispatchToolCall("freecad_analyze_printability", nlohmann::json::object()).value("ok", false));
+    CHECK_EQUAL(1, freecadPrintCalls.load());
+    CHECK_TRUE(srv.dispatchToolCall("freecad_render_view", {{"output_dir", _ws + "/renders"}}).value("ok", false));
+    CHECK_EQUAL(1, freecadRenderCalls.load());
+
+    stopPlugins.store(true);
+    srv.stop();
+    if (kcThr.joinable()) kcThr.join();
+    if (fcThr.joinable()) fcThr.join();
+
+    // 3. Verify Python plugin implementations (KiCadAimonBridge.py & AimonFreeCadBridge.py) with mock CAD APIs
+    std::string appData = _ws + "/py_appdata";
+    fs::create_directories(appData + "/KiCad/10.0/scripting/plugins");
+    fs::create_directories(appData + "/FreeCAD/v1-1/Mod");
+    std::string kcDir, fcDir, deployErr;
+    CHECK_TRUE(EdaBridgeAppConfig::deployKiCadPlugin(appData, kcDir, deployErr));
+    CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir, deployErr));
+
+    std::string pyTestScript = _ws + "/verify_plugins.py";
+    {
+        std::ofstream ofs(pyTestScript);
+        ofs << "import os, sys, types\n"
+            << "sys.path.insert(0, r'" << kcDir << "')\n"
+            << "sys.path.insert(0, r'" << fcDir << "')\n"
+            << "\n"
+            << "# --- Mock pcbnew for KiCadAimonBridge ---\n"
+            << "pcbnew = types.ModuleType('pcbnew')\n"
+            << "class MockActionPlugin:\n"
+            << "    def register(self): pass\n"
+            << "pcbnew.ActionPlugin = MockActionPlugin\n"
+            << "pcbnew.F_Cu = 0; pcbnew.B_Cu = 31; pcbnew.F_SilkS = 37; pcbnew.Edge_Cuts = 44\n"
+            << "pcbnew.F_Mask = 35; pcbnew.B_Mask = 34; pcbnew.F_Paste = 33; pcbnew.B_Paste = 32\n"
+            << "pcbnew.PAD_SHAPE_RECT = 1; pcbnew.PAD_SHAPE_CIRCLE = 0\n"
+            << "pcbnew.PAD_ATTRIB_SMD = 1; pcbnew.PAD_ATTRIB_PTH = 0; pcbnew.PAD_ATTRIB_NPTH = 3\n"
+            << "pcbnew.EDA_ANGLE = lambda deg, kind=None: deg\n"
+            << "pcbnew.DEGREES_T = 0\n"
+            << "pcbnew.FromMM = lambda v: int(round(float(v) * 1000000))\n"
+            << "pcbnew.ToMM = lambda v: float(v) / 1000000.0\n"
+            << "pcbnew.VECTOR2I = lambda x, y: (x, y)\n"
+            << "pcbnew.EDA_SHAPE_T_SEGMENT = 0\n"
+            << "class MockNet:\n"
+            << "    def __init__(self, board, name, code=1): self._name = name; self._code = code\n"
+            << "    def GetNetname(self): return self._name\n"
+            << "    def GetNetCode(self): return self._code\n"
+            << "pcbnew.NETINFO_ITEM = MockNet\n"
+            << "class MockPad:\n"
+            << "    def __init__(self, fp): self.fp = fp; self.num = '1'; self.pos = (0,0); self.size = (0,0); self.net = None; self.drill = (0,0)\n"
+            << "    def SetNumber(self, n): self.num = str(n)\n"
+            << "    def GetNumber(self): return self.num\n"
+            << "    def SetShape(self, s): pass\n"
+            << "    def SetAttribute(self, a): pass\n"
+            << "    def SetLayerSet(self, ls): pass\n"
+            << "    def SetSize(self, sz): self.size = sz\n"
+            << "    def SetDrillSize(self, sz): self.drill = sz\n"
+            << "    def SetPos0(self, p): self.pos = p\n"
+            << "    def SetPosition(self, p): self.pos = p\n"
+            << "    def SetNet(self, n): self.net = n\n"
+            << "    def SetNetCode(self, c): pass\n"
+            << "    def GetNetname(self): return self.net.GetNetname() if self.net else ''\n"
+            << "pcbnew.PAD = MockPad\n"
+            << "class MockLSET:\n"
+            << "    def addLayer(self, l): pass\n"
+            << "    @staticmethod\n"
+            << "    def AllCuMask(): return MockLSET()\n"
+            << "pcbnew.LSET = MockLSET\n"
+            << "class MockRef:\n"
+            << "    def __init__(self): self.txt = ''\n"
+            << "    def SetText(self, t): self.txt = t\n"
+            << "    def SetVisible(self, v): pass\n"
+            << "class MockFootprint:\n"
+            << "    def __init__(self, board): self.ref = ''; self.val = ''; self.pos = (0,0); self.orient = 0.0; self.layer = 0; self.pads = []; self.drawings = []; self._refObj = MockRef(); self._valObj = MockRef()\n"
+            << "    def SetReference(self, r): self.ref = r\n"
+            << "    def GetReference(self): return self.ref\n"
+            << "    def SetValue(self, v): self.val = v\n"
+            << "    def GetValue(self): return self.val\n"
+            << "    def GetFPIDAsString(self): return 'Resistor_SMD:R_0603'\n"
+            << "    def SetPosition(self, p): self.pos = p\n"
+            << "    def GetPosition(self): return types.SimpleNamespace(x=self.pos[0], y=self.pos[1])\n"
+            << "    def SetOrientationDegrees(self, d): self.orient = float(d)\n"
+            << "    def GetOrientationDegrees(self): return self.orient\n"
+            << "    def SetLayer(self, l): self.layer = l\n"
+            << "    def GetLayer(self): return self.layer\n"
+            << "    def Flip(self, p, b): self.layer = pcbnew.B_Cu\n"
+            << "    def Add(self, item):\n"
+            << "        if isinstance(item, MockPad): self.pads.append(item)\n"
+            << "        else: self.drawings.append(item)\n"
+            << "    def Pads(self): return self.pads\n"
+            << "    def Reference(self): return self._refObj\n"
+            << "    def Value(self): return self._valObj\n"
+            << "pcbnew.FOOTPRINT = MockFootprint\n"
+            << "class MockShape:\n"
+            << "    def __init__(self, parent=None): self.layer = 0; self.start = (0,0); self.end = (0,0); self.width = 0\n"
+            << "    def SetShape(self, s): pass\n"
+            << "    def SetLayer(self, l): self.layer = l\n"
+            << "    def GetLayer(self): return self.layer\n"
+            << "    def SetWidth(self, w): self.width = w\n"
+            << "    def SetStart(self, p): self.start = p\n"
+            << "    def SetEnd(self, p): self.end = p\n"
+            << "pcbnew.PCB_SHAPE = MockShape\n"
+            << "class MockTrack:\n"
+            << "    def __init__(self, board): self.start = (0,0); self.end = (0,0); self.width = 0; self.layer = 0; self.net = None\n"
+            << "    def SetStart(self, p): self.start = p\n"
+            << "    def SetEnd(self, p): self.end = p\n"
+            << "    def SetWidth(self, w): self.width = w\n"
+            << "    def SetLayer(self, l): self.layer = l\n"
+            << "    def SetNet(self, n): self.net = n\n"
+            << "    def SetNetCode(self, c): pass\n"
+            << "pcbnew.PCB_TRACK = MockTrack\n"
+            << "class MockVia:\n"
+            << "    def __init__(self, board): self.pos = (0,0); self.width = 0; self.drill = 0; self.net = None\n"
+            << "    def SetPosition(self, p): self.pos = p\n"
+            << "    def SetWidth(self, w): self.width = w\n"
+            << "    def SetDrill(self, d): self.drill = d\n"
+            << "    def SetNet(self, n): self.net = n\n"
+            << "    def SetNetCode(self, c): pass\n"
+            << "pcbnew.PCB_VIA = MockVia\n"
+            << "class MockBoard:\n"
+            << "    def __init__(self): self.fps = []; self.tracks = []; self.drawings = []; self.zones = []; self.nets = {}; self.refreshed = 0\n"
+            << "    def GetFileName(self): return 'live_test.kicad_pcb'\n"
+            << "    def GetFootprints(self): return self.fps\n"
+            << "    def GetTracks(self): return self.tracks\n"
+            << "    def GetDrawings(self): return self.drawings\n"
+            << "    def Zones(self): return self.zones\n"
+            << "    def GetLayerName(self, l): return 'B.Cu' if l == 31 else ('Edge.Cuts' if l == 44 else 'F.Cu')\n"
+            << "    def GetLayerID(self, n): return 31 if n == 'B.Cu' else (44 if n == 'Edge.Cuts' else 0)\n"
+            << "    def FindNet(self, name): return self.nets.get(name)\n"
+            << "    def GetNetInfo(self): return types.SimpleNamespace(GetNetCount=lambda: len(self.nets)+1, NetsByName=lambda: self.nets)\n"
+            << "    def Add(self, item):\n"
+            << "        if isinstance(item, MockFootprint): self.fps.append(item)\n"
+            << "        elif isinstance(item, (MockTrack, MockVia)): self.tracks.append(item)\n"
+            << "        elif isinstance(item, MockShape): self.drawings.append(item)\n"
+            << "        elif isinstance(item, MockNet): self.nets[item.GetNetname()] = item\n"
+            << "    def Remove(self, item):\n"
+            << "        if item in self.drawings: self.drawings.remove(item)\n"
+            << "mock_board = MockBoard()\n"
+            << "pcbnew.GetBoard = lambda: mock_board\n"
+            << "pcbnew.Refresh = lambda: setattr(mock_board, 'refreshed', mock_board.refreshed + 1)\n"
+            << "sys.modules['pcbnew'] = pcbnew\n"
+            << "\n"
+            << "import KiCadAimonBridge as kb\n"
+            << "kc_client = kb.KiCadAimonBridgeClient()\n"
+            << "res = kc_client._handle_call('kicad_edit_pcb', {\n"
+            << "    'board_outline': {'width_mm': 40.0, 'height_mm': 25.0},\n"
+            << "    'footprints': [{\n"
+            << "        'reference': 'R1', 'value': '10k', 'footprint': 'Resistor_SMD:R_0603', 'x_mm': 15.0, 'y_mm': 10.0, 'rotation_deg': 90.0, 'layer': 'F.Cu',\n"
+            << "        'pads': [{'number': '1', 'x_mm': -0.8, 'y_mm': 0.0, 'width_mm': 0.9, 'height_mm': 0.95, 'layer': 'F.Cu', 'net': 'VCC'},\n"
+            << "                 {'number': '2', 'x_mm': 0.8, 'y_mm': 0.0, 'width_mm': 0.9, 'height_mm': 0.95, 'layer': 'F.Cu', 'net': 'GND'}]\n"
+            << "    }],\n"
+            << "    'tracks': [{'x1': 10.0, 'y1': 10.0, 'x2': 15.0, 'y2': 10.0, 'width_mm': 0.25, 'layer': 'F.Cu', 'net': 'VCC'}],\n"
+            << "    'vias': [{'x': 15.0, 'y': 10.0, 'size_mm': 0.6, 'drill_mm': 0.3, 'net': 'VCC'}]\n"
+            << "})\n"
+            << "assert res.get('ok') is True, f'KiCad edit failed: {res}'\n"
+            << "assert len(mock_board.fps) == 1 and len(mock_board.fps[0].pads) == 2\n"
+            << "assert len(mock_board.tracks) == 2\n"
+            << "assert len(mock_board.drawings) == 4\n"
+            << "assert mock_board.refreshed >= 1\n"
+            << "\n"
+            << "# --- Mock FreeCAD / Part / FreeCADGui for AimonFreeCadBridge ---\n"
+            << "FreeCAD = types.ModuleType('FreeCAD')\n"
+            << "class MockVector:\n"
+            << "    def __init__(self, x=0.0, y=0.0, z=0.0): self.x = float(x); self.y = float(y); self.z = float(z)\n"
+            << "FreeCAD.Vector = MockVector\n"
+            << "class MockRotation:\n"
+            << "    def __init__(self, *args): self.args = args\n"
+            << "FreeCAD.Rotation = MockRotation\n"
+            << "class MockPlacement:\n"
+            << "    def __init__(self, base=None, rot=None, center=None): self.Base = base or MockVector(); self.Rotation = rot or MockRotation()\n"
+            << "FreeCAD.Placement = MockPlacement\n"
+            << "class MockShape3D:\n"
+            << "    def __init__(self): self.Volume = 1250.0; self.Area = 650.0; self.Edges = [1,2,3,4]; self.Faces = [1,2]; self.Placement = MockPlacement(); self.BoundBox = types.SimpleNamespace(XLength=50.0, YLength=30.0, ZLength=20.0, XMin=0.0, YMin=0.0, ZMin=0.0, XMax=50.0, YMax=30.0, ZMax=20.0)\n"
+            << "    def fuse(self, other): return MockShape3D()\n"
+            << "    def cut(self, other): return MockShape3D()\n"
+            << "    def common(self, other): return MockShape3D()\n"
+            << "    def rotate(self, *a): pass\n"
+            << "    def translate(self, *a): pass\n"
+            << "    def makeFillet(self, r, edges): return MockShape3D()\n"
+            << "    def makeChamfer(self, r, edges): return MockShape3D()\n"
+            << "    def isClosed(self): return True\n"
+            << "    def isValid(self): return True\n"
+            << "    def distToShape(self, other): return (2.5, [], [])\n"
+            << "    def exportStep(self, p): open(p, 'w').write('STEP')\n"
+            << "    def exportStl(self, p): open(p, 'w').write('STL')\n"
+            << "Part = types.ModuleType('Part')\n"
+            << "Part.makeBox = lambda *a: MockShape3D()\n"
+            << "Part.makeCylinder = lambda *a: MockShape3D()\n"
+            << "Part.makeCone = lambda *a: MockShape3D()\n"
+            << "Part.makeSphere = lambda *a: MockShape3D()\n"
+            << "Part.makeTorus = lambda *a: MockShape3D()\n"
+            << "class MockDocObj:\n"
+            << "    def __init__(self, name): self.Name = name; self.Label = name; self.TypeId = 'Part::Feature'; self.Shape = MockShape3D(); self.Placement = MockPlacement(); self.ViewObject = types.SimpleNamespace(ShapeColor=(0.8,0.8,0.8), Visibility=True)\n"
+            << "class MockDoc:\n"
+            << "    def __init__(self, name='RobotArm'): self.Name = name; self.FileName = ''; self.Objects = []; self.recomputed = 0\n"
+            << "    def getObject(self, n):\n"
+            << "        for o in self.Objects:\n"
+            << "            if o.Name == n: return o\n"
+            << "        return None\n"
+            << "    def addObject(self, t, n): o = MockDocObj(n); self.Objects.append(o); return o\n"
+            << "    def recompute(self): self.recomputed += 1\n"
+            << "mock_fc_doc = MockDoc()\n"
+            << "FreeCAD.ActiveDocument = mock_fc_doc\n"
+            << "FreeCAD.newDocument = lambda n='Doc': mock_fc_doc\n"
+            << "FreeCAD.listDocuments = lambda: {'RobotArm': mock_fc_doc}\n"
+            << "FreeCADGui = types.ModuleType('FreeCADGui')\n"
+            << "mock_view = types.SimpleNamespace(fit_calls=0, iso_calls=0, viewIsometric=lambda: None, fitAll=lambda: None, saveImage=lambda p,w,h,bg: open(p,'w').write('PNG'))\n"
+            << "FreeCADGui.ActiveDocument = types.SimpleNamespace(ActiveView=mock_view)\n"
+            << "FreeCADGui.updateGui = lambda: None\n"
+            << "sys.modules['FreeCAD'] = FreeCAD\n"
+            << "sys.modules['Part'] = Part\n"
+            << "sys.modules['Mesh'] = types.ModuleType('Mesh')\n"
+            << "sys.modules['FreeCADGui'] = FreeCADGui\n"
+            << "\n"
+            << "import AimonFreeCadBridge as fb\n"
+            << "fc_client = fb.AimonFreeCadBridgeClient()\n"
+            << "cad_res = fc_client.dispatch_tool('freecad_generate_cad', {\n"
+            << "    'primitives': [\n"
+            << "        {'name': 'BaseBracket', 'shape': 'mounting_bracket', 'length_mm': 48.0, 'width_mm': 32.0, 'height_mm': 24.0, 'thickness_mm': 4.0, 'color': [0.2, 0.6, 0.9]},\n"
+            << "        {'name': 'DriveGear', 'shape': 'spur_gear', 'teeth': 24, 'module_mm': 1.0, 'thickness_mm': 6.0, 'bore_diameter_mm': 5.0},\n"
+            << "        {'name': 'ServoArm', 'shape': 'servo_horn', 'arm_length_mm': 28.0, 'holes': [{'diameter_mm': 2.0, 'x_mm': 20.0}]}\n"
+            << "    ]\n"
+            << "})\n"
+            << "assert cad_res.get('ok') is True and cad_res.get('bodies_count') == 3, f'FreeCAD generate failed: {cad_res}'\n"
+            << "joint_res = fc_client.dispatch_tool('freecad_assemble_joint', {\n"
+            << "    'part_name': 'ServoArm', 'obstacle_name': 'BaseBracket', 'min_deg': -30.0, 'max_deg': 30.0, 'step_deg': 15.0\n"
+            << "})\n"
+            << "assert joint_res.get('ok') is True and joint_res.get('animated_in_gui') is True, f'FreeCAD joint failed: {joint_res}'\n"
+            << "print('PYTHON_PLUGIN_VERIFICATION_OK')\n";
+    }
+
+    ProcessResult pyRes = ProcessLauncher::run("/usr/bin/python3", {pyTestScript}, 10000);
+    CHECK_TRUE(pyRes.launched);
+    if (pyRes.exitCode != 0) {
+        std::cerr << "[PythonPluginTest Failure] stdout:\n" << pyRes.stdoutText
+                  << "\nstderr:\n" << pyRes.stderrText << "\n";
+    }
+    CHECK_EQUAL(0, pyRes.exitCode);
+    CHECK_TRUE(pyRes.stdoutText.find("PYTHON_PLUGIN_VERIFICATION_OK") != std::string::npos);
 }
 
 int main(int ac, char** av) {

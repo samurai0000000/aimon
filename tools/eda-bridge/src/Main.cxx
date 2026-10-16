@@ -155,8 +155,10 @@ int main(int argc, char** argv) {
             std::string kcDir;
             std::string fcDir;
             std::string err;
-            aimon::EdaBridgeAppConfig::deployKiCadPlugin(appData, kcDir, err);
-            aimon::EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir, err);
+            aimon::EdaBridgeAppConfig::deployKiCadPlugin(
+                appData, kcDir, err, settings.kicadPluginDir, false);
+            aimon::EdaBridgeAppConfig::deployFreeCadPlugin(
+                appData, fcDir, err, settings.freecadModDir, false);
         }
         std::error_code ec;
         std::filesystem::path eextOut =

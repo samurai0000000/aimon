@@ -32,9 +32,11 @@ struct EdaBridgeAppSettings {
     int aimonWebPort = 3883;
     int gatewayPort = 3885;
     std::string authSecret;
-    std::string allowedRoot = "Z:\\";
+    std::string allowedRoot = "";
     std::string kicadBinaryPath;
     std::string freecadBinaryPath;
+    std::string kicadPluginDir;
+    std::string freecadModDir;
 };
 
 struct AimonModelQuotaItem {
@@ -104,10 +106,16 @@ public:
                                      std::string& outError);
     static bool deployKiCadPlugin(const std::string& appDataDir,
                                   std::string& outDeployedDir,
-                                  std::string& outError);
+                                  std::string& outError,
+                                  const std::string& customTargetDir = "",
+                                  bool forceOverwrite = false,
+                                  bool* outAlreadyDeployed = nullptr);
     static bool deployFreeCadPlugin(const std::string& appDataDir,
                                     std::string& outDeployedDir,
-                                    std::string& outError);
+                                    std::string& outError,
+                                    const std::string& customTargetDir = "",
+                                    bool forceOverwrite = false,
+                                    bool* outAlreadyDeployed = nullptr);
 
     // AI Quota HTTP fetch & JSON parser (/api/status and POST /api/refresh)
     static bool parseQuotaSnapshotJson(const std::string& jsonBody,
