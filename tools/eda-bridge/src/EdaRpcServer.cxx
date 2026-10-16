@@ -25,7 +25,9 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#endif
 #else
 #include <arpa/inet.h>
 #include <cerrno>
@@ -305,7 +307,11 @@ std::vector<uint8_t> minimalPngBytes() {
 } // anonymous namespace
 
 EdaRpcServer::EdaRpcServer(const EdaRpcServerOptions& options)
-    : _options(options) {
+    : _options(options),
+      _enableEasyEda(options.enableEasyEda),
+      _enableKiCad(options.enableKiCad),
+      _enableFreeCad(options.enableFreeCad),
+      _disallowExports(options.disallowExports) {
     _kicadInfo = ToolDiscovery::discoverKiCad(
         _options.kicadBinaryPath, _options.symbolLibDir, _options.footprintLibDir);
     _freecadInfo = ToolDiscovery::discoverFreeCad(_options.freecadBinaryPath);
@@ -568,6 +574,70 @@ std::vector<nlohmann::json> EdaRpcServer::remoteToolDescriptors() {
         {"inputSchema", {{"type", "object"}}}
     });
     return list;
+}
+
+void EdaRpcServer::setBridgeEnabled(const std::string& app, bool enabled) {
+    if (app == "easyeda") {
+        _enableEasyEda.store(enabled);
+    } else if (app == "kicad") {
+        _enableKiCad.store(enabled);
+    } else if (app == "freecad") {
+        _enableFreeCad.store(enabled);
+    }
+    if (!enabled) {
+        std::lock_guard<std::mutex> lock(_pluginsMutex);
+        for (auto& kv : _pluginSessions) {
+            if (kv.second->app == app && kv.second->active.load()) {
+                kv.second->active.store(false);
+                closeSocketFd(kv.second->socketFd);
+                kv.second->socketFd = -1;
+            }
+        }
+    }
+}
+
+bool EdaRpcServer::isBridgeEnabled(const std::string& app) const {
+    if (app == "easyeda") {
+        return _enableEasyEda.load();
+    }
+    if (app == "kicad") {
+        return _enableKiCad.load();
+    }
+    if (app == "freecad") {
+        return _enableFreeCad.load();
+    }
+    return false;
+}
+
+void EdaRpcServer::setDisallowExports(bool disallow) {
+    _disallowExports.store(disallow);
+}
+
+bool EdaRpcServer::isDisallowExports() const {
+    return _disallowExports.load();
+}
+
+std::vector<nlohmann::json> EdaRpcServer::enabledRemoteToolDescriptors() const {
+    const auto allTools = remoteToolDescriptors();
+    std::vector<nlohmann::json> filtered;
+    filtered.reserve(allTools.size());
+    bool ee = _enableEasyEda.load();
+    bool kc = _enableKiCad.load();
+    bool fc = _enableFreeCad.load();
+
+    for (const auto& td : allTools) {
+        std::string name = td.value("name", "");
+        if (name.rfind("easyeda_", 0) == 0) {
+            if (ee) filtered.push_back(td);
+        } else if (name.rfind("kicad_", 0) == 0) {
+            if (kc) filtered.push_back(td);
+        } else if (name.rfind("freecad_", 0) == 0) {
+            if (fc) filtered.push_back(td);
+        } else {
+            filtered.push_back(td);
+        }
+    }
+    return filtered;
 }
 
 bool EdaRpcServer::start() {
@@ -966,9 +1036,22 @@ void EdaRpcServer::processPluginMessage(std::shared_ptr<PluginSession> session,
         nlohmann::json params = msg.value("params", nlohmann::json::object());
 
         if (method == "plugin/register" || method == "plugin/status") {
+            std::string reqApp = params.value("app", session->app);
+            if (!isBridgeEnabled(reqApp)) {
+                nlohmann::json errResp = {
+                    {"jsonrpc", "2.0"},
+                    {"id", id},
+                    {"error", {
+                        {"code", -32002},
+                        {"message", "Bridge '" + reqApp + "' is disabled in aimon settings"}
+                    }}
+                };
+                sendPluginJson(session, errResp);
+                return;
+            }
             {
                 std::lock_guard<std::mutex> lock(_pluginsMutex);
-                session->app = params.value("app", session->app);
+                session->app = reqApp;
                 session->version = params.value("version", "1.0");
                 session->activeDocument = params.value("active_document", "");
             }
@@ -1036,6 +1119,7 @@ bool EdaRpcServer::sendPluginJson(std::shared_ptr<PluginSession> session,
 }
 
 bool EdaRpcServer::isPluginConnected(const std::string& app) const {
+    if (!isBridgeEnabled(app)) return false;
     std::lock_guard<std::mutex> lock(_pluginsMutex);
     for (const auto& kv : _pluginSessions) {
         if (kv.second->active.load() && kv.second->app == app) {
@@ -1157,7 +1241,7 @@ bool EdaRpcServer::connectToGateway(const std::string& host, int port) {
             {"short_name", "EDA"},
             {"priority", 40},
             {"web_port", 0},
-            {"tools", remoteToolDescriptors()}
+            {"tools", enabledRemoteToolDescriptors()}
         }}
     };
     sendJsonLine(_gatewayFd, regMsg);
@@ -1256,13 +1340,13 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
         std::lock_guard<std::mutex> lock(_pluginsMutex);
         for (const auto& kv : _pluginSessions) {
             if (!kv.second->active.load()) continue;
-            if (kv.second->app == "easyeda") {
+            if (kv.second->app == "easyeda" && _enableEasyEda.load()) {
                 eeConn = true;
                 eeDoc = kv.second->activeDocument;
-            } else if (kv.second->app == "kicad") {
+            } else if (kv.second->app == "kicad" && _enableKiCad.load()) {
                 kcConn = true;
                 kcDoc = kv.second->activeDocument;
-            } else if (kv.second->app == "freecad") {
+            } else if (kv.second->app == "freecad" && _enableFreeCad.load()) {
                 fcConn = true;
                 fcDoc = kv.second->activeDocument;
             }
@@ -1278,6 +1362,7 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
     nlohmann::json tools = nlohmann::json::array({
         {
             {"name", "easyeda"},
+            {"enabled", _enableEasyEda.load()},
             {"available", _easyedaInfo.available},
             {"plugin_connected", eeConn},
             {"binary_path", _easyedaInfo.binaryPath},
@@ -1286,6 +1371,7 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
         },
         {
             {"name", "kicad"},
+            {"enabled", _enableKiCad.load()},
             {"available", _kicadInfo.available},
             {"plugin_connected", kcConn},
             {"binary_path", _kicadInfo.binaryPath},
@@ -1294,6 +1380,7 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
         },
         {
             {"name", "freecad"},
+            {"enabled", _enableFreeCad.load()},
             {"available", _freecadInfo.available},
             {"plugin_connected", fcConn},
             {"binary_path", _freecadInfo.binaryPath},
@@ -1307,6 +1394,7 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
         {"platform", platform},
         {"rpc_port", _boundPort.load()},
         {"plugin_port", _boundPluginPort.load()},
+        {"disallow_exports", _disallowExports.load()},
         {"tools", tools}
     };
 }
@@ -1316,13 +1404,42 @@ nlohmann::json EdaRpcServer::dispatchToolCall(const std::string& toolName,
     if (toolName == "eda_bridge_status") {
         return buildStatusPayload();
     }
+    if (_disallowExports.load()) {
+        if (toolName == "easyeda_export_jlcpcb" ||
+            toolName == "kicad_export_fab_pack" ||
+            toolName == "kicad_export_step" ||
+            toolName == "freecad_export_print_files") {
+            return {
+                {"ok", false},
+                {"error", "Manufacturing and file exports are locked in aimon settings"}
+            };
+        }
+    }
     if (toolName.rfind("kicad_", 0) == 0) {
+        if (!_enableKiCad.load()) {
+            return {
+                {"ok", false},
+                {"error", "KiCad bridge is disabled in aimon settings"}
+            };
+        }
         return handleKiCadTool(toolName, arguments);
     }
     if (toolName.rfind("freecad_", 0) == 0) {
+        if (!_enableFreeCad.load()) {
+            return {
+                {"ok", false},
+                {"error", "FreeCAD bridge is disabled in aimon settings"}
+            };
+        }
         return handleFreeCadTool(toolName, arguments);
     }
     if (toolName.rfind("easyeda_", 0) == 0) {
+        if (!_enableEasyEda.load()) {
+            return {
+                {"ok", false},
+                {"error", "EasyEDA Pro bridge is disabled in aimon settings"}
+            };
+        }
         return handleEasyEdaTool(toolName, arguments);
     }
     return {

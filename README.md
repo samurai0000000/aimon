@@ -231,16 +231,33 @@ Once configured, ask your assistant:
 - **9 KiCad Tools**: `kicad_search_library`, `kicad_inspect_project`, `kicad_edit_schematic`, `kicad_sync_sch_to_pcb`, `kicad_edit_pcb`, `kicad_run_erc`, `kicad_run_drc`, `kicad_export_fab_pack`, and `kicad_export_step`.
 - **9 FreeCAD Robotics & 3D-Printing Tools**: `freecad_live_status`, `freecad_inspect_document`, `freecad_generate_cad`, `freecad_edit_parameters`, `freecad_assemble_joint`, `freecad_analyze_printability`, `freecad_render_view`, `freecad_export_print_files`, and `freecad_invoke_api`.
 
+### Unified Windows `aimon` System Tray Application & Versioned Installer (`make windows-eda-bridge`)
+
+On a Linux workstation, cross-compile the unified Qt6 Windows System Tray application (`aimon.exe`) and package the versioned self-contained Windows installer (`build/windows/aimon-setup-<version>.exe`) with a single non-default `Makefile` target:
+
+```bash
+make windows-eda-bridge
+# (or alias: make windows-easyeda-bridge)
+```
+
+This target automatically fetches official prebuilt Qt 6.8.3 (`win64_mingw`) via `aqtinstall` into `build/qt-prebuilt/`, cross-compiles `aimon.exe` with `x86_64-w64-mingw32-g++-posix`, embeds the companion desktop plugins with zero standalone Python dependencies, and produces:
+- `build/windows/aimon-setup-1.0.17.exe` — Self-contained versioned Windows installer & upgrader (`%LOCALAPPDATA%\Programs\aimon\aimon.exe`, Start Menu shortcut, and Windows Installed Apps registration).
+- `build/windows/aimon-easyeda-bridge.eext` — Ready-to-import EasyEDA Pro extension archive.
+
+When running on Windows, **`aimon.exe`** docks in the Windows taskbar notification area (`QSystemTrayIcon`) as **`aimon`**:
+- **Clicking the `aimon` tray icon** opens the **`aimon`** window on the **AI Quotas** tab, displaying live **Google Antigravity** model/group quota bars & credits, **Cursor** fast requests & cycle spend, and **Claude Code** 5h / 7d / 30d / cycle token & USD spend fetched from `http://<aimon-host>:3883/api/status`.
+- **EDA / CAD Bridges & Settings Tab**: Provides persisted checkboxes to enable/disable **EasyEDA Pro**, **KiCad**, and **FreeCAD** bridges at runtime, lock exports, launch at Windows login, and deploy the embedded KiCad/FreeCAD plugins & EasyEDA `.eext` extension in one click.
+
 ### Building `aimon-eda-bridge` on Windows (MSVC)
 
 On a Windows 11 workstation with Visual Studio 2022 C++ Build Tools and CMake:
 
 ```powershell
-cmake -S tools/eda-bridge -B build/windows-msvc
+cmake -S tools/eda-bridge -B build/windows-msvc -DAIMON_EDA_BRIDGE_WITH_QT=ON
 cmake --build build/windows-msvc --config Release
 ```
 
-Launch the bridge daemon on Windows (sharing the workspace root mapped to `Z:\`):
+Launch in System Tray GUI mode (default) or headless daemon mode (`--headless`):
 
 ```powershell
 .\build\windows-msvc\Release\aimon-eda-bridge.exe --listen-host 0.0.0.0 --port 3892 --plugin-port 3893 --secret <shared-secret> --allowed-root Z:\
@@ -250,15 +267,15 @@ Launch the bridge daemon on Windows (sharing the workspace root mapped to `Z:\`)
 
 ### Installing the Companion Desktop Plugins on Windows
 
-1. **EasyEDA Pro Extension (`tools/eda-bridge/plugins/easyeda-pro-extension/`)**:
-   - Zip `extension.json` and `index.js` as `aimon-easyeda-bridge.eext` (or load the folder directly in EasyEDA Pro via **Advanced > Extensions > Extension Manager > Import**).
+When `Auto-deploy companion plugins on startup` is enabled (the default in `aimon.exe`), or when running `aimon.exe --deploy-plugins "%APPDATA%"`, the KiCad and FreeCAD plugins are deployed automatically:
+
+1. **EasyEDA Pro Extension (`aimon-easyeda-bridge.eext`)**:
+   - Exported automatically next to your `aimon` config (`%APPDATA%\aimon\aimon-easyeda-bridge.eext`) or via **Export EasyEDA `.eext` Extension…** in the tray menu. Import in EasyEDA Pro via **Advanced > Extensions > Extension Manager > Import**.
    - Once enabled, the extension connects automatically to `ws://127.0.0.1:3893`.
-2. **KiCad `pcbnew` Action Plugin (`tools/eda-bridge/plugins/kicad-aimon-bridge/`)**:
-   - Copy `tools/eda-bridge/plugins/kicad-aimon-bridge` into `%APPDATA%\KiCad\8.0\scripting\plugins\kicad-aimon-bridge` (or `9.0`).
-   - In KiCad PCB Editor, click **Tools > External Plugins > Aimon KiCad Live Bridge** to attach to `127.0.0.1:3893`.
-3. **FreeCAD Robotics & 3D-Printing Bridge (`tools/eda-bridge/plugins/freecad-aimon-bridge/`)**:
-   - Copy `tools/eda-bridge/plugins/freecad-aimon-bridge` into `%APPDATA%\FreeCAD\Mod\freecad-aimon-bridge`.
-   - FreeCAD loads `InitGui.py` on startup and connects to `127.0.0.1:3893` (when FreeCAD GUI is closed, `aimon-eda-bridge` automatically falls back to headless `FreeCADCmd.exe`).
+2. **KiCad `pcbnew` Action Plugin (`%APPDATA%\KiCad\8.0\scripting\plugins\kicad-aimon-bridge` & `9.0`)**:
+   - Deployed automatically by `aimon.exe`. In KiCad PCB Editor, click **Tools > External Plugins > Aimon KiCad Live Bridge** to attach to `127.0.0.1:3893`.
+3. **FreeCAD Robotics & 3D-Printing Bridge (`%APPDATA%\FreeCAD\Mod\freecad-aimon-bridge`)**:
+   - Deployed automatically by `aimon.exe`. FreeCAD loads `InitGui.py` on startup and connects to `127.0.0.1:3893` (when FreeCAD GUI is closed, `aimon` automatically falls back to headless `FreeCADCmd.exe`).
 
 ### Configuring in `~/.config/aimon/aimon.cfg` (or Web UI `#aimon/bridges`)
 

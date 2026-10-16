@@ -30,6 +30,7 @@
 #include "ProcessLauncher.hxx"
 #include "ToolDiscovery.hxx"
 #include "EdaRpcServer.hxx"
+#include "EdaBridgeAppConfig.hxx"
 #include "PathUtils.hxx"
 
 #include <CppUTest/TestHarness.h>
@@ -721,6 +722,377 @@ TEST(EdaBridge_GatewayReverse, ReverseConnectRegisters29RemoteToolsAndExecutesVi
     nlohmann::json res = bridge.callTool("kicad_search_library", {{"query", "ESP32"}});
     CHECK_TRUE(res.value("ok", false));
     CHECK_TRUE(res.value("symbols_count", 0) >= 1);
+}
+
+TEST_GROUP(EdaBridge_UnifiedAppConfigAndToggles) {
+    std::string _ws;
+
+    void setup() override {
+        _ws = makeTempWorkspace("unified_app_cfg");
+    }
+
+    void teardown() override {
+        std::error_code ec;
+        fs::remove_all(_ws, ec);
+    }
+};
+
+TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOptions) {
+    CHECK_FALSE(EdaBridgeAppConfig::defaultConfigFilePath().empty());
+
+    EdaBridgeAppSettings orig;
+    orig.version = "1.0.16";
+    orig.enableEasyEda = false;
+    orig.enableKiCad = true;
+    orig.enableFreeCad = false;
+    orig.autoDeployPlugins = false;
+    orig.startMinimizedToTray = false;
+    orig.launchAtLogin = true;
+    orig.disallowExports = true;
+    orig.connectionMode = "gateway";
+    orig.listenHost = "127.0.0.1";
+    orig.rpcPort = 13892;
+    orig.pluginPort = 13893;
+    orig.aimonHost = "192.168.1.50";
+    orig.aimonWebPort = 13883;
+    orig.gatewayPort = 13885;
+    orig.authSecret = "tray-secret-99";
+    orig.allowedRoot = _ws;
+    orig.kicadBinaryPath = "/usr/bin/kicad-cli";
+    orig.freecadBinaryPath = "/usr/bin/freecadcmd";
+
+    std::string cfgFile = _ws + "/sub/aimon-settings.json";
+    std::string err;
+    CHECK_TRUE(EdaBridgeAppConfig::saveToFile(cfgFile, orig, err));
+    CHECK_TRUE(err.empty());
+    CHECK_TRUE(fs::exists(cfgFile));
+
+    EdaBridgeAppSettings loaded;
+    CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgFile, loaded, err));
+    CHECK_TRUE(err.empty());
+    CHECK_EQUAL(orig.version, loaded.version);
+    CHECK_EQUAL(orig.enableEasyEda, loaded.enableEasyEda);
+    CHECK_EQUAL(orig.enableKiCad, loaded.enableKiCad);
+    CHECK_EQUAL(orig.enableFreeCad, loaded.enableFreeCad);
+    CHECK_EQUAL(orig.autoDeployPlugins, loaded.autoDeployPlugins);
+    CHECK_EQUAL(orig.startMinimizedToTray, loaded.startMinimizedToTray);
+    CHECK_EQUAL(orig.launchAtLogin, loaded.launchAtLogin);
+    CHECK_EQUAL(orig.disallowExports, loaded.disallowExports);
+    CHECK_EQUAL(orig.connectionMode, loaded.connectionMode);
+    CHECK_EQUAL(orig.listenHost, loaded.listenHost);
+    CHECK_EQUAL(orig.rpcPort, loaded.rpcPort);
+    CHECK_EQUAL(orig.pluginPort, loaded.pluginPort);
+    CHECK_EQUAL(orig.aimonHost, loaded.aimonHost);
+    CHECK_EQUAL(orig.aimonWebPort, loaded.aimonWebPort);
+    CHECK_EQUAL(orig.gatewayPort, loaded.gatewayPort);
+    CHECK_EQUAL(orig.authSecret, loaded.authSecret);
+    CHECK_EQUAL(orig.allowedRoot, loaded.allowedRoot);
+    CHECK_EQUAL(orig.kicadBinaryPath, loaded.kicadBinaryPath);
+    CHECK_EQUAL(orig.freecadBinaryPath, loaded.freecadBinaryPath);
+
+    EdaRpcServerOptions srvOpts = EdaBridgeAppConfig::toServerOptions(loaded);
+    CHECK_EQUAL(loaded.listenHost, srvOpts.listenHost);
+    CHECK_EQUAL(loaded.rpcPort, srvOpts.port);
+    CHECK_EQUAL(loaded.pluginPort, srvOpts.pluginPort);
+    CHECK_EQUAL(loaded.authSecret, srvOpts.authSecret);
+    CHECK_EQUAL(loaded.allowedRoot, srvOpts.allowedRoot);
+    CHECK_EQUAL(loaded.enableEasyEda, srvOpts.enableEasyEda);
+    CHECK_EQUAL(loaded.enableKiCad, srvOpts.enableKiCad);
+    CHECK_EQUAL(loaded.enableFreeCad, srvOpts.enableFreeCad);
+    CHECK_EQUAL(loaded.disallowExports, srvOpts.disallowExports);
+
+    // Fault: non-existent file and malformed JSON
+    EdaBridgeAppSettings dummy;
+    CHECK_FALSE(EdaBridgeAppConfig::loadFromFile(_ws + "/missing.json", dummy, err));
+    CHECK_FALSE(err.empty());
+
+    std::string badFile = _ws + "/bad.json";
+    {
+        std::ofstream ofs(badFile);
+        ofs << "{bad json";
+    }
+    CHECK_FALSE(EdaBridgeAppConfig::loadFromFile(badFile, dummy, err));
+    CHECK_FALSE(err.empty());
+}
+
+TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeployment) {
+    std::vector<uint8_t> zipBytes = EdaBridgeAppConfig::buildEasyEdaEextZipBytes();
+    CHECK_TRUE(zipBytes.size() > 512);
+    // PK\x03\x04 local file header signature
+    CHECK_EQUAL(0x50, static_cast<int>(zipBytes[0]));
+    CHECK_EQUAL(0x4B, static_cast<int>(zipBytes[1]));
+    CHECK_EQUAL(0x03, static_cast<int>(zipBytes[2]));
+    CHECK_EQUAL(0x04, static_cast<int>(zipBytes[3]));
+
+    std::string zipView(reinterpret_cast<const char*>(zipBytes.data()), zipBytes.size());
+    CHECK_TRUE(zipView.find("extension.json") != std::string::npos);
+    CHECK_TRUE(zipView.find("index.js") != std::string::npos);
+    CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
+    // PK\x05\x06 End of Central Directory signature
+    CHECK_TRUE(zipView.find(std::string("PK\x05\x06", 4)) != std::string::npos);
+
+    std::string eextPath = _ws + "/dist/aimon-easyeda-bridge.eext";
+    std::string err;
+    CHECK_TRUE(EdaBridgeAppConfig::writeEasyEdaEextFile(eextPath, err));
+    CHECK_TRUE(err.empty());
+    CHECK_TRUE(fs::exists(eextPath));
+    CHECK_EQUAL(zipBytes.size(), static_cast<size_t>(fs::file_size(eextPath)));
+
+    std::string kcDir;
+    CHECK_TRUE(EdaBridgeAppConfig::deployKiCadPlugin(_ws + "/appdata", kcDir, err));
+    CHECK_TRUE(err.empty());
+    CHECK_TRUE(fs::exists(kcDir + "/__init__.py"));
+    CHECK_TRUE(fs::exists(kcDir + "/KiCadAimonBridge.py"));
+
+    std::string fcDir;
+    CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(_ws + "/appdata", fcDir, err));
+    CHECK_TRUE(err.empty());
+    CHECK_TRUE(fs::exists(fcDir + "/InitGui.py"));
+    CHECK_TRUE(fs::exists(fcDir + "/AimonFreeCadBridge.py"));
+}
+
+TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnforcement) {
+    EdaRpcServerOptions opts;
+    opts.listenHost = "127.0.0.1";
+    opts.port = 0;
+    opts.pluginPort = 0;
+    opts.allowedRoot = _ws;
+
+    EdaRpcServer srv(opts);
+    CHECK_TRUE(srv.start());
+
+    CHECK_TRUE(srv.isBridgeEnabled("easyeda"));
+    CHECK_TRUE(srv.isBridgeEnabled("kicad"));
+    CHECK_TRUE(srv.isBridgeEnabled("freecad"));
+    CHECK_FALSE(srv.isDisallowExports());
+    CHECK_EQUAL(30, static_cast<int>(srv.enabledRemoteToolDescriptors().size()));
+
+    // Disable EasyEDA bridge: 11 easyeda_* tools removed -> 19 tools remain
+    srv.setBridgeEnabled("easyeda", false);
+    CHECK_FALSE(srv.isBridgeEnabled("easyeda"));
+    auto toolsNoEe = srv.enabledRemoteToolDescriptors();
+    CHECK_EQUAL(19, static_cast<int>(toolsNoEe.size()));
+    for (const auto& td : toolsNoEe) {
+        CHECK_TRUE(td.value("name", "").rfind("easyeda_", 0) != 0);
+    }
+
+    // Calling disabled EasyEDA tool is rejected
+    nlohmann::json eeCall = srv.dispatchToolCall("easyeda_live_status", nlohmann::json::object());
+    CHECK_FALSE(eeCall.value("ok", true));
+    CHECK_TRUE(eeCall.value("error", "").find("disabled") != std::string::npos);
+
+    // Attempting plugin/register for disabled bridge returns JSON-RPC error -32002
+    {
+        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        CHECK_TRUE(sock >= 0);
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(srv.boundPluginPort()));
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        CHECK_EQUAL(0, ::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)));
+
+        nlohmann::json regReq = {
+            {"jsonrpc", "2.0"},
+            {"id", "reg-dis-1"},
+            {"method", "plugin/register"},
+            {"params", {{"app", "easyeda"}, {"version", "2.2.0"}}}
+        };
+        std::string line = regReq.dump() + "\n";
+        ::send(sock, line.data(), line.size(), 0);
+
+        char rbuf[1024];
+        ssize_t n = ::recv(sock, rbuf, sizeof(rbuf) - 1, 0);
+        ::close(sock);
+        CHECK_TRUE(n > 0);
+        rbuf[n] = '\0';
+        nlohmann::json regResp = nlohmann::json::parse(rbuf, nullptr, false);
+        CHECK_FALSE(regResp.is_discarded());
+        CHECK_TRUE(regResp.contains("error"));
+        CHECK_EQUAL(-32002, regResp["error"].value("code", 0));
+    }
+
+    // Re-enable EasyEDA, disable KiCad & FreeCAD
+    srv.setBridgeEnabled("easyeda", true);
+    srv.setBridgeEnabled("kicad", false);
+    srv.setBridgeEnabled("freecad", false);
+    CHECK_FALSE(srv.isBridgeEnabled("kicad"));
+    CHECK_FALSE(srv.isBridgeEnabled("freecad"));
+    CHECK_EQUAL(12, static_cast<int>(srv.enabledRemoteToolDescriptors().size())); // 11 easyeda + 1 status
+
+    CHECK_FALSE(srv.dispatchToolCall("kicad_search_library", {{"query", "R"}}).value("ok", true));
+    CHECK_FALSE(srv.dispatchToolCall("freecad_live_status", nlohmann::json::object()).value("ok", true));
+
+    // Re-enable all bridges and test export lock
+    srv.setBridgeEnabled("kicad", true);
+    srv.setBridgeEnabled("freecad", true);
+    srv.setDisallowExports(true);
+    CHECK_TRUE(srv.isDisallowExports());
+
+    // Non-export tools still work
+    CHECK_TRUE(srv.dispatchToolCall("kicad_search_library", {{"query", "R"}}).value("ok", false));
+    CHECK_TRUE(srv.dispatchToolCall("freecad_inspect_document", nlohmann::json::object()).value("ok", false));
+
+    // Export tools are blocked
+    nlohmann::json exp1 = srv.dispatchToolCall("easyeda_export_jlcpcb", {{"output_dir", _ws + "/e1"}});
+    CHECK_FALSE(exp1.value("ok", true));
+    nlohmann::json exp2 = srv.dispatchToolCall("kicad_export_fab_pack", {{"output_dir", _ws + "/e2"}});
+    CHECK_FALSE(exp2.value("ok", true));
+    nlohmann::json exp3 = srv.dispatchToolCall("kicad_export_step", {{"output_path", _ws + "/e3.step"}});
+    CHECK_FALSE(exp3.value("ok", true));
+    nlohmann::json exp4 = srv.dispatchToolCall("freecad_export_print_files", {{"output_dir", _ws + "/e4"}});
+    CHECK_FALSE(exp4.value("ok", true));
+
+    srv.stop();
+}
+
+TEST(EdaBridge_UnifiedAppConfigAndToggles, LiveHttpQuotaClientAndTrayTooltipFormatting) {
+    int srvSock = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK_TRUE(srvSock >= 0);
+    int opt = 1;
+    ::setsockopt(srvSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    CHECK_EQUAL(0, ::bind(srvSock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)));
+    CHECK_EQUAL(0, ::listen(srvSock, 4));
+
+    socklen_t len = sizeof(addr);
+    CHECK_EQUAL(0, ::getsockname(srvSock, reinterpret_cast<struct sockaddr*>(&addr), &len));
+    int httpPort = ntohs(addr.sin_port);
+
+    std::atomic<int> postRefreshCount{0};
+    std::atomic<bool> stopHttp{false};
+    std::thread httpThread([srvSock, &postRefreshCount, &stopHttp]() {
+        for (int reqIdx = 0; reqIdx < 2 && !stopHttp.load(); ) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(srvSock, &rfds);
+            struct timeval tv{};
+            tv.tv_sec = 0;
+            tv.tv_usec = 50000;
+            int sel = ::select(srvSock + 1, &rfds, nullptr, nullptr, &tv);
+            if (sel <= 0) continue;
+
+            struct sockaddr_in caddr{};
+            socklen_t clen = sizeof(caddr);
+            int cfd = ::accept(srvSock, reinterpret_cast<struct sockaddr*>(&caddr), &clen);
+            if (cfd < 0) break;
+            ++reqIdx;
+
+            char buf[2048];
+            ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
+            if (n > 0) {
+                buf[n] = '\0';
+                if (std::strstr(buf, "POST /api/refresh") != nullptr) {
+                    postRefreshCount.fetch_add(1);
+                }
+            }
+
+            nlohmann::json payload = {
+                {"last_updated_epoch", 1760560000},
+                {"antigravity", {
+                    {"is_running", true},
+                    {"plan_tier", "Google AI Ultra"},
+                    {"available_prompt_credits", 420},
+                    {"available_flow_credits", 180},
+                    {"models", nlohmann::json::array({
+                        {{"model_name", "Claude Opus 4.6"}, {"remaining_fraction", 0.72}, {"reset_time_remaining_seconds", 3600}},
+                        {{"model_name", "Gemini 2.5 Pro"}, {"remaining_fraction", 0.95}, {"reset_time_remaining_seconds", 7200}}
+                    })}
+                }},
+                {"cursor", {
+                    {"is_authenticated", true},
+                    {"plan_tier", "Pro"},
+                    {"usage_mode", "spend"},
+                    {"fast_requests_used", 125},
+                    {"fast_requests_limit", 500},
+                    {"total_spend_usd", 18.50},
+                    {"on_demand_spend", 4.25},
+                    {"cycle_reset_iso", "2026-11-01T00:00:00Z"}
+                }},
+                {"claude", {
+                    {"enabled", true},
+                    {"accounts", nlohmann::json::array({
+                        {
+                            {"name", "personal"},
+                            {"tier", "personal"},
+                            {"last_5h", {{"total_tokens", 48000}, {"est_cost_usd", 1.25}}},
+                            {"last_7d", {{"total_tokens", 620000}, {"est_cost_usd", 14.80}}},
+                            {"window", {{"total_tokens", 1500000}, {"est_cost_usd", 38.40}}},
+                            {"cycle_configured", true},
+                            {"cycle", {{"est_cost_usd", 24.00}}},
+                            {"spend_limit_usd", 100.0},
+                            {"est_pct_of_limit", 24.0}
+                        }
+                    })}
+                }}
+            };
+            std::string body = payload.dump();
+            std::string resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                "Connection: close\r\n\r\n" + body;
+            ::send(cfd, resp.data(), resp.size(), 0);
+            ::shutdown(cfd, SHUT_RDWR);
+            ::close(cfd);
+        }
+    });
+
+    struct HttpGuard {
+        int sock;
+        std::atomic<bool>& stopFlag;
+        std::thread& thr;
+        ~HttpGuard() {
+            stopFlag.store(true);
+            if (sock >= 0) {
+                ::shutdown(sock, SHUT_RDWR);
+                ::close(sock);
+            }
+            if (thr.joinable()) thr.join();
+        }
+    } guard{srvSock, stopHttp, httpThread};
+
+    AimonQuotaSnapshot snap;
+    CHECK_TRUE(EdaBridgeAppConfig::fetchQuotaSnapshot("127.0.0.1", httpPort, false, snap, 2000));
+    CHECK_TRUE(snap.reachable);
+    CHECK_TRUE(snap.agRunning);
+    CHECK_EQUAL("Google AI Ultra", snap.agPlanTier);
+    CHECK_EQUAL(420, snap.agPromptCredits);
+    CHECK_EQUAL(180, snap.agFlowCredits);
+    CHECK_EQUAL(2, static_cast<int>(snap.agModels.size()));
+    CHECK_EQUAL("Claude Opus 4.6", snap.agModels[0].name);
+    DOUBLES_EQUAL(72.0, snap.agModels[0].remainingPct, 0.1);
+    CHECK_TRUE(snap.cursorAuthenticated);
+    CHECK_EQUAL("Pro", snap.cursorPlanTier);
+    CHECK_EQUAL(125, snap.cursorRequestsUsed);
+    CHECK_EQUAL(500, snap.cursorRequestsLimit);
+    DOUBLES_EQUAL(18.50, snap.cursorTotalSpendUsd, 0.01);
+    CHECK_TRUE(snap.claudeEnabled);
+    CHECK_EQUAL(1, static_cast<int>(snap.claudeAccounts.size()));
+    CHECK_EQUAL("personal", snap.claudeAccounts[0].name);
+    DOUBLES_EQUAL(14.80, snap.claudeAccounts[0].cost7dUsd, 0.01);
+
+    AimonQuotaSnapshot snapRefresh;
+    CHECK_TRUE(EdaBridgeAppConfig::fetchQuotaSnapshot("127.0.0.1", httpPort, true, snapRefresh, 2000));
+    CHECK_EQUAL(1, postRefreshCount.load());
+
+    std::string tooltip = EdaBridgeAppConfig::formatTrayTooltipSummary(snap, true, false, true);
+    CHECK_TRUE(tooltip.rfind("aimon", 0) == 0);
+    CHECK_TRUE(tooltip.find("72%") != std::string::npos);
+    CHECK_TRUE(tooltip.find("$18.50") != std::string::npos);
+
+    // Fault injection: unreachable port and malformed JSON
+    AimonQuotaSnapshot unreach;
+    CHECK_FALSE(EdaBridgeAppConfig::fetchQuotaSnapshot("127.0.0.1", 1, false, unreach, 300));
+    CHECK_FALSE(unreach.reachable);
+    CHECK_FALSE(unreach.errorMessage.empty());
+
+    std::string parseErr;
+    AimonQuotaSnapshot badSnap;
+    CHECK_FALSE(EdaBridgeAppConfig::parseQuotaSnapshotJson("not-json", badSnap, parseErr));
+    CHECK_FALSE(parseErr.empty());
 }
 
 int main(int ac, char** av) {

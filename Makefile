@@ -34,7 +34,7 @@ $(error SANITIZE_CANARY=1 requires SANITIZE=1)
 endif
 endif
 
-.PHONY: all clean distclean test
+.PHONY: all clean distclean test mobile windows-eda-bridge windows-easyeda-bridge
 
 all:
 	@if [ -f .gitmodules ] && [ ! -f third_party/cpp-httplib/httplib.h ]; then \
@@ -79,13 +79,30 @@ mobile:
 		cd mobile/android && ./gradlew assembleDebug; \
 	fi
 
+windows-eda-bridge:
+	@mkdir -p build/windows-eda-bridge
+	@cd build/windows-eda-bridge && $(CMAKE) $(CURDIR)/tools/eda-bridge \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_SYSTEM_NAME=Windows \
+		-DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++-posix \
+		-DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+		-DAIMON_EDA_BRIDGE_WITH_QT=ON
+	@$(MAKE) -C build/windows-eda-bridge -j$(NUM_PROCS)
+	@python3 $(CURDIR)/tools/eda-bridge/scripts/pack_windows_installer.py \
+		--root-dir $(CURDIR) \
+		--build-dir $(CURDIR)/build/windows-eda-bridge \
+		--qt-prefix $(CURDIR)/build/qt-prebuilt/6.8.3/mingw_64 \
+		--output-dir $(CURDIR)/build/windows
 
-
+windows-easyeda-bridge: windows-eda-bridge
 
 clean:
 	@if [ -d $(BUILD_DIR) ] && [ -f $(BUILD_DIR)/Makefile ]; then \
 		$(MAKE) -C $(BUILD_DIR) clean; \
 	fi
+	@if [ -d build/windows-eda-bridge ] && [ -f build/windows-eda-bridge/Makefile ]; then \
+		$(MAKE) -C build/windows-eda-bridge clean; \
+	fi
 
 distclean:
-	@rm -rf $(BUILD_DIR)
+	@rm -rf $(BUILD_DIR) build/windows-eda-bridge build/windows

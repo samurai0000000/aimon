@@ -31,6 +31,10 @@ struct EdaRpcServerOptions {
     std::string footprintLibDir;
     std::string freecadBinaryPath;
     std::string easyedaBinaryPath;
+    bool enableEasyEda = true;
+    bool enableKiCad = true;
+    bool enableFreeCad = true;
+    bool disallowExports = false;
     int defaultTimeoutMs = 60000;
     size_t maxOutputBytes = 4 * 1024 * 1024;
 };
@@ -70,6 +74,12 @@ public:
 
     bool connectToGateway(const std::string& host, int port);
     void disconnectGateway();
+    bool isGatewayConnected() const { return _gatewayActive.load(); }
+
+    void setBridgeEnabled(const std::string& app, bool enabled);
+    bool isBridgeEnabled(const std::string& app) const;
+    void setDisallowExports(bool disallow);
+    bool isDisallowExports() const;
 
     bool isPluginConnected(const std::string& app) const;
 
@@ -93,6 +103,7 @@ public:
                                      std::string& outError);
 
     static std::vector<nlohmann::json> remoteToolDescriptors();
+    std::vector<nlohmann::json> enabledRemoteToolDescriptors() const;
 
 private:
     void rpcAcceptLoop();
@@ -121,6 +132,11 @@ private:
     DiscoveredToolInfo _kicadInfo;
     DiscoveredToolInfo _freecadInfo;
     DiscoveredToolInfo _easyedaInfo;
+
+    std::atomic<bool> _enableEasyEda{true};
+    std::atomic<bool> _enableKiCad{true};
+    std::atomic<bool> _enableFreeCad{true};
+    std::atomic<bool> _disallowExports{false};
 
     std::atomic<bool> _running{false};
     int _rpcServerFd = -1;

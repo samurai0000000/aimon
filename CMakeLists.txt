@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.0.16 LANGUAGES CXX)
+project(aimon VERSION 1.0.17 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -475,6 +475,7 @@ add_executable(aimon-eda-bridge
     tools/eda-bridge/src/ProcessLauncher.cxx
     tools/eda-bridge/src/ToolDiscovery.cxx
     tools/eda-bridge/src/EdaRpcServer.cxx
+    tools/eda-bridge/src/EdaBridgeAppConfig.cxx
     src/EasyEdaConverter.cxx
     src/KiCadSchematicEditor.cxx
 )
@@ -509,6 +510,7 @@ aimon_add_claude_test(test_eda_bridge_daemon LIBCONFIG
             tools/eda-bridge/src/ProcessLauncher.cxx
             tools/eda-bridge/src/ToolDiscovery.cxx
             tools/eda-bridge/src/EdaRpcServer.cxx
+            tools/eda-bridge/src/EdaBridgeAppConfig.cxx
             src/DynamicToolRegistry.cxx src/TcpGateway.cxx
             src/ConfigManager.cxx src/PathUtils.cxx)
 
