@@ -23,6 +23,10 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "Version.hxx"
+
+#define AIMON_WIDE_STR_(x) L##x
+#define AIMON_WIDE_STR(x) AIMON_WIDE_STR_(x)
 
 namespace fs = std::filesystem;
 
@@ -31,7 +35,7 @@ namespace {
 constexpr const char* kInstallerMagic = "AIMON_INST_V1";
 constexpr size_t kInstallerMagicLen = 13;
 constexpr size_t kFooterLen = kInstallerMagicLen + sizeof(uint64_t);
-constexpr const wchar_t* kAppVersion = L"1.0.17";
+static const wchar_t* kAppVersion = AIMON_WIDE_STR(AIMON_VERSION_STRING);
 constexpr const wchar_t* kUninstallRegPath =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\aimon";
 constexpr const wchar_t* kRunRegPath =

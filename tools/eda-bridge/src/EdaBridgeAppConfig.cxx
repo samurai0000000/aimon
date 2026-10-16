@@ -5,6 +5,7 @@
  */
 
 #include "EdaBridgeAppConfig.hxx"
+#include "Version.hxx"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -65,12 +66,23 @@ void appendLe32(std::vector<uint8_t>& buf, uint32_t val) {
     buf.push_back(static_cast<uint8_t>((val >> 24) & 0xFFu));
 }
 
+std::string injectAimonVersion(std::string text) {
+    const std::string token = "__AIMON_VERSION__";
+    const std::string ver = AIMON_VERSION_STRING;
+    size_t pos = 0;
+    while ((pos = text.find(token, pos)) != std::string::npos) {
+        text.replace(pos, token.size(), ver);
+        pos += ver.size();
+    }
+    return text;
+}
+
 static const char* kEmbeddedEasyEdaExtensionJson = R"JSON({
   "name": "aimon-easyeda-pro-bridge",
-  "uuid": "8d4c91f2a70e4c6b9b24e31f6a82d919",
+  "uuid": "8d4c91f2a70e4c6b9b24e31f6a821100",
   "displayName": "Aimon AI EDA Bridge",
   "description": "Connects EasyEDA Pro Desktop to aimon-eda-bridge over local loopback WebSocket (127.0.0.1:3893)",
-  "version": "1.0.19",
+  "version": "__AIMON_VERSION__",
   "publisher": "Charles Chiou",
   "engines": {
     "eda": "^2.2.0"
@@ -214,6 +226,7 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
 var edaEsbuildExportName = (function () {
     "use strict";
 
+    const BRIDGE_VERSION = "__AIMON_VERSION__";
     const DEFAULT_WS_URL = "ws://127.0.0.1:3893";
     const HEARTBEAT_INTERVAL_MS = 10000;
     const ALLOWED_PREFIXES = [
@@ -801,7 +814,7 @@ var edaEsbuildExportName = (function () {
             method: "plugin/register",
             params: {
                 app: "easyeda",
-                version: "1.0.19",
+                version: BRIDGE_VERSION,
                 active_document: cachedActiveDocument
             }
         };
@@ -899,7 +912,7 @@ var edaEsbuildExportName = (function () {
                         method: "plugin/status",
                         params: {
                             app: "easyeda",
-                            version: "1.0.19",
+                            version: BRIDGE_VERSION,
                             active_document: cachedActiveDocument
                         }
                     });
@@ -1134,6 +1147,8 @@ import socket
 import threading
 import time
 
+BRIDGE_VERSION = "__AIMON_VERSION__"
+
 try:
     import pcbnew
     HAS_PCBNEW = True
@@ -1260,7 +1275,9 @@ class KiCadAimonBridgeClient:
                     "method": "plugin/register",
                     "params": {
                         "app": "kicad",
-                        "version": "8.0",
+                        "version": BRIDGE_VERSION,
+                        "bridge_version": BRIDGE_VERSION,
+                        "app_version": "8.0",
                         "active_document": self._get_active_board_name()
                     }
                 }
@@ -1335,6 +1352,8 @@ import os
 import socket
 import threading
 import time
+
+BRIDGE_VERSION = "__AIMON_VERSION__"
 
 try:
     import FreeCAD
@@ -1549,7 +1568,9 @@ class AimonFreeCadBridgeClient:
                     "method": "plugin/register",
                     "params": {
                         "app": "freecad",
-                        "version": "1.0",
+                        "version": BRIDGE_VERSION,
+                        "bridge_version": BRIDGE_VERSION,
+                        "app_version": "1.0",
                         "active_document": self._active_doc_name(),
                     },
                 }
@@ -1771,10 +1792,13 @@ std::vector<uint8_t> EdaBridgeAppConfig::buildEasyEdaEextZipBytes() {
         uint32_t localHeaderOffset = 0;
     };
 
+    std::string extJson = injectAimonVersion(kEmbeddedEasyEdaExtensionJson);
+    std::string indexJs = injectAimonVersion(kEmbeddedEasyEdaIndexJs);
+
     std::vector<ZipFileItem> items = {
-        {"extension.json", kEmbeddedEasyEdaExtensionJson, 0, 0},
-        {"index.js", kEmbeddedEasyEdaIndexJs, 0, 0},
-        {"dist/index.js", kEmbeddedEasyEdaIndexJs, 0, 0}
+        {"extension.json", extJson, 0, 0},
+        {"index.js", indexJs, 0, 0},
+        {"dist/index.js", indexJs, 0, 0}
     };
 
     std::vector<uint8_t> out;
@@ -1889,7 +1913,10 @@ bool EdaBridgeAppConfig::deployKiCadPlugin(const std::string& appDataDir,
     if (!writeTextFileWithDirs(targetDir / "__init__.py", kEmbeddedKiCadInitPy, outError)) {
         return false;
     }
-    if (!writeTextFileWithDirs(targetDir / "KiCadAimonBridge.py", kEmbeddedKiCadBridgePy, outError)) {
+    if (!writeTextFileWithDirs(
+            targetDir / "KiCadAimonBridge.py",
+            injectAimonVersion(kEmbeddedKiCadBridgePy),
+            outError)) {
         return false;
     }
     outDeployedDir = targetDir.string();
@@ -1909,7 +1936,10 @@ bool EdaBridgeAppConfig::deployFreeCadPlugin(const std::string& appDataDir,
     if (!writeTextFileWithDirs(targetDir / "InitGui.py", kEmbeddedFreeCadInitGuiPy, outError)) {
         return false;
     }
-    if (!writeTextFileWithDirs(targetDir / "AimonFreeCadBridge.py", kEmbeddedFreeCadBridgePy, outError)) {
+    if (!writeTextFileWithDirs(
+            targetDir / "AimonFreeCadBridge.py",
+            injectAimonVersion(kEmbeddedFreeCadBridgePy),
+            outError)) {
         return false;
     }
     outDeployedDir = targetDir.string();
@@ -2125,7 +2155,7 @@ bool EdaBridgeAppConfig::fetchQuotaSnapshot(const std::string& host,
     std::string httpReq =
         method + " " + reqPath + " HTTP/1.1\r\n"
         "Host: " + host + ":" + portStr + "\r\n"
-        "User-Agent: aimon-windows-tray/1.0.16\r\n"
+        "User-Agent: aimon-windows-tray/" AIMON_VERSION_STRING "\r\n"
         "Accept: application/json\r\n"
         "Content-Length: 0\r\n"
         "Connection: close\r\n\r\n";

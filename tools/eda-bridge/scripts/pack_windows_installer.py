@@ -32,19 +32,34 @@ def detect_project_version(root_dir: Path) -> str:
         m = re.search(r"project\s*\(\s*aimon\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)", content)
         if m:
             return m.group(1)
-    return "1.0.17"
+    return "1.1.0"
 
 
-def build_easyeda_eext(plugin_dir: Path, out_eext: Path) -> None:
+def build_easyeda_eext(plugin_dir: Path, out_eext: Path, version: str | None = None) -> None:
     ext_json = plugin_dir / "extension.json"
     index_js = plugin_dir / "index.js"
     if not ext_json.is_file() or not index_js.is_file():
         raise FileNotFoundError(f"Missing EasyEDA extension sources in {plugin_dir}")
 
     out_eext.parent.mkdir(parents=True, exist_ok=True)
-    index_bytes = index_js.read_bytes()
+    ext_text = ext_json.read_text(encoding="utf-8")
+    index_text = index_js.read_text(encoding="utf-8")
+    if version:
+        ext_text = re.sub(
+            r'("version"\s*:\s*)"[^"]+"',
+            rf'\g<1>"{version}"',
+            ext_text,
+            count=1,
+        )
+        index_text = re.sub(
+            r'(BRIDGE_VERSION\s*=\s*)["\'][^"\']+["\']',
+            rf'\g<1>"{version}"',
+            index_text,
+        )
+    ext_bytes = ext_text.encode("utf-8")
+    index_bytes = index_text.encode("utf-8")
     with zipfile.ZipFile(out_eext, "w", compression=zipfile.ZIP_STORED) as zf:
-        zf.writestr("extension.json", ext_json.read_bytes())
+        zf.writestr("extension.json", ext_bytes)
         zf.writestr("index.js", index_bytes)
         zf.writestr("dist/index.js", index_bytes)
 
@@ -180,6 +195,7 @@ def stage_windows_app(
     qt_prefix: Path,
     stage_dir: Path,
     out_root: Path,
+    version: str | None = None,
 ) -> None:
     if stage_dir.exists():
         shutil.rmtree(stage_dir)
@@ -191,10 +207,14 @@ def stage_windows_app(
 
     copy_file_fsync(built_exe, stage_dir / "aimon.exe", mode=0o755)
 
+    aimon_ico = root_dir / "tools" / "eda-bridge" / "src" / "aimon.ico"
+    if aimon_ico.is_file():
+        copy_file_fsync(aimon_ico, stage_dir / "aimon.ico", mode=0o644)
+
     # Build and stage EasyEDA Pro .eext archive
     eext_src_dir = root_dir / "tools" / "eda-bridge" / "plugins" / "easyeda-pro-extension"
     staged_eext = stage_dir / "aimon-easyeda-bridge.eext"
-    build_easyeda_eext(eext_src_dir, staged_eext)
+    build_easyeda_eext(eext_src_dir, staged_eext, version or detect_project_version(root_dir))
     copy_file_fsync(staged_eext, out_root / "aimon-easyeda-bridge.eext", mode=0o644)
 
     qt_bin = qt_prefix / "bin"
@@ -285,6 +305,7 @@ def build_self_extracting_installer(
         )
 
     stub_bytes = stub_exe.read_bytes()
+    build_dir = stub_exe.parent
 
     with tempfile.TemporaryDirectory(prefix="aimon-rcdata-") as tmp_rc_dir_str:
         tmp_rc_dir = Path(tmp_rc_dir_str)
@@ -318,7 +339,18 @@ def build_self_extracting_installer(
         linked_exe = tmp_rc_dir / "aimon-setup-linked.exe"
 
         subprocess.run(
-            [windres, "-I", str(src_dir), str(installer_rc), "-O", "coff", "-o", str(res_obj)],
+            [
+                windres,
+                "-I",
+                str(build_dir),
+                "-I",
+                str(src_dir),
+                str(installer_rc),
+                "-O",
+                "coff",
+                "-o",
+                str(res_obj),
+            ],
             check=True,
         )
         subprocess.run(
@@ -327,6 +359,10 @@ def build_self_extracting_installer(
                 "-O2",
                 "-s",
                 "-std=c++17",
+                "-I",
+                str(build_dir),
+                "-I",
+                str(src_dir),
                 "-mwindows",
                 "-static",
                 "-static-libgcc",
@@ -388,7 +424,7 @@ def main() -> int:
         tmp_stage_dir = tmp_out_dir / "app"
         tmp_installer_exe = tmp_out_dir / f"aimon-setup-{version}.exe"
 
-        stage_windows_app(root_dir, build_dir, qt_prefix, tmp_stage_dir, tmp_out_dir)
+        stage_windows_app(root_dir, build_dir, qt_prefix, tmp_stage_dir, tmp_out_dir, version)
         build_self_extracting_installer(root_dir, stub_exe, tmp_stage_dir, tmp_installer_exe)
 
         out_dir.parent.mkdir(parents=True, exist_ok=True)

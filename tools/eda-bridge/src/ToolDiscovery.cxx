@@ -6,6 +6,7 @@
 
 #include "ToolDiscovery.hxx"
 #include "ProcessLauncher.hxx"
+#include "Version.hxx"
 #include <cstdlib>
 #include <filesystem>
 #include <sstream>
@@ -111,7 +112,7 @@ DiscoveredToolInfo ToolDiscovery::discoverKiCad(const std::string& customBinaryP
     // Native C++17 KiCadSchematicEditor is always built-in even if kicad-cli is not installed
     info.available = true;
     info.binaryPath = bin.empty() ? "builtin:KiCadSchematicEditor" : bin;
-    info.version = "KiCad-8-SExp-Engine-1.0";
+    info.version = std::string("KiCad-8-SExp-Engine-") + AIMON_VERSION_STRING;
     return info;
 }
 
@@ -158,7 +159,7 @@ DiscoveredToolInfo ToolDiscovery::discoverFreeCad(const std::string& customBinar
 
     info.available = true;
     info.binaryPath = bin.empty() ? "builtin:FreeCadRoboticsEngine" : bin;
-    info.version = "FreeCAD-Robotics-1.0";
+    info.version = std::string("FreeCAD-Robotics-") + AIMON_VERSION_STRING;
     return info;
 }
 
@@ -167,7 +168,7 @@ DiscoveredToolInfo ToolDiscovery::discoverEasyEda(const std::string& customBinar
     info.name = "easyeda";
     info.available = true;
     info.binaryPath = customBinaryPath.empty() ? "builtin:EasyEdaConverter" : customBinaryPath;
-    info.version = "EasyEDA-Pro-Bridge-1.0";
+    info.version = std::string("EasyEDA-Pro-Bridge-") + AIMON_VERSION_STRING;
     return info;
 }
 

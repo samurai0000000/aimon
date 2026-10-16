@@ -11,6 +11,8 @@ import socket
 import threading
 import time
 
+BRIDGE_VERSION = "1.1.0"
+
 try:
     import FreeCAD
     import Part
@@ -224,7 +226,9 @@ class AimonFreeCadBridgeClient:
                     "method": "plugin/register",
                     "params": {
                         "app": "freecad",
-                        "version": "1.0",
+                        "version": BRIDGE_VERSION,
+                        "bridge_version": BRIDGE_VERSION,
+                        "app_version": "1.0",
                         "active_document": self._active_doc_name(),
                     },
                 }

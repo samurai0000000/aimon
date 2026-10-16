@@ -8,6 +8,7 @@
 #include "ProcessLauncher.hxx"
 #include "EasyEdaConverter.hxx"
 #include "KiCadSchematicEditor.hxx"
+#include "Version.hxx"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -1341,6 +1342,9 @@ void EdaRpcServer::gatewayReadLoop(int gwFd) {
 
 nlohmann::json EdaRpcServer::buildStatusPayload() const {
     std::string eeDoc, kcDoc, fcDoc;
+    std::string eeVer = _easyedaInfo.version;
+    std::string kcVer = _kicadInfo.version;
+    std::string fcVer = _freecadInfo.version;
     bool eeConn = false, kcConn = false, fcConn = false;
     {
         std::lock_guard<std::mutex> lock(_pluginsMutex);
@@ -1349,12 +1353,15 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
             if (kv.second->app == "easyeda" && _enableEasyEda.load()) {
                 eeConn = true;
                 eeDoc = kv.second->activeDocument;
+                if (!kv.second->version.empty()) eeVer = kv.second->version;
             } else if (kv.second->app == "kicad" && _enableKiCad.load()) {
                 kcConn = true;
                 kcDoc = kv.second->activeDocument;
+                if (!kv.second->version.empty()) kcVer = kv.second->version;
             } else if (kv.second->app == "freecad" && _enableFreeCad.load()) {
                 fcConn = true;
                 fcDoc = kv.second->activeDocument;
+                if (!kv.second->version.empty()) fcVer = kv.second->version;
             }
         }
     }
@@ -1372,7 +1379,8 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
             {"available", _easyedaInfo.available},
             {"plugin_connected", eeConn},
             {"binary_path", _easyedaInfo.binaryPath},
-            {"version", _easyedaInfo.version},
+            {"version", eeVer},
+            {"bridge_version", AIMON_VERSION_STRING},
             {"active_document", eeDoc}
         },
         {
@@ -1381,7 +1389,8 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
             {"available", _kicadInfo.available},
             {"plugin_connected", kcConn},
             {"binary_path", _kicadInfo.binaryPath},
-            {"version", _kicadInfo.version},
+            {"version", kcVer},
+            {"bridge_version", AIMON_VERSION_STRING},
             {"active_document", kcDoc}
         },
         {
@@ -1390,13 +1399,15 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
             {"available", _freecadInfo.available},
             {"plugin_connected", fcConn},
             {"binary_path", _freecadInfo.binaryPath},
-            {"version", _freecadInfo.version},
+            {"version", fcVer},
+            {"bridge_version", AIMON_VERSION_STRING},
             {"active_document", fcDoc}
         }
     });
 
     return {
         {"ok", true},
+        {"bridge_version", AIMON_VERSION_STRING},
         {"platform", platform},
         {"rpc_port", _boundPort.load()},
         {"plugin_port", _boundPluginPort.load()},

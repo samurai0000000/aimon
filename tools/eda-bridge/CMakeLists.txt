@@ -5,7 +5,7 @@
 ##
 
 cmake_minimum_required(VERSION 3.16)
-project(aimon-eda-bridge VERSION 1.0.0 LANGUAGES CXX)
+project(aimon-eda-bridge VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,39 @@ endif()
 find_package(Threads REQUIRED)
 
 set(AIMON_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+
+set(WHOAMI_OUTPUT)
+execute_process(
+    COMMAND whoami
+    OUTPUT_VARIABLE WHOAMI_OUTPUT
+    RESULT_VARIABLE WHOAMI_RESULT
+    ERROR_VARIABLE WHOAMI_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+set(HOSTNAME_OUTPUT)
+execute_process(
+    COMMAND hostname
+    OUTPUT_VARIABLE HOSTNAME_OUTPUT
+    RESULT_VARIABLE HOSTNAME_RESULT
+    ERROR_VARIABLE HOSTNAME_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+set(DATE_OUTPUT)
+execute_process(
+    COMMAND date "+%Y-%m-%d %H:%M:%S"
+    OUTPUT_VARIABLE DATE_OUTPUT
+    RESULT_VARIABLE DATE_RESULT
+    ERROR_VARIABLE DATE_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+configure_file(
+    ${AIMON_ROOT_DIR}/Version.hxx.in
+    ${CMAKE_CURRENT_BINARY_DIR}/Version.hxx
+    @ONLY
+)
 
 option(AIMON_EDA_BRIDGE_WITH_QT "Build aimon Windows System Tray GUI with Qt6" OFF)
 
@@ -40,8 +73,8 @@ endif()
 
 if(WIN32)
     enable_language(RC)
-    set_source_files_properties(src/aimon.rc PROPERTIES
-        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/aimon.manifest"
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/aimon.rc PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/aimon.manifest;${CMAKE_CURRENT_BINARY_DIR}/Version.hxx;${CMAKE_CURRENT_SOURCE_DIR}/src/aimon.ico"
     )
     list(APPEND EDA_BRIDGE_SOURCES src/aimon.rc)
 endif()
@@ -49,6 +82,8 @@ endif()
 add_executable(aimon-eda-bridge ${EDA_BRIDGE_SOURCES})
 
 target_include_directories(aimon-eda-bridge PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${AIMON_ROOT_DIR}/include
     ${AIMON_ROOT_DIR}/third_party/json/include
@@ -78,6 +113,10 @@ if(WIN32)
     add_executable(aimon-installer-stub
         src/WindowsInstallerMain.cxx
         src/aimon.rc
+    )
+    target_include_directories(aimon-installer-stub PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     if(MINGW)
         target_compile_definitions(aimon-installer-stub PRIVATE

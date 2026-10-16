@@ -9,6 +9,7 @@
 
 #ifdef AIMON_EDA_BRIDGE_WITH_QT
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <QAction>
@@ -50,6 +51,7 @@ protected:
 private:
     void buildUi();
     void buildTrayIcon();
+    QIcon createBrandAppIcon() const;
     QIcon createStatusTrayIcon(bool healthy, bool activePlugin) const;
 
     void refreshLiveStatus();
@@ -69,6 +71,8 @@ private:
 
     static std::string formatDurationCompact(int64_t seconds);
     static std::string formatTokensCompact(int64_t tokens);
+    static std::string formatHumanDate(const std::string& iso);
+    static std::string formatNumberWithCommas(int64_t value);
 
     EdaRpcServer& _server;
     EdaBridgeAppSettings _settings;

@@ -827,6 +827,8 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeployment) {
+    CHECK_EQUAL("1.1.0", EdaBridgeAppSettings().version);
+
     std::vector<uint8_t> zipBytes = EdaBridgeAppConfig::buildEasyEdaEextZipBytes();
     CHECK_TRUE(zipBytes.size() > 512);
     // PK\x03\x04 local file header signature
@@ -842,6 +844,8 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(zipView.find("edaEsbuildExportName") != std::string::npos);
     CHECK_TRUE(zipView.find("eda.sys_WebSocket") != std::string::npos);
     CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
+    CHECK_TRUE(zipView.find("1.1.0") != std::string::npos);
+    CHECK_TRUE(zipView.find("8d4c91f2a70e4c6b9b24e31f6a821100") != std::string::npos);
     // PK\x05\x06 End of Central Directory signature
     CHECK_TRUE(zipView.find(std::string("PK\x05\x06", 4)) != std::string::npos);
 
@@ -857,12 +861,24 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(err.empty());
     CHECK_TRUE(fs::exists(kcDir + "/__init__.py"));
     CHECK_TRUE(fs::exists(kcDir + "/KiCadAimonBridge.py"));
+    {
+        std::ifstream kcIfs(kcDir + "/KiCadAimonBridge.py");
+        std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
+                              std::istreambuf_iterator<char>());
+        CHECK_TRUE(kcContent.find("1.1.0") != std::string::npos);
+    }
 
     std::string fcDir;
     CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(_ws + "/appdata", fcDir, err));
     CHECK_TRUE(err.empty());
     CHECK_TRUE(fs::exists(fcDir + "/InitGui.py"));
     CHECK_TRUE(fs::exists(fcDir + "/AimonFreeCadBridge.py"));
+    {
+        std::ifstream fcIfs(fcDir + "/AimonFreeCadBridge.py");
+        std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
+                              std::istreambuf_iterator<char>());
+        CHECK_TRUE(fcContent.find("1.1.0") != std::string::npos);
+    }
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnforcement) {

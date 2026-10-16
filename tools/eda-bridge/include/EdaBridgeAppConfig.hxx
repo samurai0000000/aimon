@@ -11,11 +11,12 @@
 #include <string>
 #include <vector>
 #include "EdaRpcServer.hxx"
+#include "Version.hxx"
 
 namespace aimon {
 
 struct EdaBridgeAppSettings {
-    std::string version = "1.0.17";
+    std::string version = AIMON_VERSION_STRING;
     bool enableEasyEda = true;
     bool enableKiCad = true;
     bool enableFreeCad = true;

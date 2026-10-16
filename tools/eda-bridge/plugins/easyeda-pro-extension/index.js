@@ -7,6 +7,7 @@
 var edaEsbuildExportName = (function () {
     "use strict";
 
+    const BRIDGE_VERSION = "1.1.0";
     const DEFAULT_WS_URL = "ws://127.0.0.1:3893";
     const HEARTBEAT_INTERVAL_MS = 10000;
     const ALLOWED_PREFIXES = [
@@ -594,7 +595,7 @@ var edaEsbuildExportName = (function () {
             method: "plugin/register",
             params: {
                 app: "easyeda",
-                version: "1.0.19",
+                version: BRIDGE_VERSION,
                 active_document: cachedActiveDocument
             }
         };
@@ -692,7 +693,7 @@ var edaEsbuildExportName = (function () {
                         method: "plugin/status",
                         params: {
                             app: "easyeda",
-                            version: "1.0.19",
+                            version: BRIDGE_VERSION,
                             active_document: cachedActiveDocument
                         }
                     });

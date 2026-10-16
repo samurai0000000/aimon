@@ -5,14 +5,16 @@
  */
 
 #include <winver.h>
+#include "Version.hxx"
 
 LANGUAGE 9, 1
 
 1 24 "aimon.manifest"
+1 ICON "aimon.ico"
 
 1 VERSIONINFO
- FILEVERSION 1, 0, 17, 0
- PRODUCTVERSION 1, 0, 17, 0
+ FILEVERSION AIMON_VERSION_MAJOR, AIMON_VERSION_MINOR, AIMON_VERSION_PATCH, 0
+ PRODUCTVERSION AIMON_VERSION_MAJOR, AIMON_VERSION_MINOR, AIMON_VERSION_PATCH, 0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -25,12 +27,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Charles Chiou"
       VALUE "FileDescription", "aimon AI Quota Monitor & EDA/CAD Bridge"
-      VALUE "FileVersion", "1.0.17.0"
+      VALUE "FileVersion", AIMON_VERSION_STRING ".0"
       VALUE "InternalName", "aimon"
       VALUE "LegalCopyright", "Copyright (C) 2026, Charles Chiou"
       VALUE "OriginalFilename", "aimon.exe"
       VALUE "ProductName", "aimon"
-      VALUE "ProductVersion", "1.0.17.0"
+      VALUE "ProductVersion", AIMON_VERSION_STRING ".0"
     END
   END
   BLOCK "VarFileInfo"
