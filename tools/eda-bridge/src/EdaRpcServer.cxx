@@ -972,6 +972,12 @@ void EdaRpcServer::handlePluginSession(std::shared_ptr<PluginSession> session) {
                 }
                 session->isWebSocket = true;
                 handshakeChecked = true;
+                nlohmann::json helloMsg = {
+                    {"jsonrpc", "2.0"},
+                    {"method", "server/hello"},
+                    {"params", {{"service", "aimon-eda-bridge"}}}
+                };
+                sendPluginJson(session, helloMsg);
             } else {
                 session->isWebSocket = false;
                 handshakeChecked = true;

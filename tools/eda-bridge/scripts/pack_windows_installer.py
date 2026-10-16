@@ -42,9 +42,11 @@ def build_easyeda_eext(plugin_dir: Path, out_eext: Path) -> None:
         raise FileNotFoundError(f"Missing EasyEDA extension sources in {plugin_dir}")
 
     out_eext.parent.mkdir(parents=True, exist_ok=True)
+    index_bytes = index_js.read_bytes()
     with zipfile.ZipFile(out_eext, "w", compression=zipfile.ZIP_STORED) as zf:
         zf.writestr("extension.json", ext_json.read_bytes())
-        zf.writestr("index.js", index_js.read_bytes())
+        zf.writestr("index.js", index_bytes)
+        zf.writestr("dist/index.js", index_bytes)
 
 
 def find_mingw_dll(dll_name: str, qt_bin_dir: Path) -> Path:

@@ -1,23 +1,138 @@
 {
   "name": "aimon-easyeda-pro-bridge",
-  "uuid": "8d4c91f2a70e4c6b9b24e31f6a82d901",
+  "uuid": "8d4c91f2a70e4c6b9b24e31f6a82d919",
   "displayName": "Aimon AI EDA Bridge",
   "description": "Connects EasyEDA Pro Desktop to aimon-eda-bridge over local loopback WebSocket (127.0.0.1:3893)",
-  "version": "1.0.0",
+  "version": "1.0.19",
   "publisher": "Charles Chiou",
-  "license": "Proprietary",
   "engines": {
     "eda": "^2.2.0"
   },
-  "entry": "./index.js",
-  "activationEvents": [
-    "onStartupFinished"
+  "license": "Proprietary",
+  "repository": {
+    "type": "extension-store",
+    "url": ""
+  },
+  "categories": "Other",
+  "keywords": [
+    "AI",
+    "EDA",
+    "Aimon",
+    "Bridge"
   ],
-  "headerMenus": [
-    {
-      "id": "aimonBridgeMenu",
-      "title": "Aimon AI Bridge",
-      "registerFn": "toggleAimonBridge"
-    }
-  ]
+  "homepage": "https://selfso.com",
+  "bugs": "https://selfso.com",
+  "activationEvents": {},
+  "entry": "./dist/index",
+  "dependentExtensions": {},
+  "headerMenus": {
+    "home": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "blank": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "sch": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "symbol": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "pcb": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "footprint": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ]
+  }
 }

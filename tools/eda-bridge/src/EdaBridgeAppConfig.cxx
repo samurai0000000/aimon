@@ -67,26 +67,141 @@ void appendLe32(std::vector<uint8_t>& buf, uint32_t val) {
 
 static const char* kEmbeddedEasyEdaExtensionJson = R"JSON({
   "name": "aimon-easyeda-pro-bridge",
-  "uuid": "8d4c91f2a70e4c6b9b24e31f6a82d901",
+  "uuid": "8d4c91f2a70e4c6b9b24e31f6a82d919",
   "displayName": "Aimon AI EDA Bridge",
   "description": "Connects EasyEDA Pro Desktop to aimon-eda-bridge over local loopback WebSocket (127.0.0.1:3893)",
-  "version": "1.0.16",
+  "version": "1.0.19",
   "publisher": "Charles Chiou",
-  "license": "Proprietary",
   "engines": {
     "eda": "^2.2.0"
   },
-  "entry": "./index.js",
-  "activationEvents": [
-    "onStartupFinished"
+  "license": "Proprietary",
+  "repository": {
+    "type": "extension-store",
+    "url": ""
+  },
+  "categories": "Other",
+  "keywords": [
+    "AI",
+    "EDA",
+    "Aimon",
+    "Bridge"
   ],
-  "headerMenus": [
-    {
-      "id": "aimonBridgeMenu",
-      "title": "Aimon AI Bridge",
-      "registerFn": "toggleAimonBridge"
-    }
-  ]
+  "homepage": "https://selfso.com",
+  "bugs": "https://selfso.com",
+  "activationEvents": {},
+  "entry": "./dist/index",
+  "dependentExtensions": {},
+  "headerMenus": {
+    "home": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "blank": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "sch": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "symbol": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "pcb": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ],
+    "footprint": [
+      {
+        "id": "aimonBridgeMenu",
+        "title": "Aimon AI Bridge",
+        "menuItems": [
+          {
+            "id": "aimonReconnect",
+            "title": "Reconnect Bridge",
+            "registerFn": "reconnectBridge"
+          },
+          {
+            "id": "aimonStatus",
+            "title": "Bridge Status",
+            "registerFn": "showBridgeStatus"
+          }
+        ]
+      }
+    ]
+  }
 }
 )JSON";
 
@@ -96,10 +211,11 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
  * Copyright (C) 2026, Charles Chiou
  */
 
-(function () {
+var edaEsbuildExportName = (function () {
     "use strict";
 
     const DEFAULT_WS_URL = "ws://127.0.0.1:3893";
+    const HEARTBEAT_INTERVAL_MS = 10000;
     const ALLOWED_PREFIXES = [
         "eda.sch_",
         "eda.pcb_",
@@ -110,19 +226,76 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
     ];
 
     let wsClient = null;
+    let useEdaSysWs = false;
+    let wsIdBase = "aimon-ws-" + Math.random().toString(36).slice(2, 10);
+    let wsGeneration = 0;
+    let currentWsId = wsIdBase;
+    let isConnected = false;
+    let isConnecting = false;
+    let hasRegisteredWs = false;
+    let permissionBlocked = false;
+    let missedHeartbeats = 0;
+    let heartbeatSeq = 0;
+    let heartbeatTimer = null;
     let reconnectTimer = null;
+    let cachedActiveDocument = "EasyEDA-Pro";
 
-    function getActiveDocumentTitle() {
+    function logDiag(msg) {
         try {
-            if (typeof eda !== "undefined" && eda.dmt_SelectControl && eda.dmt_SelectControl.getCurrentDocumentInfo) {
-                const info = eda.dmt_SelectControl.getCurrentDocumentInfo();
-                if (info && info.title) {
-                    return String(info.title);
+            if (typeof eda !== "undefined" && eda.sys_Log && typeof eda.sys_Log.add === "function") {
+                eda.sys_Log.add("[aimon-eda-bridge] " + msg);
+            }
+        } catch (err) {
+        }
+    }
+
+    function showToast(msg) {
+        try {
+            if (typeof eda !== "undefined" && eda.sys_Message && typeof eda.sys_Message.showToastMessage === "function") {
+                eda.sys_Message.showToastMessage(String(msg));
+            }
+        } catch (err) {
+        }
+    }
+
+    async function resolveActiveDocumentTitle() {
+        try {
+            if (typeof eda !== "undefined" && eda.dmt_SelectControl && typeof eda.dmt_SelectControl.getCurrentDocumentInfo === "function") {
+                const info = await eda.dmt_SelectControl.getCurrentDocumentInfo();
+                if (!info || info.documentType === -1 || info.tabId === "tab_page1") {
+                    cachedActiveDocument = "Start Page";
+                    return cachedActiveDocument;
+                }
+                const docTitle = info.title || info.name || info.uuid || "";
+                if (docTitle) {
+                    cachedActiveDocument = String(docTitle);
                 }
             }
         } catch (err) {
         }
-        return "EasyEDA-Pro-Workspace";
+        return cachedActiveDocument;
+    }
+
+    function getActiveDocumentTitle() {
+        return cachedActiveDocument;
+    }
+
+    function callGetter(obj, getterName, fallbackProp, fallbackProp2, defaultVal) {
+        if (!obj) return defaultVal;
+        try {
+            if (typeof obj[getterName] === "function") {
+                const v = obj[getterName]();
+                if (v !== undefined && v !== null) return v;
+            }
+        } catch (err) {
+        }
+        if (fallbackProp && obj[fallbackProp] !== undefined && obj[fallbackProp] !== null) {
+            return obj[fallbackProp];
+        }
+        if (fallbackProp2 && obj[fallbackProp2] !== undefined && obj[fallbackProp2] !== null) {
+            return obj[fallbackProp2];
+        }
+        return defaultVal;
     }
 
     async function handleSearchLibrary(args) {
@@ -136,7 +309,7 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
                     return {
                         uuid: item.uuid || "",
                         title: item.title || item.name || "",
-                        lcsc: item.supplierPart || item.lcsc || "",
+                        lcsc: item.supplierPart || item.supplierId || item.lcsc || "",
                         footprint: item.footprintTitle || item.package || "",
                         library_type: item.jlcpcbPartClass || "Extended",
                         stock: Number(item.stock || 0)
@@ -152,47 +325,104 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
         };
     }
 
-    async function handleInspectSchematic() {
+    async function handleInspectSchematic(args) {
         const components = [];
         const wires = [];
         let netlist = {};
+        let projectInfo = {};
+        let documentInfo = {};
+
         if (typeof eda !== "undefined") {
-            if (eda.sch_PrimitiveComponent && eda.sch_PrimitiveComponent.getAll) {
-                const rawComps = await eda.sch_PrimitiveComponent.getAll();
-                if (Array.isArray(rawComps)) {
-                    for (const c of rawComps) {
-                        components.push({
-                            id: c.primitiveId || c.id || "",
-                            reference: c.designator || c.reference || "",
-                            value: c.value || c.name || "",
-                            footprint: c.footprintName || "",
-                            lcsc: c.supplierPart || "",
-                            x: Number(c.x || 0),
-                            y: Number(c.y || 0),
-                            rotation: Number(c.rotation || 0)
-                        });
+            try {
+                if (eda.dmt_SelectControl && typeof eda.dmt_SelectControl.getCurrentDocumentInfo === "function") {
+                    documentInfo = (await eda.dmt_SelectControl.getCurrentDocumentInfo()) || {};
+                }
+            } catch (err) {
+            }
+            if (!documentInfo || documentInfo.documentType === -1 || documentInfo.tabId === "tab_page1") {
+                cachedActiveDocument = "Start Page";
+                return {
+                    ok: true,
+                    active_document: cachedActiveDocument,
+                    project: {},
+                    document: documentInfo,
+                    components_count: 0,
+                    wires_count: 0,
+                    components: [],
+                    wires: [],
+                    netlist: {}
+                };
+            }
+            const docTitle = documentInfo.title || documentInfo.name || documentInfo.uuid || "Schematic";
+            cachedActiveDocument = String(docTitle);
+
+            try {
+                if (eda.dmt_Project && typeof eda.dmt_Project.getCurrentProjectInfo === "function") {
+                    projectInfo = (await eda.dmt_Project.getCurrentProjectInfo()) || {};
+                }
+            } catch (err) {
+            }
+            try {
+                if (eda.sch_PrimitiveComponent && eda.sch_PrimitiveComponent.getAll) {
+                    const rawComps = await eda.sch_PrimitiveComponent.getAll();
+                    if (Array.isArray(rawComps)) {
+                        for (const c of rawComps) {
+                            const fpRaw = callGetter(c, "getState_Footprint", "footprintName", "footprint", "");
+                            const fpStr = (fpRaw && typeof fpRaw === "object")
+                                ? String(fpRaw.name || fpRaw.title || fpRaw.uuid || JSON.stringify(fpRaw))
+                                : String(fpRaw || "");
+                            components.push({
+                                id: String(callGetter(c, "getState_PrimitiveId", "primitiveId", "id", "")),
+                                unique_id: String(callGetter(c, "getState_UniqueId", "uniqueId", "", "")),
+                                component_type: String(callGetter(c, "getState_ComponentType", "componentType", "", "")),
+                                reference: String(callGetter(c, "getState_Designator", "designator", "reference", "")),
+                                value: String(callGetter(c, "getState_Name", "value", "name", "")),
+                                footprint: fpStr,
+                                lcsc: String(callGetter(c, "getState_SupplierId", "supplierPart", "supplierId", "")),
+                                manufacturer: String(callGetter(c, "getState_Manufacturer", "manufacturer", "", "")),
+                                manufacturer_part: String(callGetter(c, "getState_ManufacturerId", "manufacturerId", "", "")),
+                                net: String(callGetter(c, "getState_Net", "net", "", "")),
+                                x: Number(callGetter(c, "getState_X", "x", "", 0) || 0),
+                                y: Number(callGetter(c, "getState_Y", "y", "", 0) || 0),
+                                rotation: Number(callGetter(c, "getState_Rotation", "rotation", "", 0) || 0),
+                                other_property: callGetter(c, "getState_OtherProperty", "otherProperty", "", {})
+                            });
+                        }
                     }
                 }
+            } catch (err) {
+                logDiag("sch_PrimitiveComponent.getAll error: " + String(err));
             }
-            if (eda.sch_PrimitiveWire && eda.sch_PrimitiveWire.getAll) {
-                const rawWires = await eda.sch_PrimitiveWire.getAll();
-                if (Array.isArray(rawWires)) {
-                    for (const w of rawWires) {
-                        wires.push({
-                            id: w.primitiveId || "",
-                            net: w.net || "",
-                            line: w.line || []
-                        });
+            try {
+                if (eda.sch_PrimitiveWire && eda.sch_PrimitiveWire.getAll) {
+                    const rawWires = await eda.sch_PrimitiveWire.getAll();
+                    if (Array.isArray(rawWires)) {
+                        for (const w of rawWires) {
+                            wires.push({
+                                id: String(callGetter(w, "getState_PrimitiveId", "primitiveId", "id", "")),
+                                net: String(callGetter(w, "getState_Net", "net", "", "")),
+                                line: callGetter(w, "getState_Line", "line", "", [])
+                            });
+                        }
                     }
                 }
+            } catch (err) {
+                logDiag("sch_PrimitiveWire.getAll error: " + String(err));
             }
-            if (eda.sch_Netlist && eda.sch_Netlist.getNetlist) {
-                netlist = await eda.sch_Netlist.getNetlist();
+            if (args && args.include_netlist === true) {
+                try {
+                    if (eda.sch_Netlist && eda.sch_Netlist.getNetlist) {
+                        netlist = (await eda.sch_Netlist.getNetlist("JLCEDA")) || {};
+                    }
+                } catch (err) {
+                }
             }
         }
         return {
             ok: true,
-            active_document: getActiveDocumentTitle(),
+            active_document: cachedActiveDocument,
+            project: projectInfo,
+            document: documentInfo,
             components_count: components.length,
             wires_count: wires.length,
             components: components,
@@ -264,7 +494,7 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
         return {
             ok: true,
             synced: synced,
-            active_document: getActiveDocumentTitle()
+            active_document: await resolveActiveDocumentTitle()
         };
     }
 
@@ -275,58 +505,71 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
         const outline = [];
 
         if (typeof eda !== "undefined") {
-            if (eda.pcb_PrimitiveComponent && eda.pcb_PrimitiveComponent.getAll) {
-                const raw = await eda.pcb_PrimitiveComponent.getAll();
-                if (Array.isArray(raw)) {
-                    for (const c of raw) {
-                        components.push({
-                            reference: c.designator || "",
-                            footprint: c.footprintName || "",
-                            x: Number(c.x || 0),
-                            y: Number(c.y || 0),
-                            rotation: Number(c.rotation || 0),
-                            layer: c.layer || "TopLayer"
-                        });
+            try {
+                if (eda.pcb_PrimitiveComponent && eda.pcb_PrimitiveComponent.getAll) {
+                    const raw = await eda.pcb_PrimitiveComponent.getAll();
+                    if (Array.isArray(raw)) {
+                        for (const c of raw) {
+                            components.push({
+                                reference: String(callGetter(c, "getState_Designator", "designator", "reference", "")),
+                                value: String(callGetter(c, "getState_Name", "name", "value", "")),
+                                footprint: String(callGetter(c, "getState_Footprint", "footprintName", "", "")),
+                                x: Number(callGetter(c, "getState_X", "x", "", 0) || 0),
+                                y: Number(callGetter(c, "getState_Y", "y", "", 0) || 0),
+                                rotation: Number(callGetter(c, "getState_Rotation", "rotation", "", 0) || 0),
+                                layer: String(callGetter(c, "getState_Layer", "layer", "", "TopLayer"))
+                            });
+                        }
                     }
                 }
+            } catch (err) {
             }
-            if (eda.pcb_PrimitiveTrack && eda.pcb_PrimitiveTrack.getAll) {
-                const rawTracks = await eda.pcb_PrimitiveTrack.getAll();
-                if (Array.isArray(rawTracks)) {
-                    for (const t of rawTracks) {
-                        tracks.push({
-                            net: t.net || "",
-                            layer: t.layer || "TopLayer",
-                            width: Number(t.lineWidth || 0.25),
-                            x1: Number(t.startX || 0),
-                            y1: Number(t.startY || 0),
-                            x2: Number(t.endX || 0),
-                            y2: Number(t.endY || 0)
-                        });
+            try {
+                if (eda.pcb_PrimitiveTrack && eda.pcb_PrimitiveTrack.getAll) {
+                    const rawTracks = await eda.pcb_PrimitiveTrack.getAll();
+                    if (Array.isArray(rawTracks)) {
+                        for (const t of rawTracks) {
+                            tracks.push({
+                                net: String(callGetter(t, "getState_Net", "net", "", "")),
+                                layer: String(callGetter(t, "getState_Layer", "layer", "", "TopLayer")),
+                                width: Number(callGetter(t, "getState_LineWidth", "lineWidth", "", 0.25) || 0.25),
+                                x1: Number(callGetter(t, "getState_StartX", "startX", "", 0) || 0),
+                                y1: Number(callGetter(t, "getState_StartY", "startY", "", 0) || 0),
+                                x2: Number(callGetter(t, "getState_EndX", "endX", "", 0) || 0),
+                                y2: Number(callGetter(t, "getState_EndY", "endY", "", 0) || 0)
+                            });
+                        }
                     }
                 }
+            } catch (err) {
             }
-            if (eda.pcb_PrimitiveVia && eda.pcb_PrimitiveVia.getAll) {
-                const rawVias = await eda.pcb_PrimitiveVia.getAll();
-                if (Array.isArray(rawVias)) {
-                    for (const v of rawVias) {
-                        vias.push({
-                            net: v.net || "",
-                            x: Number(v.x || 0),
-                            y: Number(v.y || 0),
-                            diameter: Number(v.diameter || 0.6),
-                            drill: Number(v.holeDiameter || 0.3)
-                        });
+            try {
+                if (eda.pcb_PrimitiveVia && eda.pcb_PrimitiveVia.getAll) {
+                    const rawVias = await eda.pcb_PrimitiveVia.getAll();
+                    if (Array.isArray(rawVias)) {
+                        for (const v of rawVias) {
+                            vias.push({
+                                net: String(callGetter(v, "getState_Net", "net", "", "")),
+                                x: Number(callGetter(v, "getState_X", "x", "", 0) || 0),
+                                y: Number(callGetter(v, "getState_Y", "y", "", 0) || 0),
+                                diameter: Number(callGetter(v, "getState_Diameter", "diameter", "", 0.6) || 0.6),
+                                drill: Number(callGetter(v, "getState_HoleDiameter", "holeDiameter", "", 0.3) || 0.3)
+                            });
+                        }
                     }
                 }
+            } catch (err) {
             }
-            if (eda.pcb_PrimitiveLine && eda.pcb_PrimitiveLine.getAll) {
-                const rawLines = await eda.pcb_PrimitiveLine.getAll();
-                if (Array.isArray(rawLines)) {
-                    for (const ln of rawLines) {
-                        outline.push(ln);
+            try {
+                if (eda.pcb_PrimitiveLine && eda.pcb_PrimitiveLine.getAll) {
+                    const rawLines = await eda.pcb_PrimitiveLine.getAll();
+                    if (Array.isArray(rawLines)) {
+                        for (const ln of rawLines) {
+                            outline.push(ln);
+                        }
                     }
                 }
+            } catch (err) {
             }
         }
 
@@ -510,7 +753,7 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
                 return {
                     ok: true,
                     plugin_connected: true,
-                    active_document: getActiveDocumentTitle()
+                    active_document: await resolveActiveDocumentTitle()
                 };
             case "easyeda_search_library":
                 return await handleSearchLibrary(args);
@@ -535,63 +778,244 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
         }
     }
 
+    function sendRawJson(obj) {
+        const text = JSON.stringify(obj);
+        if (useEdaSysWs) {
+            if (typeof eda !== "undefined" && eda.sys_WebSocket && typeof eda.sys_WebSocket.send === "function") {
+                eda.sys_WebSocket.send(currentWsId, text);
+                return true;
+            }
+            return false;
+        }
+        if (wsClient && wsClient.readyState === 1) {
+            wsClient.send(text);
+            return true;
+        }
+        return false;
+    }
+
+    function sendRegistration() {
+        const regMsg = {
+            jsonrpc: "2.0",
+            id: "easyeda-reg-1",
+            method: "plugin/register",
+            params: {
+                app: "easyeda",
+                version: "1.0.19",
+                active_document: cachedActiveDocument
+            }
+        };
+        try {
+            sendRawJson(regMsg);
+        } catch (err) {
+            logDiag("sendRegistration failed: " + String(err));
+        }
+    }
+
+    async function onIncomingMessage(event) {
+        let msg = null;
+        try {
+            const raw = (event && event.data !== undefined) ? event.data : event;
+            msg = JSON.parse(String(raw));
+        } catch (err) {
+            return;
+        }
+        if (!msg) return;
+
+        missedHeartbeats = 0;
+
+        if (msg.method === "server/hello") {
+            isConnected = true;
+            isConnecting = false;
+            sendRegistration();
+            return;
+        }
+
+        if (msg.result && (msg.result.registered || msg.result.status === "registered")) {
+            if (!isConnected) {
+                isConnected = true;
+                isConnecting = false;
+                logDiag("Registered with aimon on 127.0.0.1:3893");
+                showToast("Connected to Aimon AI Bridge (port 3893)");
+            }
+            return;
+        }
+
+        if (msg.method !== "tools/call" || !msg.params) {
+            return;
+        }
+
+        const reqId = msg.id;
+        const toolName = msg.params.name || "";
+        const toolArgs = msg.params.arguments || {};
+
+        try {
+            const res = await dispatchTool(toolName, toolArgs);
+            sendRawJson({
+                jsonrpc: "2.0",
+                id: reqId,
+                result: res
+            });
+        } catch (err) {
+            sendRawJson({
+                jsonrpc: "2.0",
+                id: reqId,
+                error: {
+                    code: -32000,
+                    message: String(err && err.message ? err.message : err)
+                }
+            });
+        }
+    }
+
+    function startHeartbeatLoop(targetUrl) {
+        if (heartbeatTimer || permissionBlocked) return;
+        heartbeatTimer = setInterval(function () {
+            if (permissionBlocked) {
+                if (heartbeatTimer) {
+                    clearInterval(heartbeatTimer);
+                    heartbeatTimer = null;
+                }
+                return;
+            }
+            if (!isConnected && !isConnecting) {
+                connectRelay(targetUrl);
+                return;
+            }
+            if (isConnected) {
+                missedHeartbeats += 1;
+                if (missedHeartbeats > 3) {
+                    logDiag("Heartbeat timeout -> reconnecting");
+                    isConnected = false;
+                    isConnecting = false;
+                    rotateAndReconnect(targetUrl);
+                    return;
+                }
+                heartbeatSeq += 1;
+                try {
+                    sendRawJson({
+                        jsonrpc: "2.0",
+                        id: "hb-" + heartbeatSeq,
+                        method: "plugin/status",
+                        params: {
+                            app: "easyeda",
+                            version: "1.0.19",
+                            active_document: cachedActiveDocument
+                        }
+                    });
+                } catch (err) {
+                    isConnected = false;
+                    isConnecting = false;
+                    rotateAndReconnect(targetUrl);
+                }
+            }
+        }, HEARTBEAT_INTERVAL_MS);
+    }
+
+    function rotateAndReconnect(targetUrl) {
+        try {
+            if (useEdaSysWs && hasRegisteredWs && typeof eda !== "undefined" && eda.sys_WebSocket && typeof eda.sys_WebSocket.close === "function") {
+                eda.sys_WebSocket.close(currentWsId);
+            } else if (wsClient) {
+                wsClient.close();
+                wsClient = null;
+            }
+        } catch (err) {
+        }
+        hasRegisteredWs = false;
+        wsGeneration += 1;
+        currentWsId = wsIdBase + "-r" + wsGeneration;
+        isConnected = false;
+        isConnecting = true;
+        if (!reconnectTimer && !permissionBlocked) {
+            reconnectTimer = setTimeout(function () {
+                reconnectTimer = null;
+                isConnecting = false;
+                connectRelay(targetUrl || DEFAULT_WS_URL);
+            }, 500);
+        } else {
+            isConnecting = false;
+        }
+    }
+
     function connectRelay(url) {
+        if (permissionBlocked || isConnected || isConnecting) {
+            return;
+        }
         const targetUrl = url || DEFAULT_WS_URL;
+        startHeartbeatLoop(targetUrl);
+
+        if (typeof eda !== "undefined" && eda.sys_WebSocket && typeof eda.sys_WebSocket.register === "function") {
+            useEdaSysWs = true;
+            isConnecting = true;
+            missedHeartbeats = 0;
+            try {
+                if (hasRegisteredWs && typeof eda.sys_WebSocket.close === "function") {
+                    eda.sys_WebSocket.close(currentWsId);
+                }
+            } catch (err) {
+            }
+            hasRegisteredWs = false;
+
+            setTimeout(function () {
+                try {
+                    logDiag("Registering eda.sys_WebSocket id=" + currentWsId + " url=" + targetUrl);
+                    eda.sys_WebSocket.register(
+                        currentWsId,
+                        targetUrl,
+                        onIncomingMessage,
+                        function () {
+                            isConnected = true;
+                            isConnecting = false;
+                            sendRegistration();
+                        }
+                    );
+                    hasRegisteredWs = true;
+                    setTimeout(function () {
+                        if (hasRegisteredWs && !permissionBlocked) {
+                            sendRegistration();
+                        }
+                    }, 350);
+                } catch (err) {
+                    const errText = String(err);
+                    logDiag("eda.sys_WebSocket.register error: " + errText);
+                    isConnecting = false;
+                    hasRegisteredWs = false;
+                    if (errText.indexOf("权限") !== -1 ||
+                        errText.toLowerCase().indexOf("permission") !== -1 ||
+                        errText.toLowerCase().indexOf("external") !== -1) {
+                        permissionBlocked = true;
+                        if (heartbeatTimer) {
+                            clearInterval(heartbeatTimer);
+                            heartbeatTimer = null;
+                        }
+                        logDiag("Paused auto-retry: enable External Interaction permission in Extensions Manager, then click Aimon AI Bridge -> Reconnect Bridge.");
+                    }
+                }
+            }, 200);
+            return;
+        }
+
         if (typeof WebSocket === "undefined") {
             return;
         }
+        useEdaSysWs = false;
+        isConnecting = true;
         wsClient = new WebSocket(targetUrl);
 
         wsClient.onopen = function () {
-            const regMsg = {
-                jsonrpc: "2.0",
-                id: "easyeda-reg-1",
-                method: "plugin/register",
-                params: {
-                    app: "easyeda",
-                    version: "2.2.0",
-                    active_document: getActiveDocumentTitle()
-                }
-            };
-            wsClient.send(JSON.stringify(regMsg));
+            isConnected = true;
+            isConnecting = false;
+            sendRegistration();
         };
 
-        wsClient.onmessage = async function (event) {
-            let msg = null;
-            try {
-                msg = JSON.parse(String(event.data));
-            } catch (err) {
-                return;
-            }
-            if (!msg || msg.method !== "tools/call" || !msg.params) {
-                return;
-            }
-            const reqId = msg.id;
-            const toolName = msg.params.name || "";
-            const toolArgs = msg.params.arguments || {};
-
-            try {
-                const res = await dispatchTool(toolName, toolArgs);
-                wsClient.send(JSON.stringify({
-                    jsonrpc: "2.0",
-                    id: reqId,
-                    result: res
-                }));
-            } catch (err) {
-                wsClient.send(JSON.stringify({
-                    jsonrpc: "2.0",
-                    id: reqId,
-                    error: {
-                        code: -32000,
-                        message: String(err && err.message ? err.message : err)
-                    }
-                }));
-            }
-        };
+        wsClient.onmessage = onIncomingMessage;
 
         wsClient.onclose = function () {
             wsClient = null;
-            if (!reconnectTimer) {
+            isConnected = false;
+            isConnecting = false;
+            if (!reconnectTimer && !permissionBlocked) {
                 reconnectTimer = setTimeout(function () {
                     reconnectTimer = null;
                     connectRelay(targetUrl);
@@ -600,15 +1024,89 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
         };
     }
 
-    if (typeof module !== "undefined" && module.exports) {
-        module.exports = {
-            connectRelay: connectRelay,
-            dispatchTool: dispatchTool
-        };
-    } else {
+    function activate() {
+        logDiag("activate() called");
+        permissionBlocked = false;
         connectRelay(DEFAULT_WS_URL);
     }
+
+    function deactivate() {
+        if (heartbeatTimer) {
+            clearInterval(heartbeatTimer);
+            heartbeatTimer = null;
+        }
+        try {
+            if (useEdaSysWs && hasRegisteredWs && typeof eda !== "undefined" && eda.sys_WebSocket && typeof eda.sys_WebSocket.close === "function") {
+                eda.sys_WebSocket.close(currentWsId);
+            } else if (wsClient) {
+                wsClient.close();
+                wsClient = null;
+            }
+        } catch (err) {
+        }
+        hasRegisteredWs = false;
+        isConnected = false;
+        isConnecting = false;
+    }
+
+    function reconnectBridge() {
+        permissionBlocked = false;
+        showToast("Reconnecting to Aimon AI Bridge...");
+        rotateAndReconnect(DEFAULT_WS_URL);
+    }
+
+    function showBridgeStatus() {
+        if (permissionBlocked) {
+            showToast("Aimon AI Bridge: Enable External Interaction in Extensions Manager, then click Reconnect Bridge");
+            return;
+        }
+        showToast(isConnected
+            ? ("Aimon AI Bridge: Connected (" + cachedActiveDocument + ")")
+            : "Aimon AI Bridge: Disconnected (retrying 127.0.0.1:3893)");
+    }
+
+    // Bootstrap immediately on script evaluation as well as on activate()
+    try {
+        connectRelay(DEFAULT_WS_URL);
+    } catch (err) {
+    }
+
+    const exportsObj = {
+        activate: activate,
+        deactivate: deactivate,
+        reconnectBridge: reconnectBridge,
+        showBridgeStatus: showBridgeStatus,
+        toggleAimonBridge: reconnectBridge,
+        connectRelay: connectRelay,
+        dispatchTool: dispatchTool
+    };
+
+    if (typeof module !== "undefined" && module.exports) {
+        module.exports = exportsObj;
+    }
+
+    return exportsObj;
 })();
+
+function activate(status, arg) {
+    return edaEsbuildExportName.activate(status, arg);
+}
+
+function deactivate() {
+    return edaEsbuildExportName.deactivate();
+}
+
+function reconnectBridge() {
+    return edaEsbuildExportName.reconnectBridge();
+}
+
+function showBridgeStatus() {
+    return edaEsbuildExportName.showBridgeStatus();
+}
+
+function toggleAimonBridge() {
+    return edaEsbuildExportName.reconnectBridge();
+}
 )JS";
 
 static const char* kEmbeddedKiCadInitPy = R"PY(#
@@ -1275,11 +1773,12 @@ std::vector<uint8_t> EdaBridgeAppConfig::buildEasyEdaEextZipBytes() {
 
     std::vector<ZipFileItem> items = {
         {"extension.json", kEmbeddedEasyEdaExtensionJson, 0, 0},
-        {"index.js", kEmbeddedEasyEdaIndexJs, 0, 0}
+        {"index.js", kEmbeddedEasyEdaIndexJs, 0, 0},
+        {"dist/index.js", kEmbeddedEasyEdaIndexJs, 0, 0}
     };
 
     std::vector<uint8_t> out;
-    out.reserve(32768);
+    out.reserve(65536);
 
     // 1. Write Local File Headers + uncompressed data
     for (auto& item : items) {

@@ -89,10 +89,16 @@ public:
             return false;
         }
         hdrBuf[n] = '\0';
-        if (std::strstr(hdrBuf, "101 Switching Protocols") == nullptr) {
+        char* hdrEnd = std::strstr(hdrBuf, "\r\n\r\n");
+        if (std::strstr(hdrBuf, "101 Switching Protocols") == nullptr || hdrEnd == nullptr) {
             ::close(_sock);
             _sock = -1;
             return false;
+        }
+        size_t hdrBytes = static_cast<size_t>((hdrEnd - hdrBuf) + 4);
+        if (static_cast<size_t>(n) > hdrBytes) {
+            _initialBuf.assign(reinterpret_cast<const uint8_t*>(hdrBuf + hdrBytes),
+                               reinterpret_cast<const uint8_t*>(hdrBuf + n));
         }
 
         _running.store(true);
@@ -131,12 +137,16 @@ public:
 
 private:
     void loop() {
-        std::vector<uint8_t> buf;
+        std::vector<uint8_t> buf = _initialBuf;
+        bool needRecv = buf.empty();
         uint8_t chunk[4096];
         while (_running.load()) {
-            ssize_t n = ::recv(_sock, chunk, sizeof(chunk), 0);
-            if (n <= 0) break;
-            buf.insert(buf.end(), chunk, chunk + n);
+            if (needRecv) {
+                ssize_t n = ::recv(_sock, chunk, sizeof(chunk), 0);
+                if (n <= 0) break;
+                buf.insert(buf.end(), chunk, chunk + n);
+            }
+            needRecv = true;
 
             while (!buf.empty()) {
                 size_t consumed = 0;
@@ -202,6 +212,7 @@ private:
     }
 
     int _sock = -1;
+    std::vector<uint8_t> _initialBuf;
     std::atomic<bool> _running{false};
     std::thread _thread;
 };
@@ -827,6 +838,9 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     std::string zipView(reinterpret_cast<const char*>(zipBytes.data()), zipBytes.size());
     CHECK_TRUE(zipView.find("extension.json") != std::string::npos);
     CHECK_TRUE(zipView.find("index.js") != std::string::npos);
+    CHECK_TRUE(zipView.find("dist/index.js") != std::string::npos);
+    CHECK_TRUE(zipView.find("edaEsbuildExportName") != std::string::npos);
+    CHECK_TRUE(zipView.find("eda.sys_WebSocket") != std::string::npos);
     CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
     // PK\x05\x06 End of Central Directory signature
     CHECK_TRUE(zipView.find(std::string("PK\x05\x06", 4)) != std::string::npos);
