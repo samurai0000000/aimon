@@ -348,6 +348,28 @@ TEST(KiCadSchematicEditor_Unit, EndToEndLibrarySearchSchematicEditSyncAndPcbLayo
     CHECK_EQUAL(1, pcbEditRes.value("zones_count", 0));
     CHECK_EQUAL(1, pcbEditRes.value("tracks_count", 0));
     CHECK_EQUAL(1, pcbEditRes.value("vias_count", 0));
+
+    // 5. Test declarative connect_pins auto-wiring in KiCadSchematicEditor::applySchematicEdits
+    std::string autoWireSchPath = _ws + "/autowire.kicad_sch";
+    nlohmann::json autoWireRes = KiCadSchematicEditor::applySchematicEdits({
+        {"schematic_path", autoWireSchPath},
+        {"add_components", nlohmann::json::array({
+            {{"reference", "R1"}, {"value", "10k"}, {"lib_id", "Device:R"}, {"x", 25.4}, {"y", 25.4}},
+            {{"reference", "C1"}, {"value", "100nF"}, {"lib_id", "Device:C"}, {"x", 50.8}, {"y", 38.1}}
+        })},
+        {"connect_pins", nlohmann::json::array({
+            {{"from", "R1.2"}, {"to", "C1.1"}, {"net", "STAGE_MID"}}
+        })}
+    });
+    CHECK_TRUE(autoWireRes.value("ok", false));
+    CHECK_TRUE(autoWireRes.value("wires_count", 0) >= 1);
+    bool foundStageMidNet = false;
+    for (const auto& netObj : autoWireRes["nets"]) {
+        if (netObj.value("name", "") == "STAGE_MID" && netObj["nodes"].size() == 2) {
+            foundStageMidNet = true;
+        }
+    }
+    CHECK_TRUE(foundStageMidNet);
 }
 
 TEST_GROUP(EdaBridge_ProcessLauncher) {
@@ -655,6 +677,79 @@ TEST(EdaBridge_LoopbackRpc, All36ToolsExecuteEndToEndAndEnforceFaultInjection) {
     nlohmann::json authErrRes = badAuthBridge.callTool("kicad_search_library", {{"query", "R"}});
     CHECK_FALSE(authErrRes.value("ok", true));
     CHECK_EQUAL(-32001, authErrRes.value("error_code", 0));
+
+    // 9. Verify JSON-RPC 2.0 Batch Array [req1, req2, req3] in a single TCP round-trip on EdaRpcServer
+    {
+        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        CHECK_TRUE(sock >= 0);
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(_server->boundPort()));
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        CHECK_EQUAL(0, ::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)));
+
+        nlohmann::json batchReq = nlohmann::json::array({
+            {
+                {"jsonrpc", "2.0"},
+                {"id", 1},
+                {"method", "eda/status"},
+                {"auth_token", "test-secret-token-2026"}
+            },
+            {
+                {"jsonrpc", "2.0"},
+                {"id", 2},
+                {"method", "tools/call"},
+                {"auth_token", "test-secret-token-2026"},
+                {"params", {
+                    {"name", "eda_calc_pcb_connectivity_audit"},
+                    {"arguments", {
+                        {"pads", nlohmann::json::array({
+                            {{"ref", "R1"}, {"pad", "1"}, {"net", "VCC"}, {"x", 5.0}, {"y", 5.0}, {"layer", "1"}},
+                            {{"ref", "R2"}, {"pad", "1"}, {"net", "VCC"}, {"x", 15.0}, {"y", 5.0}, {"layer", "1"}}
+                        })},
+                        {"tracks", nlohmann::json::array({
+                            {{"net", "VCC"}, {"layer", "1"}, {"x1", 5.0}, {"y1", 5.0}, {"x2", 15.0}, {"y2", 5.0}, {"width", 0.25}}
+                        })}
+                    }}
+                }}
+            },
+            {
+                {"jsonrpc", "2.0"},
+                {"id", 3},
+                {"method", "tools/call"},
+                {"auth_token", "test-secret-token-2026"},
+                {"params", {
+                    {"name", "kicad_run_drc"},
+                    {"arguments", {{"pcb_path", pcbPath}}}
+                }}
+            }
+        });
+
+        std::string batchLine = batchReq.dump() + "\n";
+        CHECK_TRUE(::send(sock, batchLine.data(), batchLine.size(), 0) > 0);
+
+        std::string recvBuf;
+        char chunk[4096];
+        while (recvBuf.find('\n') == std::string::npos) {
+            ssize_t n = ::recv(sock, chunk, sizeof(chunk), 0);
+            if (n <= 0) break;
+            recvBuf.append(chunk, static_cast<size_t>(n));
+        }
+        ::close(sock);
+
+        nlohmann::json batchResp = nlohmann::json::parse(recvBuf, nullptr, false);
+        CHECK_FALSE(batchResp.is_discarded());
+        CHECK_TRUE(batchResp.is_array());
+        CHECK_EQUAL(3, static_cast<int>(batchResp.size()));
+        CHECK_EQUAL(1, batchResp[0].value("id", 0));
+        CHECK_TRUE(batchResp[0]["result"].value("ok", false));
+        CHECK_EQUAL(2, batchResp[1].value("id", 0));
+        CHECK_TRUE(batchResp[1]["result"].value("ok", false));
+        CHECK_TRUE(batchResp[1]["result"].value("all_connected", false));
+        CHECK_EQUAL(3, batchResp[2].value("id", 0));
+        CHECK_TRUE(batchResp[2]["result"].value("ok", false));
+        CHECK_TRUE(batchResp[2]["result"].contains("connectivity_audit"));
+    }
 }
 
 TEST_GROUP(EdaBridge_GatewayReverse) {
@@ -786,7 +881,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     EdaBridgeAppSettings loaded;
     CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgFile, loaded, err));
     CHECK_TRUE(err.empty());
-    STRCMP_EQUAL("1.1.1", loaded.version.c_str());
+    STRCMP_EQUAL("1.1.2", loaded.version.c_str());
     CHECK_EQUAL(orig.enableEasyEda, loaded.enableEasyEda);
     CHECK_EQUAL(orig.enableKiCad, loaded.enableKiCad);
     CHECK_EQUAL(orig.enableFreeCad, loaded.enableFreeCad);
@@ -819,6 +914,23 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     CHECK_EQUAL(loaded.enableFreeCad, srvOpts.enableFreeCad);
     CHECK_EQUAL(loaded.disallowExports, srvOpts.disallowExports);
 
+    // Legacy Z:\ or Z:/ allowed_root in JSON must be cleared to ""
+    std::string legacyZFile = _ws + "/legacy_z.json";
+    {
+        std::ofstream ofs(legacyZFile);
+        ofs << "{\"allowed_root\": \"Z:\\\\\", \"connection_mode\": \"bidirectional\"}\n";
+    }
+    EdaBridgeAppSettings legacyZLoaded;
+    CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(legacyZFile, legacyZLoaded, err));
+    CHECK_EQUAL("", legacyZLoaded.allowedRoot);
+
+    {
+        std::ofstream ofs(legacyZFile);
+        ofs << "{\"allowed_root\": \"Z:/\", \"connection_mode\": \"bidirectional\"}\n";
+    }
+    CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(legacyZFile, legacyZLoaded, err));
+    CHECK_EQUAL("", legacyZLoaded.allowedRoot);
+
     // Fault: non-existent file and malformed JSON
     EdaBridgeAppSettings dummy;
     CHECK_FALSE(EdaBridgeAppConfig::loadFromFile(_ws + "/missing.json", dummy, err));
@@ -834,7 +946,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeployment) {
-    CHECK_EQUAL("1.1.1", EdaBridgeAppSettings().version);
+    CHECK_EQUAL("1.1.2", EdaBridgeAppSettings().version);
 
     std::vector<uint8_t> zipBytes = EdaBridgeAppConfig::buildEasyEdaEextZipBytes();
     CHECK_TRUE(zipBytes.size() > 512);
@@ -851,8 +963,13 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(zipView.find("edaEsbuildExportName") != std::string::npos);
     CHECK_TRUE(zipView.find("eda.sys_WebSocket") != std::string::npos);
     CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
-    CHECK_TRUE(zipView.find("1.1.1") != std::string::npos);
+    CHECK_TRUE(zipView.find("1.1.2") != std::string::npos);
     CHECK_TRUE(zipView.find("8d4c91f2a70e4c6b9b24e31f6a821100") != std::string::npos);
+    CHECK_TRUE(zipView.find("check(false, false, true)") != std::string::npos);
+    CHECK_TRUE(zipView.find("getAllPinsByPrimitiveId") != std::string::npos);
+    CHECK_TRUE(zipView.find("connect_pins") != std::string::npos);
+    CHECK_TRUE(zipView.find("board_outline") != std::string::npos);
+    CHECK_TRUE(zipView.find("placed_component_details") != std::string::npos);
     // PK\x05\x06 End of Central Directory signature
     CHECK_TRUE(zipView.find(std::string("PK\x05\x06", 4)) != std::string::npos);
 
@@ -894,7 +1011,9 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream kcIfs(kcDir + "/KiCadAimonBridge.py");
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(kcContent.find("1.1.1") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.2") != std::string::npos);
+        CHECK_TRUE(kcContent.find("*.Cu") != std::string::npos);
+        CHECK_TRUE(kcContent.find("GetAttribute") != std::string::npos);
     }
 
     fcAlready = true;
@@ -907,7 +1026,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream fcIfs(fcDir + "/AimonFreeCadBridge.py");
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(fcContent.find("1.1.1") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.2") != std::string::npos);
     }
 
     // 3a. Re-run when destination files are identical -> do NOT overwrite (alreadyDeployed == true)
@@ -935,7 +1054,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(kcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(kcContent.find("1.1.1") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.2") != std::string::npos);
     }
 
     CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir2, err, "", false, &fcAlready));
@@ -945,7 +1064,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(fcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(fcContent.find("1.1.1") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.2") != std::string::npos);
     }
 
     // 4. Test customTargetDir (simulating QFileDialog user selection)

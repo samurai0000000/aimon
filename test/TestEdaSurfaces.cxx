@@ -253,6 +253,7 @@ static constexpr const char* kAllAcceleratorTools[] = {
     "eda_calc_pcb_placement",
     "eda_calc_pcb_autoroute",
     "eda_calc_electrical_synth",
+    "eda_calc_pcb_connectivity_audit",
     "cad_calc_robot_kinematics_statics",
     "cad_calc_mechanism_synth",
     "cad_calc_print_orientation_dfm"
@@ -374,8 +375,8 @@ TEST(McpServer_EdaProfile, WorkspaceAutoDetectsEdaProfileAndPreservesExistingPro
 }
 
 TEST(McpServer_EdaProfile, ProfileScopingAndPerComponentTogglesFilterToolsListAndCall) {
-    // 1. When all 4 components and eda.enabled are true, "eda" and "all" list all 36 EDA tools
-    for (const char* prof : {"eda", "all"}) {
+    // 1. When all 4 components and eda.enabled are true, "eda", "cad", and "all" list all 37 EDA tools
+    for (const char* prof : {"eda", "cad", "all"}) {
         auto names = listMcpToolNames(*_mcp, prof);
         for (const char* t : kAllAcceleratorTools) CHECK_TRUE_TEXT(names.count(t) == 1, t);
         for (const char* t : kAllKiCadTools) CHECK_TRUE_TEXT(names.count(t) == 1, t);
@@ -399,8 +400,8 @@ TEST(McpServer_EdaProfile, ProfileScopingAndPerComponentTogglesFilterToolsListAn
         LONGS_EQUAL(-32601, errRes["error"].value("code", 0));
     }
 
-    // 3. Boundary: When remote Windows bridge eda.enabled == false, the 7 local CPU accelerators
-    // remain listed and callable under "eda" and "all", while the 29 remote tools are hidden & rejected
+    // 3. Boundary: When remote Windows bridge eda.enabled == false and no gateway session is registered,
+    // the 8 local CPU accelerators remain listed and callable under "eda", "cad", and "all", while the 29 remote tools are hidden & rejected
     EdaBridgeConfig localOnlyCfg = _cfg;
     localOnlyCfg.enabled = false;
     localOnlyCfg.accelerators.enabled = true;
@@ -413,13 +414,44 @@ TEST(McpServer_EdaProfile, ProfileScopingAndPerComponentTogglesFilterToolsListAn
     for (const char* t : kAllEasyEdaTools) CHECK_FALSE_TEXT(localOnlyNames.count(t) > 0, t);
 
     json localCall = callMcpTool(*_mcp, "eda_calc_electrical_synth",
-                                 {{"mode", "divider"}, {"vin_v", 5.0}, {"vout_target_v", 3.3}}, "eda");
+                                 {{"mode", "divider"}, {"vin_v", 5.0}, {"vout_target_v", 3.3}}, "cad");
     CHECK_TRUE(localCall.contains("result"));
     CHECK_FALSE(localCall["result"].value("isError", true));
 
     json remoteRejected = callMcpTool(*_mcp, "kicad_run_erc", {{"schematic_path", _ws + "/a.kicad_sch"}}, "eda");
     CHECK_TRUE(remoteRejected.contains("error"));
     LONGS_EQUAL(-32601, remoteRejected["error"].value("code", 0));
+
+    // 3b. Dynamic TcpGateway Registration: When eda.enabled == false in config, but aimon-eda-bridge
+    // connects to TcpGateway and registers tools in DynamicToolRegistry, McpServer lists and dispatches them!
+    {
+        DynamicToolRegistry dynReg;
+        TcpGateway tcpGw(dynReg);
+        int gwPort = 41885 + (::getpid() % 3000);
+        if (!tcpGw.start("127.0.0.1", gwPort)) {
+            gwPort += 173;
+            CHECK_TRUE(tcpGw.start("127.0.0.1", gwPort));
+        }
+        CHECK_TRUE(_rpcServer->connectToGateway("127.0.0.1", gwPort));
+        for (int i = 0; i < 40 && !dynReg.hasTool("easyeda_live_status"); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+        CHECK_TRUE(dynReg.hasTool("easyeda_live_status"));
+
+        McpServer dynMcp(StateStore::getInstance(), &dynReg, &tcpGw);
+        dynMcp.setEdaBridge(_bridge.get()); // _bridge still has localOnlyCfg.enabled == false!
+
+        auto dynNames = listMcpToolNames(dynMcp, "cad");
+        CHECK_TRUE(dynNames.count("easyeda_live_status") == 1);
+        CHECK_TRUE(dynNames.count("eda_calc_pcb_connectivity_audit") == 1);
+
+        json dynCall = callMcpTool(dynMcp, "easyeda_live_status", json::object(), "cad");
+        CHECK_TRUE(dynCall.contains("result"));
+        CHECK_FALSE(dynCall["result"].value("isError", true));
+
+        _rpcServer->disconnectGateway();
+        tcpGw.stop();
+    }
 
     // 4. Per-component toggles: disabling kicad, freecad, easyeda, or accelerators individually
     EdaBridgeConfig kicadOffCfg = _cfg;
@@ -458,7 +490,7 @@ TEST(McpServer_EdaProfile, All36ToolsExecuteThroughMcpServerAndUpdateTelemetry) 
         return parsed;
     };
 
-    // 1..7: Local CPU Accelerators
+    // 1..8: Local CPU Accelerators
     json r1 = callAndParse("eda_calc_schematic_layout", {
         {"components", json::array({
             {{"reference", "J1"}, {"role", "connector"}},
@@ -486,6 +518,15 @@ TEST(McpServer_EdaProfile, All36ToolsExecuteThroughMcpServerAndUpdateTelemetry) 
         })}
     });
     callAndParse("eda_calc_electrical_synth", {{"mode", "divider"}, {"vin_v", 12.0}, {"vout_target_v", 3.3}});
+    callAndParse("eda_calc_pcb_connectivity_audit", {
+        {"pads", json::array({
+            {{"ref", "U1"}, {"pad", "1"}, {"net", "SIG"}, {"x", 5.0}, {"y", 5.0}, {"layer", "F.Cu"}},
+            {{"ref", "C1"}, {"pad", "1"}, {"net", "SIG"}, {"x", 12.0}, {"y", 5.0}, {"layer", "F.Cu"}}
+        })},
+        {"tracks", json::array({
+            {{"net", "SIG"}, {"layer", "F.Cu"}, {"x1", 5.0}, {"y1", 5.0}, {"x2", 12.0}, {"y2", 5.0}, {"width", 0.25}}
+        })}
+    });
     callAndParse("cad_calc_robot_kinematics_statics", {
         {"links", json::array({{{"name", "L1"}, {"length_m", 0.08}, {"mass_kg", 0.045}, {"angle_deg", 0.0}}})},
         {"payload_kg", 0.10}
@@ -500,7 +541,7 @@ TEST(McpServer_EdaProfile, All36ToolsExecuteThroughMcpServerAndUpdateTelemetry) 
         {"load_vector_n", {{"fx", 0.0}, {"fy", 0.0}, {"fz", 20.0}}}
     });
 
-    // 8..16: KiCad Tools
+    // 9..17: KiCad Tools
     std::string schPath = _ws + "/mcp_board.kicad_sch";
     std::string pcbPath = _ws + "/mcp_board.kicad_pcb";
     std::string fabDir = _ws + "/fab_out";
@@ -526,7 +567,7 @@ TEST(McpServer_EdaProfile, All36ToolsExecuteThroughMcpServerAndUpdateTelemetry) 
     callAndParse("kicad_export_fab_pack", {{"pcb_path", pcbPath}, {"output_dir", fabDir}});
     callAndParse("kicad_export_step", {{"pcb_path", pcbPath}, {"output_path", stepPath}});
 
-    // 17..25: FreeCAD Tools
+    // 18..26: FreeCAD Tools
     std::string fcDoc = _ws + "/robot_bracket.FCStd";
     std::string fcRenders = _ws + "/renders";
     std::string fcExports = _ws + "/prints";
@@ -550,7 +591,7 @@ TEST(McpServer_EdaProfile, All36ToolsExecuteThroughMcpServerAndUpdateTelemetry) 
     callAndParse("freecad_export_print_files", {{"output_dir", fcExports}, {"part_name", "joint_housing"}});
     callAndParse("freecad_invoke_api", {{"module", "Part"}, {"method", "makeBox"}});
 
-    // 26..36: EasyEDA Tools
+    // 27..37: EasyEDA Tools
     std::string jlcDir = _ws + "/jlcpcb";
     callAndParse("easyeda_live_status", json::object());
     callAndParse("easyeda_search_library", {{"query", "10k"}});
@@ -567,13 +608,13 @@ TEST(McpServer_EdaProfile, All36ToolsExecuteThroughMcpServerAndUpdateTelemetry) 
         {"target_format", "kicad_sch"}
     });
 
-    // Verify telemetry counters across all 4 components and 36-call ring buffer
+    // Verify telemetry counters across all 4 components and 37-call ring buffer
     EdaBridgeStatus st = _bridge->getStatus();
-    LONGS_EQUAL(36, static_cast<long>(st.recentCalls.size()));
+    LONGS_EQUAL(37, static_cast<long>(st.recentCalls.size()));
     for (const auto& ti : st.tools) {
         if (ti.name == "accelerators") {
-            LONGS_EQUAL(7, static_cast<long>(ti.totalCalls));
-            LONGS_EQUAL(7, static_cast<long>(ti.successCalls));
+            LONGS_EQUAL(8, static_cast<long>(ti.totalCalls));
+            LONGS_EQUAL(8, static_cast<long>(ti.successCalls));
         } else if (ti.name == "kicad") {
             LONGS_EQUAL(9, static_cast<long>(ti.totalCalls));
             LONGS_EQUAL(9, static_cast<long>(ti.successCalls));

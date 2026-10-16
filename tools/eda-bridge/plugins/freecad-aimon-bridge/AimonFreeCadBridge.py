@@ -12,7 +12,7 @@ import socket
 import threading
 import time
 
-BRIDGE_VERSION = "1.1.1"
+BRIDGE_VERSION = "1.1.2"
 
 try:
     import FreeCAD

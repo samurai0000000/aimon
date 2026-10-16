@@ -1668,6 +1668,66 @@ nlohmann::json KiCadSchematicEditor::applySchematicEdits(const nlohmann::json& a
         processWires(arguments["wires"]);
     }
 
+    // 6. Auto-route orthogonal 50-mil wires for `connect_pins`
+    if (arguments.contains("connect_pins") && arguments["connect_pins"].is_array()) {
+        auto resolvePinCoord = [&](const std::string& spec, double& outX, double& outY) -> bool {
+            size_t dot = spec.find('.');
+            if (dot == std::string::npos) return false;
+            std::string ref = spec.substr(0, dot);
+            std::string pinKey = spec.substr(dot + 1);
+            for (const auto& c : comps) {
+                if (c.reference == ref) {
+                    for (const auto& p : c.pins) {
+                        if (p.number == pinKey || p.name == pinKey) {
+                            outX = snapTo50MilGrid(p.x);
+                            outY = snapTo50MilGrid(p.y);
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        };
+
+        for (const auto& cpObj : arguments["connect_pins"]) {
+            if (!cpObj.is_object()) continue;
+            std::string fromSpec = cpObj.value("from", cpObj.value("from_pin", ""));
+            std::string toSpec = cpObj.value("to", cpObj.value("to_pin", ""));
+            std::string netName = cpObj.value("net", "");
+            double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
+            if (!resolvePinCoord(fromSpec, x1, y1) || !resolvePinCoord(toSpec, x2, y2)) {
+                continue;
+            }
+            if (std::fabs(x1 - x2) < 1e-4 || std::fabs(y1 - y2) < 1e-4) {
+                SchWireModel w;
+                w.x1 = x1;
+                w.y1 = y1;
+                w.x2 = x2;
+                w.y2 = y2;
+                w.net = netName;
+                wires.push_back(w);
+            } else {
+                double midX = x2;
+                double midY = y1;
+                SchWireModel w1;
+                w1.x1 = x1;
+                w1.y1 = y1;
+                w1.x2 = midX;
+                w1.y2 = midY;
+                w1.net = netName;
+                wires.push_back(w1);
+
+                SchWireModel w2;
+                w2.x1 = midX;
+                w2.y1 = midY;
+                w2.x2 = x2;
+                w2.y2 = y2;
+                w2.net = "";
+                wires.push_back(w2);
+            }
+        }
+    }
+
     std::string sexp = serializeSchematicSexp(comps, wires, labels);
     if (!schPath.empty()) {
         fs::path p(schPath);

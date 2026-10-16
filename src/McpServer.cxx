@@ -59,11 +59,26 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "eda_calc_pcb_autoroute",
             "accelerators",
-            "PathFinder negotiated-congestion multi-layer 45-degree A* PCB trace & via router (outputs tracks[] & vias[]).",
+            "PathFinder negotiated-congestion N-layer (2/4/6-layer EasyEDA/KiCad) 45-degree A* PCB trace & via router with incremental existing_tracks/existing_vias.",
             {
-                {"board", {{"type", "object"}, {"description", "Board outline and routing grid settings"}}},
+                {"board", {{"type", "object"}, {"description", "Board outline and routing grid settings ({width_mm, height_mm, layers, layer_style})"}}},
                 {"nets", {{"type", "array"}, {"description", "Nets with pad coordinates ({name, width_mm, clearance_mm, pads[]})"}}},
-                {"obstacles", {{"type", "array"}, {"description", "Keepout or obstacle rectangles"}}}
+                {"obstacles", {{"type", "array"}, {"description", "Keepout or obstacle rectangles"}}},
+                {"existing_tracks", {{"type", "array"}, {"description", "Existing routed tracks for incremental routing"}}},
+                {"existing_vias", {{"type", "array"}, {"description", "Existing vias for incremental routing"}}}
+            },
+            {}
+        },
+        {
+            "eda_calc_pcb_connectivity_audit",
+            "accelerators",
+            "3D layer-aware Union-Find PCB physical connectivity, broken net island, dangling track, unassigned pad & schematic-PCB sync auditor.",
+            {
+                {"pads", {{"type", "array"}, {"description", "PCB pads ({id, ref, pad, net, x, y, layer, size_x, size_y})"}}},
+                {"tracks", {{"type", "array"}, {"description", "PCB track segments ({id, net, layer, x1, y1, x2, y2, width})"}}},
+                {"vias", {{"type", "array"}, {"description", "PCB vias ({id, net, x, y, diameter, drill})"}}},
+                {"schematic_components", {{"type", "array"}, {"description", "Optional schematic components for parity check"}}},
+                {"pcb_components", {{"type", "array"}, {"description", "Optional PCB components for parity check"}}}
             },
             {}
         },
@@ -453,7 +468,8 @@ bool McpServer::isEdaToolEnabledInConfig(const std::string& toolName) const {
     if (EdaAccelerators::isAcceleratorTool(toolName)) {
         return cfg.accelerators.enabled;
     }
-    if (!cfg.enabled) {
+    bool dynRegistered = (_dynamicRegistry != nullptr && _dynamicRegistry->hasTool(toolName));
+    if (!cfg.enabled && !dynRegistered) {
         return false;
     }
     if (toolName.rfind("kicad_", 0) == 0) {
@@ -512,7 +528,7 @@ bool McpServer::isToolAllowedInProfile(const std::string& toolName, const std::s
         return (toolName.rfind("mail_", 0) == 0);
     }
 
-    if (profile == "eda") {
+    if (profile == "eda" || profile == "cad") {
         return isEdaTool(toolName);
     }
 
@@ -821,7 +837,22 @@ nlohmann::json McpServer::handleToolsCall(const nlohmann::json& id, const nlohma
 
         nlohmann::json args = params.value("arguments", nlohmann::json::object());
         nlohmann::json edaRes;
-        if (_edaBridge) {
+        bool useDynGateway = (!EdaAccelerators::isAcceleratorTool(toolName) &&
+                              (!_edaBridge || !_edaBridge->getConfig().enabled) &&
+                              _tcpGateway != nullptr &&
+                              _dynamicRegistry != nullptr &&
+                              _dynamicRegistry->hasTool(toolName));
+        if (useDynGateway) {
+            nlohmann::json gwArgs = args;
+            if (_edaBridge && !_edaBridge->getConfig().authSecret.empty() &&
+                gwArgs.is_object() && !gwArgs.contains("_auth_token")) {
+                gwArgs["_auth_token"] = _edaBridge->getConfig().authSecret;
+            }
+            std::string gwErr;
+            if (!_tcpGateway->callTool(toolName, gwArgs, edaRes, gwErr, 45000)) {
+                edaRes = {{"ok", false}, {"error", gwErr}};
+            }
+        } else if (_edaBridge) {
             edaRes = _edaBridge->callTool(toolName, args);
         } else {
             EdaBridge fallbackBridge;

@@ -11,7 +11,7 @@ import socket
 import threading
 import time
 
-BRIDGE_VERSION = "1.1.1"
+BRIDGE_VERSION = "1.1.2"
 
 try:
     import pcbnew
@@ -142,53 +142,132 @@ class KiCadAimonBridgeClient:
     def _inspect_live_board(self):
         def _do_inspect():
             footprints = []
+            all_pads = []
             tracks = []
             vias = []
             outline_segments = 0
             if HAS_PCBNEW and hasattr(pcbnew, "GetBoard"):
                 board = pcbnew.GetBoard()
                 if board is not None:
+                    f_cu = getattr(pcbnew, "F_Cu", 0)
+                    b_cu = getattr(pcbnew, "B_Cu", 31)
+                    pth_attr = getattr(pcbnew, "PAD_ATTRIB_PTH", 0)
+                    npth_attr = getattr(pcbnew, "PAD_ATTRIB_NPTH", 3)
                     for fp in board.GetFootprints():
                         pos = fp.GetPosition()
+                        fp_pos_x = pos.x if hasattr(pos, "x") else pos[0]
+                        fp_pos_y = pos.y if hasattr(pos, "y") else pos[1]
+                        fp_layer_name = board.GetLayerName(fp.GetLayer()) if hasattr(board, "GetLayerName") else "F.Cu"
+                        fp_ref = fp.GetReference()
                         pads = []
                         if hasattr(fp, "Pads"):
                             for pad in fp.Pads():
-                                ppos = pad.GetPosition()
-                                pads.append({
-                                    "number": pad.GetNumber() if hasattr(pad, "GetNumber") else "1",
-                                    "x": pcbnew.ToMM(ppos.x),
-                                    "y": pcbnew.ToMM(ppos.y),
-                                    "net": pad.GetNetname() if hasattr(pad, "GetNetname") else ""
-                                })
+                                ppos = pad.GetPosition() if hasattr(pad, "GetPosition") else getattr(pad, "pos", (0, 0))
+                                px_raw = ppos.x if hasattr(ppos, "x") else ppos[0]
+                                py_raw = ppos.y if hasattr(ppos, "y") else ppos[1]
+                                p_num = pad.GetNumber() if hasattr(pad, "GetNumber") else "1"
+                                p_net = pad.GetNetname() if hasattr(pad, "GetNetname") else ""
+                                p_w = 0.8
+                                p_h = 0.8
+                                if hasattr(pad, "GetSize"):
+                                    try:
+                                        psz = pad.GetSize()
+                                        sx_raw = psz.x if hasattr(psz, "x") else psz[0]
+                                        sy_raw = psz.y if hasattr(psz, "y") else psz[1]
+                                        if sx_raw > 0:
+                                            p_w = pcbnew.ToMM(sx_raw)
+                                        if sy_raw > 0:
+                                            p_h = pcbnew.ToMM(sy_raw)
+                                    except Exception:
+                                        pass
+                                elif hasattr(pad, "size") and isinstance(pad.size, tuple) and len(pad.size) == 2:
+                                    if pad.size[0] > 0:
+                                        p_w = pcbnew.ToMM(pad.size[0])
+                                    if pad.size[1] > 0:
+                                        p_h = pcbnew.ToMM(pad.size[1])
+
+                                pad_layer = fp_layer_name
+                                is_thru = False
+                                if hasattr(pad, "GetAttribute"):
+                                    try:
+                                        attr = pad.GetAttribute()
+                                        if attr in (pth_attr, npth_attr):
+                                            is_thru = True
+                                    except Exception:
+                                        pass
+                                if not is_thru and hasattr(pad, "GetDrillSize"):
+                                    try:
+                                        dsz = pad.GetDrillSize()
+                                        dx = dsz.x if hasattr(dsz, "x") else dsz[0]
+                                        if dx > 0:
+                                            is_thru = True
+                                    except Exception:
+                                        pass
+                                if not is_thru and hasattr(pad, "GetLayerSet"):
+                                    try:
+                                        lset = pad.GetLayerSet()
+                                        if hasattr(lset, "Contains"):
+                                            has_f = bool(lset.Contains(f_cu))
+                                            has_b = bool(lset.Contains(b_cu))
+                                            if has_f and has_b:
+                                                is_thru = True
+                                            elif has_b and not has_f:
+                                                pad_layer = "B.Cu"
+                                            elif has_f and not has_b:
+                                                pad_layer = "F.Cu"
+                                    except Exception:
+                                        pass
+                                if is_thru:
+                                    pad_layer = "*.Cu"
+
+                                pad_entry = {
+                                    "number": p_num,
+                                    "pad": p_num,
+                                    "ref": fp_ref,
+                                    "x": pcbnew.ToMM(px_raw),
+                                    "y": pcbnew.ToMM(py_raw),
+                                    "width": p_w,
+                                    "height": p_h,
+                                    "layer": pad_layer,
+                                    "net": p_net
+                                }
+                                pads.append(pad_entry)
+                                all_pads.append(pad_entry)
                         footprints.append({
-                            "reference": fp.GetReference(),
+                            "reference": fp_ref,
                             "value": fp.GetValue(),
-                            "x": pcbnew.ToMM(pos.x),
-                            "y": pcbnew.ToMM(pos.y),
+                            "x": pcbnew.ToMM(fp_pos_x),
+                            "y": pcbnew.ToMM(fp_pos_y),
                             "rotation": fp.GetOrientationDegrees(),
-                            "layer": board.GetLayerName(fp.GetLayer()) if hasattr(board, "GetLayerName") else "F.Cu",
+                            "layer": fp_layer_name,
                             "pads": pads
                         })
                     for trk in board.GetTracks():
                         if hasattr(pcbnew, "PCB_VIA") and isinstance(trk, pcbnew.PCB_VIA):
-                            vpos = trk.GetPosition()
+                            vpos = trk.GetPosition() if hasattr(trk, "GetPosition") else getattr(trk, "pos", (0, 0))
+                            vx_raw = vpos.x if hasattr(vpos, "x") else vpos[0]
+                            vy_raw = vpos.y if hasattr(vpos, "y") else vpos[1]
                             vias.append({
                                 "net": trk.GetNetname() if hasattr(trk, "GetNetname") else "",
-                                "x": pcbnew.ToMM(vpos.x),
-                                "y": pcbnew.ToMM(vpos.y),
+                                "x": pcbnew.ToMM(vx_raw),
+                                "y": pcbnew.ToMM(vy_raw),
                                 "size": pcbnew.ToMM(trk.GetWidth()) if hasattr(trk, "GetWidth") else 0.6
                             })
                         else:
-                            start = trk.GetStart()
-                            end = trk.GetEnd()
+                            start = trk.GetStart() if hasattr(trk, "GetStart") else getattr(trk, "start", (0, 0))
+                            end = trk.GetEnd() if hasattr(trk, "GetEnd") else getattr(trk, "end", (0, 0))
+                            sx_raw = start.x if hasattr(start, "x") else start[0]
+                            sy_raw = start.y if hasattr(start, "y") else start[1]
+                            ex_raw = end.x if hasattr(end, "x") else end[0]
+                            ey_raw = end.y if hasattr(end, "y") else end[1]
                             tracks.append({
                                 "net": trk.GetNetname() if hasattr(trk, "GetNetname") else "",
-                                "x1": pcbnew.ToMM(start.x),
-                                "y1": pcbnew.ToMM(start.y),
-                                "x2": pcbnew.ToMM(end.x),
-                                "y2": pcbnew.ToMM(end.y),
-                                "width": pcbnew.ToMM(trk.GetWidth()),
-                                "layer": board.GetLayerName(trk.GetLayer()) if hasattr(board, "GetLayerName") else "F.Cu"
+                                "x1": pcbnew.ToMM(sx_raw),
+                                "y1": pcbnew.ToMM(sy_raw),
+                                "x2": pcbnew.ToMM(ex_raw),
+                                "y2": pcbnew.ToMM(ey_raw),
+                                "width": pcbnew.ToMM(trk.GetWidth()) if hasattr(trk, "GetWidth") else 0.25,
+                                "layer": board.GetLayerName(trk.GetLayer()) if hasattr(board, "GetLayerName") and hasattr(trk, "GetLayer") else "F.Cu"
                             })
                     if hasattr(board, "GetDrawings"):
                         edge_layer = getattr(pcbnew, "Edge_Cuts", 44)
@@ -200,10 +279,12 @@ class KiCadAimonBridgeClient:
                 "live_gui": True,
                 "active_document": self._get_active_board_name(),
                 "footprints_count": len(footprints),
+                "pads_count": len(all_pads),
                 "tracks_count": len(tracks),
                 "vias_count": len(vias),
                 "outline_segments": outline_segments,
                 "footprints": footprints,
+                "pads": all_pads,
                 "tracks": tracks,
                 "vias": vias
             }
@@ -626,7 +707,11 @@ class KiCadAimonBridgeClient:
             "violation_count": 0,
             "unconnected_count": len(unconnected),
             "violations": [],
-            "unconnected_items": unconnected
+            "unconnected_items": unconnected,
+            "footprints": info.get("footprints", []),
+            "pads": info.get("pads", []),
+            "tracks": info.get("tracks", []),
+            "vias": info.get("vias", [])
         }
 
     def _maybe_hot_reload(self):

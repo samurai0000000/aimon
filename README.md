@@ -180,14 +180,14 @@ To prevent token exhaustion and eliminate irrelevant context in specialized work
 | Profile | Target Domain | Tools Included |
 | :--- | :--- | :--- |
 | `core` | General development, quota & insights tracking | Quota (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`) and Insights (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`) tools |
-| `eda` | PCB design & 3D robotics CAD (`kicad`, `freecad`, `easyeda`, `pcb`, `cad`, `robot`, `hw-`) | Core + all 36 EDA/CAD & CPU accelerator tools (`eda_calc_*`, `cad_calc_*`, `kicad_*`, `freecad_*`, `easyeda_*`) |
+| `eda` / `cad` | PCB design & 3D robotics CAD (`kicad`, `freecad`, `easyeda`, `pcb`, `cad`, `robot`, `hw-`) | Core + all 37 EDA/CAD & CPU accelerator tools (`eda_calc_*`, `cad_calc_*`, `kicad_*`, `freecad_*`, `easyeda_*`) |
 | `embedded` | Embedded hardware development (`boards`, `embdevenv`) | Core + all `embdevenv_*` tools |
 | `network` | Network monitoring & security (`netmon`, `network`) | Core + `firewall_*`, `lan_*`, `snmp_*` tools |
 | `mesh` | LoRa wireless mesh networking (`meshmon`) | Core + all `meshmon_*` tools |
 | `mail` | Mail access through `alpine-mcp` | Core + all `mail_*` tools |
 | `all` | Full administrative & gateway access | Full unified catalog across all satellites |
 
-`aimon` detects profiles automatically from workspace folder names during MCP client initialization (e.g. `boards` -> `embedded`, `pcb`/`robot` -> `eda`), or you can explicitly select a profile via URL query parameter:
+`aimon` detects profiles automatically from workspace folder names during MCP client initialization (e.g. `boards` -> `embedded`, `pcb`/`robot`/`cad` -> `eda`), or you can explicitly select a profile via URL query parameter (`?profile=eda` or `?profile=cad`):
 
 #### Configuring in Cursor (SSE)
 In Cursor **Settings > Features > MCP > Add New Server** (Type: `sse`):
@@ -225,10 +225,10 @@ Once configured, ask your assistant:
 
 ## 4. EDA & Robotics CAD Bridge (`EdaBridge`, `EdaAccelerators` & `aimon-eda-bridge`)
 
-`aimon` includes a 100% C++17 AI-assisted hardware design and robotics CAD subsystem exposing **36 MCP tools** under `--profile=eda` (or `--profile=all`):
-- **7 Local C++17 CPU Algorithmic Accelerators (`EdaAccelerators`)**: Runs in-process inside `aimon` for sub-100 ms deterministic synthesis (`eda_calc_schematic_layout`, `eda_calc_pcb_placement`, `eda_calc_pcb_autoroute`, `eda_calc_electrical_synth`, `cad_calc_robot_kinematics_statics`, `cad_calc_mechanism_synth`, `cad_calc_print_orientation_dfm`). Always available even when the remote Windows bridge is offline.
-- **11 EasyEDA Pro Tools**: `easyeda_live_status`, `easyeda_search_library`, `easyeda_inspect_schematic`, `easyeda_edit_schematic`, `easyeda_sync_sch_to_pcb`, `easyeda_inspect_pcb`, `easyeda_edit_pcb`, `easyeda_run_drc`, `easyeda_export_jlcpcb`, `easyeda_invoke_api`, and `easyeda_convert`.
-- **9 KiCad Tools**: `kicad_search_library`, `kicad_inspect_project`, `kicad_edit_schematic`, `kicad_sync_sch_to_pcb`, `kicad_edit_pcb`, `kicad_run_erc`, `kicad_run_drc`, `kicad_export_fab_pack`, and `kicad_export_step`.
+`aimon` includes a 100% C++17 AI-assisted hardware design and robotics CAD subsystem exposing **37 MCP tools** under `--profile=eda` / `--profile=cad` (or `--profile=all`):
+- **8 Local C++17 CPU Algorithmic Accelerators (`EdaAccelerators`)**: Runs in-process inside `aimon` for sub-100 ms deterministic synthesis and verification (`eda_calc_schematic_layout`, `eda_calc_pcb_placement`, `eda_calc_pcb_autoroute` with 1..6 layer EasyEDA/KiCad layer mapping + PTH pads + `existing_tracks[]`/`existing_vias[]` incremental routing, `eda_calc_pcb_connectivity_audit` for 3D layer-aware Union-Find copper connectivity, broken-net airwire vectors, dangling track endpoints, unassigned pads, and schematic-vs-PCB sync checks, `eda_calc_electrical_synth`, `cad_calc_robot_kinematics_statics`, `cad_calc_mechanism_synth`, `cad_calc_print_orientation_dfm`). Always available even when the remote Windows bridge is offline.
+- **11 EasyEDA Pro Tools**: `easyeda_live_status`, `easyeda_search_library`, `easyeda_inspect_schematic` (with live symbol pin coordinates), `easyeda_edit_schematic` (with declarative `connect_pins` pin-to-pin 50-mil orthogonal auto-wiring), `easyeda_sync_sch_to_pcb`, `easyeda_inspect_pcb` (with auto-attached `connectivity_audit`), `easyeda_edit_pcb`, `easyeda_run_drc` (with detailed `check(false, false, true)` violation objects and `connectivity_audit`), `easyeda_export_jlcpcb`, `easyeda_invoke_api`, and `easyeda_convert`.
+- **9 KiCad Tools**: `kicad_search_library`, `kicad_inspect_project` (with auto-attached `connectivity_audit`), `kicad_edit_schematic` (with declarative `connect_pins` pin-to-pin 50-mil orthogonal auto-wiring), `kicad_sync_sch_to_pcb`, `kicad_edit_pcb`, `kicad_run_erc`, `kicad_run_drc` (with auto-attached `connectivity_audit`), `kicad_export_fab_pack`, and `kicad_export_step`.
 - **9 FreeCAD Robotics & 3D-Printing Tools**: `freecad_live_status`, `freecad_inspect_document`, `freecad_generate_cad`, `freecad_edit_parameters`, `freecad_assemble_joint`, `freecad_analyze_printability`, `freecad_render_view`, `freecad_export_print_files`, and `freecad_invoke_api`.
 
 ### Unified Windows `aimon` System Tray Application & Versioned Installer (`make windows-eda-bridge`)
@@ -241,12 +241,12 @@ make windows-eda-bridge
 ```
 
 This target automatically fetches official prebuilt Qt 6.8.3 (`win64_mingw`) via `aqtinstall` into `build/qt-prebuilt/`, cross-compiles `aimon.exe` with `x86_64-w64-mingw32-g++-posix`, embeds the companion desktop plugins with zero standalone Python dependencies, and produces:
-- `build/windows/aimon-setup-1.0.17.exe` — Self-contained versioned Windows installer & upgrader (`%LOCALAPPDATA%\Programs\aimon\aimon.exe`, Start Menu shortcut, and Windows Installed Apps registration).
+- `build/windows/aimon-setup-1.1.2.exe` — Self-contained versioned Windows installer & upgrader (`%LOCALAPPDATA%\Programs\aimon\aimon.exe`, Start Menu shortcut, and Windows Installed Apps registration).
 - `build/windows/aimon-easyeda-bridge.eext` — Ready-to-import EasyEDA Pro extension archive.
 
 When running on Windows, **`aimon.exe`** docks in the Windows taskbar notification area (`QSystemTrayIcon`) as **`aimon`**:
 - **Clicking the `aimon` tray icon** opens the **`aimon`** window on the **AI Quotas** tab, displaying live **Google Antigravity** model/group quota bars & credits, **Cursor** fast requests & cycle spend, and **Claude Code** 5h / 7d / 30d / cycle token & USD spend fetched from `http://<aimon-host>:3883/api/status`.
-- **EDA / CAD Bridges & Settings Tab**: Provides persisted checkboxes to enable/disable **EasyEDA Pro**, **KiCad**, and **FreeCAD** bridges at runtime, lock exports, launch at Windows login, and deploy the embedded KiCad/FreeCAD plugins & EasyEDA `.eext` extension in one click.
+- **EDA / CAD Bridges & Settings Tab**: Provides a streamlined UI with persisted checkboxes to enable/disable **EasyEDA Pro**, **KiCad**, and **FreeCAD** bridges at runtime, configure the `aimon` Server Host, Web/API Port (`3883`), TCP Gateway Port (`3885`), and Shared Secret, toggle launch at Windows login and auto-deployment of companion plugins, and deploy the embedded KiCad/FreeCAD plugins & EasyEDA `.eext` extension in one click.
 
 ### Building `aimon-eda-bridge` on Windows (MSVC)
 
@@ -322,7 +322,7 @@ aimon/
 │   ├── PriceCatalog.hxx           # Online price catalog (pricing page parser, cache)
 │   ├── DynamicToolRegistry.hxx    # Thread-safe satellite tool registry & routing
 │   ├── EasyEdaConverter.hxx       # Native C++17 EasyEDA JSON to KiCad 8 S-expression converter
-│   ├── EdaAccelerators.hxx        # 7 native C++17 CPU algorithmic accelerators for EDA & CAD
+│   ├── EdaAccelerators.hxx        # 8 native C++17 CPU algorithmic accelerators for EDA & CAD
 │   ├── EdaBridge.hxx              # EDA/CAD bridge client, path mapper, and TNP/API guards
 │   ├── HistoryStore.hxx           # SQLite3 time-series diff store (~/.config/aimon/history.db)
 │   ├── InsightEngine.hxx          # Cross-platform usage insights & workflow coaching engine
@@ -368,7 +368,7 @@ aimon/
 │   ├── TestAgentTelemetryDb.cxx   # Unit tests for SQLite WAL rolling timeseries DB
 │   ├── TestEasyEdaConverterProps.cxx # RapidCheck property tests for EasyEDA & KiCad 50-mil grid
 │   ├── TestEdaBridge.cxx          # Unit tests for EdaBridge path mapper, guards & EdaAccelerators
-│   ├── TestEdaBridgeDaemon.cxx    # End-to-end loopback tests for aimon-eda-bridge & all 36 tools
+│   ├── TestEdaBridgeDaemon.cxx    # End-to-end loopback tests for aimon-eda-bridge & all 37 tools
 │   ├── TestEdaBridgeProps.cxx     # RapidCheck property tests for EdaBridge & EdaAccelerators
 │   ├── TestEdaSurfaces.cxx        # Integration tests for eda MCP profile, /api/eda/* & Web UI
 │   ├── TestGatewayTimeout.cxx     # Unit tests for TcpGateway timeout execution

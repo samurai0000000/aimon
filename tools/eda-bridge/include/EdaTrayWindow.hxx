@@ -15,7 +15,6 @@
 #include <QAction>
 #include <QCheckBox>
 #include <QCloseEvent>
-#include <QComboBox>
 #include <QDialog>
 #include <QIcon>
 #include <QLabel>
@@ -116,19 +115,11 @@ private:
     QCheckBox* _chkAutoDeployPlugins = nullptr;
     QCheckBox* _chkStartMinimized = nullptr;
     QCheckBox* _chkLaunchAtLogin = nullptr;
-    QCheckBox* _chkDisallowExports = nullptr;
 
     QLineEdit* _edtAimonHost = nullptr;
     QSpinBox* _spnAimonWebPort = nullptr;
     QSpinBox* _spnGatewayPort = nullptr;
-    QComboBox* _cmbConnectionMode = nullptr;
-    QLineEdit* _edtListenHost = nullptr;
-    QSpinBox* _spnRpcPort = nullptr;
-    QSpinBox* _spnPluginPort = nullptr;
     QLineEdit* _edtAuthSecret = nullptr;
-    QLineEdit* _edtAllowedRoot = nullptr;
-    QLineEdit* _edtKiCadBin = nullptr;
-    QLineEdit* _edtFreeCadBin = nullptr;
     QLabel* _lblSettingsStatus = nullptr;
 
     // System Tray Icon & Menu
@@ -141,7 +132,6 @@ private:
     QAction* _actTrayEasyEda = nullptr;
     QAction* _actTrayKiCad = nullptr;
     QAction* _actTrayFreeCad = nullptr;
-    QAction* _actTrayLockExports = nullptr;
 
     QTimer* _statusTimer = nullptr;
     QTimer* _quotaTimer = nullptr;

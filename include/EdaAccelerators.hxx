@@ -57,6 +57,10 @@ public:
                                            bool& outSuccess,
                                            std::string& outSummary) const;
 
+    nlohmann::json calcPcbConnectivityAudit(const nlohmann::json& args,
+                                            bool& outSuccess,
+                                            std::string& outSummary) const;
+
 private:
     EdaAcceleratorConfig _config;
 };

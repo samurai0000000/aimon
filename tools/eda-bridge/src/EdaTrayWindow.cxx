@@ -773,7 +773,6 @@ void EdaTrayWindow::buildUi() {
     _chkAutoDeployPlugins = new QCheckBox("Auto-deploy companion plugins on startup", togglesCard);
     _chkStartMinimized = new QCheckBox("Start minimized to Windows System Tray", togglesCard);
     _chkLaunchAtLogin = new QCheckBox("Launch automatically at Windows login", togglesCard);
-    _chkDisallowExports = new QCheckBox("Lock manufacturing & file exports (Read-only guard)", togglesCard);
 
     togglesGrid->addWidget(_chkEnableEasyEda, 0, 0);
     togglesGrid->addWidget(_chkEnableKiCad, 0, 1);
@@ -781,7 +780,6 @@ void EdaTrayWindow::buildUi() {
     togglesGrid->addWidget(_chkAutoDeployPlugins, 1, 1);
     togglesGrid->addWidget(_chkStartMinimized, 2, 0);
     togglesGrid->addWidget(_chkLaunchAtLogin, 2, 1);
-    togglesGrid->addWidget(_chkDisallowExports, 3, 0, 1, 2);
     togglesCardLayout->addLayout(togglesGrid);
     settingsVBox->addWidget(togglesCard);
 
@@ -796,7 +794,6 @@ void EdaTrayWindow::buildUi() {
     QObject::connect(_chkEnableEasyEda, &QCheckBox::toggled, onInstantToggleChanged);
     QObject::connect(_chkEnableKiCad, &QCheckBox::toggled, onInstantToggleChanged);
     QObject::connect(_chkEnableFreeCad, &QCheckBox::toggled, onInstantToggleChanged);
-    QObject::connect(_chkDisallowExports, &QCheckBox::toggled, onInstantToggleChanged);
 
     // Connection & Paths Card
     QFrame* connCard = new QFrame(settingsContent);
@@ -820,51 +817,18 @@ void EdaTrayWindow::buildUi() {
     _spnGatewayPort = new QSpinBox(connCard);
     _spnGatewayPort->setRange(1, 65535);
 
-    _cmbConnectionMode = new QComboBox(connCard);
-    _cmbConnectionMode->addItem("bidirectional");
-    _cmbConnectionMode->addItem("listen");
-    _cmbConnectionMode->addItem("gateway");
-
-    _edtListenHost = new QLineEdit(connCard);
-    _spnRpcPort = new QSpinBox(connCard);
-    _spnRpcPort->setRange(1, 65535);
-    _spnPluginPort = new QSpinBox(connCard);
-    _spnPluginPort->setRange(1, 65535);
-
     _edtAuthSecret = new QLineEdit(connCard);
     _edtAuthSecret->setEchoMode(QLineEdit::PasswordEchoOnEdit);
-    _edtAllowedRoot = new QLineEdit(connCard);
-    _edtKiCadBin = new QLineEdit(connCard);
-    _edtFreeCadBin = new QLineEdit(connCard);
 
     connGrid->addWidget(new QLabel("aimon Host:", connCard), 0, 0);
     connGrid->addWidget(_edtAimonHost, 0, 1);
     connGrid->addWidget(new QLabel("Web Port:", connCard), 0, 2);
     connGrid->addWidget(_spnAimonWebPort, 0, 3);
 
-    connGrid->addWidget(new QLabel("Mode:", connCard), 1, 0);
-    connGrid->addWidget(_cmbConnectionMode, 1, 1);
-    connGrid->addWidget(new QLabel("Gateway Port:", connCard), 1, 2);
-    connGrid->addWidget(_spnGatewayPort, 1, 3);
-
-    connGrid->addWidget(new QLabel("Listen Host:", connCard), 2, 0);
-    connGrid->addWidget(_edtListenHost, 2, 1);
-    connGrid->addWidget(new QLabel("RPC Port:", connCard), 2, 2);
-    connGrid->addWidget(_spnRpcPort, 2, 3);
-
-    connGrid->addWidget(new QLabel("Plugin Port:", connCard), 3, 0);
-    connGrid->addWidget(_spnPluginPort, 3, 1);
-    connGrid->addWidget(new QLabel("Auth Secret:", connCard), 3, 2);
-    connGrid->addWidget(_edtAuthSecret, 3, 3);
-
-    connGrid->addWidget(new QLabel("Workspace Root:", connCard), 4, 0);
-    connGrid->addWidget(_edtAllowedRoot, 4, 1, 1, 3);
-
-    connGrid->addWidget(new QLabel("kicad-cli Path:", connCard), 5, 0);
-    connGrid->addWidget(_edtKiCadBin, 5, 1, 1, 3);
-
-    connGrid->addWidget(new QLabel("FreeCADCmd Path:", connCard), 6, 0);
-    connGrid->addWidget(_edtFreeCadBin, 6, 1, 1, 3);
+    connGrid->addWidget(new QLabel("Gateway Port:", connCard), 1, 0);
+    connGrid->addWidget(_spnGatewayPort, 1, 1);
+    connGrid->addWidget(new QLabel("Auth Secret:", connCard), 1, 2);
+    connGrid->addWidget(_edtAuthSecret, 1, 3);
 
     connCardLayout->addLayout(connGrid);
     settingsVBox->addWidget(connCard);
@@ -974,13 +938,6 @@ void EdaTrayWindow::buildTrayIcon() {
         _chkEnableFreeCad->setChecked(checked);
     });
 
-    _actTrayLockExports = _trayMenu->addAction("Lock Exports (Read-Only Guard)");
-    _actTrayLockExports->setCheckable(true);
-    QObject::connect(_actTrayLockExports, &QAction::toggled, [this](bool checked) {
-        if (_syncingUi) return;
-        _chkDisallowExports->setChecked(checked);
-    });
-
     _trayMenu->addSeparator();
 
     QAction* actDeployPlugins = _trayMenu->addAction("Deploy Desktop Plugins Now");
@@ -1021,29 +978,15 @@ void EdaTrayWindow::syncControlsFromSettings() {
     _chkAutoDeployPlugins->setChecked(_settings.autoDeployPlugins);
     _chkStartMinimized->setChecked(_settings.startMinimizedToTray);
     _chkLaunchAtLogin->setChecked(_settings.launchAtLogin);
-    _chkDisallowExports->setChecked(_settings.disallowExports);
 
     if (_actTrayEasyEda) _actTrayEasyEda->setChecked(_settings.enableEasyEda);
     if (_actTrayKiCad) _actTrayKiCad->setChecked(_settings.enableKiCad);
     if (_actTrayFreeCad) _actTrayFreeCad->setChecked(_settings.enableFreeCad);
-    if (_actTrayLockExports) _actTrayLockExports->setChecked(_settings.disallowExports);
 
     _edtAimonHost->setText(QString::fromStdString(_settings.aimonHost));
     _spnAimonWebPort->setValue(_settings.aimonWebPort);
     _spnGatewayPort->setValue(_settings.gatewayPort);
-
-    int modeIdx = _cmbConnectionMode->findText(QString::fromStdString(_settings.connectionMode));
-    if (modeIdx >= 0) {
-        _cmbConnectionMode->setCurrentIndex(modeIdx);
-    }
-
-    _edtListenHost->setText(QString::fromStdString(_settings.listenHost));
-    _spnRpcPort->setValue(_settings.rpcPort);
-    _spnPluginPort->setValue(_settings.pluginPort);
     _edtAuthSecret->setText(QString::fromStdString(_settings.authSecret));
-    _edtAllowedRoot->setText(QString::fromStdString(_settings.allowedRoot));
-    _edtKiCadBin->setText(QString::fromStdString(_settings.kicadBinaryPath));
-    _edtFreeCadBin->setText(QString::fromStdString(_settings.freecadBinaryPath));
     _syncingUi = false;
 }
 
@@ -1054,7 +997,7 @@ void EdaTrayWindow::collectSettingsFromControls() {
     _settings.autoDeployPlugins = _chkAutoDeployPlugins->isChecked();
     _settings.startMinimizedToTray = _chkStartMinimized->isChecked();
     _settings.launchAtLogin = _chkLaunchAtLogin->isChecked();
-    _settings.disallowExports = _chkDisallowExports->isChecked();
+    _settings.disallowExports = false;
 
     _settings.aimonHost = _edtAimonHost->text().trimmed().toStdString();
     if (_settings.aimonHost.empty()) {
@@ -1062,14 +1005,12 @@ void EdaTrayWindow::collectSettingsFromControls() {
     }
     _settings.aimonWebPort = _spnAimonWebPort->value();
     _settings.gatewayPort = _spnGatewayPort->value();
-    _settings.connectionMode = _cmbConnectionMode->currentText().toStdString();
-    _settings.listenHost = _edtListenHost->text().trimmed().toStdString();
-    _settings.rpcPort = _spnRpcPort->value();
-    _settings.pluginPort = _spnPluginPort->value();
+    _settings.connectionMode = "bidirectional";
+    _settings.listenHost = "0.0.0.0";
+    _settings.rpcPort = 3892;
+    _settings.pluginPort = 3893;
     _settings.authSecret = _edtAuthSecret->text().toStdString();
-    _settings.allowedRoot = _edtAllowedRoot->text().trimmed().toStdString();
-    _settings.kicadBinaryPath = _edtKiCadBin->text().trimmed().toStdString();
-    _settings.freecadBinaryPath = _edtFreeCadBin->text().trimmed().toStdString();
+    _settings.allowedRoot = "";
 }
 
 void EdaTrayWindow::applyRuntimeToggles() {
@@ -1083,7 +1024,6 @@ void EdaTrayWindow::applyRuntimeToggles() {
     if (_actTrayEasyEda) _actTrayEasyEda->setChecked(_settings.enableEasyEda);
     if (_actTrayKiCad) _actTrayKiCad->setChecked(_settings.enableKiCad);
     if (_actTrayFreeCad) _actTrayFreeCad->setChecked(_settings.enableFreeCad);
-    if (_actTrayLockExports) _actTrayLockExports->setChecked(_settings.disallowExports);
     _syncingUi = false;
 }
 

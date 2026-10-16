@@ -5,6 +5,7 @@
  */
 
 #include "EdaRpcServer.hxx"
+#include "EdaAccelerators.hxx"
 #include "ProcessLauncher.hxx"
 #include "EasyEdaConverter.hxx"
 #include "KiCadSchematicEditor.hxx"
@@ -838,8 +839,8 @@ void EdaRpcServer::handleRpcClient(int clientFd) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) continue;
 
-            nlohmann::json req = nlohmann::json::parse(line, nullptr, false);
-            if (req.is_discarded() || !req.is_object()) {
+            nlohmann::json parsed = nlohmann::json::parse(line, nullptr, false);
+            if (parsed.is_discarded() || (!parsed.is_object() && (!parsed.is_array() || parsed.empty()))) {
                 nlohmann::json errResp = {
                     {"jsonrpc", "2.0"},
                     {"id", nullptr},
@@ -849,79 +850,91 @@ void EdaRpcServer::handleRpcClient(int clientFd) {
                 continue;
             }
 
-            nlohmann::json id = req.value("id", nlohmann::json(1));
-            std::string method = req.value("method", "");
-            nlohmann::json params = req.value("params", nlohmann::json::object());
+            auto processSingleRequest = [&](const nlohmann::json& req) -> nlohmann::json {
+                if (!req.is_object()) {
+                    return {
+                        {"jsonrpc", "2.0"},
+                        {"id", nullptr},
+                        {"error", {{"code", -32600}, {"message", "Invalid Request"}}}
+                    };
+                }
+                nlohmann::json id = req.value("id", nlohmann::json(1));
+                std::string method = req.value("method", "");
+                nlohmann::json params = req.value("params", nlohmann::json::object());
 
-            // Constant-time authentication check
-            if (!_options.authSecret.empty()) {
-                std::string providedToken;
-                if (req.contains("auth_token") && req["auth_token"].is_string()) {
-                    providedToken = req["auth_token"].get<std::string>();
-                } else if (params.is_object() && params.contains("auth_token") && params["auth_token"].is_string()) {
-                    providedToken = params["auth_token"].get<std::string>();
-                } else if (params.is_object() && params.contains("arguments") &&
-                           params["arguments"].is_object() &&
-                           params["arguments"].contains("_auth_token") &&
-                           params["arguments"]["_auth_token"].is_string()) {
-                    providedToken = params["arguments"]["_auth_token"].get<std::string>();
+                // Constant-time authentication check
+                if (!_options.authSecret.empty()) {
+                    std::string providedToken;
+                    if (req.contains("auth_token") && req["auth_token"].is_string()) {
+                        providedToken = req["auth_token"].get<std::string>();
+                    } else if (params.is_object() && params.contains("auth_token") && params["auth_token"].is_string()) {
+                        providedToken = params["auth_token"].get<std::string>();
+                    } else if (params.is_object() && params.contains("arguments") &&
+                               params["arguments"].is_object() &&
+                               params["arguments"].contains("_auth_token") &&
+                               params["arguments"]["_auth_token"].is_string()) {
+                        providedToken = params["arguments"]["_auth_token"].get<std::string>();
+                    }
+
+                    if (!constantTimeEquals(providedToken, _options.authSecret)) {
+                        return {
+                            {"jsonrpc", "2.0"},
+                            {"id", id},
+                            {"error", {
+                                {"code", -32001},
+                                {"message", "Unauthorized: invalid or missing bearer auth_token"}
+                            }}
+                        };
+                    }
                 }
 
-                if (!constantTimeEquals(providedToken, _options.authSecret)) {
-                    nlohmann::json authErr = {
+                if (method == "eda/ping" || method == "eda/status" || method == "ping") {
+                    return {
+                        {"jsonrpc", "2.0"},
+                        {"id", id},
+                        {"result", buildStatusPayload()}
+                    };
+                }
+
+                std::string toolName = method;
+                nlohmann::json toolArgs = params;
+                if (method == "tools/call" && params.is_object()) {
+                    toolName = params.value("name", "");
+                    toolArgs = params.value("arguments", nlohmann::json::object());
+                }
+                if (toolArgs.is_object() && toolArgs.contains("_auth_token")) {
+                    toolArgs.erase("_auth_token");
+                }
+
+                std::string pathErr;
+                if (!validateJsonSandboxPaths(toolArgs, pathErr)) {
+                    return {
                         {"jsonrpc", "2.0"},
                         {"id", id},
                         {"error", {
-                            {"code", -32001},
-                            {"message", "Unauthorized: invalid or missing bearer auth_token"}
+                            {"code", -32602},
+                            {"message", pathErr}
                         }}
                     };
-                    sendJsonLine(clientFd, authErr);
-                    continue;
                 }
-            }
 
-            if (method == "eda/ping" || method == "eda/status" || method == "ping") {
-                nlohmann::json resp = {
+                nlohmann::json toolRes = dispatchToolCall(toolName, toolArgs);
+                return {
                     {"jsonrpc", "2.0"},
                     {"id", id},
-                    {"result", buildStatusPayload()}
+                    {"result", toolRes}
                 };
-                sendJsonLine(clientFd, resp);
-                continue;
-            }
-
-            std::string toolName = method;
-            nlohmann::json toolArgs = params;
-            if (method == "tools/call" && params.is_object()) {
-                toolName = params.value("name", "");
-                toolArgs = params.value("arguments", nlohmann::json::object());
-            }
-            if (toolArgs.is_object() && toolArgs.contains("_auth_token")) {
-                toolArgs.erase("_auth_token");
-            }
-
-            std::string pathErr;
-            if (!validateJsonSandboxPaths(toolArgs, pathErr)) {
-                nlohmann::json sandboxErr = {
-                    {"jsonrpc", "2.0"},
-                    {"id", id},
-                    {"error", {
-                        {"code", -32602},
-                        {"message", pathErr}
-                    }}
-                };
-                sendJsonLine(clientFd, sandboxErr);
-                continue;
-            }
-
-            nlohmann::json toolRes = dispatchToolCall(toolName, toolArgs);
-            nlohmann::json resp = {
-                {"jsonrpc", "2.0"},
-                {"id", id},
-                {"result", toolRes}
             };
-            sendJsonLine(clientFd, resp);
+
+            if (parsed.is_array()) {
+                nlohmann::json batchResp = nlohmann::json::array();
+                for (const auto& item : parsed) {
+                    batchResp.push_back(processSingleRequest(item));
+                }
+                sendJsonLine(clientFd, batchResp);
+            } else {
+                sendJsonLine(clientFd, processSingleRequest(parsed));
+            }
         }
     }
 
@@ -1463,6 +1476,12 @@ nlohmann::json EdaRpcServer::dispatchToolCall(const std::string& toolName,
     if (toolName == "eda_bridge_status") {
         return buildStatusPayload();
     }
+    if (EdaAccelerators::isAcceleratorTool(toolName)) {
+        EdaAccelerators acc;
+        bool ok = false;
+        std::string summary;
+        return acc.executeTool(toolName, arguments, ok, summary);
+    }
     if (_disallowExports.load()) {
         if (toolName == "easyeda_export_jlcpcb" ||
             toolName == "kicad_export_fab_pack" ||
@@ -1533,11 +1552,24 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
             nlohmann::json plugRes;
             std::string plugErr;
             if (callPlugin("kicad", toolName, args, plugRes, plugErr, timeoutMs)) {
+                if (plugRes.is_object() && !plugRes.contains("connectivity_audit") &&
+                    (plugRes.contains("footprints") || plugRes.contains("pads") || plugRes.contains("tracks"))) {
+                    EdaAccelerators acc;
+                    bool auditOk = false;
+                    std::string auditSummary;
+                    plugRes["connectivity_audit"] = acc.calcPcbConnectivityAudit(plugRes, auditOk, auditSummary);
+                }
                 return plugRes;
             }
         }
         nlohmann::json res = KiCadSchematicEditor::inspectFile(args);
         res["plugin_connected"] = isPluginConnected("kicad");
+        if (res.is_object() && res.value("ok", false)) {
+            EdaAccelerators acc;
+            bool auditOk = false;
+            std::string auditSummary;
+            res["connectivity_audit"] = acc.calcPcbConnectivityAudit(res, auditOk, auditSummary);
+        }
         return res;
     }
 
@@ -1664,6 +1696,12 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
             nlohmann::json plugRes;
             std::string plugErr;
             if (callPlugin("kicad", toolName, args, plugRes, plugErr, timeoutMs)) {
+                if (plugRes.is_object() && !plugRes.contains("connectivity_audit")) {
+                    EdaAccelerators acc;
+                    bool auditOk = false;
+                    std::string auditSummary;
+                    plugRes["connectivity_audit"] = acc.calcPcbConnectivityAudit(plugRes, auditOk, auditSummary);
+                }
                 return plugRes;
             }
         }
@@ -1680,6 +1718,12 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
             if (pr.timedOut) {
                 return {{"ok", false}, {"timed_out", true}, {"error", pr.errorMessage}};
             }
+            nlohmann::json inspected = KiCadSchematicEditor::inspectFile({{"file_path", pcbPath}});
+            EdaAccelerators acc;
+            bool auditOk = false;
+            std::string auditSummary;
+            nlohmann::json audit = acc.calcPcbConnectivityAudit(inspected, auditOk, auditSummary);
+
             if (fs::exists(reportPath)) {
                 std::ifstream ifs(reportPath);
                 std::string txt((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
@@ -1687,6 +1731,7 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
                 if (!rep.is_discarded()) {
                     rep["ok"] = (pr.exitCode == 0);
                     rep["truncated"] = pr.truncated;
+                    rep["connectivity_audit"] = audit;
                     return rep;
                 }
             }
@@ -1694,6 +1739,7 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
             if (!parsedOut.is_discarded() && parsedOut.is_object()) {
                 parsedOut["ok"] = (pr.exitCode == 0);
                 parsedOut["truncated"] = pr.truncated;
+                parsedOut["connectivity_audit"] = audit;
                 return parsedOut;
             }
             return {
@@ -1703,12 +1749,17 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
                 {"stdout_bytes", pr.stdoutText.size()},
                 {"violations", nlohmann::json::array()},
                 {"unconnected_items", nlohmann::json::array()},
-                {"violation_count", 0}
+                {"violation_count", 0},
+                {"connectivity_audit", audit}
             };
         }
 
         nlohmann::json inspected = KiCadSchematicEditor::inspectFile({{"file_path", pcbPath}});
         if (!inspected.value("ok", false)) return inspected;
+        EdaAccelerators acc;
+        bool auditOk = false;
+        std::string auditSummary;
+        nlohmann::json audit = acc.calcPcbConnectivityAudit(inspected, auditOk, auditSummary);
         nlohmann::json violations = nlohmann::json::array();
         nlohmann::json unconnected = inspected.value("unrouted_nets", nlohmann::json::array());
         return {
@@ -1718,7 +1769,8 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
             {"violation_count", violations.size()},
             {"unconnected_count", unconnected.size()},
             {"violations", violations},
-            {"unconnected_items", unconnected}
+            {"unconnected_items", unconnected},
+            {"connectivity_audit", audit}
         };
     }
 
@@ -2340,6 +2392,14 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
             plugRes["bom_file"] = bomCsv;
             plugRes["cpl_file"] = cplCsv;
         }
+    }
+
+    if ((toolName == "easyeda_inspect_pcb" || toolName == "easyeda_run_drc") &&
+        plugRes.is_object() && !plugRes.contains("connectivity_audit")) {
+        EdaAccelerators acc;
+        bool auditOk = false;
+        std::string auditSummary;
+        plugRes["connectivity_audit"] = acc.calcPcbConnectivityAudit(plugRes, auditOk, auditSummary);
     }
 
     if (plugRes.is_object() && !plugRes.contains("ok")) {

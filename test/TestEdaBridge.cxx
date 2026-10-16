@@ -478,6 +478,149 @@ TEST(EdaAccelerators_Unit, DirectEdaBridgeCallToolAndTelemetryRingBuffer) {
     CHECK_EQUAL("eda_calc_electrical_synth", st.recentCalls[0].toolName);
 }
 
+TEST(EdaAccelerators_Unit, CalcPcbConnectivityAudit3DMultiLayerAndDefects) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // 1. Nominal 4-layer board:
+    //    - NET_3V3: U1.1 (TopLayer/1 at 10,10) -> track on TopLayer to via (15,10)
+    //               -> track on InnerLayer1/15 from (15,10) to PTH pad J1.1 (MultiLayer/12 at 22,10)
+    //               -> track on BottomLayer/2 from J1.1 (22,10) to SMD pad C1.1 (BottomLayer/2 at 28,10).
+    //    - NET_GND: U1.2 (TopLayer at 10,14) -> track on TopLayer to (14,14) -> via (14,14)
+    //               -> track on InnerLayer2/16 from (14,14) to (28,14) -> via (28,14) -> C1.2 (BottomLayer at 28,14).
+    nlohmann::json nominalArgs = {
+        {"pads", nlohmann::json::array({
+            {{"id", "p1"}, {"ref", "U1"}, {"pad", "1"}, {"net", "3V3"}, {"x", 10.0}, {"y", 10.0}, {"layer", "TopLayer"}, {"size_x", 0.6}, {"size_y", 0.6}},
+            {{"id", "p2"}, {"ref", "J1"}, {"pad", "1"}, {"net", "3V3"}, {"x", 22.0}, {"y", 10.0}, {"layer", "MultiLayer"}, {"size_x", 1.2}, {"size_y", 1.2}},
+            {{"id", "p3"}, {"ref", "C1"}, {"pad", "1"}, {"net", "3V3"}, {"x", 28.0}, {"y", 10.0}, {"layer", "BottomLayer"}, {"size_x", 0.8}, {"size_y", 0.8}},
+            {{"id", "p4"}, {"ref", "U1"}, {"pad", "2"}, {"net", "GND"}, {"x", 10.0}, {"y", 14.0}, {"layer", "1"}, {"size_x", 0.6}, {"size_y", 0.6}},
+            {{"id", "p5"}, {"ref", "C1"}, {"pad", "2"}, {"net", "GND"}, {"x", 28.0}, {"y", 14.0}, {"layer", "2"}, {"size_x", 0.8}, {"size_y", 0.8}},
+            {{"id", "mh1"}, {"ref", "H1"}, {"pad", "MP"}, {"net", ""}, {"x", 2.0}, {"y", 2.0}, {"layer", "12"}, {"size_x", 3.2}, {"size_y", 3.2}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"id", "t1"}, {"net", "3V3"}, {"layer", "TopLayer"}, {"x1", 10.0}, {"y1", 10.0}, {"x2", 15.0}, {"y2", 10.0}, {"width", 0.25}},
+            {{"id", "t2"}, {"net", "3V3"}, {"layer", "InnerLayer1"}, {"x1", 15.0}, {"y1", 10.0}, {"x2", 22.0}, {"y2", 10.0}, {"width", 0.25}},
+            {{"id", "t3"}, {"net", "3V3"}, {"layer", "BottomLayer"}, {"x1", 22.0}, {"y1", 10.0}, {"x2", 28.0}, {"y2", 10.0}, {"width", 0.25}},
+            {{"id", "t4"}, {"net", "GND"}, {"layer", "1"}, {"x1", 10.0}, {"y1", 14.0}, {"x2", 14.0}, {"y2", 14.0}, {"width", 0.3}},
+            {{"id", "t5"}, {"net", "GND"}, {"layer", "16"}, {"x1", 14.0}, {"y1", 14.0}, {"x2", 28.0}, {"y2", 14.0}, {"width", 0.3}}
+        })},
+        {"vias", nlohmann::json::array({
+            {{"id", "v1"}, {"net", "3V3"}, {"x", 15.0}, {"y", 10.0}, {"diameter", 0.6}, {"drill", 0.3}},
+            {{"id", "v2"}, {"net", "GND"}, {"x", 14.0}, {"y", 14.0}, {"diameter", 0.6}, {"drill", 0.3}},
+            {{"id", "v3"}, {"net", "GND"}, {"x", 28.0}, {"y", 14.0}, {"diameter", 0.6}, {"drill", 0.3}}
+        })},
+        {"schematic_components", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "MCU"}, {"footprint", "QFN-32"}},
+            {{"reference", "J1"}, {"value", "CONN"}, {"footprint", "HDR-1x2"}},
+            {{"reference", "C1"}, {"value", "100nF"}, {"footprint", "C0603"}},
+            {{"reference", "FRAME1"}, {"value", "A4"}, {"footprint", ""}, {"component_type", "netport"}}
+        })},
+        {"pcb_components", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "MCU"}, {"footprint", "QFN-32"}},
+            {{"reference", "J1"}, {"value", "CONN"}, {"footprint", "HDR-1x2"}},
+            {{"reference", "C1"}, {"value", "100nF"}, {"footprint", "C0603"}}
+        })}
+    };
+
+    nlohmann::json nomRes = acc.calcPcbConnectivityAudit(nominalArgs, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(nomRes.value("ok", false));
+    CHECK_TRUE(nomRes.value("all_connected", false));
+    CHECK_TRUE(nomRes.value("schematic_pcb_synced", false));
+    CHECK_EQUAL(2, nomRes.value("total_nets", 0));
+    CHECK_EQUAL(2, nomRes.value("fully_routed_nets", 0));
+    CHECK_EQUAL(0, nomRes.value("unrouted_nets_count", -1));
+    CHECK_EQUAL(0, nomRes.value("dangling_tracks_count", -1));
+    CHECK_EQUAL(0, nomRes.value("unassigned_pads_count", -1));
+    CHECK_EQUAL(0, nomRes.value("unsynced_schematic_components_count", -1));
+
+    // 2. Fault injection:
+    //    - Broken net "SIG_BROKEN": 2 disconnected islands (U1.3 at 10,20 wired to 14,20; R2.1 at 20,20 unwired)
+    //      Plus dangling track endpoint at (14,20) on TopLayer!
+    //    - Unassigned pad: R2.2 has net == ""
+    //    - Schematic has XT1 and REG0 missing from PCB
+    nlohmann::json faultArgs = {
+        {"pads", nlohmann::json::array({
+            {{"id", "fp1"}, {"ref", "U1"}, {"pad", "3"}, {"net", "SIG_BROKEN"}, {"x", 10.0}, {"y", 20.0}, {"layer", "TopLayer"}, {"size_x", 0.6}, {"size_y", 0.6}},
+            {{"id", "fp2"}, {"ref", "R2"}, {"pad", "1"}, {"net", "SIG_BROKEN"}, {"x", 20.0}, {"y", 20.0}, {"layer", "TopLayer"}, {"size_x", 0.6}, {"size_y", 0.6}},
+            {{"id", "fp3"}, {"ref", "R2"}, {"pad", "2"}, {"net", ""}, {"x", 22.0}, {"y", 20.0}, {"layer", "TopLayer"}, {"size_x", 0.6}, {"size_y", 0.6}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"id", "ft1"}, {"net", "SIG_BROKEN"}, {"layer", "TopLayer"}, {"x1", 10.0}, {"y1", 20.0}, {"x2", 14.0}, {"y2", 20.0}, {"width", 0.25}}
+        })},
+        {"vias", nlohmann::json::array()},
+        {"schematic_components", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "MCU"}, {"footprint", "QFN-32"}},
+            {{"reference", "R2"}, {"value", "10k"}, {"footprint", "R0603"}},
+            {{"reference", "XT1"}, {"value", "XT30PW-M"}, {"footprint", "CONN-TH_XT30PW-M"}},
+            {{"reference", "REG0"}, {"value", "TPS5430"}, {"footprint", "SOIC-8"}}
+        })},
+        {"pcb_components", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "MCU"}, {"footprint", "QFN-32"}},
+            {{"reference", "R2"}, {"value", "10k"}, {"footprint", "R0603"}}
+        })}
+    };
+
+    bool faultOk = false;
+    nlohmann::json faultRes = acc.calcPcbConnectivityAudit(faultArgs, faultOk, summary);
+    CHECK_TRUE(faultOk);
+    CHECK_TRUE(faultRes.value("ok", false));
+    CHECK_FALSE(faultRes.value("all_connected", true));
+    CHECK_FALSE(faultRes.value("schematic_pcb_synced", true));
+    CHECK_EQUAL(1, faultRes.value("unrouted_nets_count", 0));
+    CHECK_EQUAL(1, static_cast<int>(faultRes["unrouted_nets"].size()));
+    CHECK_EQUAL("SIG_BROKEN", faultRes["unrouted_nets"][0].value("net", ""));
+    CHECK_EQUAL(2, faultRes["unrouted_nets"][0].value("island_count", 0));
+    DOUBLES_EQUAL(10.0, faultRes["unrouted_nets"][0]["airwire"].value("distance_mm", 0.0), 0.1);
+    CHECK_EQUAL(1, faultRes.value("dangling_tracks_count", 0));
+    DOUBLES_EQUAL(14.0, faultRes["dangling_tracks"][0].value("x", 0.0), 0.05);
+    DOUBLES_EQUAL(20.0, faultRes["dangling_tracks"][0].value("y", 0.0), 0.05);
+    CHECK_EQUAL(1, faultRes.value("unassigned_pads_count", 0));
+    CHECK_EQUAL("R2", faultRes["unassigned_pads"][0].value("ref", ""));
+    CHECK_EQUAL(2, faultRes.value("unsynced_schematic_components_count", 0));
+}
+
+TEST(EdaAccelerators_Unit, CalcPcbAutoroute4LayerEasyEdaAndIncrementalExistingTracks) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // 4-layer EasyEDA board:
+    // - Foreign existing track on TopLayer blocking direct y=10 path at x=12
+    // - Same-net existing track on TopLayer for NET_INC from (5, 10) to (9, 10)
+    // - Pad 1 at (5, 10) on TopLayer, Pad 2 at (20, 10) on MultiLayer (PTH pad reachable on any layer!)
+    nlohmann::json args = {
+        {"board", {{"width_mm", 25.0}, {"height_mm", 20.0}, {"layers", 4}, {"layer_style", "easyeda"}}},
+        {"rules", {{"track_width_mm", 0.25}, {"clearance_mm", 0.25}, {"via_size_mm", 0.6}, {"via_drill_mm", 0.3}}},
+        {"existing_tracks", nlohmann::json::array({
+            {{"net", "BLOCKER_NET"}, {"layer", "TopLayer"}, {"x1_mm", 12.0}, {"y1_mm", 2.0}, {"x2_mm", 12.0}, {"y2_mm", 18.0}, {"width_mm", 0.4}},
+            {{"net", "NET_INC"}, {"layer", "TopLayer"}, {"x1_mm", 5.0}, {"y1_mm", 10.0}, {"x2_mm", 9.0}, {"y2_mm", 10.0}, {"width_mm", 0.25}}
+        })},
+        {"nets", nlohmann::json::array({
+            {{"name", "NET_INC"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 5.0}, {"y_mm", 10.0}, {"layer", "TopLayer"}},
+                {{"x_mm", 20.0}, {"y_mm", 10.0}, {"layer", "MultiLayer"}}
+            })}}
+        })}
+    };
+
+    nlohmann::json res = acc.calcPcbAutoroute(args, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(res.value("ok", false));
+    CHECK_EQUAL(1, res.value("routed_nets", 0));
+    CHECK_EQUAL(0, res.value("unrouted_nets", -1));
+    CHECK_TRUE(res["tracks"].size() >= 1);
+
+    // Verify EasyEDA layer naming style is emitted on output tracks
+    for (const auto& t : res["tracks"]) {
+        std::string ly = t.value("layer", "");
+        bool validEasyEdaLayer = (ly == "TopLayer" || ly == "InnerLayer1" ||
+                                  ly == "InnerLayer2" || ly == "BottomLayer");
+        CHECK_TRUE_TEXT(validEasyEdaLayer, ly.c_str());
+    }
+}
+
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {
         if (std::strcmp(av[i], "--negative-control") == 0) {

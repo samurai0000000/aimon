@@ -96,6 +96,7 @@ bool EdaAccelerators::isAcceleratorTool(const std::string& toolName) {
     return toolName == "eda_calc_schematic_layout" ||
            toolName == "eda_calc_pcb_placement" ||
            toolName == "eda_calc_pcb_autoroute" ||
+           toolName == "eda_calc_pcb_connectivity_audit" ||
            toolName == "eda_calc_electrical_synth" ||
            toolName == "cad_calc_robot_kinematics_statics" ||
            toolName == "cad_calc_mechanism_synth" ||
@@ -114,6 +115,9 @@ nlohmann::json EdaAccelerators::executeTool(const std::string& toolName,
     }
     if (toolName == "eda_calc_pcb_autoroute") {
         return calcPcbAutoroute(args, outSuccess, outSummary);
+    }
+    if (toolName == "eda_calc_pcb_connectivity_audit") {
+        return calcPcbConnectivityAudit(args, outSuccess, outSummary);
     }
     if (toolName == "eda_calc_electrical_synth") {
         return calcElectricalSynth(args, outSuccess, outSummary);
@@ -716,10 +720,35 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
     double boardW = 40.0;
     double boardH = 30.0;
     int numLayers = 2;
+    bool useEasyEdaNames = false;
     if (args.contains("board") && args["board"].is_object()) {
         boardW = std::max(5.0, args["board"].value("width_mm", 40.0));
         boardH = std::max(5.0, args["board"].value("height_mm", 30.0));
         numLayers = std::clamp(args["board"].value("layers", 2), 1, 6);
+        std::string style = args["board"].value("layer_style", "");
+        if (style == "easyeda" || style == "EasyEDA") {
+            useEasyEdaNames = true;
+        }
+    }
+
+    auto isEasyEdaLayerToken = [](const std::string& l) -> bool {
+        return l == "TopLayer" || l == "BottomLayer" ||
+               l == "InnerLayer1" || l == "InnerLayer2" ||
+               l == "InnerLayer3" || l == "InnerLayer4" ||
+               l == "MultiLayer" || l == "1" || l == "2" ||
+               l == "12" || l == "15" || l == "16" || l == "17" || l == "18";
+    };
+
+    if (!useEasyEdaNames) {
+        for (const auto& n : args["nets"]) {
+            if (!n.is_object() || !n.contains("pads") || !n["pads"].is_array()) continue;
+            for (const auto& p : n["pads"]) {
+                if (p.is_object() && isEasyEdaLayerToken(p.value("layer", ""))) {
+                    useEasyEdaNames = true;
+                    break;
+                }
+            }
+        }
     }
 
     double trackWidthMm = 0.25;
@@ -742,14 +771,28 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         gyMax = std::max(4, static_cast<int>(std::ceil(boardH / gridMm)));
     }
 
+    // Returns -1 for MultiLayer / PTH pads that span all copper layers
     auto layerNameToIdx = [&](const std::string& l) -> int {
-        if (l == "B.Cu" && numLayers >= 2) return numLayers - 1;
-        if (l == "In1.Cu" && numLayers >= 3) return 1;
-        if (l == "In2.Cu" && numLayers >= 4) return 2;
+        if (l == "MultiLayer" || l == "12" || l == "*.Cu" ||
+            l == "Multi-Layer" || l == "PTH" || l == "thru_hole") {
+            return -1;
+        }
+        if ((l == "B.Cu" || l == "BottomLayer" || l == "2" || l == "Bottom") && numLayers >= 2) {
+            return numLayers - 1;
+        }
+        if ((l == "In1.Cu" || l == "InnerLayer1" || l == "15") && numLayers >= 3) return 1;
+        if ((l == "In2.Cu" || l == "InnerLayer2" || l == "16") && numLayers >= 4) return 2;
+        if ((l == "In3.Cu" || l == "InnerLayer3" || l == "17") && numLayers >= 5) return 3;
+        if ((l == "In4.Cu" || l == "InnerLayer4" || l == "18") && numLayers >= 6) return 4;
         return 0;
     };
     auto layerIdxToName = [&](int idx) -> std::string {
-        if (idx == 0) return "F.Cu";
+        if (useEasyEdaNames) {
+            if (idx <= 0) return "TopLayer";
+            if (idx == numLayers - 1 && numLayers >= 2) return "BottomLayer";
+            return "InnerLayer" + std::to_string(idx);
+        }
+        if (idx <= 0) return "F.Cu";
         if (idx == numLayers - 1 && numLayers >= 2) return "B.Cu";
         return "In" + std::to_string(idx) + ".Cu";
     };
@@ -759,29 +802,98 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
     };
     size_t totalCells = static_cast<size_t>(numLayers * gxMax * gyMax);
     std::vector<uint8_t> obstacleMask(totalCells, 0);
+    std::vector<std::string> existingNetOwner(totalCells, "");
 
     if (args.contains("obstacles") && args["obstacles"].is_array()) {
         for (const auto& obs : args["obstacles"]) {
             if (!obs.is_object()) continue;
-            double ox = obs.value("x_mm", 0.0);
-            double oy = obs.value("y_mm", 0.0);
-            double ow = obs.value("width_mm", 1.0) * 0.5 + clearanceMm;
-            double oh = obs.value("height_mm", 1.0) * 0.5 + clearanceMm;
+            double ox = obs.value("x_mm", obs.value("x", 0.0));
+            double oy = obs.value("y_mm", obs.value("y", 0.0));
+            double ow = obs.value("width_mm", obs.value("size_x", 1.0)) * 0.5 + clearanceMm;
+            double oh = obs.value("height_mm", obs.value("size_y", 1.0)) * 0.5 + clearanceMm;
             int l = layerNameToIdx(obs.value("layer", "F.Cu"));
             int x0 = std::max(0, toGridCoord(ox - ow, gridMm));
             int x1 = std::min(gxMax - 1, toGridCoord(ox + ow, gridMm));
             int y0 = std::max(0, toGridCoord(oy - oh, gridMm));
             int y1 = std::min(gyMax - 1, toGridCoord(oy + oh, gridMm));
-            for (int y = y0; y <= y1; ++y) {
-                for (int x = x0; x <= x1; ++x) {
-                    obstacleMask[nodeIdx(l, x, y)] = 1;
+            for (int ly = 0; ly < numLayers; ++ly) {
+                if (l != -1 && ly != l) continue;
+                for (int y = y0; y <= y1; ++y) {
+                    for (int x = x0; x <= x1; ++x) {
+                        obstacleMask[nodeIdx(ly, x, y)] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Rasterize existing_tracks and existing_vias for incremental routing
+    if (args.contains("existing_tracks") && args["existing_tracks"].is_array()) {
+        for (const auto& et : args["existing_tracks"]) {
+            if (!et.is_object()) continue;
+            std::string netName = et.value("net", "");
+            int l = layerNameToIdx(et.value("layer", "F.Cu"));
+            if (l < 0) l = 0;
+            double x1 = et.value("x1_mm", et.value("x1", 0.0));
+            double y1 = et.value("y1_mm", et.value("y1", 0.0));
+            double x2 = et.value("x2_mm", et.value("x2", 0.0));
+            double y2 = et.value("y2_mm", et.value("y2", 0.0));
+            double w = et.value("width_mm", et.value("width", trackWidthMm));
+            double halo = 0.5 * (w + trackWidthMm) + clearanceMm;
+            int haloCells = std::max(1, static_cast<int>(std::ceil(halo / gridMm)));
+
+            double segLen = std::hypot(x2 - x1, y2 - y1);
+            int steps = std::max(1, static_cast<int>(std::ceil(segLen / (gridMm * 0.5))));
+            for (int s = 0; s <= steps; ++s) {
+                double t = static_cast<double>(s) / static_cast<double>(steps);
+                int cx = std::clamp(toGridCoord(x1 + t * (x2 - x1), gridMm), 0, gxMax - 1);
+                int cy = std::clamp(toGridCoord(y1 + t * (y2 - y1), gridMm), 0, gyMax - 1);
+                existingNetOwner[nodeIdx(l, cx, cy)] = netName;
+                for (int dy = -haloCells; dy <= haloCells; ++dy) {
+                    for (int dx = -haloCells; dx <= haloCells; ++dx) {
+                        int nx = cx + dx;
+                        int ny = cy + dy;
+                        if (nx < 0 || nx >= gxMax || ny < 0 || ny >= gyMax) continue;
+                        size_t cid = nodeIdx(l, nx, ny);
+                        if (existingNetOwner[cid].empty()) {
+                            existingNetOwner[cid] = netName;
+                        }
+                        obstacleMask[cid] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if (args.contains("existing_vias") && args["existing_vias"].is_array()) {
+        for (const auto& ev : args["existing_vias"]) {
+            if (!ev.is_object()) continue;
+            std::string netName = ev.value("net", "");
+            double vx = ev.value("x_mm", ev.value("x", 0.0));
+            double vy = ev.value("y_mm", ev.value("y", 0.0));
+            double vd = ev.value("size_mm", ev.value("diameter", viaSizeMm));
+            int haloCells = std::max(1, static_cast<int>(std::ceil((0.5 * vd + clearanceMm) / gridMm)));
+            int cx = std::clamp(toGridCoord(vx, gridMm), 0, gxMax - 1);
+            int cy = std::clamp(toGridCoord(vy, gridMm), 0, gyMax - 1);
+            for (int ly = 0; ly < numLayers; ++ly) {
+                for (int dy = -haloCells; dy <= haloCells; ++dy) {
+                    for (int dx = -haloCells; dx <= haloCells; ++dx) {
+                        int nx = cx + dx;
+                        int ny = cy + dy;
+                        if (nx < 0 || nx >= gxMax || ny < 0 || ny >= gyMax) continue;
+                        size_t cid = nodeIdx(ly, nx, ny);
+                        if (existingNetOwner[cid].empty()) {
+                            existingNetOwner[cid] = netName;
+                        }
+                        obstacleMask[cid] = 1;
+                    }
                 }
             }
         }
     }
 
     struct PadCell {
-        int l = 0;
+        int l = 0; // -1 means MultiLayer (all copper layers)
         int x = 0;
         int y = 0;
     };
@@ -789,6 +901,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         std::string name;
         std::vector<PadCell> pads;
         std::vector<size_t> routedCells;
+        std::vector<std::vector<size_t>> pairPaths;
         bool routed = false;
     };
 
@@ -801,9 +914,15 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             if (!p.is_object()) continue;
             PadCell pc;
             pc.l = layerNameToIdx(p.value("layer", "F.Cu"));
-            pc.x = std::clamp(toGridCoord(p.value("x_mm", 0.0), gridMm), 0, gxMax - 1);
-            pc.y = std::clamp(toGridCoord(p.value("y_mm", 0.0), gridMm), 0, gyMax - 1);
-            obstacleMask[nodeIdx(pc.l, pc.x, pc.y)] = 0;
+            pc.x = std::clamp(toGridCoord(p.value("x_mm", p.value("x", 0.0)), gridMm), 0, gxMax - 1);
+            pc.y = std::clamp(toGridCoord(p.value("y_mm", p.value("y", 0.0)), gridMm), 0, gyMax - 1);
+            if (pc.l == -1) {
+                for (int ly = 0; ly < numLayers; ++ly) {
+                    obstacleMask[nodeIdx(ly, pc.x, pc.y)] = 0;
+                }
+            } else {
+                obstacleMask[nodeIdx(pc.l, pc.x, pc.y)] = 0;
+            }
             ns.pads.push_back(pc);
         }
         if (ns.pads.size() >= 2) nets.push_back(ns);
@@ -849,16 +968,16 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                     occupancy[c] = std::max(0, occupancy[c] - 1);
                 }
                 net.routedCells.clear();
+                net.pairPaths.clear();
                 net.routed = false;
             }
 
             std::set<size_t> netCells;
+            std::vector<std::vector<size_t>> pairPaths;
             bool okNet = true;
             for (size_t pIdx = 0; pIdx + 1 < net.pads.size(); ++pIdx) {
                 PadCell src = net.pads[pIdx];
                 PadCell dst = net.pads[pIdx + 1];
-                size_t startId = nodeIdx(src.l, src.x, src.y);
-                size_t goalId = nodeIdx(dst.l, dst.x, dst.y);
 
                 struct ANode {
                     double f;
@@ -874,21 +993,41 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                     double ddx = std::abs(x - dst.x);
                     double ddy = std::abs(y - dst.y);
                     double oct = (ddx + ddy) + (1.4142 - 2.0) * std::min(ddx, ddy);
-                    return oct + (l != dst.l ? 4.0 : 0.0);
+                    double layerPen = (dst.l != -1 && l != dst.l) ? 4.0 : 0.0;
+                    return oct + layerPen;
                 };
 
-                bestG[startId] = 0.0;
-                pq.push({heuristic(src.l, src.x, src.y), 0.0, startId});
+                auto isGoalCell = [&](int l, int x, int y) -> bool {
+                    if (x != dst.x || y != dst.y) return false;
+                    return (dst.l == -1 || l == dst.l);
+                };
+
+                auto isCellBlockedForNet = [&](size_t cid) -> bool {
+                    if (!obstacleMask[cid]) return false;
+                    if (!existingNetOwner[cid].empty() && existingNetOwner[cid] == net.name) {
+                        return false;
+                    }
+                    return true;
+                };
+
+                if (src.l == -1) {
+                    for (int ly = 0; ly < numLayers; ++ly) {
+                        size_t sid = nodeIdx(ly, src.x, src.y);
+                        bestG[sid] = 0.0;
+                        pq.push({heuristic(ly, src.x, src.y), 0.0, sid});
+                    }
+                } else {
+                    size_t sid = nodeIdx(src.l, src.x, src.y);
+                    bestG[sid] = 0.0;
+                    pq.push({heuristic(src.l, src.x, src.y), 0.0, sid});
+                }
+
                 bool segFound = false;
+                size_t reachedGoalId = std::numeric_limits<size_t>::max();
 
                 while (!pq.empty()) {
                     ANode cur = pq.top();
                     pq.pop();
-                    if (cur.id == goalId) {
-                        segFound = true;
-                        break;
-                    }
-                    if (cur.g > bestG[cur.id]) continue;
 
                     int rem = static_cast<int>(cur.id);
                     int cx = rem % gxMax;
@@ -896,15 +1035,25 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                     int cy = rem % gyMax;
                     int cl = rem / gyMax;
 
+                    if (isGoalCell(cl, cx, cy)) {
+                        segFound = true;
+                        reachedGoalId = cur.id;
+                        break;
+                    }
+                    if (cur.g > bestG[cur.id]) continue;
+
                     // Planar 8-way moves
                     for (int d = 0; d < 8; ++d) {
                         int nx = cx + dx[d];
                         int ny = cy + dy[d];
                         if (nx < 0 || nx >= gxMax || ny < 0 || ny >= gyMax) continue;
                         size_t nid = nodeIdx(cl, nx, ny);
-                        if (nid != goalId && obstacleMask[nid]) continue;
+                        if (!isGoalCell(cl, nx, ny) && isCellBlockedForNet(nid)) continue;
                         double cong = 1.0 + occupancy[nid] * presentFactor;
-                        double ng = cur.g + stepCost[d] * historyCost[nid] * cong;
+                        double stepMult = (!existingNetOwner[nid].empty() && existingNetOwner[nid] == net.name)
+                                              ? 0.1
+                                              : stepCost[d];
+                        double ng = cur.g + stepMult * historyCost[nid] * cong;
                         if (ng < bestG[nid]) {
                             bestG[nid] = ng;
                             parent[nid] = cur.id;
@@ -916,7 +1065,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                     for (int nl = 0; nl < numLayers; ++nl) {
                         if (nl == cl) continue;
                         size_t nid = nodeIdx(nl, cx, cy);
-                        if (nid != goalId && obstacleMask[nid]) continue;
+                        if (!isGoalCell(nl, cx, cy) && isCellBlockedForNet(nid)) continue;
                         double cong = 1.0 + occupancy[nid] * presentFactor;
                         double ng = cur.g + 5.0 * historyCost[nid] * cong;
                         if (ng < bestG[nid]) {
@@ -931,17 +1080,21 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                     okNet = false;
                     break;
                 }
-                size_t cur = goalId;
+                std::vector<size_t> ordered;
+                size_t cur = reachedGoalId;
                 while (cur != std::numeric_limits<size_t>::max()) {
                     netCells.insert(cur);
-                    if (cur == startId) break;
+                    ordered.push_back(cur);
                     cur = parent[cur];
                 }
+                std::reverse(ordered.begin(), ordered.end());
+                pairPaths.push_back(std::move(ordered));
             }
 
             if (okNet) {
                 net.routed = true;
                 net.routedCells.assign(netCells.begin(), netCells.end());
+                net.pairPaths = std::move(pairPaths);
                 for (size_t c : net.routedCells) {
                     occupancy[c] += 1;
                 }
@@ -959,6 +1112,14 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
     int routedCount = 0;
     int unroutedCount = 0;
 
+    auto decodeCell = [&](size_t cid, int& outL, int& outX, int& outY) {
+        int rem = static_cast<int>(cid);
+        outX = rem % gxMax;
+        rem /= gxMax;
+        outY = rem % gyMax;
+        outL = rem / gyMax;
+    };
+
     for (const auto& net : nets) {
         if (!net.routed || net.routedCells.empty()) {
             ++unroutedCount;
@@ -966,51 +1127,76 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         }
         ++routedCount;
 
-        // Reconstruct ordered segments per pair of pads
-        for (size_t i = 0; i + 1 < net.pads.size(); ++i) {
-            const auto& p1 = net.pads[i];
-            const auto& p2 = net.pads[i + 1];
-            // Check if net used another layer to jump obstacles
-            int usedLayer = p1.l;
-            for (size_t c : net.routedCells) {
-                int l = static_cast<int>(c) / (gxMax * gyMax);
-                if (l != p1.l) {
-                    usedLayer = l;
-                    break;
+        for (const auto& path : net.pairPaths) {
+            if (path.size() < 2) continue;
+            int curL = 0, startX = 0, startY = 0;
+            decodeCell(path[0], curL, startX, startY);
+            int prevX = startX, prevY = startY;
+            int dirX = 0, dirY = 0;
+            bool hasDir = false;
+
+            for (size_t k = 1; k < path.size(); ++k) {
+                int nl = 0, nx = 0, ny = 0;
+                decodeCell(path[k], nl, nx, ny);
+                if (nl != curL) {
+                    if (prevX != startX || prevY != startY) {
+                        tracksJson.push_back({
+                            {"net", net.name},
+                            {"layer", layerIdxToName(curL)},
+                            {"x1_mm", fromGridCoord(startX, gridMm)},
+                            {"y1_mm", fromGridCoord(startY, gridMm)},
+                            {"x2_mm", fromGridCoord(prevX, gridMm)},
+                            {"y2_mm", fromGridCoord(prevY, gridMm)},
+                            {"width_mm", trackWidthMm}
+                        });
+                    }
+                    viasJson.push_back({
+                        {"net", net.name},
+                        {"x_mm", fromGridCoord(nx, gridMm)},
+                        {"y_mm", fromGridCoord(ny, gridMm)},
+                        {"size_mm", viaSizeMm},
+                        {"drill_mm", viaDrillMm}
+                    });
+                    curL = nl;
+                    startX = nx;
+                    startY = ny;
+                    prevX = nx;
+                    prevY = ny;
+                    hasDir = false;
+                } else {
+                    int sdx = nx - prevX;
+                    int sdy = ny - prevY;
+                    if (!hasDir) {
+                        dirX = sdx;
+                        dirY = sdy;
+                        hasDir = true;
+                    } else if (sdx != dirX || sdy != dirY) {
+                        tracksJson.push_back({
+                            {"net", net.name},
+                            {"layer", layerIdxToName(curL)},
+                            {"x1_mm", fromGridCoord(startX, gridMm)},
+                            {"y1_mm", fromGridCoord(startY, gridMm)},
+                            {"x2_mm", fromGridCoord(prevX, gridMm)},
+                            {"y2_mm", fromGridCoord(prevY, gridMm)},
+                            {"width_mm", trackWidthMm}
+                        });
+                        startX = prevX;
+                        startY = prevY;
+                        dirX = sdx;
+                        dirY = sdy;
+                    }
+                    prevX = nx;
+                    prevY = ny;
                 }
             }
-            if (usedLayer != p1.l) {
-                viasJson.push_back({
-                    {"net", net.name},
-                    {"x_mm", fromGridCoord(p1.x, gridMm)},
-                    {"y_mm", fromGridCoord(p1.y, gridMm)},
-                    {"size_mm", viaSizeMm},
-                    {"drill_mm", viaDrillMm}
-                });
+            if (prevX != startX || prevY != startY) {
                 tracksJson.push_back({
                     {"net", net.name},
-                    {"layer", layerIdxToName(usedLayer)},
-                    {"x1_mm", fromGridCoord(p1.x, gridMm)},
-                    {"y1_mm", fromGridCoord(p1.y, gridMm)},
-                    {"x2_mm", fromGridCoord(p2.x, gridMm)},
-                    {"y2_mm", fromGridCoord(p2.y, gridMm)},
-                    {"width_mm", trackWidthMm}
-                });
-                viasJson.push_back({
-                    {"net", net.name},
-                    {"x_mm", fromGridCoord(p2.x, gridMm)},
-                    {"y_mm", fromGridCoord(p2.y, gridMm)},
-                    {"size_mm", viaSizeMm},
-                    {"drill_mm", viaDrillMm}
-                });
-            } else {
-                tracksJson.push_back({
-                    {"net", net.name},
-                    {"layer", layerIdxToName(p1.l)},
-                    {"x1_mm", fromGridCoord(p1.x, gridMm)},
-                    {"y1_mm", fromGridCoord(p1.y, gridMm)},
-                    {"x2_mm", fromGridCoord(p2.x, gridMm)},
-                    {"y2_mm", fromGridCoord(p2.y, gridMm)},
+                    {"layer", layerIdxToName(curL)},
+                    {"x1_mm", fromGridCoord(startX, gridMm)},
+                    {"y1_mm", fromGridCoord(startY, gridMm)},
+                    {"x2_mm", fromGridCoord(prevX, gridMm)},
+                    {"y2_mm", fromGridCoord(prevY, gridMm)},
                     {"width_mm", trackWidthMm}
                 });
             }
@@ -1599,6 +1785,511 @@ nlohmann::json EdaAccelerators::calcPrintOrientationDfm(const nlohmann::json& ar
         {"optimal_orientation", bestOrientation},
         {"delamination_safety_factor", bestDelamSf},
         {"candidates", candArray},
+        {"summary", outSummary}
+    };
+}
+
+nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& args,
+                                                         bool& outSuccess,
+                                                         std::string& outSummary) const {
+    if (!args.is_object()) {
+        outSuccess = false;
+        outSummary = "eda_calc_pcb_connectivity_audit requires JSON object arguments";
+        return {{"ok", false}, {"error", outSummary}};
+    }
+
+    auto canonicalLayer = [](const nlohmann::json& obj, const std::string& defVal) -> std::string {
+        std::string raw = defVal;
+        if (obj.contains("layer")) {
+            if (obj["layer"].is_string()) {
+                raw = obj["layer"].get<std::string>();
+            } else if (obj["layer"].is_number_integer()) {
+                raw = std::to_string(obj["layer"].get<int>());
+            }
+        }
+        if (raw == "TopLayer" || raw == "1" || raw == "F.Cu" || raw == "Top") return "TopLayer";
+        if (raw == "BottomLayer" || raw == "2" || raw == "B.Cu" || raw == "Bottom") return "BottomLayer";
+        if (raw == "InnerLayer1" || raw == "15" || raw == "In1.Cu") return "InnerLayer1";
+        if (raw == "InnerLayer2" || raw == "16" || raw == "In2.Cu") return "InnerLayer2";
+        if (raw == "InnerLayer3" || raw == "17" || raw == "In3.Cu") return "InnerLayer3";
+        if (raw == "InnerLayer4" || raw == "18" || raw == "In4.Cu") return "InnerLayer4";
+        if (raw == "MultiLayer" || raw == "12" || raw == "*.Cu" ||
+            raw == "Multi-Layer" || raw == "PTH" || raw == "thru_hole") {
+            return "MultiLayer";
+        }
+        return raw;
+    };
+
+    auto layersMatch = [](const std::string& l1, const std::string& l2) -> bool {
+        return l1 == l2 || l1 == "MultiLayer" || l2 == "MultiLayer";
+    };
+
+    auto distPointToSeg = [](double px, double py,
+                             double x1, double y1,
+                             double x2, double y2) -> double {
+        double dx = x2 - x1;
+        double dy = y2 - y1;
+        double len2 = dx * dx + dy * dy;
+        if (len2 < 1e-12) {
+            return std::hypot(px - x1, py - y1);
+        }
+        double t = std::clamp(((px - x1) * dx + (py - y1) * dy) / len2, 0.0, 1.0);
+        return std::hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+    };
+
+    auto distSegToSeg = [&](double ax1, double ay1, double ax2, double ay2,
+                            double bx1, double by1, double bx2, double by2) -> double {
+        double d1 = distPointToSeg(ax1, ay1, bx1, by1, bx2, by2);
+        double d2 = distPointToSeg(ax2, ay2, bx1, by1, bx2, by2);
+        double d3 = distPointToSeg(bx1, by1, ax1, ay1, ax2, ay2);
+        double d4 = distPointToSeg(bx2, by2, ax1, ay1, ax2, ay2);
+        return std::min({d1, d2, d3, d4});
+    };
+
+    struct AuditPad {
+        std::string id;
+        std::string ref;
+        std::string pad;
+        std::string net;
+        double x = 0.0;
+        double y = 0.0;
+        double sx = 0.6;
+        double sy = 0.6;
+        std::string layer;
+    };
+    struct AuditTrack {
+        std::string id;
+        std::string net;
+        std::string layer;
+        double x1 = 0.0;
+        double y1 = 0.0;
+        double x2 = 0.0;
+        double y2 = 0.0;
+        double width = 0.25;
+    };
+    struct AuditVia {
+        std::string id;
+        std::string net;
+        double x = 0.0;
+        double y = 0.0;
+        double diameter = 0.6;
+        double drill = 0.3;
+    };
+
+    std::vector<AuditPad> allPads;
+    std::set<std::string> pcbRefs;
+
+    auto ingestPadObj = [&](const nlohmann::json& p, const std::string& parentRef) {
+        if (!p.is_object()) return;
+        AuditPad ap;
+        ap.id = p.value("id", "pad_" + std::to_string(allPads.size() + 1));
+        ap.ref = p.value("ref", p.value("reference", parentRef));
+        ap.pad = p.value("pad", p.value("number", ""));
+        ap.net = p.value("net", "");
+        ap.x = p.value("x", p.value("x_mm", 0.0));
+        ap.y = p.value("y", p.value("y_mm", 0.0));
+        ap.sx = std::max(0.1, p.value("size_x", p.value("width_mm", 0.6)));
+        ap.sy = std::max(0.1, p.value("size_y", p.value("height_mm", 0.6)));
+        ap.layer = canonicalLayer(p, "TopLayer");
+        if (!ap.ref.empty()) pcbRefs.insert(ap.ref);
+        allPads.push_back(ap);
+    };
+
+    if (args.contains("pads") && args["pads"].is_array()) {
+        for (const auto& p : args["pads"]) {
+            ingestPadObj(p, "");
+        }
+    }
+    bool hadTopLevelPads = !allPads.empty();
+    if (args.contains("footprints") && args["footprints"].is_array()) {
+        for (const auto& fp : args["footprints"]) {
+            if (!fp.is_object()) continue;
+            std::string fpRef = fp.value("reference", fp.value("ref", ""));
+            if (!fpRef.empty()) pcbRefs.insert(fpRef);
+            if (!hadTopLevelPads && fp.contains("pads") && fp["pads"].is_array()) {
+                double fpx = fp.value("x", fp.value("x_mm", 0.0));
+                double fpy = fp.value("y", fp.value("y_mm", 0.0));
+                for (const auto& p : fp["pads"]) {
+                    if (!p.is_object()) continue;
+                    nlohmann::json copyP = p;
+                    if (!copyP.contains("ref") && !copyP.contains("reference")) {
+                        copyP["ref"] = fpRef;
+                    }
+                    if (!copyP.contains("x") && !copyP.contains("x_mm")) {
+                        copyP["x"] = copyP.value("rel_x", copyP.value("dx", 0.0)) + fpx;
+                        copyP["y"] = copyP.value("rel_y", copyP.value("dy", 0.0)) + fpy;
+                    }
+                    ingestPadObj(copyP, fpRef);
+                }
+            }
+        }
+    }
+
+    std::vector<AuditTrack> allTracks;
+    if (args.contains("tracks") && args["tracks"].is_array()) {
+        for (const auto& t : args["tracks"]) {
+            if (!t.is_object()) continue;
+            std::string tid = t.value("id", "trk_" + std::to_string(allTracks.size() + 1));
+            std::string tnet = t.value("net", "");
+            std::string tlayer = canonicalLayer(t, "TopLayer");
+            double tw = std::max(0.05, t.value("width", t.value("width_mm", 0.25)));
+            if (t.contains("points") && t["points"].is_array() && t["points"].size() >= 2 &&
+                !t.contains("x1") && !t.contains("x1_mm")) {
+                const auto& pts = t["points"];
+                for (size_t i = 0; i + 1 < pts.size(); ++i) {
+                    if (pts[i].is_array() && pts[i].size() >= 2 &&
+                        pts[i + 1].is_array() && pts[i + 1].size() >= 2) {
+                        AuditTrack at;
+                        at.id = tid;
+                        at.net = tnet;
+                        at.layer = tlayer;
+                        at.x1 = pts[i][0].get<double>();
+                        at.y1 = pts[i][1].get<double>();
+                        at.x2 = pts[i + 1][0].get<double>();
+                        at.y2 = pts[i + 1][1].get<double>();
+                        at.width = tw;
+                        allTracks.push_back(at);
+                    }
+                }
+            } else {
+                AuditTrack at;
+                at.id = tid;
+                at.net = tnet;
+                at.layer = tlayer;
+                at.x1 = t.value("x1", t.value("x1_mm", 0.0));
+                at.y1 = t.value("y1", t.value("y1_mm", 0.0));
+                at.x2 = t.value("x2", t.value("x2_mm", 0.0));
+                at.y2 = t.value("y2", t.value("y2_mm", 0.0));
+                at.width = tw;
+                allTracks.push_back(at);
+            }
+        }
+    }
+
+    std::vector<AuditVia> allVias;
+    if (args.contains("vias") && args["vias"].is_array()) {
+        for (const auto& v : args["vias"]) {
+            if (!v.is_object()) continue;
+            AuditVia av;
+            av.id = v.value("id", "via_" + std::to_string(allVias.size() + 1));
+            av.net = v.value("net", "");
+            av.x = v.value("x", v.value("x_mm", 0.0));
+            av.y = v.value("y", v.value("y_mm", 0.0));
+            av.diameter = std::max(0.2, v.value("diameter", v.value("size_mm", 0.6)));
+            av.drill = std::max(0.1, v.value("drill", v.value("drill_mm", 0.3)));
+            allVias.push_back(av);
+        }
+    }
+
+    // 1. Unassigned pads (ignoring mechanical mounting holes H*, MH*, MP)
+    nlohmann::json unassignedPadsJson = nlohmann::json::array();
+    std::map<std::string, std::vector<size_t>> netPadsMap;
+    for (size_t i = 0; i < allPads.size(); ++i) {
+        const auto& p = allPads[i];
+        if (p.net.empty()) {
+            bool isMountingHole = (p.ref.rfind("H", 0) == 0 || p.ref.rfind("MH", 0) == 0 ||
+                                   p.pad == "MP" || p.pad == "MH" || p.id.rfind("mh", 0) == 0);
+            if (!isMountingHole) {
+                unassignedPadsJson.push_back({
+                    {"id", p.id},
+                    {"ref", p.ref},
+                    {"pad", p.pad},
+                    {"x", p.x},
+                    {"y", p.y},
+                    {"layer", p.layer}
+                });
+            }
+        } else {
+            netPadsMap[p.net].push_back(i);
+        }
+    }
+
+    // 2. Per-net 3D Layer-Aware Union-Find connectivity analysis
+    int totalNets = 0;
+    int fullyRoutedNets = 0;
+    nlohmann::json unroutedNetsJson = nlohmann::json::array();
+    constexpr double kTouchTolMm = 0.08;
+
+    for (const auto& kv : netPadsMap) {
+        const std::string& netName = kv.first;
+        const auto& padIndices = kv.second;
+        if (padIndices.size() < 2) continue;
+        ++totalNets;
+
+        std::vector<size_t> trkIndices;
+        for (size_t i = 0; i < allTracks.size(); ++i) {
+            if (allTracks[i].net == netName || allTracks[i].net.empty()) {
+                trkIndices.push_back(i);
+            }
+        }
+        std::vector<size_t> viaIndices;
+        for (size_t i = 0; i < allVias.size(); ++i) {
+            if (allVias[i].net == netName || allVias[i].net.empty()) {
+                viaIndices.push_back(i);
+            }
+        }
+
+        size_t nP = padIndices.size();
+        size_t nT = trkIndices.size();
+        size_t nV = viaIndices.size();
+        size_t totalNodes = nP + nT + nV;
+        std::vector<size_t> ufParent(totalNodes);
+        for (size_t i = 0; i < totalNodes; ++i) ufParent[i] = i;
+
+        auto ufFind = [&](size_t x) {
+            size_t r = x;
+            while (ufParent[r] != r) r = ufParent[r];
+            while (ufParent[x] != r) {
+                size_t nxt = ufParent[x];
+                ufParent[x] = r;
+                x = nxt;
+            }
+            return r;
+        };
+        auto ufUnion = [&](size_t a, size_t b) {
+            size_t ra = ufFind(a);
+            size_t rb = ufFind(b);
+            if (ra != rb) ufParent[rb] = ra;
+        };
+
+        // Pad-to-Pad
+        for (size_t i = 0; i < nP; ++i) {
+            const auto& pa = allPads[padIndices[i]];
+            double ra = 0.5 * std::max(pa.sx, pa.sy);
+            for (size_t j = i + 1; j < nP; ++j) {
+                const auto& pb = allPads[padIndices[j]];
+                if (!layersMatch(pa.layer, pb.layer)) continue;
+                double rb = 0.5 * std::max(pb.sx, pb.sy);
+                if (std::hypot(pa.x - pb.x, pa.y - pb.y) <= ra + rb + kTouchTolMm) {
+                    ufUnion(i, j);
+                }
+            }
+        }
+
+        // Pad-to-Track
+        for (size_t i = 0; i < nP; ++i) {
+            const auto& pa = allPads[padIndices[i]];
+            double ra = 0.5 * std::max(pa.sx, pa.sy);
+            for (size_t j = 0; j < nT; ++j) {
+                const auto& trk = allTracks[trkIndices[j]];
+                if (!layersMatch(pa.layer, trk.layer)) continue;
+                double d = distPointToSeg(pa.x, pa.y, trk.x1, trk.y1, trk.x2, trk.y2);
+                if (d <= ra + 0.5 * trk.width + kTouchTolMm) {
+                    ufUnion(i, nP + j);
+                }
+            }
+        }
+
+        // Pad-to-Via (vias span all layers)
+        for (size_t i = 0; i < nP; ++i) {
+            const auto& pa = allPads[padIndices[i]];
+            double ra = 0.5 * std::max(pa.sx, pa.sy);
+            for (size_t k = 0; k < nV; ++k) {
+                const auto& via = allVias[viaIndices[k]];
+                if (std::hypot(pa.x - via.x, pa.y - via.y) <= ra + 0.5 * via.diameter + kTouchTolMm) {
+                    ufUnion(i, nP + nT + k);
+                }
+            }
+        }
+
+        // Track-to-Via (vias span all layers)
+        for (size_t j = 0; j < nT; ++j) {
+            const auto& trk = allTracks[trkIndices[j]];
+            for (size_t k = 0; k < nV; ++k) {
+                const auto& via = allVias[viaIndices[k]];
+                double d = distPointToSeg(via.x, via.y, trk.x1, trk.y1, trk.x2, trk.y2);
+                if (d <= 0.5 * via.diameter + 0.5 * trk.width + kTouchTolMm) {
+                    ufUnion(nP + j, nP + nT + k);
+                }
+            }
+        }
+
+        // Track-to-Track on matching layer
+        for (size_t i = 0; i < nT; ++i) {
+            const auto& ta = allTracks[trkIndices[i]];
+            for (size_t j = i + 1; j < nT; ++j) {
+                const auto& tb = allTracks[trkIndices[j]];
+                if (!layersMatch(ta.layer, tb.layer)) continue;
+                double d = distSegToSeg(ta.x1, ta.y1, ta.x2, ta.y2, tb.x1, tb.y1, tb.x2, tb.y2);
+                if (d <= 0.5 * (ta.width + tb.width) + kTouchTolMm) {
+                    ufUnion(nP + i, nP + j);
+                }
+            }
+        }
+
+        // Via-to-Via
+        for (size_t i = 0; i < nV; ++i) {
+            const auto& va = allVias[viaIndices[i]];
+            for (size_t j = i + 1; j < nV; ++j) {
+                const auto& vb = allVias[viaIndices[j]];
+                if (std::hypot(va.x - vb.x, va.y - vb.y) <= 0.5 * (va.diameter + vb.diameter) + kTouchTolMm) {
+                    ufUnion(nP + nT + i, nP + nT + j);
+                }
+            }
+        }
+
+        std::map<size_t, std::vector<size_t>> islands;
+        for (size_t i = 0; i < nP; ++i) {
+            islands[ufFind(i)].push_back(padIndices[i]);
+        }
+
+        if (islands.size() == 1) {
+            ++fullyRoutedNets;
+        } else {
+            double minDist = std::numeric_limits<double>::infinity();
+            size_t bestA = padIndices[0];
+            size_t bestB = padIndices[1];
+            for (auto itA = islands.begin(); itA != islands.end(); ++itA) {
+                auto itB = itA;
+                ++itB;
+                for (; itB != islands.end(); ++itB) {
+                    for (size_t idxA : itA->second) {
+                        for (size_t idxB : itB->second) {
+                            double d = std::hypot(allPads[idxA].x - allPads[idxB].x,
+                                                  allPads[idxA].y - allPads[idxB].y);
+                            if (d < minDist) {
+                                minDist = d;
+                                bestA = idxA;
+                                bestB = idxB;
+                            }
+                        }
+                    }
+                }
+            }
+            unroutedNetsJson.push_back({
+                {"net", netName},
+                {"island_count", static_cast<int>(islands.size())},
+                {"pad_count", static_cast<int>(nP)},
+                {"airwire", {
+                    {"from_ref", allPads[bestA].ref},
+                    {"from_pad", allPads[bestA].pad},
+                    {"from_x", allPads[bestA].x},
+                    {"from_y", allPads[bestA].y},
+                    {"to_ref", allPads[bestB].ref},
+                    {"to_pad", allPads[bestB].pad},
+                    {"to_x", allPads[bestB].x},
+                    {"to_y", allPads[bestB].y},
+                    {"distance_mm", std::round(minDist * 100.0) / 100.0}
+                }}
+            });
+        }
+    }
+
+    // 3. Dangling track endpoints detection
+    nlohmann::json danglingTracksJson = nlohmann::json::array();
+    for (size_t i = 0; i < allTracks.size(); ++i) {
+        const auto& trk = allTracks[i];
+        double endPts[2][2] = {{trk.x1, trk.y1}, {trk.x2, trk.y2}};
+        for (int ep = 0; ep < 2; ++ep) {
+            double ex = endPts[ep][0];
+            double ey = endPts[ep][1];
+            bool anchored = false;
+
+            for (const auto& pad : allPads) {
+                if (!trk.net.empty() && !pad.net.empty() && trk.net != pad.net) continue;
+                if (!layersMatch(trk.layer, pad.layer)) continue;
+                double rp = 0.5 * std::max(pad.sx, pad.sy);
+                if (std::hypot(ex - pad.x, ey - pad.y) <= rp + 0.5 * trk.width + kTouchTolMm) {
+                    anchored = true;
+                    break;
+                }
+            }
+            if (!anchored) {
+                for (const auto& via : allVias) {
+                    if (!trk.net.empty() && !via.net.empty() && trk.net != via.net) continue;
+                    if (std::hypot(ex - via.x, ey - via.y) <= 0.5 * via.diameter + 0.5 * trk.width + kTouchTolMm) {
+                        anchored = true;
+                        break;
+                    }
+                }
+            }
+            if (!anchored) {
+                for (size_t j = 0; j < allTracks.size(); ++j) {
+                    if (j == i) continue;
+                    const auto& other = allTracks[j];
+                    if (!trk.net.empty() && !other.net.empty() && trk.net != other.net) continue;
+                    if (!layersMatch(trk.layer, other.layer)) continue;
+                    double d = distPointToSeg(ex, ey, other.x1, other.y1, other.x2, other.y2);
+                    if (d <= 0.5 * (trk.width + other.width) + kTouchTolMm) {
+                        anchored = true;
+                        break;
+                    }
+                }
+            }
+            if (!anchored) {
+                danglingTracksJson.push_back({
+                    {"id", trk.id},
+                    {"net", trk.net},
+                    {"layer", trk.layer},
+                    {"x", ex},
+                    {"y", ey}
+                });
+            }
+        }
+    }
+
+    // 4. Schematic-to-PCB component parity check
+    if (args.contains("pcb_components") && args["pcb_components"].is_array()) {
+        for (const auto& pc : args["pcb_components"]) {
+            if (!pc.is_object()) continue;
+            std::string ref = pc.value("reference", pc.value("ref", pc.value("designator", "")));
+            if (!ref.empty()) pcbRefs.insert(ref);
+        }
+    }
+
+    nlohmann::json unsyncedJson = nlohmann::json::array();
+    if (args.contains("schematic_components") && args["schematic_components"].is_array()) {
+        for (const auto& sc : args["schematic_components"]) {
+            if (!sc.is_object()) continue;
+            std::string ref = sc.value("reference", sc.value("ref", sc.value("designator", "")));
+            std::string compType = sc.value("component_type", sc.value("type", ""));
+            std::string fp = sc.value("footprint", "");
+            if (ref.empty() || compType == "netport" || compType == "frame" || compType == "power" ||
+                ref.rfind("FRAME", 0) == 0 || ref.rfind("#", 0) == 0 ||
+                ref == "GND" || ref == "VCC") {
+                continue;
+            }
+            if (fp.empty() && !compType.empty() && compType != "part") {
+                continue;
+            }
+            if (pcbRefs.find(ref) == pcbRefs.end()) {
+                unsyncedJson.push_back({
+                    {"reference", ref},
+                    {"value", sc.value("value", "")},
+                    {"footprint", fp}
+                });
+            }
+        }
+    }
+
+    int unroutedCount = static_cast<int>(unroutedNetsJson.size());
+    int danglingCount = static_cast<int>(danglingTracksJson.size());
+    int unassignedCount = static_cast<int>(unassignedPadsJson.size());
+    int unsyncedCount = static_cast<int>(unsyncedJson.size());
+    bool allConnected = (unroutedCount == 0 && danglingCount == 0 && unassignedCount == 0);
+    bool schPcbSynced = (unsyncedCount == 0);
+
+    outSuccess = true;
+    outSummary = "Nets " + std::to_string(fullyRoutedNets) + "/" + std::to_string(totalNets) +
+                 " connected • " + std::to_string(unroutedCount) + " broken • " +
+                 std::to_string(danglingCount) + " dangling • " +
+                 std::to_string(unassignedCount) + " unassigned pads • " +
+                 std::to_string(unsyncedCount) + " unsynced components";
+
+    return {
+        {"ok", true},
+        {"all_connected", allConnected},
+        {"schematic_pcb_synced", schPcbSynced},
+        {"total_nets", totalNets},
+        {"fully_routed_nets", fullyRoutedNets},
+        {"unrouted_nets_count", unroutedCount},
+        {"unrouted_nets", unroutedNetsJson},
+        {"dangling_tracks_count", danglingCount},
+        {"dangling_tracks", danglingTracksJson},
+        {"unassigned_pads_count", unassignedCount},
+        {"unassigned_pads", unassignedPadsJson},
+        {"unsynced_schematic_components_count", unsyncedCount},
+        {"unsynced_schematic_components", unsyncedJson},
         {"summary", outSummary}
     };
 }
