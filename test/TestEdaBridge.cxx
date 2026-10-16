@@ -4,6 +4,7 @@
  * Copyright (C) 2026, Charles Chiou
  */
 
+#include <rapidcheck.h>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include "PathUtils.hxx"
 #include <CppUTest/TestHarness.h>
 #include <CppUTest/CommandLineTestRunner.h>
+#include <CppUTest/MemoryLeakWarningPlugin.h>
 
 using namespace aimon;
 
@@ -579,6 +581,105 @@ TEST(EdaAccelerators_Unit, CalcPcbConnectivityAudit3DMultiLayerAndDefects) {
     CHECK_EQUAL(1, faultRes.value("unassigned_pads_count", 0));
     CHECK_EQUAL("R2", faultRes["unassigned_pads"][0].value("ref", ""));
     CHECK_EQUAL(2, faultRes.value("unsynced_schematic_components_count", 0));
+}
+
+TEST(EdaAccelerators_Unit, CalcPcbConnectivityAuditEasyEdaMilUnitsAndComponentsArray) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // EasyEDA Pro canvas in mil units:
+    // - NET_MIL_OK: pads at (1000, 1000) and (2000, 1000) without explicit size_x/size_y
+    //   (default pad size in mil is 24.0 mils -> radius 12.0 mils).
+    //   Track from (1008, 1000) to (1992, 1000) with width 10 mils (endpoint 8 mils from pad center).
+    // - NET_MIL_BROKEN: pads at (1000, 2000) and (2000, 2000) (1000 mils = 25.4 mm apart), unwired.
+    // - "components" array (EasyEDA handleInspectPcb format) has U1 and R1, while schematic_components
+    //   has U1, R1, and XT1 -> unsynced_schematic_components_count must be 1 (XT1 only).
+    nlohmann::json milArgs = {
+        {"units", "mil"},
+        {"pads", nlohmann::json::array({
+            {{"id", "mp1"}, {"ref", "U1"}, {"pad", "1"}, {"net", "NET_MIL_OK"}, {"x", 1000.0}, {"y", 1000.0}, {"layer", "TopLayer"}},
+            {{"id", "mp2"}, {"ref", "R1"}, {"pad", "1"}, {"net", "NET_MIL_OK"}, {"x", 2000.0}, {"y", 1000.0}, {"layer", "TopLayer"}},
+            {{"id", "mp3"}, {"ref", "U1"}, {"pad", "2"}, {"net", "NET_MIL_BROKEN"}, {"x", 1000.0}, {"y", 2000.0}, {"layer", "TopLayer"}},
+            {{"id", "mp4"}, {"ref", "R1"}, {"pad", "2"}, {"net", "NET_MIL_BROKEN"}, {"x", 2000.0}, {"y", 2000.0}, {"layer", "TopLayer"}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"id", "mt1"}, {"net", "NET_MIL_OK"}, {"layer", "TopLayer"}, {"x1", 1008.0}, {"y1", 1000.0}, {"x2", 1992.0}, {"y2", 1000.0}, {"width", 10.0}}
+        })},
+        {"vias", nlohmann::json::array()},
+        {"components", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "MCU"}, {"footprint", "QFN-32"}},
+            {{"reference", "R1"}, {"value", "10k"}, {"footprint", "0603"}}
+        })},
+        {"schematic_components", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "MCU"}, {"footprint", "QFN-32"}},
+            {{"reference", "R1"}, {"value", "10k"}, {"footprint", "0603"}},
+            {{"reference", "XT1"}, {"value", "XT30"}, {"footprint", "HC-49"}}
+        })}
+    };
+
+    nlohmann::json milRes = acc.calcPcbConnectivityAudit(milArgs, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(milRes.value("ok", false));
+    CHECK_EQUAL(2, milRes.value("total_nets", 0));
+    CHECK_EQUAL(1, milRes.value("fully_routed_nets", 0));
+    CHECK_EQUAL(1, milRes.value("unrouted_nets_count", 0));
+    CHECK_EQUAL(0, milRes.value("dangling_tracks_count", -1));
+    CHECK_EQUAL("NET_MIL_BROKEN", milRes["unrouted_nets"][0].value("net", ""));
+    DOUBLES_EQUAL(25.4, milRes["unrouted_nets"][0]["airwire"].value("distance_mm", 0.0), 0.1);
+    CHECK_EQUAL(1, milRes.value("unsynced_schematic_components_count", -1));
+    CHECK_EQUAL("XT1", milRes["unsynced_schematic_components"][0].value("reference", ""));
+
+    // RapidCheck property: mm vs mil coordinate equivalence on calcPcbConnectivityAudit
+    setenv("RC_PARAMS", "max_success=50", 0);
+    MemoryLeakWarningPlugin::turnOffNewDeleteOverloads();
+    bool propOk = rc::check("calcPcbConnectivityAudit mil coordinates match mm coordinates", [&]() {
+        const int distMmInt = *rc::gen::inRange(5, 80);
+        const bool connected = *rc::gen::arbitrary<bool>();
+        double x1Mm = 10.0;
+        double y1Mm = 10.0;
+        double x2Mm = 10.0 + static_cast<double>(distMmInt);
+        double y2Mm = 10.0;
+
+        nlohmann::json mmInput = {
+            {"units", "mm"},
+            {"pads", nlohmann::json::array({
+                {{"id", "p1"}, {"ref", "U1"}, {"pad", "1"}, {"net", "N1"}, {"x", x1Mm}, {"y", y1Mm}, {"layer", "TopLayer"}},
+                {{"id", "p2"}, {"ref", "U2"}, {"pad", "1"}, {"net", "N1"}, {"x", x2Mm}, {"y", y2Mm}, {"layer", "TopLayer"}}
+            })},
+            {"tracks", connected ? nlohmann::json::array({
+                {{"id", "t1"}, {"net", "N1"}, {"layer", "TopLayer"}, {"x1", x1Mm + 0.15}, {"y1", y1Mm}, {"x2", x2Mm - 0.15}, {"y2", y2Mm}}
+            }) : nlohmann::json::array()}
+        };
+
+        const double kMmToMil = 1.0 / 0.0254;
+        nlohmann::json milInput = {
+            {"units", "mil"},
+            {"pads", nlohmann::json::array({
+                {{"id", "p1"}, {"ref", "U1"}, {"pad", "1"}, {"net", "N1"}, {"x", x1Mm * kMmToMil}, {"y", y1Mm * kMmToMil}, {"layer", "TopLayer"}},
+                {{"id", "p2"}, {"ref", "U2"}, {"pad", "1"}, {"net", "N1"}, {"x", x2Mm * kMmToMil}, {"y", y2Mm * kMmToMil}, {"layer", "TopLayer"}}
+            })},
+            {"tracks", connected ? nlohmann::json::array({
+                {{"id", "t1"}, {"net", "N1"}, {"layer", "TopLayer"}, {"x1", (x1Mm + 0.15) * kMmToMil}, {"y1", y1Mm * kMmToMil}, {"x2", (x2Mm - 0.15) * kMmToMil}, {"y2", y2Mm * kMmToMil}}
+            }) : nlohmann::json::array()}
+        };
+
+        bool okMm = false, okMil = false;
+        std::string sumMm, sumMil;
+        nlohmann::json rMm = acc.calcPcbConnectivityAudit(mmInput, okMm, sumMm);
+        nlohmann::json rMil = acc.calcPcbConnectivityAudit(milInput, okMil, sumMil);
+        RC_ASSERT(okMm && okMil);
+        RC_ASSERT(rMm.value("all_connected", false) == connected);
+        RC_ASSERT(rMil.value("all_connected", false) == connected);
+        RC_ASSERT(rMm.value("fully_routed_nets", -1) == rMil.value("fully_routed_nets", -2));
+        if (!connected) {
+            double dMm = rMm["unrouted_nets"][0]["airwire"].value("distance_mm", 0.0);
+            double dMil = rMil["unrouted_nets"][0]["airwire"].value("distance_mm", -100.0);
+            RC_ASSERT(std::fabs(dMm - dMil) < 0.05);
+        }
+    });
+    MemoryLeakWarningPlugin::turnOnDefaultNotThreadSafeNewDeleteOverloads();
+    CHECK_TRUE(propOk);
 }
 
 TEST(EdaAccelerators_Unit, CalcPcbAutoroute4LayerEasyEdaAndIncrementalExistingTracks) {

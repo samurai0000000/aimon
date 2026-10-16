@@ -7,7 +7,7 @@
 var edaEsbuildExportName = (function () {
     "use strict";
 
-    const BRIDGE_VERSION = "1.1.2";
+    const BRIDGE_VERSION = "1.1.3";
     const DEFAULT_WS_URL = "ws://127.0.0.1:3893";
     const HEARTBEAT_INTERVAL_MS = 10000;
     const ALLOWED_PREFIXES = [
@@ -26,6 +26,7 @@ var edaEsbuildExportName = (function () {
     let currentWsId = wsIdBase;
     let isConnected = false;
     let isConnecting = false;
+    let connectingTicks = 0;
     let hasRegisteredWs = false;
     let permissionBlocked = false;
     let missedHeartbeats = 0;
@@ -570,6 +571,7 @@ var edaEsbuildExportName = (function () {
 
     async function handleInspectPcb(args) {
         const components = [];
+        const schematicComponents = [];
         const pads = [];
         const tracks = [];
         const vias = [];
@@ -606,6 +608,26 @@ var edaEsbuildExportName = (function () {
             } catch (err) {
             }
             try {
+                if (eda.sch_PrimitiveComponent && typeof eda.sch_PrimitiveComponent.getAll === "function") {
+                    const rawSch = await eda.sch_PrimitiveComponent.getAll();
+                    if (Array.isArray(rawSch)) {
+                        for (const sc of rawSch) {
+                            const fpRaw = callGetter(sc, "getState_Footprint", "footprintName", "footprint", "");
+                            const fpStr = (fpRaw && typeof fpRaw === "object")
+                                ? String(fpRaw.name || fpRaw.title || fpRaw.uuid || JSON.stringify(fpRaw))
+                                : String(fpRaw || "");
+                            schematicComponents.push({
+                                reference: String(callGetter(sc, "getState_Designator", "designator", "reference", "")),
+                                value: String(callGetter(sc, "getState_Name", "name", "value", "")),
+                                footprint: fpStr,
+                                component_type: String(callGetter(sc, "getState_ComponentType", "componentType", "", "part"))
+                            });
+                        }
+                    }
+                }
+            } catch (err) {
+            }
+            try {
                 if (eda.pcb_PrimitivePad && typeof eda.pcb_PrimitivePad.getAll === "function") {
                     const seenPadIds = {};
                     const padLayersToQuery = [1, 2, 12];
@@ -634,8 +656,11 @@ var edaEsbuildExportName = (function () {
                         if (pid) seenPadIds[pid] = true;
                         const padNum = String(callGetter(p, "getState_PadNumber", "padNumber", "number", "") ||
                                               callGetter(p, "getState_Pad", "pad", "", ""));
+                        const padRef = String(callGetter(p, "getState_Designator", "designator", "reference", "") ||
+                                              callGetter(p, "getState_ComponentDesignator", "componentDesignator", "ref", ""));
                         pads.push({
                             id: pid,
+                            ref: padRef,
                             pad: padNum,
                             number: padNum,
                             net: String(callGetter(p, "getState_Net", "net", "", "")),
@@ -729,12 +754,14 @@ var edaEsbuildExportName = (function () {
 
         return {
             ok: true,
+            units: "mil",
             active_document: await resolveActiveDocumentTitle(),
             components_count: components.length,
             pads_count: pads.length,
             tracks_count: tracks.length,
             vias_count: vias.length,
             components: components,
+            schematic_components: schematicComponents,
             pads: pads,
             tracks: tracks,
             vias: vias,
@@ -1058,10 +1085,12 @@ var edaEsbuildExportName = (function () {
 
         if (target === "pcb") {
             const pcbSnap = await handleInspectPcb({});
+            out.units = pcbSnap.units || "mil";
             out.pads = pcbSnap.pads || [];
             out.tracks = pcbSnap.tracks || [];
             out.vias = pcbSnap.vias || [];
             out.components = pcbSnap.components || [];
+            out.schematic_components = pcbSnap.schematic_components || [];
         }
 
         return out;
@@ -1158,20 +1187,46 @@ var edaEsbuildExportName = (function () {
         }
     }
 
-    function sendRawJson(obj) {
-        const text = JSON.stringify(obj);
+    function sendRawFrameString(frameText) {
         if (useEdaSysWs) {
             if (typeof eda !== "undefined" && eda.sys_WebSocket && typeof eda.sys_WebSocket.send === "function") {
-                eda.sys_WebSocket.send(currentWsId, text);
+                eda.sys_WebSocket.send(currentWsId, frameText);
                 return true;
             }
             return false;
         }
         if (wsClient && wsClient.readyState === 1) {
-            wsClient.send(text);
+            wsClient.send(frameText);
             return true;
         }
         return false;
+    }
+
+    function sendRawJson(obj) {
+        const text = JSON.stringify(obj);
+        const CHUNK_LIMIT = 24000;
+        if (text.length <= CHUNK_LIMIT) {
+            return sendRawFrameString(text);
+        }
+        const totalChunks = Math.ceil(text.length / CHUNK_LIMIT);
+        const msgId = String((obj && obj.id !== undefined) ? obj.id : ("chk-" + Date.now()));
+        for (let i = 0; i < totalChunks; i++) {
+            const slice = text.slice(i * CHUNK_LIMIT, (i + 1) * CHUNK_LIMIT);
+            const env = JSON.stringify({
+                jsonrpc: "2.0",
+                method: "plugin/chunk",
+                params: {
+                    msg_id: msgId,
+                    index: i,
+                    total: totalChunks,
+                    data: slice
+                }
+            });
+            if (!sendRawFrameString(env)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     function sendRegistration() {
@@ -1203,6 +1258,7 @@ var edaEsbuildExportName = (function () {
         if (!msg) return;
 
         missedHeartbeats = 0;
+        connectingTicks = 0;
 
         if (msg.method === "server/hello") {
             isConnected = true;
@@ -1262,6 +1318,15 @@ var edaEsbuildExportName = (function () {
                 connectRelay(targetUrl);
                 return;
             }
+            if (!isConnected && isConnecting) {
+                connectingTicks += 1;
+                if (connectingTicks >= 2) {
+                    connectingTicks = 0;
+                    isConnecting = false;
+                    rotateAndReconnect(targetUrl);
+                }
+                return;
+            }
             if (isConnected) {
                 missedHeartbeats += 1;
                 if (missedHeartbeats > 3) {
@@ -1307,6 +1372,7 @@ var edaEsbuildExportName = (function () {
         currentWsId = wsIdBase + "-r" + wsGeneration;
         isConnected = false;
         isConnecting = true;
+        connectingTicks = 0;
         if (!reconnectTimer && !permissionBlocked) {
             reconnectTimer = setTimeout(function () {
                 reconnectTimer = null;
@@ -1328,6 +1394,7 @@ var edaEsbuildExportName = (function () {
         if (typeof eda !== "undefined" && eda.sys_WebSocket && typeof eda.sys_WebSocket.register === "function") {
             useEdaSysWs = true;
             isConnecting = true;
+            connectingTicks = 0;
             missedHeartbeats = 0;
             try {
                 if (hasRegisteredWs && typeof eda.sys_WebSocket.close === "function") {

@@ -39,6 +39,13 @@ struct EdaRpcServerOptions {
     size_t maxOutputBytes = 4 * 1024 * 1024;
 };
 
+struct PluginChunkState {
+    int total = 0;
+    int receivedCount = 0;
+    std::vector<std::string> parts;
+    std::vector<bool> received;
+};
+
 struct PluginSession {
     int sessionId = -1;
     int socketFd = -1;
@@ -49,6 +56,7 @@ struct PluginSession {
     std::atomic<bool> active{true};
     std::mutex writeMutex;
     std::unique_ptr<std::thread> readThread;
+    std::map<std::string, PluginChunkState> chunkBuffers;
 };
 
 struct PluginPendingCall {
@@ -102,7 +110,8 @@ public:
                                      size_t& outConsumed,
                                      uint8_t& outOpcode,
                                      std::string& outPayload,
-                                     std::string& outError);
+                                     std::string& outError,
+                                     bool* outFin = nullptr);
 
     static std::vector<nlohmann::json> remoteToolDescriptors();
     std::vector<nlohmann::json> enabledRemoteToolDescriptors() const;

@@ -1876,6 +1876,31 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         double drill = 0.3;
     };
 
+    std::string units = args.value("units", "");
+    bool isMilUnits = (units == "mil");
+    if (units.empty() && args.contains("components") && !args.contains("footprints") &&
+        !args.contains("pcb_components")) {
+        if (args.contains("pads") && args["pads"].is_array()) {
+            for (const auto& p : args["pads"]) {
+                if (p.is_object() && (std::fabs(p.value("x", 0.0)) > 300.0 ||
+                                      std::fabs(p.value("y", 0.0)) > 300.0)) {
+                    isMilUnits = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    const double defaultPadSize = isMilUnits ? (0.6 / 0.0254) : 0.6;
+    const double minPadSize = isMilUnits ? (0.1 / 0.0254) : 0.1;
+    const double defaultTrackWidth = isMilUnits ? (0.25 / 0.0254) : 0.25;
+    const double minTrackWidth = isMilUnits ? (0.05 / 0.0254) : 0.05;
+    const double defaultViaDia = isMilUnits ? (0.6 / 0.0254) : 0.6;
+    const double minViaDia = isMilUnits ? (0.2 / 0.0254) : 0.2;
+    const double defaultViaDrill = isMilUnits ? (0.3 / 0.0254) : 0.3;
+    const double minViaDrill = isMilUnits ? (0.1 / 0.0254) : 0.1;
+    const double touchTol = isMilUnits ? (0.08 / 0.0254) : 0.08;
+
     std::vector<AuditPad> allPads;
     std::set<std::string> pcbRefs;
 
@@ -1888,8 +1913,8 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         ap.net = p.value("net", "");
         ap.x = p.value("x", p.value("x_mm", 0.0));
         ap.y = p.value("y", p.value("y_mm", 0.0));
-        ap.sx = std::max(0.1, p.value("size_x", p.value("width_mm", 0.6)));
-        ap.sy = std::max(0.1, p.value("size_y", p.value("height_mm", 0.6)));
+        ap.sx = std::max(minPadSize, p.value("size_x", p.value("width_mm", defaultPadSize)));
+        ap.sy = std::max(minPadSize, p.value("size_y", p.value("height_mm", defaultPadSize)));
         ap.layer = canonicalLayer(p, "TopLayer");
         if (!ap.ref.empty()) pcbRefs.insert(ap.ref);
         allPads.push_back(ap);
@@ -1932,7 +1957,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             std::string tid = t.value("id", "trk_" + std::to_string(allTracks.size() + 1));
             std::string tnet = t.value("net", "");
             std::string tlayer = canonicalLayer(t, "TopLayer");
-            double tw = std::max(0.05, t.value("width", t.value("width_mm", 0.25)));
+            double tw = std::max(minTrackWidth, t.value("width", t.value("width_mm", defaultTrackWidth)));
             if (t.contains("points") && t["points"].is_array() && t["points"].size() >= 2 &&
                 !t.contains("x1") && !t.contains("x1_mm")) {
                 const auto& pts = t["points"];
@@ -1975,8 +2000,8 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             av.net = v.value("net", "");
             av.x = v.value("x", v.value("x_mm", 0.0));
             av.y = v.value("y", v.value("y_mm", 0.0));
-            av.diameter = std::max(0.2, v.value("diameter", v.value("size_mm", 0.6)));
-            av.drill = std::max(0.1, v.value("drill", v.value("drill_mm", 0.3)));
+            av.diameter = std::max(minViaDia, v.value("diameter", v.value("size_mm", defaultViaDia)));
+            av.drill = std::max(minViaDrill, v.value("drill", v.value("drill_mm", defaultViaDrill)));
             allVias.push_back(av);
         }
     }
@@ -2008,7 +2033,6 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
     int totalNets = 0;
     int fullyRoutedNets = 0;
     nlohmann::json unroutedNetsJson = nlohmann::json::array();
-    constexpr double kTouchTolMm = 0.08;
 
     for (const auto& kv : netPadsMap) {
         const std::string& netName = kv.first;
@@ -2060,7 +2084,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                 const auto& pb = allPads[padIndices[j]];
                 if (!layersMatch(pa.layer, pb.layer)) continue;
                 double rb = 0.5 * std::max(pb.sx, pb.sy);
-                if (std::hypot(pa.x - pb.x, pa.y - pb.y) <= ra + rb + kTouchTolMm) {
+                if (std::hypot(pa.x - pb.x, pa.y - pb.y) <= ra + rb + touchTol) {
                     ufUnion(i, j);
                 }
             }
@@ -2074,7 +2098,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                 const auto& trk = allTracks[trkIndices[j]];
                 if (!layersMatch(pa.layer, trk.layer)) continue;
                 double d = distPointToSeg(pa.x, pa.y, trk.x1, trk.y1, trk.x2, trk.y2);
-                if (d <= ra + 0.5 * trk.width + kTouchTolMm) {
+                if (d <= ra + 0.5 * trk.width + touchTol) {
                     ufUnion(i, nP + j);
                 }
             }
@@ -2086,7 +2110,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             double ra = 0.5 * std::max(pa.sx, pa.sy);
             for (size_t k = 0; k < nV; ++k) {
                 const auto& via = allVias[viaIndices[k]];
-                if (std::hypot(pa.x - via.x, pa.y - via.y) <= ra + 0.5 * via.diameter + kTouchTolMm) {
+                if (std::hypot(pa.x - via.x, pa.y - via.y) <= ra + 0.5 * via.diameter + touchTol) {
                     ufUnion(i, nP + nT + k);
                 }
             }
@@ -2098,7 +2122,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             for (size_t k = 0; k < nV; ++k) {
                 const auto& via = allVias[viaIndices[k]];
                 double d = distPointToSeg(via.x, via.y, trk.x1, trk.y1, trk.x2, trk.y2);
-                if (d <= 0.5 * via.diameter + 0.5 * trk.width + kTouchTolMm) {
+                if (d <= 0.5 * via.diameter + 0.5 * trk.width + touchTol) {
                     ufUnion(nP + j, nP + nT + k);
                 }
             }
@@ -2111,7 +2135,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                 const auto& tb = allTracks[trkIndices[j]];
                 if (!layersMatch(ta.layer, tb.layer)) continue;
                 double d = distSegToSeg(ta.x1, ta.y1, ta.x2, ta.y2, tb.x1, tb.y1, tb.x2, tb.y2);
-                if (d <= 0.5 * (ta.width + tb.width) + kTouchTolMm) {
+                if (d <= 0.5 * (ta.width + tb.width) + touchTol) {
                     ufUnion(nP + i, nP + j);
                 }
             }
@@ -2122,7 +2146,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             const auto& va = allVias[viaIndices[i]];
             for (size_t j = i + 1; j < nV; ++j) {
                 const auto& vb = allVias[viaIndices[j]];
-                if (std::hypot(va.x - vb.x, va.y - vb.y) <= 0.5 * (va.diameter + vb.diameter) + kTouchTolMm) {
+                if (std::hypot(va.x - vb.x, va.y - vb.y) <= 0.5 * (va.diameter + vb.diameter) + touchTol) {
                     ufUnion(nP + nT + i, nP + nT + j);
                 }
             }
@@ -2156,6 +2180,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                     }
                 }
             }
+            double distMm = isMilUnits ? (minDist * 0.0254) : minDist;
             unroutedNetsJson.push_back({
                 {"net", netName},
                 {"island_count", static_cast<int>(islands.size())},
@@ -2169,7 +2194,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                     {"to_pad", allPads[bestB].pad},
                     {"to_x", allPads[bestB].x},
                     {"to_y", allPads[bestB].y},
-                    {"distance_mm", std::round(minDist * 100.0) / 100.0}
+                    {"distance_mm", std::round(distMm * 100.0) / 100.0}
                 }}
             });
         }
@@ -2189,7 +2214,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                 if (!trk.net.empty() && !pad.net.empty() && trk.net != pad.net) continue;
                 if (!layersMatch(trk.layer, pad.layer)) continue;
                 double rp = 0.5 * std::max(pad.sx, pad.sy);
-                if (std::hypot(ex - pad.x, ey - pad.y) <= rp + 0.5 * trk.width + kTouchTolMm) {
+                if (std::hypot(ex - pad.x, ey - pad.y) <= rp + 0.5 * trk.width + touchTol) {
                     anchored = true;
                     break;
                 }
@@ -2197,7 +2222,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             if (!anchored) {
                 for (const auto& via : allVias) {
                     if (!trk.net.empty() && !via.net.empty() && trk.net != via.net) continue;
-                    if (std::hypot(ex - via.x, ey - via.y) <= 0.5 * via.diameter + 0.5 * trk.width + kTouchTolMm) {
+                    if (std::hypot(ex - via.x, ey - via.y) <= 0.5 * via.diameter + 0.5 * trk.width + touchTol) {
                         anchored = true;
                         break;
                     }
@@ -2210,7 +2235,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                     if (!trk.net.empty() && !other.net.empty() && trk.net != other.net) continue;
                     if (!layersMatch(trk.layer, other.layer)) continue;
                     double d = distPointToSeg(ex, ey, other.x1, other.y1, other.x2, other.y2);
-                    if (d <= 0.5 * (trk.width + other.width) + kTouchTolMm) {
+                    if (d <= 0.5 * (trk.width + other.width) + touchTol) {
                         anchored = true;
                         break;
                     }
@@ -2229,11 +2254,13 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
     }
 
     // 4. Schematic-to-PCB component parity check
-    if (args.contains("pcb_components") && args["pcb_components"].is_array()) {
-        for (const auto& pc : args["pcb_components"]) {
-            if (!pc.is_object()) continue;
-            std::string ref = pc.value("reference", pc.value("ref", pc.value("designator", "")));
-            if (!ref.empty()) pcbRefs.insert(ref);
+    for (const char* compKey : {"pcb_components", "components"}) {
+        if (args.contains(compKey) && args[compKey].is_array()) {
+            for (const auto& pc : args[compKey]) {
+                if (!pc.is_object()) continue;
+                std::string ref = pc.value("reference", pc.value("ref", pc.value("designator", "")));
+                if (!ref.empty()) pcbRefs.insert(ref);
+            }
         }
     }
 

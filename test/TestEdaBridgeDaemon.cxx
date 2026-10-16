@@ -420,6 +420,286 @@ TEST(EdaBridge_PluginRelay, WebSocketFramingAcross7Bit16BitAnd64BitPayloads) {
     }
 }
 
+TEST(EdaBridge_PluginRelay, WebSocketMultiFrameContinuationAndPluginChunkReassemblyAndCompactInspect) {
+    // 1. Verify decodeWebSocketFrame reports outFin accurately for FIN=1 and FIN=0 frames
+    {
+        auto f1 = EdaRpcServer::encodeWebSocketFrame("hello", 0x1, true);
+        size_t consumed = 0;
+        uint8_t opcode = 0;
+        std::string decoded, err;
+        bool fin = false;
+        CHECK_TRUE(EdaRpcServer::decodeWebSocketFrame(
+            f1.data(), f1.size(), consumed, opcode, decoded, err, &fin));
+        CHECK_TRUE(fin);
+
+        f1[0] = static_cast<uint8_t>(f1[0] & 0x7Fu); // Clear FIN bit (0x80)
+        fin = true;
+        CHECK_TRUE(EdaRpcServer::decodeWebSocketFrame(
+            f1.data(), f1.size(), consumed, opcode, decoded, err, &fin));
+        CHECK_FALSE(fin);
+    }
+
+    // 2. End-to-end test on EdaRpcServer with a >150 KB PCB payload sent via:
+    //    (a) 3 RFC 6455 fragmented WebSocket frames (FIN=0 text + mid-stream Ping + FIN=0 cont + FIN=1 cont)
+    //    (b) 6 application-level plugin/chunk JSON-RPC frames
+    //    and verifying compact default response vs include_raw_primitives: true
+    std::string ws = makeTempWorkspace("ws_frag_chunk");
+    EdaRpcServerOptions opts;
+    opts.listenHost = "127.0.0.1";
+    opts.port = 0;
+    opts.pluginPort = 0;
+    opts.allowedRoot = ws;
+    opts.defaultTimeoutMs = 4000;
+
+    EdaRpcServer srv(opts);
+    CHECK_TRUE(srv.start());
+
+    std::atomic<bool> stopMock{false};
+    std::atomic<bool> mockRegistered{false};
+    std::atomic<int> callIndex{0};
+
+    std::thread mockPlug([&]() {
+        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return;
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(srv.boundPluginPort()));
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+            ::close(sock);
+            return;
+        }
+
+        std::string hs =
+            "GET / HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n";
+        ::send(sock, hs.data(), hs.size(), 0);
+        char hbuf[1024];
+        ssize_t hn = ::recv(sock, hbuf, sizeof(hbuf) - 1, 0);
+        if (hn <= 0) {
+            ::close(sock);
+            return;
+        }
+        std::vector<uint8_t> buf;
+        hbuf[hn] = '\0';
+        char* hend = std::strstr(hbuf, "\r\n\r\n");
+        if (hend != nullptr) {
+            size_t hbytes = static_cast<size_t>((hend - hbuf) + 4);
+            if (static_cast<size_t>(hn) > hbytes) {
+                buf.assign(reinterpret_cast<const uint8_t*>(hbuf + hbytes),
+                           reinterpret_cast<const uint8_t*>(hbuf + hn));
+            }
+        }
+
+        nlohmann::json reg = {
+            {"jsonrpc", "2.0"},
+            {"id", "frag-reg-1"},
+            {"method", "plugin/register"},
+            {"params", {{"app", "easyeda"}, {"version", "1.1.3"}, {"active_document", "servosense.epro"}}}
+        };
+        auto regFrame = EdaRpcServer::encodeWebSocketFrame(reg.dump(), 0x1, true);
+        ::send(sock, regFrame.data(), regFrame.size(), 0);
+        mockRegistered.store(true);
+
+        // Build >150 KB realistic PCB payload (300 pads, 1050 tracks in mil coordinates)
+        nlohmann::json padsArr = nlohmann::json::array();
+        for (int i = 0; i < 300; ++i) {
+            padsArr.push_back({
+                {"id", "ep_" + std::to_string(i + 1)},
+                {"ref", (i % 2 == 0) ? "U1" : "R1"},
+                {"pad", std::to_string((i / 2) + 1)},
+                {"number", std::to_string((i / 2) + 1)},
+                {"net", "NET_" + std::to_string(i / 2)},
+                {"x", (i % 2 == 0) ? 1000.0 : 2000.0},
+                {"y", 1000.0 + (i / 2) * 50.0},
+                {"layer", "1"},
+                {"rotation", 0.0}
+            });
+        }
+        nlohmann::json tracksArr = nlohmann::json::array();
+        for (int i = 0; i < 1050; ++i) {
+            int netIdx = i % 150;
+            double y = 1000.0 + netIdx * 50.0;
+            tracksArr.push_back({
+                {"id", "et_" + std::to_string(i + 1)},
+                {"net", "NET_" + std::to_string(netIdx)},
+                {"layer", "1"},
+                {"width", 10.0},
+                {"x1", 1008.0},
+                {"y1", y},
+                {"x2", 1992.0},
+                {"y2", y}
+            });
+        }
+
+        while (!stopMock.load()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(sock, &rfds);
+            struct timeval tv{};
+            tv.tv_sec = 0;
+            tv.tv_usec = 30000;
+            if (buf.empty()) {
+                int sel = ::select(sock + 1, &rfds, nullptr, nullptr, &tv);
+                if (sel <= 0) continue;
+                uint8_t chunk[4096];
+                ssize_t rn = ::recv(sock, chunk, sizeof(chunk), 0);
+                if (rn <= 0) break;
+                buf.insert(buf.end(), chunk, chunk + rn);
+            }
+
+            bool decodedAny = false;
+            while (!buf.empty()) {
+                size_t consumed = 0;
+                uint8_t opcode = 0;
+                std::string payload, err;
+                if (!EdaRpcServer::decodeWebSocketFrame(buf.data(), buf.size(), consumed, opcode, payload, err)) {
+                    break;
+                }
+                decodedAny = true;
+                buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(consumed));
+                if (opcode != 0x1 && opcode != 0x2) continue;
+
+                nlohmann::json msg = nlohmann::json::parse(payload, nullptr, false);
+                if (msg.is_discarded() || !msg.is_object()) continue;
+                if (msg.value("method", "") != "tools/call") continue;
+
+                int idx = callIndex.fetch_add(1);
+                nlohmann::json fullResp = {
+                    {"jsonrpc", "2.0"},
+                    {"id", msg["id"]},
+                    {"result", {
+                        {"ok", true},
+                        {"active_document", "servosense.epro"},
+                        {"units", "mil"},
+                        {"components_count", 2},
+                        {"pads_count", static_cast<int>(padsArr.size())},
+                        {"tracks_count", static_cast<int>(tracksArr.size())},
+                        {"vias_count", 0},
+                        {"components", nlohmann::json::array({
+                            {{"reference", "U1"}, {"value", "ESP32"}, {"footprint", "QFN"}},
+                            {{"reference", "R1"}, {"value", "10k"}, {"footprint", "0603"}}
+                        })},
+                        {"schematic_components", nlohmann::json::array({
+                            {{"reference", "U1"}, {"value", "ESP32"}, {"footprint", "QFN"}},
+                            {{"reference", "R1"}, {"value", "10k"}, {"footprint", "0603"}},
+                            {{"reference", "XT1"}, {"value", "XT30"}, {"footprint", "CONN"}}
+                        })},
+                        {"pads", padsArr},
+                        {"tracks", tracksArr},
+                        {"vias", nlohmann::json::array()},
+                        {"board_outline", nlohmann::json::array()}
+                    }}
+                };
+                std::string dumped = fullResp.dump();
+
+                if (idx == 0 || idx == 1) {
+                    // Send as 3 RFC 6455 fragmented frames:
+                    // Frame 1: FIN=0, opcode=0x1
+                    // Control Ping mid-fragmentation: FIN=1, opcode=0x9
+                    // Frame 2: FIN=0, opcode=0x0
+                    // Frame 3: FIN=1, opcode=0x0
+                    size_t p1 = dumped.size() / 3;
+                    size_t p2 = (dumped.size() * 2) / 3;
+                    auto fr1 = EdaRpcServer::encodeWebSocketFrame(dumped.substr(0, p1), 0x1, true);
+                    fr1[0] = static_cast<uint8_t>(fr1[0] & 0x7Fu); // FIN=0
+                    auto pingFr = EdaRpcServer::encodeWebSocketFrame("ping", 0x9, true);
+                    auto fr2 = EdaRpcServer::encodeWebSocketFrame(dumped.substr(p1, p2 - p1), 0x0, true);
+                    fr2[0] = static_cast<uint8_t>(fr2[0] & 0x7Fu); // FIN=0, opcode=0x0
+                    auto fr3 = EdaRpcServer::encodeWebSocketFrame(dumped.substr(p2), 0x0, true); // FIN=1, opcode=0x0
+
+                    ::send(sock, fr1.data(), fr1.size(), 0);
+                    ::send(sock, pingFr.data(), pingFr.size(), 0);
+                    ::send(sock, fr2.data(), fr2.size(), 0);
+                    ::send(sock, fr3.data(), fr3.size(), 0);
+                } else {
+                    // Send as 6 plugin/chunk JSON-RPC frames
+                    const int totalChunks = 6;
+                    size_t chunkLen = (dumped.size() + totalChunks - 1) / totalChunks;
+                    for (int c = 0; c < totalChunks; ++c) {
+                        size_t start = static_cast<size_t>(c) * chunkLen;
+                        std::string slice = (start < dumped.size())
+                            ? dumped.substr(start, chunkLen)
+                            : std::string();
+                        nlohmann::json env = {
+                            {"jsonrpc", "2.0"},
+                            {"method", "plugin/chunk"},
+                            {"params", {
+                                {"chunk_id", "chk-test-" + std::to_string(idx)},
+                                {"seq", c},
+                                {"total", totalChunks},
+                                {"data", slice}
+                            }}
+                        };
+                        auto cFrame = EdaRpcServer::encodeWebSocketFrame(env.dump(), 0x1, true);
+                        ::send(sock, cFrame.data(), cFrame.size(), 0);
+                    }
+                }
+            }
+            if (!decodedAny) {
+                uint8_t chunk[4096];
+                ssize_t rn = ::recv(sock, chunk, sizeof(chunk), 0);
+                if (rn <= 0) break;
+                buf.insert(buf.end(), chunk, chunk + rn);
+            }
+        }
+        ::close(sock);
+    });
+
+    struct MockGuard {
+        std::atomic<bool>& stop;
+        EdaRpcServer& srv;
+        std::thread& thr;
+        std::string wsDir;
+        ~MockGuard() {
+            stop.store(true);
+            srv.stop();
+            if (thr.joinable()) thr.join();
+            std::error_code ec;
+            fs::remove_all(wsDir, ec);
+        }
+    } guard{stopMock, srv, mockPlug, ws};
+
+    for (int i = 0; i < 40 && !srv.isPluginConnected("easyeda"); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    CHECK_TRUE(srv.isPluginConnected("easyeda"));
+
+    // Call 0: RFC 6455 3-frame continuation reassembly + default compact response (include_raw_primitives omitted)
+    nlohmann::json resCompact = srv.dispatchToolCall("easyeda_inspect_pcb", nlohmann::json::object());
+    CHECK_TRUE(resCompact.value("ok", false));
+    CHECK_EQUAL(300, resCompact.value("pads_count", 0));
+    CHECK_EQUAL(1050, resCompact.value("tracks_count", 0));
+    CHECK_FALSE(resCompact.contains("pads"));
+    CHECK_FALSE(resCompact.contains("tracks"));
+    CHECK_TRUE(resCompact.contains("connectivity_audit"));
+    CHECK_TRUE(resCompact["connectivity_audit"].value("all_connected", false));
+    CHECK_EQUAL(150, resCompact["connectivity_audit"].value("fully_routed_nets", 0));
+    CHECK_EQUAL(1, resCompact["connectivity_audit"].value("unsynced_schematic_components_count", 0));
+
+    // Call 1: RFC 6455 3-frame continuation reassembly + include_raw_primitives: true preserves pads & tracks
+    nlohmann::json resFull = srv.dispatchToolCall("easyeda_inspect_pcb", {{"include_raw_primitives", true}});
+    CHECK_TRUE(resFull.value("ok", false));
+    CHECK_TRUE(resFull.contains("pads"));
+    CHECK_TRUE(resFull.contains("tracks"));
+    CHECK_EQUAL(300, static_cast<int>(resFull["pads"].size()));
+    CHECK_EQUAL(1050, static_cast<int>(resFull["tracks"].size()));
+
+    // Call 2: 6-frame plugin/chunk reassembly + compact response
+    nlohmann::json resChunked = srv.dispatchToolCall("easyeda_inspect_pcb", nlohmann::json::object());
+    CHECK_TRUE(resChunked.value("ok", false));
+    CHECK_EQUAL(300, resChunked.value("pads_count", 0));
+    CHECK_EQUAL(1050, resChunked.value("tracks_count", 0));
+    CHECK_FALSE(resChunked.contains("pads"));
+    CHECK_FALSE(resChunked.contains("tracks"));
+    CHECK_TRUE(resChunked.contains("connectivity_audit"));
+    CHECK_EQUAL(150, resChunked["connectivity_audit"].value("fully_routed_nets", 0));
+}
+
 TEST_GROUP(EdaBridge_LoopbackRpc) {
     std::string _ws;
     std::unique_ptr<EdaRpcServer> _server;
@@ -881,7 +1161,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     EdaBridgeAppSettings loaded;
     CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgFile, loaded, err));
     CHECK_TRUE(err.empty());
-    STRCMP_EQUAL("1.1.2", loaded.version.c_str());
+    STRCMP_EQUAL("1.1.3", loaded.version.c_str());
     CHECK_EQUAL(orig.enableEasyEda, loaded.enableEasyEda);
     CHECK_EQUAL(orig.enableKiCad, loaded.enableKiCad);
     CHECK_EQUAL(orig.enableFreeCad, loaded.enableFreeCad);
@@ -946,7 +1226,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeployment) {
-    CHECK_EQUAL("1.1.2", EdaBridgeAppSettings().version);
+    CHECK_EQUAL("1.1.3", EdaBridgeAppSettings().version);
 
     std::vector<uint8_t> zipBytes = EdaBridgeAppConfig::buildEasyEdaEextZipBytes();
     CHECK_TRUE(zipBytes.size() > 512);
@@ -963,13 +1243,15 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(zipView.find("edaEsbuildExportName") != std::string::npos);
     CHECK_TRUE(zipView.find("eda.sys_WebSocket") != std::string::npos);
     CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
-    CHECK_TRUE(zipView.find("1.1.2") != std::string::npos);
+    CHECK_TRUE(zipView.find("1.1.3") != std::string::npos);
     CHECK_TRUE(zipView.find("8d4c91f2a70e4c6b9b24e31f6a821100") != std::string::npos);
     CHECK_TRUE(zipView.find("check(false, false, true)") != std::string::npos);
     CHECK_TRUE(zipView.find("getAllPinsByPrimitiveId") != std::string::npos);
     CHECK_TRUE(zipView.find("connect_pins") != std::string::npos);
     CHECK_TRUE(zipView.find("board_outline") != std::string::npos);
     CHECK_TRUE(zipView.find("placed_component_details") != std::string::npos);
+    CHECK_TRUE(zipView.find("plugin/chunk") != std::string::npos);
+    CHECK_TRUE(zipView.find("connectingTicks") != std::string::npos);
     // PK\x05\x06 End of Central Directory signature
     CHECK_TRUE(zipView.find(std::string("PK\x05\x06", 4)) != std::string::npos);
 
@@ -1011,7 +1293,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream kcIfs(kcDir + "/KiCadAimonBridge.py");
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(kcContent.find("1.1.2") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.3") != std::string::npos);
         CHECK_TRUE(kcContent.find("*.Cu") != std::string::npos);
         CHECK_TRUE(kcContent.find("GetAttribute") != std::string::npos);
     }
@@ -1026,7 +1308,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream fcIfs(fcDir + "/AimonFreeCadBridge.py");
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(fcContent.find("1.1.2") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.3") != std::string::npos);
     }
 
     // 3a. Re-run when destination files are identical -> do NOT overwrite (alreadyDeployed == true)
@@ -1054,7 +1336,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(kcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(kcContent.find("1.1.2") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.3") != std::string::npos);
     }
 
     CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir2, err, "", false, &fcAlready));
@@ -1064,7 +1346,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(fcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(fcContent.find("1.1.2") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.3") != std::string::npos);
     }
 
     // 4. Test customTargetDir (simulating QFileDialog user selection)

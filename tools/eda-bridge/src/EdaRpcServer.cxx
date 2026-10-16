@@ -503,16 +503,19 @@ bool EdaRpcServer::decodeWebSocketFrame(const uint8_t* data,
                                         size_t& outConsumed,
                                         uint8_t& outOpcode,
                                         std::string& outPayload,
-                                        std::string& outError) {
+                                        std::string& outError,
+                                        bool* outFin) {
     outConsumed = 0;
     outOpcode = 0;
     outPayload.clear();
     outError.clear();
+    if (outFin) *outFin = true;
 
     if (len < 2) return false; // Need more bytes
 
     uint8_t b0 = data[0];
     uint8_t b1 = data[1];
+    if (outFin) *outFin = ((b0 & 0x80u) != 0);
     outOpcode = b0 & 0x0Fu;
     bool masked = (b1 & 0x80u) != 0;
     uint64_t payloadLen = b1 & 0x7Fu;
@@ -968,6 +971,8 @@ void EdaRpcServer::pluginAcceptLoop() {
 
 void EdaRpcServer::handlePluginSession(std::shared_ptr<PluginSession> session) {
     std::vector<uint8_t> buf;
+    std::string wsFragBuffer;
+    uint8_t wsFragOpcode = 0;
     uint8_t chunk[4096];
     bool handshakeChecked = false;
 
@@ -980,7 +985,7 @@ void EdaRpcServer::handlePluginSession(std::shared_ptr<PluginSession> session) {
 #endif
         if (n <= 0) break;
         buf.insert(buf.end(), chunk, chunk + n);
-        if (buf.size() > _options.maxOutputBytes + 4096) break;
+        if (buf.size() > 4 * 1024 * 1024 + 65536) break;
 
         if (!handshakeChecked) {
             std::string view(reinterpret_cast<const char*>(buf.data()), buf.size());
@@ -1038,7 +1043,8 @@ void EdaRpcServer::handlePluginSession(std::shared_ptr<PluginSession> session) {
                 uint8_t opcode = 0;
                 std::string payload;
                 std::string wsErr;
-                if (!decodeWebSocketFrame(buf.data(), buf.size(), consumed, opcode, payload, wsErr)) {
+                bool fin = true;
+                if (!decodeWebSocketFrame(buf.data(), buf.size(), consumed, opcode, payload, wsErr, &fin)) {
                     if (!wsErr.empty()) {
                         session->active.store(false);
                     }
@@ -1053,10 +1059,36 @@ void EdaRpcServer::handlePluginSession(std::shared_ptr<PluginSession> session) {
                     auto pong = encodeWebSocketFrame(payload, 0xA, false);
                     std::lock_guard<std::mutex> wLock(session->writeMutex);
                     sendAllBytes(session->socketFd, pong.data(), pong.size());
-                } else if (opcode == 0x1 || opcode == 0x2) { // Text or binary JSON frame
-                    nlohmann::json msg = nlohmann::json::parse(payload, nullptr, false);
-                    if (!msg.is_discarded() && msg.is_object()) {
-                        processPluginMessage(session, msg);
+                } else if (opcode == 0x1 || opcode == 0x2) { // Text or binary data frame
+                    if (!fin) {
+                        wsFragOpcode = opcode;
+                        wsFragBuffer = std::move(payload);
+                    } else {
+                        wsFragBuffer.clear();
+                        wsFragOpcode = 0;
+                        nlohmann::json msg = nlohmann::json::parse(payload, nullptr, false);
+                        if (!msg.is_discarded() && msg.is_object()) {
+                            processPluginMessage(session, msg);
+                        }
+                    }
+                } else if (opcode == 0x0) { // Continuation frame (RFC 6455 Section 5.4)
+                    if (wsFragOpcode == 0x1 || wsFragOpcode == 0x2) {
+                        if (wsFragBuffer.size() + payload.size() > 4 * 1024 * 1024) {
+                            wsFragBuffer.clear();
+                            wsFragOpcode = 0;
+                            session->active.store(false);
+                            break;
+                        }
+                        wsFragBuffer.append(payload);
+                        if (fin) {
+                            std::string fullMsg = std::move(wsFragBuffer);
+                            wsFragBuffer.clear();
+                            wsFragOpcode = 0;
+                            nlohmann::json msg = nlohmann::json::parse(fullMsg, nullptr, false);
+                            if (!msg.is_discarded() && msg.is_object()) {
+                                processPluginMessage(session, msg);
+                            }
+                        }
                     }
                 }
             }
@@ -1088,6 +1120,47 @@ void EdaRpcServer::processPluginMessage(std::shared_ptr<PluginSession> session,
         std::string method = msg["method"].get<std::string>();
         nlohmann::json id = msg.value("id", nlohmann::json(1));
         nlohmann::json params = msg.value("params", nlohmann::json::object());
+
+        if (method == "plugin/chunk") {
+            std::string msgId = params.value("chunk_id", params.value("msg_id", ""));
+            int index = params.value("seq", params.value("index", -1));
+            int total = params.value("total", 0);
+            std::string data = params.value("data", "");
+            if (msgId.empty() || index < 0 || total <= 0 || index >= total || total > 256) {
+                return;
+            }
+            auto& st = session->chunkBuffers[msgId];
+            if (st.total != total) {
+                st.total = total;
+                st.parts.assign(static_cast<size_t>(total), std::string());
+                st.received.assign(static_cast<size_t>(total), false);
+                st.receivedCount = 0;
+            }
+            if (!st.received[static_cast<size_t>(index)]) {
+                st.parts[static_cast<size_t>(index)] = std::move(data);
+                st.received[static_cast<size_t>(index)] = true;
+                st.receivedCount++;
+            }
+            if (st.receivedCount == st.total) {
+                std::string joined;
+                size_t totalBytes = 0;
+                for (const auto& p : st.parts) totalBytes += p.size();
+                if (totalBytes <= 4 * 1024 * 1024) {
+                    joined.reserve(totalBytes);
+                    for (const auto& p : st.parts) joined.append(p);
+                }
+                session->chunkBuffers.erase(msgId);
+                if (!joined.empty()) {
+                    nlohmann::json fullMsg = nlohmann::json::parse(joined, nullptr, false);
+                    if (!fullMsg.is_discarded() && fullMsg.is_object()) {
+                        processPluginMessage(session, fullMsg);
+                    }
+                }
+            } else if (session->chunkBuffers.size() > 32) {
+                session->chunkBuffers.erase(session->chunkBuffers.begin());
+            }
+            return;
+        }
 
         if (method == "plugin/register" || method == "plugin/status") {
             std::string reqApp = params.value("app", session->app);
@@ -2349,7 +2422,8 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
         }
     }
 
-    int timeoutMs = args.value("timeout_ms", _options.defaultTimeoutMs);
+    int defaultTimeout = std::max(_options.defaultTimeoutMs, 25000);
+    int timeoutMs = args.value("timeout_ms", defaultTimeout);
     nlohmann::json plugRes;
     std::string plugErr;
     if (!callPlugin("easyeda", toolName, args, plugRes, plugErr, timeoutMs)) {
@@ -2395,11 +2469,20 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
     }
 
     if ((toolName == "easyeda_inspect_pcb" || toolName == "easyeda_run_drc") &&
-        plugRes.is_object() && !plugRes.contains("connectivity_audit")) {
-        EdaAccelerators acc;
-        bool auditOk = false;
-        std::string auditSummary;
-        plugRes["connectivity_audit"] = acc.calcPcbConnectivityAudit(plugRes, auditOk, auditSummary);
+        plugRes.is_object()) {
+        if (!plugRes.contains("connectivity_audit")) {
+            EdaAccelerators acc;
+            bool auditOk = false;
+            std::string auditSummary;
+            plugRes["connectivity_audit"] = acc.calcPcbConnectivityAudit(plugRes, auditOk, auditSummary);
+        }
+        bool includeRawPrimitives = args.value("include_raw_primitives", false);
+        if (!includeRawPrimitives) {
+            plugRes.erase("tracks");
+            plugRes.erase("pads");
+            plugRes.erase("vias");
+            plugRes.erase("schematic_components");
+        }
     }
 
     if (plugRes.is_object() && !plugRes.contains("ok")) {

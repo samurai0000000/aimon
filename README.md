@@ -241,7 +241,7 @@ make windows-eda-bridge
 ```
 
 This target automatically fetches official prebuilt Qt 6.8.3 (`win64_mingw`) via `aqtinstall` into `build/qt-prebuilt/`, cross-compiles `aimon.exe` with `x86_64-w64-mingw32-g++-posix`, embeds the companion desktop plugins with zero standalone Python dependencies, and produces:
-- `build/windows/aimon-setup-1.1.2.exe` — Self-contained versioned Windows installer & upgrader (`%LOCALAPPDATA%\Programs\aimon\aimon.exe`, Start Menu shortcut, and Windows Installed Apps registration).
+- `build/windows/aimon-setup-1.1.3.exe` — Self-contained versioned Windows installer & upgrader (`%LOCALAPPDATA%\Programs\aimon\aimon.exe`, Start Menu shortcut, and Windows Installed Apps registration).
 - `build/windows/aimon-easyeda-bridge.eext` — Ready-to-import EasyEDA Pro extension archive.
 
 When running on Windows, **`aimon.exe`** docks in the Windows taskbar notification area (`QSystemTrayIcon`) as **`aimon`**:

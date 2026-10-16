@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.1.2 LANGUAGES CXX)
+project(aimon VERSION 1.1.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -498,6 +498,7 @@ aimon_add_claude_test(test_eda_bridge LIBCONFIG
             src/EasyEdaConverter.cxx src/KiCadSchematicEditor.cxx
             src/DynamicToolRegistry.cxx src/TcpGateway.cxx
             src/ConfigManager.cxx src/PathUtils.cxx)
+target_link_libraries(test_eda_bridge PRIVATE ${RAPIDCHECK_LIBRARY})
 
 aimon_add_claude_test(test_eda_bridge_props RAPIDCHECK LIBCONFIG
     SOURCES test/TestEdaBridgeProps.cxx src/EdaBridge.cxx src/EdaAccelerators.cxx
