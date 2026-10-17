@@ -1286,7 +1286,246 @@ void WebServer::setupRoutes() {
     auto lastRpcEndpoint = std::make_shared<std::pair<int, std::string>>(0, "");
     auto lastRpcMutex = std::make_shared<std::mutex>();
 
-    _server->Get("/api/agent/transcript", [getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex](
+    auto mapModelPlaceholderToName = [](const std::string& raw) -> std::string {
+        if (raw == "MODEL_PLACEHOLDER_M418" || raw == "gemini-4-argon-medium" || raw == "pro") {
+            return "gemini-4-argon-medium";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M322" || raw == "gemini-3.8-flash-tiered" || raw == "flash") {
+            return "gemini-3.8-flash-tiered";
+        }
+        return raw;
+    };
+
+    auto extractTrajectoryModelName = [mapModelPlaceholderToName](const nlohmann::json& tj) -> std::string {
+        if (!tj.is_object() || !tj.contains("trajectory") || !tj["trajectory"].is_object()) {
+            return "gemini-4-argon-medium";
+        }
+        const auto& traj = tj["trajectory"];
+        std::string fallbackM322Model;
+        if (traj.contains("executorMetadatas") && traj["executorMetadatas"].is_array()) {
+            const auto& ems = traj["executorMetadatas"];
+            for (auto it = ems.rbegin(); it != ems.rend(); ++it) {
+                if (!it->is_object() || !it->contains("cascadeConfig") || !(*it)["cascadeConfig"].is_object()) {
+                    continue;
+                }
+                const auto& cc = (*it)["cascadeConfig"];
+                if (!cc.contains("plannerConfig") || !cc["plannerConfig"].is_object()) {
+                    continue;
+                }
+                const auto& pc = cc["plannerConfig"];
+                std::string mName = pc.value("modelName", "");
+                std::string pModel = pc.value("planModel", "");
+                bool hasCustomCfg = pc.contains("customizationConfig") && !pc["customizationConfig"].is_null() &&
+                                    pc["customizationConfig"].is_object() && !pc["customizationConfig"].empty();
+                std::string candidate = !mName.empty() ? mapModelPlaceholderToName(mName)
+                                                       : (!pModel.empty() ? mapModelPlaceholderToName(pModel) : "");
+                if (candidate.empty()) {
+                    continue;
+                }
+                if (candidate == "gemini-3.8-flash-tiered" && !hasCustomCfg) {
+                    if (fallbackM322Model.empty()) {
+                        fallbackM322Model = candidate;
+                    }
+                    continue;
+                }
+                return candidate;
+            }
+        }
+        if (traj.contains("generatorMetadata") && traj["generatorMetadata"].is_array()) {
+            const auto& gms = traj["generatorMetadata"];
+            for (auto it = gms.rbegin(); it != gms.rend(); ++it) {
+                if (it->is_object() && it->contains("chatModel") && (*it)["chatModel"].is_object()) {
+                    std::string gmModel = (*it)["chatModel"].value("model", "");
+                    if (!gmModel.empty()) {
+                        std::string mapped = mapModelPlaceholderToName(gmModel);
+                        if (!mapped.empty() && (mapped != "gemini-3.8-flash-tiered" || fallbackM322Model.empty())) {
+                            return mapped;
+                        }
+                    }
+                }
+            }
+        }
+        if (!fallbackM322Model.empty()) {
+            return fallbackM322Model;
+        }
+        return "gemini-4-argon-medium";
+    };
+
+    auto resolveCascadeConfigForRpc = [](const LsEndpoint& ep,
+                                         const std::string& targetCid,
+                                         const std::string& requestedModel,
+                                         const std::string& workspacePath) -> nlohmann::json {
+        auto extractBestCascadeConfigFromTrajectory = [](const nlohmann::json& tj, nlohmann::json& outConfig) -> bool {
+            if (!tj.is_object() || !tj.contains("trajectory") || !tj["trajectory"].is_object()) {
+                return false;
+            }
+            const auto& traj = tj["trajectory"];
+            if (!traj.contains("executorMetadatas") || !traj["executorMetadatas"].is_array()) {
+                return false;
+            }
+            const auto& ems = traj["executorMetadatas"];
+            nlohmann::json latestCascadeConfig = nlohmann::json::object();
+            nlohmann::json richCascadeConfig = nlohmann::json::object();
+            nlohmann::json recoveredDynamicUris = nlohmann::json::array();
+
+            for (auto it = ems.rbegin(); it != ems.rend(); ++it) {
+                if (!it->is_object() || !it->contains("cascadeConfig") || !(*it)["cascadeConfig"].is_object()) {
+                    continue;
+                }
+                const auto& cc = (*it)["cascadeConfig"];
+                if (cc.empty()) {
+                    continue;
+                }
+                if (latestCascadeConfig.empty()) {
+                    latestCascadeConfig = cc;
+                }
+                if (recoveredDynamicUris.empty() && cc.contains("dynamicWorkspaceUris") &&
+                    cc["dynamicWorkspaceUris"].is_array() && !cc["dynamicWorkspaceUris"].empty()) {
+                    recoveredDynamicUris = cc["dynamicWorkspaceUris"];
+                }
+                if (richCascadeConfig.empty() && cc.contains("plannerConfig") && cc["plannerConfig"].is_object()) {
+                    const auto& pc = cc["plannerConfig"];
+                    if (pc.contains("customizationConfig") && pc["customizationConfig"].is_object() &&
+                        !pc["customizationConfig"].empty()) {
+                        richCascadeConfig = cc;
+                    }
+                }
+                if (!latestCascadeConfig.empty() && !richCascadeConfig.empty() && !recoveredDynamicUris.empty()) {
+                    break;
+                }
+            }
+
+            if (latestCascadeConfig.empty() && richCascadeConfig.empty()) {
+                return false;
+            }
+
+            outConfig = !richCascadeConfig.empty() ? richCascadeConfig : latestCascadeConfig;
+            if (!recoveredDynamicUris.empty() &&
+                (!outConfig.contains("dynamicWorkspaceUris") || !outConfig["dynamicWorkspaceUris"].is_array() ||
+                 outConfig["dynamicWorkspaceUris"].empty())) {
+                outConfig["dynamicWorkspaceUris"] = recoveredDynamicUris;
+            }
+
+            if (!outConfig.contains("plannerConfig") || !outConfig["plannerConfig"].is_object()) {
+                outConfig["plannerConfig"] = nlohmann::json::object();
+            }
+            auto& pc = outConfig["plannerConfig"];
+            bool latestHadCustom = latestCascadeConfig.contains("plannerConfig") &&
+                                   latestCascadeConfig["plannerConfig"].is_object() &&
+                                   latestCascadeConfig["plannerConfig"].contains("customizationConfig") &&
+                                   latestCascadeConfig["plannerConfig"]["customizationConfig"].is_object() &&
+                                   !latestCascadeConfig["plannerConfig"]["customizationConfig"].empty();
+            std::string curPlanModel = pc.value("planModel", "");
+            if (curPlanModel.empty() || (curPlanModel == "MODEL_PLACEHOLDER_M322" && !latestHadCustom)) {
+                pc["planModel"] = "MODEL_PLACEHOLDER_M418";
+                if (pc.contains("modelName") && pc["modelName"].is_string()) {
+                    pc["modelName"] = "gemini-4-argon-medium";
+                }
+            }
+            return true;
+        };
+
+        nlohmann::json cascadeConfig = nlohmann::json::object();
+        bool resolved = false;
+
+        if (ep.port > 0 && ep.port <= 65535 && !ep.csrf.empty()) {
+            try {
+                httplib::Client cli("127.0.0.1", ep.port);
+                cli.set_connection_timeout(0, 500000);
+                cli.set_read_timeout(2, 0);
+                httplib::Headers hdrs = {
+                    {"Content-Type", "application/json"},
+                    {"x-codeium-csrf-token", ep.csrf}
+                };
+                if (!targetCid.empty() && targetCid != "new") {
+                    auto trajRes = cli.Post(
+                        "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory",
+                        hdrs,
+                        nlohmann::json({{"cascadeId", targetCid}}).dump(),
+                        "application/json"
+                    );
+                    if (trajRes && trajRes->status == 200) {
+                        auto tj = nlohmann::json::parse(trajRes->body, nullptr, false);
+                        if (!tj.is_discarded()) {
+                            resolved = extractBestCascadeConfigFromTrajectory(tj, cascadeConfig);
+                        }
+                    }
+                }
+                if (!resolved) {
+                    auto allRes = cli.Post(
+                        "/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories",
+                        hdrs,
+                        "{}",
+                        "application/json"
+                    );
+                    if (allRes && allRes->status == 200) {
+                        auto aj = nlohmann::json::parse(allRes->body, nullptr, false);
+                        if (!aj.is_discarded() && aj.is_object() &&
+                            aj.contains("trajectorySummaries") && aj["trajectorySummaries"].is_object()) {
+                            int probed = 0;
+                            for (auto it = aj["trajectorySummaries"].begin();
+                                 it != aj["trajectorySummaries"].end() && probed < 5; ++it) {
+                                std::string otherCid = it.key();
+                                if (otherCid.empty() || otherCid == targetCid) continue;
+                                ++probed;
+                                auto otherRes = cli.Post(
+                                    "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory",
+                                    hdrs,
+                                    nlohmann::json({{"cascadeId", otherCid}}).dump(),
+                                    "application/json"
+                                );
+                                if (otherRes && otherRes->status == 200) {
+                                    auto otj = nlohmann::json::parse(otherRes->body, nullptr, false);
+                                    if (!otj.is_discarded() &&
+                                        extractBestCascadeConfigFromTrajectory(otj, cascadeConfig)) {
+                                        resolved = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+
+        if (!cascadeConfig.is_object()) {
+            cascadeConfig = nlohmann::json::object();
+        }
+        if (!cascadeConfig.contains("plannerConfig") || !cascadeConfig["plannerConfig"].is_object()) {
+            cascadeConfig["plannerConfig"] = nlohmann::json::object();
+        }
+        auto& pc = cascadeConfig["plannerConfig"];
+        if (!pc.contains("planModel") || !pc["planModel"].is_string() || pc["planModel"].get<std::string>().empty()) {
+            pc["planModel"] = "MODEL_PLACEHOLDER_M418";
+        }
+        if ((!cascadeConfig.contains("dynamicWorkspaceUris") || !cascadeConfig["dynamicWorkspaceUris"].is_array() ||
+             cascadeConfig["dynamicWorkspaceUris"].empty()) && !workspacePath.empty()) {
+            cascadeConfig["dynamicWorkspaceUris"] = nlohmann::json::array({"file://" + workspacePath});
+        }
+
+        if (!requestedModel.empty()) {
+            if (requestedModel == "MODEL_PLACEHOLDER_M418" || requestedModel == "gemini-4-argon-medium" ||
+                requestedModel == "pro") {
+                pc["planModel"] = "MODEL_PLACEHOLDER_M418";
+                if (pc.contains("modelName")) {
+                    pc["modelName"] = "gemini-4-argon-medium";
+                }
+            } else if (requestedModel == "MODEL_PLACEHOLDER_M322" || requestedModel == "gemini-3.8-flash-tiered" ||
+                       requestedModel == "flash" || requestedModel == "flash_lite") {
+                pc["planModel"] = "MODEL_PLACEHOLDER_M322";
+                if (pc.contains("modelName")) {
+                    pc["modelName"] = "gemini-3.8-flash-tiered";
+                }
+            } else if (requestedModel.rfind("MODEL_", 0) == 0) {
+                pc["planModel"] = requestedModel;
+            }
+        }
+
+        return cascadeConfig;
+    };
+
+    _server->Get("/api/agent/transcript", [getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName](
                                               const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string id = req.get_param_value("id");
@@ -1333,6 +1572,7 @@ void WebServer::setupRoutes() {
             // Fallback: check live in-memory trajectory via ConnectRPC GetCascadeTrajectory
             nlohmann::json liveSteps = nlohmann::json::array();
             int liveTotalSteps = 0;
+            std::string liveModel = "gemini-4-argon-medium";
             bool foundInMemory = false;
 
             auto tryProbeRpcTrajectory = [&](int port, const std::string& csrf) -> bool {
@@ -1354,6 +1594,7 @@ void WebServer::setupRoutes() {
                     if (rpcRes && rpcRes->status == 200) {
                         auto tj = nlohmann::json::parse(rpcRes->body, nullptr, false);
                         if (!tj.is_discarded() && tj.contains("trajectory") && tj["trajectory"].is_object()) {
+                            liveModel = extractTrajectoryModelName(tj);
                             const auto& rawSteps = tj["trajectory"].value("steps", nlohmann::json::array());
                             int idx = 0;
                             for (const auto& rs : rawSteps) {
@@ -1447,7 +1688,7 @@ void WebServer::setupRoutes() {
                 nlohmann::json resp;
                 resp["conversationId"] = id;
                 resp["source"] = "live";
-                resp["model"] = "gemini-2.5-pro";
+                resp["model"] = liveModel;
                 resp["stepCount"] = liveTotalSteps;
                 resp["steps"] = liveSteps;
                 res.set_content(resp.dump(2), "application/json");
@@ -1593,13 +1834,13 @@ void WebServer::setupRoutes() {
         nlohmann::json resp;
         resp["conversationId"] = id;
         resp["source"] = source;
-        resp["model"] = "gemini-2.5-pro";
+        resp["model"] = "gemini-4-argon-medium";
         resp["stepCount"] = totalStepCount;
         resp["steps"] = steps;
         res.set_content(resp.dump(2), "application/json");
     });
 
-    _server->Post("/api/agent/prompt", [discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex](const httplib::Request& req, httplib::Response& res) {
+    _server->Post("/api/agent/prompt", [getWorkspaceRoot, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         nlohmann::json j;
         try {
@@ -1613,6 +1854,7 @@ void WebServer::setupRoutes() {
         std::string text = j.value("text", j.value("prompt", ""));
         std::string agentId = j.value("agentId", "antigravity");
         std::string cid = j.value("conversationId", "");
+        std::string requestedModel = j.value("model", "");
         if (text.empty()) {
             res.status = 400;
             res.set_content("{\"status\":\"error\",\"error\":\"Prompt text cannot be empty\"}", "application/json");
@@ -1644,9 +1886,12 @@ void WebServer::setupRoutes() {
             return;
         }
 
+        std::string wsPath = getWorkspaceRoot().string();
+
         // 3. Attempt direct ConnectRPC dispatch with conversation ownership verification
         auto sendRpcCascadeMessage = [&](const LsEndpoint& ep, const std::string& targetCid, std::string& outBody) -> bool {
             try {
+                nlohmann::json cascadeCfg = resolveCascadeConfigForRpc(ep, targetCid, requestedModel, wsPath);
                 httplib::Client cli("127.0.0.1", ep.port);
                 cli.set_connection_timeout(1, 0);
                 cli.set_read_timeout(5, 0);
@@ -1657,11 +1902,7 @@ void WebServer::setupRoutes() {
                 nlohmann::json payload = {
                     {"cascadeId", targetCid},
                     {"items", nlohmann::json::array({{{"text", text}}})},
-                    {"cascadeConfig", {
-                        {"plannerConfig", {
-                            {"planModel", "MODEL_PLACEHOLDER_M322"}
-                        }}
-                    }}
+                    {"cascadeConfig", cascadeCfg}
                 };
                 auto rpcRes = cli.Post(
                     "/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage",
@@ -1828,11 +2069,20 @@ void WebServer::setupRoutes() {
                 setenv("ANTIGRAVITY_CSRF_TOKEN", ep.csrf.c_str(), 1);
                 setenv("ANTIGRAVITY_PROJECT_ID", "default-cli-project", 1);
 
+                std::string cliModelFlag = "--model=pro";
+                if (requestedModel == "flash" || requestedModel == "MODEL_PLACEHOLDER_M322" ||
+                    requestedModel == "gemini-3.8-flash-tiered") {
+                    cliModelFlag = "--model=flash";
+                } else if (requestedModel == "flash_lite") {
+                    cliModelFlag = "--model=flash_lite";
+                }
+
                 std::vector<char*> argv;
                 argv.push_back(const_cast<char*>(agyBin.c_str()));
                 argv.push_back(const_cast<char*>("agentapi"));
                 if (cid.empty() || cid == "new") {
                     argv.push_back(const_cast<char*>("new-conversation"));
+                    argv.push_back(const_cast<char*>(cliModelFlag.c_str()));
                     argv.push_back(const_cast<char*>(text.c_str()));
                 } else {
                     argv.push_back(const_cast<char*>("send-message"));

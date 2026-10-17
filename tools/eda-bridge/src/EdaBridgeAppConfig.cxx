@@ -2791,7 +2791,7 @@ class AimonFreeCadBridgeClient:
                     return f"{v[0]}.{v[1]}.{v[2]}"
             except Exception:
                 pass
-        return "1.1.3"
+        return "1.1.4"
 
     def _active_doc_name(self):
         if HAS_FREECAD and getattr(FreeCAD, "ActiveDocument", None) is not None:

@@ -903,6 +903,354 @@ static void testAgentPromptNoFakeElizaAndRealBridge() {
     std::cout << "[TestMobileGateway] testAgentPromptNoFakeElizaAndRealBridge passed!" << std::endl;
 }
 
+static void testAgentPromptPreservesCascadeConfigAndModelM418() {
+    std::cout << "[TestMobileGateway] Running testAgentPromptPreservesCascadeConfigAndModelM418..." << std::endl;
+    std::string baseDir = "/tmp/aimon_m418_test_" + std::to_string(getpid());
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliBrain = baseDir + "/cli_brain";
+    std::string wsRoot = baseDir + "/workspace";
+    std::string tempMobileDb = baseDir + "/mobile_devices.json";
+    fs::remove_all(baseDir);
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+    fs::create_directories(wsRoot);
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_WORKSPACE_ROOT", wsRoot.c_str(), 1);
+
+    // Create a mock agy binary so the binary existence check passes and CLI fallback can be verified
+    std::string mockAgy = baseDir + "/mock_agy.sh";
+    {
+        std::ofstream mf(mockAgy);
+        mf << "#!/bin/sh\n"
+           << "if [ \"$1\" = \"agentapi\" ] && [ \"$2\" = \"new-conversation\" ]; then\n"
+           << "  echo \"{\\\"response\\\":{\\\"newConversation\\\":{\\\"conversationId\\\":\\\"cli-new-conv\\\",\\\"modelFlag\\\":\\\"$3\\\",\\\"prompt\\\":\\\"$4\\\"}}}\"\n"
+           << "  exit 0\n"
+           << "fi\n"
+           << "exit 1\n";
+    }
+    chmod(mockAgy.c_str(), 0755);
+    setenv("AIMON_AGY_BIN", mockAgy.c_str(), 1);
+
+    assert(MobileGateway::getInstance().init(tempMobileDb));
+    std::string secret = MobileGateway::getInstance().createPairingSecret(120);
+    std::string validToken;
+    assert(MobileGateway::getInstance().verifyPairingCode(secret, "m418-dev", "Test Device", validToken));
+
+    // Mock Antigravity Language Server with a trajectory whose earlier executorMetadatas[0] has M418 + customizationConfig
+    // and whose latest executorMetadatas[1] was corrupted by a prior M322 prompt without customizationConfig.
+    httplib::Server mockLs;
+    std::mutex lsMutex;
+    json currentExecutorMetadatas = json::array({
+        {
+            {"cascadeConfig", {
+                {"plannerConfig", {
+                    {"planModel", "MODEL_PLACEHOLDER_M418"},
+                    {"modelName", "gemini-4-argon-medium"},
+                    {"useAiCredits", false},
+                    {"customizationConfig", {
+                        {"enableJsonHooks", true},
+                        {"workspacePaths", json::array({wsRoot})}
+                    }}
+                }},
+                {"dynamicWorkspaceUris", json::array({"file://" + wsRoot})}
+            }}
+        },
+        {
+            {"cascadeConfig", {
+                {"plannerConfig", {
+                    {"planModel", "MODEL_PLACEHOLDER_M322"},
+                    {"modelName", "gemini-3.8-flash-tiered"}
+                }}
+            }}
+        }
+    });
+    json lastSentPayload;
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/GetConversationMetadata",
+                [](const httplib::Request &req, httplib::Response &res) {
+        if (req.get_header_value("x-codeium-csrf-token") != "m418-csrf") {
+            res.status = 401;
+            return;
+        }
+        auto j = json::parse(req.body, nullptr, false);
+        if (j.value("conversationId", "") == "conv-corrupted-m322") {
+            res.set_content("{\"metadata\":{\"workspaces\":[]}}", "application/json");
+        } else {
+            res.status = 404;
+            res.set_content("{\"code\":\"not_found\"}", "application/json");
+        }
+    });
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories",
+                [](const httplib::Request &req, httplib::Response &res) {
+        if (req.get_header_value("x-codeium-csrf-token") != "m418-csrf") {
+            res.status = 401;
+            return;
+        }
+        res.set_content("{\"trajectorySummaries\":{\"conv-corrupted-m322\":{}}}", "application/json");
+    });
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory",
+                [&](const httplib::Request &req, httplib::Response &res) {
+        if (req.get_header_value("x-codeium-csrf-token") != "m418-csrf") {
+            res.status = 401;
+            return;
+        }
+        auto j = json::parse(req.body, nullptr, false);
+        std::string reqCid = j.value("cascadeId", "");
+        if (reqCid == "conv-corrupted-m322") {
+            std::lock_guard<std::mutex> lk(lsMutex);
+            json tj = {
+                {"trajectory", {
+                    {"steps", json::array({
+                        {
+                            {"type", "CORTEX_STEP_TYPE_USER_INPUT"},
+                            {"userInput", {{"userResponse", "Check model preservation"}}}
+                        },
+                        {
+                            {"type", "CORTEX_STEP_TYPE_PLANNER_RESPONSE"},
+                            {"plannerResponse", {{"response", "Running on Gemini 4 Argon Medium"}, {"thinking", "Checking..."}}}
+                        }
+                    })},
+                    {"executorMetadatas", currentExecutorMetadatas},
+                    {"generatorMetadata", json::array({
+                        {{"chatModel", {{"model", "MODEL_PLACEHOLDER_M418"}}}}
+                    })}
+                }}
+            };
+            res.set_content(tj.dump(), "application/json");
+            return;
+        }
+        res.status = 404;
+        res.set_content("{\"code\":\"not_found\"}", "application/json");
+    });
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/StartCascade",
+                [](const httplib::Request &req, httplib::Response &res) {
+        if (req.get_header_value("x-codeium-csrf-token") != "m418-csrf") {
+            res.status = 401;
+            return;
+        }
+        res.set_content("{\"cascadeId\":\"fresh-cascade-m418\"}", "application/json");
+    });
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage",
+                [&](const httplib::Request &req, httplib::Response &res) {
+        if (req.get_header_value("x-codeium-csrf-token") != "m418-csrf") {
+            res.status = 401;
+            return;
+        }
+        std::lock_guard<std::mutex> lk(lsMutex);
+        lastSentPayload = json::parse(req.body, nullptr, false);
+        res.set_content("{}", "application/json");
+    });
+
+    int lsPort = mockLs.bind_to_any_port("127.0.0.1");
+    std::thread lsThread([&]() { mockLs.listen_after_bind(); });
+
+    setenv("AGY_LS_PORT", std::to_string(lsPort).c_str(), 1);
+    setenv("AGY_LS_CSRF_TOKEN", "m418-csrf", 1);
+
+    StateStore &stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.endpointsEnabled = false;
+
+    WebServer server(stateStore, historyStore, config);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", validToken}};
+
+    // 1. Dispatch POST /api/agent/prompt to conv-corrupted-m322 and verify SendUserCascadeMessage
+    // restores MODEL_PLACEHOLDER_M418, customizationConfig, and dynamicWorkspaceUris!
+    json promptReq = {
+        {"text", "Continue envelope execution"},
+        {"conversationId", "conv-corrupted-m322"}
+    };
+    auto resPrompt = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
+    assert(resPrompt && resPrompt->status == 200);
+    {
+        std::lock_guard<std::mutex> lk(lsMutex);
+        assert(lastSentPayload.is_object());
+        assert(lastSentPayload.contains("cascadeConfig") && lastSentPayload["cascadeConfig"].is_object());
+        const auto &cc = lastSentPayload["cascadeConfig"];
+        assert(cc.contains("plannerConfig") && cc["plannerConfig"].is_object());
+        const auto &pc = cc["plannerConfig"];
+        assert(pc.value("planModel", "") == "MODEL_PLACEHOLDER_M418");
+        assert(pc.contains("customizationConfig") && pc["customizationConfig"].is_object());
+        assert(pc["customizationConfig"].value("enableJsonHooks", false) == true);
+        assert(cc.contains("dynamicWorkspaceUris") && cc["dynamicWorkspaceUris"].is_array());
+        assert(!cc["dynamicWorkspaceUris"].empty());
+        assert(cc["dynamicWorkspaceUris"][0].get<std::string>() == "file://" + wsRoot);
+    }
+
+    // 2. Verify GET /api/agent/transcript (live RPC trajectory branch) returns model = "gemini-4-argon-medium" (never "gemini-2.5-pro")
+    auto resLiveTrans = client.Get("/api/agent/transcript?id=conv-corrupted-m322", headers);
+    assert(resLiveTrans && resLiveTrans->status == 200);
+    json liveTransJson = json::parse(resLiveTrans->body);
+    assert(liveTransJson.value("model", "") == "gemini-4-argon-medium");
+
+    // 3. Verify GET /api/agent/transcript (JSONL file branch) also returns "gemini-4-argon-medium" (never "gemini-2.5-pro")
+    fs::path jsonlDir = fs::path(cliBrain) / "jsonl-only-conv" / ".system_generated" / "logs";
+    fs::create_directories(jsonlDir);
+    {
+        std::ofstream jf(jsonlDir / "transcript.jsonl");
+        jf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"Hello\"}\n";
+    }
+    auto resJsonlTrans = client.Get("/api/agent/transcript?id=jsonl-only-conv", headers);
+    assert(resJsonlTrans && resJsonlTrans->status == 200);
+    json jsonlTransJson = json::parse(resJsonlTrans->body);
+    assert(jsonlTransJson.value("model", "") == "gemini-4-argon-medium");
+
+    // 3b. Verify new cascade ("conversationId": "new") clones workspace cascadeConfig via GetAllCascadeTrajectories
+    json newCascadeReq = {
+        {"text", "Start new conversation with preserved workspace config"},
+        {"conversationId", "new"}
+    };
+    auto resNewCascade = client.Post("/api/agent/prompt", headers, newCascadeReq.dump(), "application/json");
+    assert(resNewCascade && resNewCascade->status == 200);
+    {
+        std::lock_guard<std::mutex> lk(lsMutex);
+        assert(lastSentPayload.value("cascadeId", "") == "fresh-cascade-m418");
+        const auto &cc = lastSentPayload["cascadeConfig"];
+        assert(cc["plannerConfig"].value("planModel", "") == "MODEL_PLACEHOLDER_M418");
+        assert(cc["plannerConfig"]["customizationConfig"].value("enableJsonHooks", false) == true);
+        assert(cc["dynamicWorkspaceUris"][0].get<std::string>() == "file://" + wsRoot);
+    }
+
+    // 3c. Verify explicit model overrides ("flash", "pro", "MODEL_CUSTOM_999") preserve customizationConfig
+    json flashReq = {
+        {"text", "Quick flash query"},
+        {"conversationId", "conv-corrupted-m322"},
+        {"model", "flash"}
+    };
+    auto resFlash = client.Post("/api/agent/prompt", headers, flashReq.dump(), "application/json");
+    assert(resFlash && resFlash->status == 200);
+    {
+        std::lock_guard<std::mutex> lk(lsMutex);
+        const auto &pc = lastSentPayload["cascadeConfig"]["plannerConfig"];
+        assert(pc.value("planModel", "") == "MODEL_PLACEHOLDER_M322");
+        assert(pc.value("modelName", "") == "gemini-3.8-flash-tiered");
+        assert(pc["customizationConfig"].value("enableJsonHooks", false) == true);
+    }
+
+    json proReq = {
+        {"text", "Explicit pro query"},
+        {"conversationId", "conv-corrupted-m322"},
+        {"model", "pro"}
+    };
+    auto resPro = client.Post("/api/agent/prompt", headers, proReq.dump(), "application/json");
+    assert(resPro && resPro->status == 200);
+    {
+        std::lock_guard<std::mutex> lk(lsMutex);
+        const auto &pc = lastSentPayload["cascadeConfig"]["plannerConfig"];
+        assert(pc.value("planModel", "") == "MODEL_PLACEHOLDER_M418");
+        assert(pc.value("modelName", "") == "gemini-4-argon-medium");
+    }
+
+    json customModelReq = {
+        {"text", "Custom enum query"},
+        {"conversationId", "conv-corrupted-m322"},
+        {"model", "MODEL_CUSTOM_999"}
+    };
+    auto resCustomModel = client.Post("/api/agent/prompt", headers, customModelReq.dump(), "application/json");
+    assert(resCustomModel && resCustomModel->status == 200);
+    {
+        std::lock_guard<std::mutex> lk(lsMutex);
+        const auto &pc = lastSentPayload["cascadeConfig"]["plannerConfig"];
+        assert(pc.value("planModel", "") == "MODEL_CUSTOM_999");
+    }
+
+    // 4. RapidCheck property: across arbitrary sequences of corrupted M322 turns appended after a valid M418 turn,
+    // POST /api/agent/prompt always recovers MODEL_PLACEHOLDER_M418, customizationConfig, and dynamicWorkspaceUris.
+    bool rcOk = rc::check("POST /api/agent/prompt recovers M418 and customizationConfig across arbitrary trailing M322 turns",
+                          [&]() {
+        const int trailingM322Count = *rc::gen::inRange(0, 6);
+        const auto wsSubdir = *rc::gen::element<std::string>("aimon", "netmon", "meshmon", "robohero");
+        std::string expectedUri = "file:///workspace/" + wsSubdir;
+
+        {
+            std::lock_guard<std::mutex> lk(lsMutex);
+            currentExecutorMetadatas = json::array();
+            currentExecutorMetadatas.push_back({
+                {"cascadeConfig", {
+                    {"plannerConfig", {
+                        {"planModel", "MODEL_PLACEHOLDER_M418"},
+                        {"modelName", "gemini-4-argon-medium"},
+                        {"customizationConfig", {
+                            {"enableJsonHooks", true}
+                        }}
+                    }},
+                    {"dynamicWorkspaceUris", json::array({expectedUri})}
+                }}
+            });
+            for (int k = 0; k < trailingM322Count; ++k) {
+                currentExecutorMetadatas.push_back({
+                    {"cascadeConfig", {
+                        {"plannerConfig", {
+                            {"planModel", "MODEL_PLACEHOLDER_M322"},
+                            {"modelName", "gemini-3.8-flash-tiered"}
+                        }}
+                    }}
+                });
+            }
+            lastSentPayload = json::object();
+        }
+
+        auto r = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
+        RC_ASSERT(r != nullptr);
+        RC_ASSERT(r->status == 200);
+
+        std::lock_guard<std::mutex> lk(lsMutex);
+        RC_ASSERT(lastSentPayload.contains("cascadeConfig"));
+        const auto &cc = lastSentPayload["cascadeConfig"];
+        RC_ASSERT(cc.contains("plannerConfig"));
+        RC_ASSERT(cc["plannerConfig"].value("planModel", "") == "MODEL_PLACEHOLDER_M418");
+        RC_ASSERT(cc["plannerConfig"].contains("customizationConfig"));
+        RC_ASSERT(cc["plannerConfig"]["customizationConfig"].value("enableJsonHooks", false) == true);
+        RC_ASSERT(cc.contains("dynamicWorkspaceUris"));
+        RC_ASSERT(cc["dynamicWorkspaceUris"].is_array() && !cc["dynamicWorkspaceUris"].empty());
+        RC_ASSERT(cc["dynamicWorkspaceUris"][0].get<std::string>() == expectedUri);
+    });
+    assert(rcOk);
+
+    mockLs.stop();
+    if (lsThread.joinable()) lsThread.join();
+
+    // 5. Verify agy agentapi CLI fallback passes --model=pro by default, and --model=flash / --model=flash_lite when requested
+    setenv("AGY_LS_PORT", "46798", 1);
+    json cliDefaultReq = {{"text", "CLI default new"}, {"conversationId", "new"}};
+    auto resCliDefault = client.Post("/api/agent/prompt", headers, cliDefaultReq.dump(), "application/json");
+    assert(resCliDefault && resCliDefault->status == 200);
+    assert(resCliDefault->body.find("--model=pro") != std::string::npos);
+
+    json cliFlashReq = {{"text", "CLI flash new"}, {"conversationId", "new"}, {"model", "flash"}};
+    auto resCliFlash = client.Post("/api/agent/prompt", headers, cliFlashReq.dump(), "application/json");
+    assert(resCliFlash && resCliFlash->status == 200);
+    assert(resCliFlash->body.find("--model=flash") != std::string::npos);
+
+    json cliFlashLiteReq = {{"text", "CLI flash_lite new"}, {"conversationId", "new"}, {"model", "flash_lite"}};
+    auto resCliFlashLite = client.Post("/api/agent/prompt", headers, cliFlashLiteReq.dump(), "application/json");
+    assert(resCliFlashLite && resCliFlashLite->status == 200);
+    assert(resCliFlashLite->body.find("--model=flash_lite") != std::string::npos);
+
+    server.stop();
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    unsetenv("AIMON_AGY_BIN");
+    unsetenv("AGY_LS_PORT");
+    unsetenv("AGY_LS_CSRF_TOKEN");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] testAgentPromptPreservesCascadeConfigAndModelM418 passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -917,6 +1265,7 @@ int main() {
     testTranscriptJsonlParsingAndRapidCheck();
     testWorkspaceRecursiveTree();
     testAgentPromptNoFakeElizaAndRealBridge();
+    testAgentPromptPreservesCascadeConfigAndModelM418();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;
