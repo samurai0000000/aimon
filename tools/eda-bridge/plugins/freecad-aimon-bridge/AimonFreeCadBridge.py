@@ -12,7 +12,7 @@ import socket
 import threading
 import time
 
-BRIDGE_VERSION = "1.1.5"
+BRIDGE_VERSION = "1.1.6"
 
 try:
     import FreeCAD
@@ -156,7 +156,7 @@ class AimonFreeCadBridgeClient:
                     return f"{v[0]}.{v[1]}.{v[2]}"
             except Exception:
                 pass
-        return "1.1.5"
+        return "1.1.6"
 
     def _active_doc_name(self):
         if HAS_FREECAD and getattr(FreeCAD, "ActiveDocument", None) is not None:

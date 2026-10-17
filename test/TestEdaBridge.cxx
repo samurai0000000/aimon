@@ -1645,6 +1645,190 @@ TEST(EdaAccelerators_Unit, EdaAccelerators_RipUpAutorouteAndDecouplingAudit) {
     }
 }
 
+TEST(EdaAccelerators_Unit, EasyEdaFourTupleWireSegmentsNetStubsAndParameterAliases) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // 1. Reproduce servosense 4-tuple multi-segment wire format & multi-sheet net-labeled stubs:
+    //    - Wire e607 (VCC) has 4-tuple segments [885, 240, 865, 240, 865, 220, 885, 220, 885, 220, 885, 240, 885, 240, 885, 260]
+    //      where the odd-to-even transition (865, 240) -> (865, 220) passes directly over EXT0.2 (GND at 865, 230)
+    //      if mistakenly treated as a continuous polyline.
+    //    - U1.1 has a net-labeled wire stub e545 ("AIN0") on a 2-sheet project (Sheet 2 component U3_0 has on_active_sheet=false).
+    //    - RB1 resistor array pulls ALERT_0 up to 3V3.
+    nlohmann::json servoArgs = {
+        {"project", {
+            {"data", nlohmann::json::array({
+                {
+                    {"schematic", {
+                        {"page", nlohmann::json::array({
+                            {{"title", "main"}, {"uuid", "sheet1"}},
+                            {{"title", "INA226x16"}, {"uuid", "sheet2"}}
+                        })}
+                    }}
+                }
+            })}
+        }},
+        {"components", nlohmann::json::array({
+            {
+                {"id", "c_ext0"},
+                {"reference", "EXT0"},
+                {"value", "CONN"},
+                {"component_type", "part"},
+                {"footprint", "HDR-3"},
+                {"unique_id", "uid_ext0"},
+                {"x", 850.0},
+                {"y", 230.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "ext0_1"}, {"number", "1"}, {"name", "V+"}, {"net", "VCC"}, {"x", 865.0}, {"y", 240.0}},
+                    {{"id", "ext0_2"}, {"number", "2"}, {"name", "GND"}, {"net", "GND"}, {"x", 865.0}, {"y", 230.0}},
+                    {{"id", "ext0_3"}, {"number", "3"}, {"name", "V+"}, {"net", "VCC"}, {"x", 865.0}, {"y", 220.0}}
+                })}
+            },
+            {
+                {"id", "c_u1"},
+                {"reference", "U1"},
+                {"value", "CD74HC4067"},
+                {"component_type", "part"},
+                {"footprint", "SOIC-24"},
+                {"unique_id", "uid_u1"},
+                {"x", 450.0},
+                {"y", 750.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "u1_1"}, {"number", "1"}, {"name", "I0"}, {"net", "AIN0"}, {"x", 385.0}, {"y", 795.0}},
+                    {{"id", "u1_2"}, {"number", "2"}, {"name", "ALERT"}, {"net", "ALERT_0"}, {"x", 385.0}, {"y", 775.0}},
+                    {{"id", "u1_24"}, {"number", "24"}, {"name", "VCC"}, {"net", "3V3"}, {"x", 515.0}, {"y", 795.0}},
+                    {{"id", "u1_12"}, {"number", "12"}, {"name", "GND"}, {"net", "GND"}, {"x", 515.0}, {"y", 775.0}}
+                })}
+            },
+            {
+                {"id", "c_rb1"},
+                {"reference", "RB1"},
+                {"value", "10k"},
+                {"component_type", "part"},
+                {"footprint", "RES-ARRAY-4"},
+                {"unique_id", "uid_rb1"},
+                {"x", 265.0},
+                {"y", 420.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "rb1_1"}, {"number", "1"}, {"name", "1"}, {"net", "ALERT_0"}, {"x", 245.0}, {"y", 435.0}},
+                    {{"id", "rb1_8"}, {"number", "8"}, {"name", "8"}, {"net", "3V3"}, {"x", 285.0}, {"y", 435.0}}
+                })}
+            },
+            {
+                {"id", "c_c1"},
+                {"reference", "C1"},
+                {"value", "100nF"},
+                {"component_type", "part"},
+                {"footprint", "C0402"},
+                {"unique_id", "uid_c1"},
+                {"x", 600.0},
+                {"y", 785.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "c1_1"}, {"number", "1"}, {"name", "1"}, {"net", "3V3"}, {"x", 600.0}, {"y", 795.0}},
+                    {{"id", "c1_2"}, {"number", "2"}, {"name", "2"}, {"net", "GND"}, {"x", 600.0}, {"y", 775.0}}
+                })}
+            },
+            {
+                {"id", "c_u3_0"},
+                {"reference", "U3_0"},
+                {"value", "INA226"},
+                {"component_type", "part"},
+                {"footprint", "MSOP-10"},
+                {"unique_id", "uid_u3_0"},
+                {"on_active_sheet", false},
+                {"x", 450.0},
+                {"y", 750.0},
+                {"pins", nlohmann::json::array()}
+            }
+        })},
+        {"wires", nlohmann::json::array({
+            {
+                {"id", "e607"},
+                {"net", "VCC"},
+                {"line", nlohmann::json::array({
+                    885.0, 240.0, 865.0, 240.0,
+                    865.0, 220.0, 885.0, 220.0,
+                    885.0, 220.0, 885.0, 240.0,
+                    885.0, 240.0, 885.0, 260.0
+                })}
+            },
+            {
+                {"id", "e609"},
+                {"net", "GND"},
+                {"line", nlohmann::json::array({865.0, 230.0, 845.0, 230.0})}
+            },
+            {
+                {"id", "e545"},
+                {"net", "AIN0"},
+                {"line", nlohmann::json::array({385.0, 795.0, 345.0, 795.0})}
+            },
+            {
+                {"id", "e_alert"},
+                {"net", "ALERT_0"},
+                {"line", nlohmann::json::array({385.0, 775.0, 345.0, 775.0})}
+            }
+        })}
+    };
+
+    nlohmann::json servoRes = acc.calcSchematicErcAudit(servoArgs, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_EQUAL(0, servoRes.value("net_issues_count", -1));
+    CHECK_EQUAL(0, servoRes.value("voltage_domain_issues_count", -1));
+    CHECK_EQUAL(0, servoRes.value("dangling_wires_count", -1));
+    CHECK_EQUAL(0, servoRes.value("unconnected_pins_count", -1));
+    CHECK_EQUAL(0, servoRes.value("single_pin_nets_count", -1));
+    CHECK_EQUAL(0, servoRes.value("pullup_issues_count", -1));
+    CHECK_EQUAL(0, servoRes.value("overlapping_components_count", -1));
+    CHECK_TRUE(servoRes.value("passed", false));
+
+    // 2. Verify backward-compatible parameter aliases across eda_calc_* and cad_calc_*
+    nlohmann::json synthDiv = acc.calcElectricalSynth({
+        {"mode", "voltage_divider"},
+        {"vin_v", 12.0},
+        {"vout_v", 3.3},
+        {"r_series", "E24"}
+    }, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(synthDiv.value("ok", false));
+
+    nlohmann::json synthTrace = acc.calcElectricalSynth({
+        {"mode", "trace_width"},
+        {"current_a", 3.0},
+        {"max_temp_rise_c", 15.0},
+        {"copper_weight_oz", 1.0}
+    }, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(synthTrace.value("ok", false));
+
+    nlohmann::json synthImp = acc.calcElectricalSynth({
+        {"mode", "diff_pair"},
+        {"z_diff_target_ohm", 90.0},
+        {"substrate_height_mm", 0.15}
+    }, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(synthImp.value("ok", false));
+
+    nlohmann::json kinRes = acc.calcRobotKinematicsStatics({
+        {"links", nlohmann::json::array({
+            {{"name", "femur"}, {"length_mm", 90.0}, {"mass_g", 85.0}, {"joint_angle_deg", 15.0}}
+        })},
+        {"payload_g", 150.0}
+    }, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(kinRes.value("ok", false));
+
+    nlohmann::json mechRes = acc.calcMechanismSynth({
+        {"mechanism_type", "four_bar_linkage"},
+        {"ground_length_mm", 40.0},
+        {"crank_length_mm", 15.0},
+        {"coupler_length_mm", 35.0},
+        {"rocker_length_mm", 30.0}
+    }, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(mechRes.value("ok", false));
+}
+
 
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {

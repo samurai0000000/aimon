@@ -179,10 +179,10 @@ nlohmann::json EdaAccelerators::calcSchematicLayout(const nlohmann::json& args,
     for (const auto& c : args["components"]) {
         if (!c.is_object()) continue;
         CompNode node;
-        node.ref = c.value("reference", "U" + std::to_string(nodes.size() + 1));
+        node.ref = c.value("reference", c.value("ref", "U" + std::to_string(nodes.size() + 1)));
         node.category = c.value("category", "mcu");
-        node.widthMm = snapTo50Mil(std::max(5.08, c.value("width_mm", 10.16)));
-        node.heightMm = snapTo50Mil(std::max(5.08, c.value("height_mm", 10.16)));
+        node.widthMm = snapTo50Mil(std::max(5.08, c.value("width_mm", c.value("width", 10.16))));
+        node.heightMm = snapTo50Mil(std::max(5.08, c.value("height_mm", c.value("height", 10.16))));
         node.rank = layerPriorityForCategory(node.category);
 
         if (c.contains("pins") && c["pins"].is_array()) {
@@ -191,8 +191,8 @@ nlohmann::json EdaAccelerators::calcSchematicLayout(const nlohmann::json& args,
                 PinSpec ps;
                 ps.number = p.value("number", "1");
                 ps.name = p.value("name", ps.number);
-                ps.dxMm = snapTo50Mil(p.value("dx_mm", 0.0));
-                ps.dyMm = snapTo50Mil(p.value("dy_mm", 0.0));
+                ps.dxMm = snapTo50Mil(p.value("dx_mm", p.value("dx", 0.0)));
+                ps.dyMm = snapTo50Mil(p.value("dy_mm", p.value("dy", 0.0)));
                 node.pins.push_back(ps);
             }
         }
@@ -214,9 +214,16 @@ nlohmann::json EdaAccelerators::calcSchematicLayout(const nlohmann::json& args,
     std::vector<std::vector<size_t>> adj(nodes.size());
     if (args.contains("nets") && args["nets"].is_array()) {
         for (const auto& net : args["nets"]) {
-            if (!net.is_object() || !net.contains("connections") || !net["connections"].is_array()) continue;
+            if (!net.is_object()) continue;
+            const nlohmann::json* connArrPtr = nullptr;
+            if (net.contains("connections") && net["connections"].is_array()) {
+                connArrPtr = &net["connections"];
+            } else if (net.contains("pins") && net["pins"].is_array()) {
+                connArrPtr = &net["pins"];
+            }
+            if (connArrPtr == nullptr) continue;
             std::vector<size_t> connectedComps;
-            for (const auto& conn : net["connections"]) {
+            for (const auto& conn : *connArrPtr) {
                 if (!conn.is_string()) continue;
                 std::string s = conn.get<std::string>();
                 size_t dot = s.find('.');
@@ -419,10 +426,17 @@ nlohmann::json EdaAccelerators::calcSchematicLayout(const nlohmann::json& args,
 
     if (args.contains("nets") && args["nets"].is_array()) {
         for (const auto& net : args["nets"]) {
-            if (!net.is_object() || !net.contains("connections") || !net["connections"].is_array()) continue;
+            if (!net.is_object()) continue;
+            const nlohmann::json* connArrPtr = nullptr;
+            if (net.contains("connections") && net["connections"].is_array()) {
+                connArrPtr = &net["connections"];
+            } else if (net.contains("pins") && net["pins"].is_array()) {
+                connArrPtr = &net["pins"];
+            }
+            if (connArrPtr == nullptr) continue;
             std::string netName = net.value("name", "NET");
             std::vector<GridPt> netPins;
-            for (const auto& conn : net["connections"]) {
+            for (const auto& conn : *connArrPtr) {
                 if (!conn.is_string()) continue;
                 auto it = pinGridLookup.find(conn.get<std::string>());
                 if (it != pinGridLookup.end()) {
@@ -493,9 +507,9 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
     double boardH = 40.0;
     double clearanceMm = 0.5;
     if (args.contains("board") && args["board"].is_object()) {
-        boardW = std::max(10.0, args["board"].value("width_mm", 60.0));
-        boardH = std::max(10.0, args["board"].value("height_mm", 40.0));
-        clearanceMm = std::max(0.1, args["board"].value("clearance_mm", 0.5));
+        boardW = std::max(10.0, args["board"].value("width_mm", args["board"].value("width", 60.0)));
+        boardH = std::max(10.0, args["board"].value("height_mm", args["board"].value("height", 40.0)));
+        clearanceMm = std::max(0.1, args["board"].value("clearance_mm", args["board"].value("clearance", 0.5)));
     }
 
     struct PcbItem {
@@ -517,20 +531,20 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
         const auto& c = args["components"][i];
         if (!c.is_object()) continue;
         PcbItem item;
-        item.ref = c.value("reference", "U" + std::to_string(i + 1));
-        item.w = std::max(0.5, c.value("width_mm", 3.0));
-        item.h = std::max(0.5, c.value("height_mm", 3.0));
+        item.ref = c.value("reference", c.value("ref", "U" + std::to_string(i + 1)));
+        item.w = std::max(0.5, c.value("width_mm", c.value("width", 3.0)));
+        item.h = std::max(0.5, c.value("height_mm", c.value("height", 3.0)));
         item.fixed = c.value("fixed", false);
         item.layer = c.value("layer", "F.Cu");
-        item.rotDeg = c.value("rotation_deg", 0);
+        item.rotDeg = c.value("rotation_deg", c.value("rotation", 0));
         item.decouplesRef = c.value("decouples", "");
 
         int r = static_cast<int>(i) / cols;
         int col = static_cast<int>(i) % cols;
         double initX = (col + 1) * (boardW / (cols + 1));
         double initY = (r + 1) * (boardH / (cols + 1));
-        item.x = c.value("x_mm", initX);
-        item.y = c.value("y_mm", initY);
+        item.x = c.value("x_mm", c.value("x", initX));
+        item.y = c.value("y_mm", c.value("y", initY));
         refIdx[item.ref] = items.size();
         items.push_back(item);
     }
@@ -538,9 +552,16 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
     std::vector<std::vector<size_t>> netLists;
     if (args.contains("nets") && args["nets"].is_array()) {
         for (const auto& net : args["nets"]) {
-            if (!net.is_object() || !net.contains("pins") || !net["pins"].is_array()) continue;
+            if (!net.is_object()) continue;
+            const nlohmann::json* pinArrPtr = nullptr;
+            if (net.contains("pins") && net["pins"].is_array()) {
+                pinArrPtr = &net["pins"];
+            } else if (net.contains("connections") && net["connections"].is_array()) {
+                pinArrPtr = &net["connections"];
+            }
+            if (pinArrPtr == nullptr) continue;
             std::vector<size_t> members;
-            for (const auto& p : net["pins"]) {
+            for (const auto& p : *pinArrPtr) {
                 if (!p.is_string()) continue;
                 std::string s = p.get<std::string>();
                 size_t dot = s.find('.');
@@ -772,21 +793,21 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         }
     }
 
-    double trackWidthMm = 0.25;
-    double clearanceMm = 0.20;
-    double viaSizeMm = 0.60;
-    double viaDrillMm = 0.30;
-    double gridMm = std::clamp(_config.autorouteGridMm, 0.10, 1.0);
+    double trackWidthMm = std::max(0.08, args.value("track_width_mm", 0.25));
+    double clearanceMm = std::max(0.08, args.value("clearance_mm", 0.20));
+    double viaSizeMm = std::max(0.25, args.value("via_size_mm", args.value("via_diameter_mm", 0.60)));
+    double viaDrillMm = std::max(0.12, args.value("via_drill_mm", 0.30));
+    double gridMm = std::clamp(args.value("grid_step_mm", _config.autorouteGridMm), 0.10, 1.0);
     int maxPasses = std::clamp(_config.autorouteMaxRipupPasses, 1, 50);
     if (args.contains("max_ripup_passes") && args["max_ripup_passes"].is_number_integer()) {
         maxPasses = std::clamp(args["max_ripup_passes"].get<int>(), 1, 50);
     }
     if (args.contains("rules") && args["rules"].is_object()) {
         const auto& r = args["rules"];
-        trackWidthMm = std::max(0.08, r.value("track_width_mm", 0.25));
-        clearanceMm = std::max(0.08, r.value("clearance_mm", 0.20));
-        viaSizeMm = std::max(0.25, r.value("via_size_mm", 0.60));
-        viaDrillMm = std::max(0.12, r.value("via_drill_mm", 0.30));
+        trackWidthMm = std::max(0.08, r.value("track_width_mm", trackWidthMm));
+        clearanceMm = std::max(0.08, r.value("clearance_mm", clearanceMm));
+        viaSizeMm = std::max(0.25, r.value("via_size_mm", r.value("via_diameter_mm", viaSizeMm)));
+        viaDrillMm = std::max(0.12, r.value("via_drill_mm", viaDrillMm));
         if (r.contains("grid_step_mm") && r["grid_step_mm"].is_number()) {
             gridMm = std::clamp(r["grid_step_mm"].get<double>(), 0.10, 1.0);
         }
@@ -1476,12 +1497,16 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
         return {{"ok", false}, {"error", outSummary}};
     }
 
-    std::string mode = args.value("mode", "divider");
+    std::string rawMode = args.value("mode", "divider");
+    std::string mode = rawMode;
+    if (mode == "voltage_divider") mode = "divider";
+    else if (mode == "trace_width") mode = "ipc2152";
+    else if (mode == "microstrip" || mode == "diff_pair") mode = "impedance";
 
     if (mode == "divider" || mode == "feedback" || mode == "rc_filter") {
         double vin = args.value("vin_v", 5.0);
-        double voutTarget = args.value("vout_target_v", 3.3);
-        std::string series = args.value("series", "E24");
+        double voutTarget = args.value("vout_target_v", args.value("vout_v", 3.3));
+        std::string series = args.value("series", args.value("r_series", "E24"));
         if (vin <= 0.0 || voutTarget <= 0.0 || voutTarget >= vin) {
             outSuccess = false;
             outSummary = "Invalid divider voltages (require 0 < vout_target_v < vin_v)";
@@ -1538,9 +1563,9 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
 
     if (mode == "ipc2152") {
         double currentA = std::max(0.05, args.value("current_a", 1.0));
-        double tempRiseC = std::max(5.0, args.value("temp_rise_c", 20.0));
-        double copperOz = std::max(0.5, args.value("copper_oz", _config.defaultCopperWeightOz));
-        double lengthMm = std::max(1.0, args.value("length_mm", 25.0));
+        double tempRiseC = std::max(5.0, args.value("temp_rise_c", args.value("max_temp_rise_c", 20.0)));
+        double copperOz = std::max(0.5, args.value("copper_oz", args.value("copper_weight_oz", _config.defaultCopperWeightOz)));
+        double lengthMm = std::max(1.0, args.value("length_mm", args.value("trace_length_mm", 25.0)));
 
         // IPC-2152 / IPC-2221 analytical cross-sectional area in sq mils: I = k * dT^0.44 * A^0.725
         double areaExtMils2 = std::pow(currentA / (0.048 * std::pow(tempRiseC, 0.44)), 1.0 / 0.725);
@@ -1571,9 +1596,12 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
     }
 
     if (mode == "impedance") {
-        std::string type = args.value("type", "microstrip");
-        double targetZ = std::max(20.0, args.value("target_z_ohm", 50.0));
-        double hMm = std::max(0.05, args.value("dielectric_h_mm", 0.15));
+        std::string type = args.value("type", (rawMode == "diff_pair") ? "diff_microstrip" : "microstrip");
+        if (type == "diff_pair") type = "diff_microstrip";
+        double targetZ = std::max(20.0, args.value("target_z_ohm",
+                                        args.value("z0_target_ohm",
+                                        args.value("z_diff_target_ohm", (type == "diff_microstrip") ? 90.0 : 50.0))));
+        double hMm = std::max(0.05, args.value("dielectric_h_mm", args.value("substrate_height_mm", 0.15)));
         double er = std::max(2.0, args.value("er", 4.4));
         double sMm = std::max(0.08, args.value("spacing_mm", 0.15));
         double tMm = 0.035;
@@ -1621,8 +1649,12 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
             for (const auto& r : args["rails"]) {
                 if (!r.is_object()) continue;
                 std::string rName = r.value("name", "VCC");
-                double v = r.value("voltage_v", 3.3);
-                double iA = r.value("current_a", 0.5);
+                double v = r.value("voltage_v", r.value("voltage", r.value("v", 3.3)));
+                double iA = r.contains("current_a")
+                    ? r.value("current_a", 0.5)
+                    : (r.contains("max_current_a")
+                        ? r.value("max_current_a", 0.5)
+                        : (r.contains("current_ma") ? (r.value("current_ma", 500.0) / 1000.0) : 0.5));
                 int pins = std::max(1, r.value("ic_power_pins", 2));
                 totalPowerW += v * iA;
                 bom.push_back({
@@ -1641,6 +1673,7 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
             {"mode", "power_budget"},
             {"total_power_w", totalPowerW},
             {"decoupling_bom", bom},
+            {"rails", bom},
             {"summary", outSummary}
         };
     }
@@ -1672,13 +1705,21 @@ nlohmann::json EdaAccelerators::calcRobotKinematicsStatics(const nlohmann::json&
         if (!l.is_object()) continue;
         LinkSpec ls;
         ls.name = l.value("name", "link_" + std::to_string(links.size() + 1));
-        ls.lengthM = std::max(0.005, l.value("length_m", 0.10));
-        ls.massKg = std::max(0.001, l.value("mass_kg", 0.10));
-        ls.angleDeg = l.value("angle_deg", 0.0);
+        double lenM = l.contains("length_m")
+            ? l.value("length_m", 0.10)
+            : (l.contains("length_mm") ? (l.value("length_mm", 100.0) / 1000.0) : 0.10);
+        double mKg = l.contains("mass_kg")
+            ? l.value("mass_kg", 0.10)
+            : (l.contains("mass_g") ? (l.value("mass_g", 100.0) / 1000.0) : 0.10);
+        ls.lengthM = std::max(0.005, lenM);
+        ls.massKg = std::max(0.001, mKg);
+        ls.angleDeg = l.value("angle_deg", l.value("joint_angle_deg", 0.0));
         links.push_back(ls);
     }
 
-    double payloadKg = std::max(0.0, args.value("payload_kg", 0.10));
+    double payloadKg = args.contains("payload_kg")
+        ? std::max(0.0, args.value("payload_kg", 0.10))
+        : (args.contains("payload_g") ? std::max(0.0, args.value("payload_g", 100.0) / 1000.0) : 0.10);
     double dynFactor = std::max(1.0, args.value("dynamic_factor", 1.35));
     double stallTorqueKgCm = std::max(0.5, args.value("servo_stall_torque_kgcm", 20.0));
     double stallTorqueNm = stallTorqueKgCm * 0.0980665;
@@ -1767,15 +1808,17 @@ nlohmann::json EdaAccelerators::calcMechanismSynth(const nlohmann::json& args,
         return {{"ok", false}, {"error", outSummary}};
     }
 
-    std::string type = args.value("type", "spur_gear");
+    std::string type = args.value("type", args.value("mechanism_type", "spur_gear"));
+    if (type == "four_bar_linkage") type = "four_bar";
+    else if (type == "planetary_gear") type = "planetary";
     double clearanceMm = std::max(0.02, args.value("clearance_mm", 0.20));
     double pressureAngleDeg = args.value("pressure_angle_deg", _config.defaultGearPressureAngleDeg);
     double alphaRad = pressureAngleDeg * (kPi / 180.0);
 
     if (type == "spur_gear" || type == "planetary") {
         double modMm = std::max(0.3, args.value("module_mm", 1.0));
-        int zSun = args.value("sun_teeth", args.value("teeth_1", 16));
-        int zPlanet = args.value("planet_teeth", args.value("teeth_2", 16));
+        int zSun = args.value("sun_teeth", args.value("teeth_1", args.value("teeth", 16)));
+        int zPlanet = args.value("planet_teeth", args.value("teeth_2", args.value("teeth", 16)));
         double thicknessMm = std::max(1.0, args.value("thickness_mm", 6.0));
 
         if (zSun < 6 || zPlanet < 6) {
@@ -1876,10 +1919,10 @@ nlohmann::json EdaAccelerators::calcMechanismSynth(const nlohmann::json& args,
     }
 
     if (type == "four_bar") {
-        double g = args.value("ground_mm", 40.0);
-        double a = args.value("crank_mm", 15.0);
-        double b = args.value("coupler_mm", 35.0);
-        double c = args.value("rocker_mm", 30.0);
+        double g = args.value("ground_mm", args.value("ground_length_mm", 40.0));
+        double a = args.value("crank_mm", args.value("crank_length_mm", 15.0));
+        double b = args.value("coupler_mm", args.value("coupler_length_mm", 35.0));
+        double c = args.value("rocker_mm", args.value("rocker_length_mm", 30.0));
         std::vector<double> lengths = {g, a, b, c};
         std::sort(lengths.begin(), lengths.end());
         double s = lengths[0];
@@ -1934,14 +1977,42 @@ nlohmann::json EdaAccelerators::calcPrintOrientationDfm(const nlohmann::json& ar
         sigmaZMpa = 38.0;
     }
 
-    double areaMm2 = std::max(10.0, args.value("cross_section_mm2", 120.0));
-    double secModMm3 = std::max(20.0, args.value("section_modulus_mm3", 250.0));
+    double defaultAreaMm2 = 120.0;
+    double defaultSecModMm3 = 250.0;
+    if (args.contains("bbox_mm")) {
+        double bx = 20.0, by = 10.0;
+        if (args["bbox_mm"].is_array() && args["bbox_mm"].size() >= 2 &&
+            args["bbox_mm"][0].is_number() && args["bbox_mm"][1].is_number()) {
+            bx = std::max(2.0, args["bbox_mm"][0].get<double>());
+            by = std::max(2.0, args["bbox_mm"][1].get<double>());
+        } else if (args["bbox_mm"].is_object()) {
+            bx = std::max(2.0, args["bbox_mm"].value("x", 20.0));
+            by = std::max(2.0, args["bbox_mm"].value("y", 10.0));
+        }
+        defaultAreaMm2 = std::max(10.0, bx * by * 0.25);
+        defaultSecModMm3 = std::max(20.0, (bx * by * by) / 12.0);
+    }
+    double areaMm2 = std::max(10.0, args.value("cross_section_mm2", defaultAreaMm2));
+    double secModMm3 = std::max(20.0, args.value("section_modulus_mm3", defaultSecModMm3));
 
     double fx = 0.0, fy = 0.0, fz = 50.0;
     if (args.contains("load_vector_n") && args["load_vector_n"].is_object()) {
         fx = args["load_vector_n"].value("fx", 0.0);
         fy = args["load_vector_n"].value("fy", 0.0);
         fz = args["load_vector_n"].value("fz", 50.0);
+    } else if (args.contains("load_cases") && args["load_cases"].is_array() && !args["load_cases"].empty()) {
+        const auto& lc = args["load_cases"][0];
+        if (lc.is_object()) {
+            if (lc.contains("force_n") && lc["force_n"].is_array() && lc["force_n"].size() >= 3) {
+                fx = lc["force_n"][0].is_number() ? lc["force_n"][0].get<double>() : 0.0;
+                fy = lc["force_n"][1].is_number() ? lc["force_n"][1].get<double>() : 0.0;
+                fz = lc["force_n"][2].is_number() ? lc["force_n"][2].get<double>() : 50.0;
+            } else {
+                fx = lc.value("fx", 0.0);
+                fy = lc.value("fy", 0.0);
+                fz = lc.value("fz", 50.0);
+            }
+        }
     }
     double mx = 1.0, my = 0.0, mz = 0.0;
     if (args.contains("moment_vector_nm") && args["moment_vector_nm"].is_object()) {
@@ -2886,6 +2957,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         bool touchesWire = false;
     };
 
+    const double kTol = std::max(1e-3, args.value("tolerance", 1.5));
     std::vector<SchWire> wires;
     bool anyWireVertex = false;
     bool allWireYNonNegative = true;
@@ -2893,9 +2965,9 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
     if (args.contains("wires") && args["wires"].is_array()) {
         for (const auto& w : args["wires"]) {
             if (!w.is_object()) continue;
-            SchWire sw;
-            sw.id = w.value("id", "w_" + std::to_string(wires.size() + 1));
-            sw.net = w.value("net", "");
+            std::string wId = w.value("id", "w_" + std::to_string(wires.size() + 1));
+            std::string wNet = w.value("net", "");
+            std::vector<std::pair<double, double>> rawPts;
             for (const char* lineKey : {"line", "points"}) {
                 if (w.contains(lineKey) && w[lineKey].is_array()) {
                     const auto& arr = w[lineKey];
@@ -2904,7 +2976,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
                             if (arr[i].is_number() && arr[i + 1].is_number()) {
                                 double wx = arr[i].get<double>();
                                 double wy = arr[i + 1].get<double>();
-                                sw.pts.push_back({wx, wy});
+                                rawPts.push_back({wx, wy});
                                 anyWireVertex = true;
                                 if (wy < 0.0) allWireYNonNegative = false;
                             }
@@ -2914,35 +2986,115 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
                             if (pt.is_array() && pt.size() >= 2 && pt[0].is_number() && pt[1].is_number()) {
                                 double wx = pt[0].get<double>();
                                 double wy = pt[1].get<double>();
-                                sw.pts.push_back({wx, wy});
+                                rawPts.push_back({wx, wy});
                                 anyWireVertex = true;
                                 if (wy < 0.0) allWireYNonNegative = false;
                             } else if (pt.is_object() && pt.contains("x") && pt.contains("y") &&
                                        pt["x"].is_number() && pt["y"].is_number()) {
                                 double wx = pt["x"].get<double>();
                                 double wy = pt["y"].get<double>();
-                                sw.pts.push_back({wx, wy});
+                                rawPts.push_back({wx, wy});
                                 anyWireVertex = true;
                                 if (wy < 0.0) allWireYNonNegative = false;
                             }
                         }
                     }
-                    if (!sw.pts.empty()) break;
+                    if (!rawPts.empty()) break;
                 }
             }
-            if (sw.pts.empty() && w.contains("x1") && w.contains("y1") &&
+            if (rawPts.empty() && w.contains("x1") && w.contains("y1") &&
                 w.contains("x2") && w.contains("y2")) {
                 double x1 = w.value("x1", 0.0);
                 double y1 = w.value("y1", 0.0);
                 double x2 = w.value("x2", 0.0);
                 double y2 = w.value("y2", 0.0);
-                sw.pts.push_back({x1, y1});
-                sw.pts.push_back({x2, y2});
+                rawPts.push_back({x1, y1});
+                rawPts.push_back({x2, y2});
                 anyWireVertex = true;
                 if (y1 < 0.0 || y2 < 0.0) allWireYNonNegative = false;
             }
-            if (sw.pts.size() >= 2) {
-                wires.push_back(sw);
+            if (rawPts.size() >= 4 && rawPts.size() % 2 == 0) {
+                bool allPairsOrtho = true;
+                for (size_t k = 0; k + 1 < rawPts.size(); k += 2) {
+                    if (std::fabs(rawPts[k].first - rawPts[k + 1].first) > kTol &&
+                        std::fabs(rawPts[k].second - rawPts[k + 1].second) > kTol) {
+                        allPairsOrtho = false;
+                        break;
+                    }
+                }
+                bool anyOddToEvenNonOrtho = false;
+                for (size_t k = 1; k + 1 < rawPts.size(); k += 2) {
+                    if (std::fabs(rawPts[k].first - rawPts[k + 1].first) > kTol &&
+                        std::fabs(rawPts[k].second - rawPts[k + 1].second) > kTol) {
+                        anyOddToEvenNonOrtho = true;
+                        break;
+                    }
+                }
+                bool hasRepeatedVertex = false;
+                for (size_t a = 0; a < rawPts.size() && !hasRepeatedVertex; ++a) {
+                    for (size_t b = a + 1; b < rawPts.size(); ++b) {
+                        if (std::hypot(rawPts[a].first - rawPts[b].first,
+                                       rawPts[a].second - rawPts[b].second) <= kTol) {
+                            hasRepeatedVertex = true;
+                            break;
+                        }
+                    }
+                }
+                if (allPairsOrtho && (anyOddToEvenNonOrtho || hasRepeatedVertex)) {
+                    for (size_t k = 0; k + 1 < rawPts.size(); k += 2) {
+                        SchWire sw;
+                        sw.id = wId;
+                        sw.net = wNet;
+                        sw.pts = {rawPts[k], rawPts[k + 1]};
+                        wires.push_back(std::move(sw));
+                    }
+                    continue;
+                }
+            }
+            if (rawPts.size() > 2) {
+                std::vector<std::pair<double, double>> curSeg = {rawPts[0]};
+                for (size_t k = 1; k < rawPts.size(); ++k) {
+                    double dx = std::fabs(rawPts[k].first - curSeg.back().first);
+                    double dy = std::fabs(rawPts[k].second - curSeg.back().second);
+                    if (dx > kTol && dy > kTol) {
+                        if (curSeg.size() >= 2) {
+                            SchWire sw;
+                            sw.id = wId;
+                            sw.net = wNet;
+                            sw.pts = std::move(curSeg);
+                            wires.push_back(std::move(sw));
+                        }
+                        curSeg = {rawPts[k]};
+                    } else {
+                        curSeg.push_back(rawPts[k]);
+                    }
+                }
+                if (curSeg.size() >= 2) {
+                    SchWire sw;
+                    sw.id = wId;
+                    sw.net = wNet;
+                    sw.pts = std::move(curSeg);
+                    wires.push_back(std::move(sw));
+                }
+            } else if (rawPts.size() >= 2) {
+                SchWire sw;
+                sw.id = wId;
+                sw.net = wNet;
+                sw.pts = std::move(rawPts);
+                wires.push_back(std::move(sw));
+            }
+        }
+    }
+
+    bool isMultiSheetSchematic = false;
+    if (args.contains("project") && args["project"].is_object() &&
+        args["project"].contains("data") && args["project"]["data"].is_array()) {
+        for (const auto& dItem : args["project"]["data"]) {
+            if (dItem.is_object() && dItem.contains("schematic") &&
+                dItem["schematic"].is_object() && dItem["schematic"].contains("page") &&
+                dItem["schematic"]["page"].is_array() && dItem["schematic"]["page"].size() > 1) {
+                isMultiSheetSchematic = true;
+                break;
             }
         }
     }
@@ -2971,6 +3123,10 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
     if (args.contains("components") && args["components"].is_array()) {
         for (const auto& c : args["components"]) {
             if (!c.is_object()) continue;
+            bool onActiveSheet = c.value("on_active_sheet", true);
+            if (!onActiveSheet) {
+                isMultiSheetSchematic = true;
+            }
             std::string cid = c.value("id", "");
             std::string ref = c.value("reference", c.value("ref", c.value("designator", "")));
             std::string val = c.value("value", c.value("name", ""));
@@ -2981,7 +3137,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
             double cy = c.value("y", 0.0);
             double normCy = (cy < 0.0 && anyWireVertex && allWireYNonNegative) ? std::fabs(cy) : cy;
 
-            bool isFrame = (compType == "frame" || ref.rfind("FRAME", 0) == 0);
+            bool isFrame = (compType == "frame" || compType == "sheet" || ref.rfind("FRAME", 0) == 0);
             if (isFrame) continue;
 
             bool isNetFlag = (compType == "netflag" || compType == "netport" ||
@@ -3029,6 +3185,8 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
                     });
                 }
             }
+
+            if (!onActiveSheet) continue;
 
             std::vector<size_t> thisCompPins;
             if (c.contains("pins") && c["pins"].is_array() && !c["pins"].empty()) {
@@ -3090,12 +3248,14 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
                 pc.normY = normCy;
                 pc.pinIndices = thisCompPins;
 
+                bool hasValidBbox = false;
                 if (c.contains("bbox") && c["bbox"].is_object()) {
                     const auto& bb = c["bbox"];
                     pc.minX = bb.value("min_x", bb.value("x1", cx - 20.0));
                     pc.minY = bb.value("min_y", bb.value("y1", normCy - 20.0));
                     pc.maxX = bb.value("max_x", bb.value("x2", cx + 20.0));
                     pc.maxY = bb.value("max_y", bb.value("y2", normCy + 20.0));
+                    hasValidBbox = true;
                 } else if (c.contains("width") && c["width"].is_number() &&
                            c.contains("height") && c["height"].is_number()) {
                     double w = std::max(0.0, c["width"].get<double>());
@@ -3108,6 +3268,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
                     pc.maxX = cx + w * 0.5;
                     pc.minY = normCy - h * 0.5;
                     pc.maxY = normCy + h * 0.5;
+                    hasValidBbox = true;
                 } else if (thisCompPins.size() >= 2) {
                     pc.minX = pins[thisCompPins[0]].x;
                     pc.maxX = pins[thisCompPins[0]].x;
@@ -3127,13 +3288,11 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
                         pc.minY -= 5.0;
                         pc.maxY += 5.0;
                     }
-                } else {
-                    pc.minX = cx - 15.0;
-                    pc.maxX = cx + 15.0;
-                    pc.minY = normCy - 15.0;
-                    pc.maxY = normCy + 15.0;
+                    hasValidBbox = true;
                 }
-                partComps.push_back(std::move(pc));
+                if (hasValidBbox) {
+                    partComps.push_back(std::move(pc));
+                }
             }
         }
     }
@@ -3165,7 +3324,6 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         }
     }
 
-    const double kTol = std::max(1e-3, args.value("tolerance", 1.5));
     size_t nW = wires.size();
     size_t nP = pins.size();
     size_t totalNodes = nW + nP;
@@ -3212,14 +3370,16 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         return false;
     };
 
-    // 1. Wire-to-Wire union (shared vertices and T-junction mid-segment landings)
+    // 1. Wire-to-Wire union (shared vertices, T-junction mid-segment landings, or same primitive ID)
     for (size_t i = 0; i < nW; ++i) {
         for (size_t j = i + 1; j < nW; ++j) {
-            bool touches = false;
-            for (const auto& pt : wires[i].pts) {
-                if (pointTouchesWire(pt.first, pt.second, wires[j])) {
-                    touches = true;
-                    break;
+            bool touches = (!wires[i].id.empty() && wires[i].id == wires[j].id);
+            if (!touches) {
+                for (const auto& pt : wires[i].pts) {
+                    if (pointTouchesWire(pt.first, pt.second, wires[j])) {
+                        touches = true;
+                        break;
+                    }
                 }
             }
             if (!touches) {
@@ -3237,11 +3397,13 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
     }
 
     // 2. Pin-to-Wire union
+    std::map<std::string, bool> wireTouchesPin;
     for (size_t p = 0; p < nP; ++p) {
         for (size_t w = 0; w < nW; ++w) {
             if (pinMatchesWire(pins[p], wires[w])) {
                 ufUnion(nW + p, w);
                 pins[p].touchesWire = true;
+                wireTouchesPin[wires[w].id] = true;
             }
         }
     }
@@ -3263,6 +3425,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         std::vector<size_t> netFlagPinIndices;
         std::set<std::string> netFlagNames;
         std::set<std::string> explicitNetNames;
+        bool hasNamedWire = false;
     };
     std::map<size_t, IslandData> islands;
     for (size_t w = 0; w < nW; ++w) {
@@ -3270,6 +3433,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         islands[r].wireIndices.push_back(w);
         if (!wires[w].net.empty()) {
             islands[r].explicitNetNames.insert(wires[w].net);
+            islands[r].hasNamedWire = true;
         }
     }
     for (size_t p = 0; p < nP; ++p) {
@@ -3289,16 +3453,20 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         }
     }
 
-    // Count global occurrences of each explicit net name across part pins / netflags
+    // Count global occurrences of each explicit net name across part pins / netflags / named wires
     std::map<std::string, int> globalNetPinCount;
     std::map<std::string, std::vector<size_t>> globalNetPartPins;
     std::map<std::string, int> globalNetFlagCount;
+    std::map<std::string, int> globalNetNamedWireCount;
     for (const auto& kv : islands) {
         const auto& isl = kv.second;
         int pinCount = static_cast<int>(isl.partPinIndices.size() + isl.netFlagPinIndices.size());
         for (const auto& netName : isl.explicitNetNames) {
             globalNetPinCount[netName] += pinCount;
             globalNetFlagCount[netName] += static_cast<int>(isl.netFlagPinIndices.size());
+            if (isl.hasNamedWire) {
+                globalNetNamedWireCount[netName] += 1;
+            }
             for (size_t pIdx : isl.partPinIndices) {
                 if (!pins[pIdx].noConnected) {
                     globalNetPartPins[netName].push_back(pIdx);
@@ -3405,6 +3573,8 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         return isGnd;
     };
 
+    const bool isPartialCompSubset = args.value("_partial_component_subset", false);
+
     // 4. Identify unconnected part pins
     nlohmann::json unconnectedPinsJson = nlohmann::json::array();
     for (size_t p = 0; p < nP; ++p) {
@@ -3413,13 +3583,16 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         size_t r = ufFind(nW + p);
         const auto& isl = islands[r];
         size_t totalIslandPins = isl.partPinIndices.size() + isl.netFlagPinIndices.size();
-        bool connectedByNetName = false;
-        for (const auto& netName : isl.explicitNetNames) {
-            if (!netName.empty() && (globalNetPinCount[netName] >= 2 ||
-                                     !isl.netFlagPinIndices.empty() ||
-                                     isSupplyOrGroundNet(netName))) {
-                connectedByNetName = true;
-                break;
+        bool connectedByNetName = isl.hasNamedWire || (isPartialCompSubset && pin.touchesWire);
+        if (!connectedByNetName) {
+            for (const auto& netName : isl.explicitNetNames) {
+                if (!netName.empty() && (globalNetPinCount[netName] >= 2 ||
+                                         !isl.netFlagPinIndices.empty() ||
+                                         isSupplyOrGroundNet(netName) ||
+                                         isPartialCompSubset)) {
+                    connectedByNetName = true;
+                    break;
+                }
             }
         }
         if (totalIslandPins < 2 && !connectedByNetName) {
@@ -3437,7 +3610,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
 
     // 5. Identify dangling wires
     nlohmann::json danglingWiresJson = nlohmann::json::array();
-    for (size_t w = 0; w < nW; ++w) {
+    for (size_t w = 0; !isPartialCompSubset && w < nW; ++w) {
         const auto& wire = wires[w];
         size_t r = ufFind(w);
         const auto& isl = islands[r];
@@ -3473,7 +3646,8 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
             }
         }
 
-        if (totalIslandPins < 2 || anchoredEps < 2) {
+        bool isNamedNetStub = !wire.net.empty() && wireTouchesPin[wire.id] && anchoredEps >= 1;
+        if ((totalIslandPins < 2 && !isNamedNetStub) || (anchoredEps < 2 && !isNamedNetStub)) {
             danglingWiresJson.push_back({
                 {"wire_id", wire.id},
                 {"net", wire.net},
@@ -3491,6 +3665,9 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
     int powerShortsCount = 0;
     int autoNetIdx = 1;
     std::vector<std::string> pinResolvedNet(nP, "");
+
+    std::map<std::string, nlohmann::json> mergedInferredNets;
+    std::vector<std::string> inferredNetOrder;
 
     for (const auto& kv : islands) {
         const auto& isl = kv.second;
@@ -3546,39 +3723,54 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         }
 
         if (!isl.partPinIndices.empty() && !resolvedNet.empty()) {
-            inferredNetsJson.push_back({
-                {"name", resolvedNet},
-                {"pins", pinRefsJson}
-            });
+            auto it = mergedInferredNets.find(resolvedNet);
+            if (it == mergedInferredNets.end()) {
+                inferredNetOrder.push_back(resolvedNet);
+                mergedInferredNets[resolvedNet] = pinRefsJson;
+            } else {
+                for (const auto& pr : pinRefsJson) {
+                    it->second.push_back(pr);
+                }
+            }
         }
+    }
+
+    for (const auto& nName : inferredNetOrder) {
+        inferredNetsJson.push_back({
+            {"name", nName},
+            {"pins", mergedInferredNets[nName]}
+        });
     }
 
     // 7. Semantic Layer 2a: Single-pin signal nets across the schematic
     nlohmann::json singlePinNetsJson = nlohmann::json::array();
-    for (const auto& kv : globalNetPartPins) {
-        const std::string& netName = kv.first;
-        const auto& pList = kv.second;
-        if (netName.empty() || netName.rfind("$NET_", 0) == 0) continue;
-        if (isSupplyOrGroundNet(netName)) continue;
-        if (globalNetFlagCount[netName] > 0) continue;
-        if (pList.size() == 1) {
-            const auto& sp = pins[pList[0]];
-            singlePinNetsJson.push_back({
-                {"net", netName},
-                {"reference", sp.ref},
-                {"pin_number", sp.number},
-                {"pin_name", sp.name},
-                {"x", sp.x},
-                {"y", sp.normY},
-                {"pin", {
-                    {"id", sp.id},
+    if (!isPartialCompSubset) {
+        for (const auto& kv : globalNetPartPins) {
+            const std::string& netName = kv.first;
+            const auto& pList = kv.second;
+            if (netName.empty() || netName.rfind("$NET_", 0) == 0) continue;
+            if (isSupplyOrGroundNet(netName)) continue;
+            if (globalNetFlagCount[netName] > 0) continue;
+            if (isMultiSheetSchematic && globalNetNamedWireCount[netName] > 0) continue;
+            if (pList.size() == 1) {
+                const auto& sp = pins[pList[0]];
+                singlePinNetsJson.push_back({
+                    {"net", netName},
                     {"reference", sp.ref},
                     {"pin_number", sp.number},
                     {"pin_name", sp.name},
                     {"x", sp.x},
-                    {"y", sp.normY}
-                }}
-            });
+                    {"y", sp.normY},
+                    {"pin", {
+                        {"id", sp.id},
+                        {"reference", sp.ref},
+                        {"pin_number", sp.number},
+                        {"pin_name", sp.name},
+                        {"x", sp.x},
+                        {"y", sp.normY}
+                    }}
+                });
+            }
         }
     }
 
@@ -3639,12 +3831,14 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         return std::isdigit(static_cast<unsigned char>(nextCh)) || nextCh == '?' || nextCh == '_';
     };
 
-    // Identify nets that have a pull-up resistor (R*) to a positive supply rail
+    // Identify nets that have a pull-up resistor (R*, RN*, RP*, RB*, RA*) to a positive supply rail
     // and positive supply rails that have a decoupling capacitor (C*) to ground
     std::set<std::string> pulledUpNets;
     std::set<std::string> decoupledSupplyNets;
     for (const auto& pc : partComps) {
-        bool isResistor = hasRefPrefix(pc.ref, "R") || hasRefPrefix(pc.ref, "RN") || hasRefPrefix(pc.ref, "RP");
+        bool isResistor = hasRefPrefix(pc.ref, "R") || hasRefPrefix(pc.ref, "RN") ||
+                          hasRefPrefix(pc.ref, "RP") || hasRefPrefix(pc.ref, "RB") ||
+                          hasRefPrefix(pc.ref, "RA");
         bool isCapacitor = hasRefPrefix(pc.ref, "C");
         if (!isResistor && !isCapacitor) continue;
 
@@ -3706,51 +3900,55 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
     };
 
     nlohmann::json pullupIssuesJson = nlohmann::json::array();
-    for (const auto& kv : netToPartPins) {
-        const std::string& netName = kv.first;
-        const auto& pList = kv.second;
-        if (pList.empty()) continue;
-        if (requiresPullup(netName) && pulledUpNets.count(netName) == 0) {
-            nlohmann::json netPinRefs = nlohmann::json::array();
-            for (size_t pIdx : pList) {
-                netPinRefs.push_back(pins[pIdx].ref + "." + pins[pIdx].number);
+    if (!isPartialCompSubset) {
+        for (const auto& kv : netToPartPins) {
+            const std::string& netName = kv.first;
+            const auto& pList = kv.second;
+            if (pList.empty()) continue;
+            if (requiresPullup(netName) && pulledUpNets.count(netName) == 0) {
+                nlohmann::json netPinRefs = nlohmann::json::array();
+                for (size_t pIdx : pList) {
+                    netPinRefs.push_back(pins[pIdx].ref + "." + pins[pIdx].number);
+                }
+                pullupIssuesJson.push_back({
+                    {"net", netName},
+                    {"issue", "missing_pullup_resistor"},
+                    {"pins", netPinRefs}
+                });
             }
-            pullupIssuesJson.push_back({
-                {"net", netName},
-                {"issue", "missing_pullup_resistor"},
-                {"pins", netPinRefs}
-            });
         }
     }
 
     // 10. Semantic Layer 4: Decoupling capacitor validation on active ICs (U* / IC*)
     nlohmann::json decouplingIssuesJson = nlohmann::json::array();
-    for (const auto& pc : partComps) {
-        if (!hasRefPrefix(pc.ref, "U") && !hasRefPrefix(pc.ref, "IC")) continue;
-        std::set<std::string> icSupplyNets;
-        std::string icGndNet;
-        for (size_t pIdx : pc.pinIndices) {
-            if (pins[pIdx].noConnected) continue;
-            const std::string& n = pinResolvedNet[pIdx];
-            if (n.empty()) continue;
-            if (isGroundNet(n)) {
-                icGndNet = n;
-            } else if (isPositiveSupplyNet(n)) {
-                icSupplyNets.insert(n);
+    if (!isPartialCompSubset) {
+        for (const auto& pc : partComps) {
+            if (!hasRefPrefix(pc.ref, "U") && !hasRefPrefix(pc.ref, "IC")) continue;
+            std::set<std::string> icSupplyNets;
+            std::string icGndNet;
+            for (size_t pIdx : pc.pinIndices) {
+                if (pins[pIdx].noConnected) continue;
+                const std::string& n = pinResolvedNet[pIdx];
+                if (n.empty()) continue;
+                if (isGroundNet(n)) {
+                    icGndNet = n;
+                } else if (isPositiveSupplyNet(n)) {
+                    icSupplyNets.insert(n);
+                }
             }
-        }
-        if (!icGndNet.empty() && !icSupplyNets.empty()) {
-            for (const auto& supNet : icSupplyNets) {
-                if (decoupledSupplyNets.count(supNet) == 0) {
-                    decouplingIssuesJson.push_back({
-                        {"id", pc.id},
-                        {"reference", pc.ref},
-                        {"supply_net", supNet},
-                        {"ground_net", icGndNet},
-                        {"issue", "missing_decoupling_capacitor"},
-                        {"x", pc.x},
-                        {"y", pc.normY}
-                    });
+            if (!icGndNet.empty() && !icSupplyNets.empty()) {
+                for (const auto& supNet : icSupplyNets) {
+                    if (decoupledSupplyNets.count(supNet) == 0) {
+                        decouplingIssuesJson.push_back({
+                            {"id", pc.id},
+                            {"reference", pc.ref},
+                            {"supply_net", supNet},
+                            {"ground_net", icGndNet},
+                            {"issue", "missing_decoupling_capacitor"},
+                            {"x", pc.x},
+                            {"y", pc.normY}
+                        });
+                    }
                 }
             }
         }
@@ -3765,6 +3963,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
     int pullupIssuesCount = static_cast<int>(pullupIssuesJson.size());
     int decouplingIssuesCount = static_cast<int>(decouplingIssuesJson.size());
     int voltageDomainIssuesCount = static_cast<int>(voltageDomainIssuesJson.size());
+    int inferredNetsCount = static_cast<int>(inferredNetsJson.size());
 
     bool passed = (unconnectedCount == 0 && danglingWiresCount == 0 &&
                    compIssuesCount == 0 && powerShortsCount == 0 && netIssuesCount == 0 &&
@@ -3807,6 +4006,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         {"decoupling_issues", decouplingIssuesJson},
         {"voltage_domain_issues_count", voltageDomainIssuesCount},
         {"voltage_domain_issues", voltageDomainIssuesJson},
+        {"inferred_nets_count", inferredNetsCount},
         {"inferred_nets", inferredNetsJson},
         {"summary", outSummary}
     };
