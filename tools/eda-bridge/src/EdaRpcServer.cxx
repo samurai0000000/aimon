@@ -20,6 +20,9 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <chrono>
+#include <cwctype>
+#include <thread>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -27,8 +30,14 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
+#include <ole2.h>
+#include <oleauto.h>
+#include <uiautomation.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
 #endif
 #else
 #include <arpa/inet.h>
@@ -47,6 +56,279 @@ namespace fs = std::filesystem;
 namespace aimon {
 
 namespace {
+
+#ifdef _WIN32
+// CLSID_CUIAutomation {ff48dba4-60ef-4201-aa87-54103eef594e} as declared in uiautomationclient.h.
+// Defined locally so linking does not depend on the toolchain's uuid library exporting it.
+const CLSID kClsidCUIAutomation = {
+    0xff48dba4, 0x60ef, 0x4201, {0xaa, 0x87, 0x54, 0x10, 0x3e, 0xef, 0x59, 0x4e}
+};
+
+template <typename T>
+struct ComRelease {
+    T* p = nullptr;
+    ComRelease() = default;
+    ComRelease(const ComRelease&) = delete;
+    ComRelease& operator=(const ComRelease&) = delete;
+    ~ComRelease() { reset(); }
+    void reset() {
+        if (p != nullptr) {
+            p->Release();
+            p = nullptr;
+        }
+    }
+};
+
+class ComApartmentScope {
+public:
+    ComApartmentScope() : _hr(::CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+    ~ComApartmentScope() {
+        if (SUCCEEDED(_hr)) ::CoUninitialize();
+    }
+    ComApartmentScope(const ComApartmentScope&) = delete;
+    ComApartmentScope& operator=(const ComApartmentScope&) = delete;
+    // RPC_E_CHANGED_MODE: this thread already has an STA; COM is usable, do not uninitialize.
+    bool usable() const { return SUCCEEDED(_hr) || _hr == RPC_E_CHANGED_MODE; }
+
+private:
+    HRESULT _hr;
+};
+
+struct EasyEdaWindowSearch {
+    bool byProcess = true;
+    HWND hwnd = nullptr;
+};
+
+bool windowProcessIsEasyEdaPro(HWND hwnd) {
+    DWORD pid = 0;
+    ::GetWindowThreadProcessId(hwnd, &pid);
+    HANDLE proc = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (proc == nullptr) return false;
+    wchar_t path[1024] = {0};
+    DWORD len = 1023;
+    bool match = false;
+    if (::QueryFullProcessImageNameW(proc, 0, path, &len) && len > 0) {
+        std::wstring p(path, len);
+        std::transform(p.begin(), p.end(), p.begin(), [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+        const std::wstring exe = L"\\easyeda-pro.exe";
+        match = p.size() >= exe.size() && p.compare(p.size() - exe.size(), exe.size(), exe) == 0;
+    }
+    ::CloseHandle(proc);
+    return match;
+}
+
+bool windowTitleIsEasyEda(HWND hwnd) {
+    wchar_t title[512] = {0};
+    int n = ::GetWindowTextW(hwnd, title, 511);
+    if (n <= 0) return false;
+    std::wstring t(title, static_cast<size_t>(n));
+    // "EasyEDA" or "\u5609\u7acb\u521bEDA" (JLC EDA, Chinese UI)
+    return t.find(L"EasyEDA") != std::wstring::npos ||
+           t.find(L"\u5609\u7acb\u521b" L"EDA") != std::wstring::npos;
+}
+
+BOOL CALLBACK enumEasyEdaWindowsProc(HWND hwnd, LPARAM lParam) {
+    auto* search = reinterpret_cast<EasyEdaWindowSearch*>(lParam);
+    if (!::IsWindowVisible(hwnd) || ::GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+    bool match = search->byProcess ? windowProcessIsEasyEdaPro(hwnd) : windowTitleIsEasyEda(hwnd);
+    if (match) {
+        search->hwnd = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND findEasyEdaProWindow() {
+    EasyEdaWindowSearch search;
+    search.byProcess = true;
+    ::EnumWindows(enumEasyEdaWindowsProc, reinterpret_cast<LPARAM>(&search));
+    if (search.hwnd == nullptr) {
+        search.byProcess = false;
+        ::EnumWindows(enumEasyEdaWindowsProc, reinterpret_cast<LPARAM>(&search));
+    }
+    return search.hwnd;
+}
+
+// Returns an AddRef'd element whose Name equals one of names (and whose ControlType equals
+// controlType when controlType != 0), searching all descendants of root; nullptr if none.
+IUIAutomationElement* findUiaElementByName(IUIAutomation* uia, IUIAutomationElement* root,
+                                           const std::vector<std::wstring>& names, int controlType) {
+    for (const auto& name : names) {
+        VARIANT nameVar;
+        ::VariantInit(&nameVar);
+        nameVar.vt = VT_BSTR;
+        nameVar.bstrVal = ::SysAllocString(name.c_str());
+        if (nameVar.bstrVal == nullptr) continue;
+        ComRelease<IUIAutomationCondition> nameCond;
+        ComRelease<IUIAutomationCondition> typeCond;
+        ComRelease<IUIAutomationCondition> andCond;
+        IUIAutomationElement* found = nullptr;
+        if (SUCCEEDED(uia->CreatePropertyCondition(UIA_NamePropertyId, nameVar, &nameCond.p)) &&
+            nameCond.p != nullptr) {
+            IUIAutomationCondition* cond = nameCond.p;
+            if (controlType != 0) {
+                VARIANT typeVar;
+                ::VariantInit(&typeVar);
+                typeVar.vt = VT_I4;
+                typeVar.lVal = controlType;
+                if (SUCCEEDED(uia->CreatePropertyCondition(UIA_ControlTypePropertyId, typeVar, &typeCond.p)) &&
+                    typeCond.p != nullptr &&
+                    SUCCEEDED(uia->CreateAndCondition(nameCond.p, typeCond.p, &andCond.p)) &&
+                    andCond.p != nullptr) {
+                    cond = andCond.p;
+                }
+            }
+            root->FindFirst(TreeScope_Descendants, cond, &found);
+        }
+        ::VariantClear(&nameVar);
+        if (found != nullptr) return found;
+    }
+    return nullptr;
+}
+
+IUIAutomationElement* pollUiaElementByName(IUIAutomation* uia, IUIAutomationElement* root,
+                                           const std::vector<std::wstring>& names, int controlType,
+                                           int timeoutMs) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        IUIAutomationElement* el = findUiaElementByName(uia, root, names, controlType);
+        if (el != nullptr) return el;
+        if (std::chrono::steady_clock::now() >= deadline) return nullptr;
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+void sendMouseClickAt(int x, int y) {
+    ::SetCursorPos(x, y);
+    INPUT inputs[2] = {};
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    inputs[1].type = INPUT_MOUSE;
+    inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    ::SendInput(2, inputs, sizeof(INPUT));
+}
+
+void sendVirtualKey(WORD vk) {
+    INPUT inputs[2] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = vk;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = vk;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    ::SendInput(2, inputs, sizeof(INPUT));
+}
+
+// Invoke -> ExpandCollapse -> SendInput click at the element centre. Returns the method used.
+std::string activateUiaElement(IUIAutomationElement* el) {
+    ComRelease<IUIAutomationInvokePattern> invoke;
+    if (SUCCEEDED(el->GetCurrentPatternAs(UIA_InvokePatternId, __uuidof(IUIAutomationInvokePattern),
+                                          reinterpret_cast<void**>(&invoke.p))) &&
+        invoke.p != nullptr && SUCCEEDED(invoke.p->Invoke())) {
+        return "invoke";
+    }
+    ComRelease<IUIAutomationExpandCollapsePattern> expand;
+    if (SUCCEEDED(el->GetCurrentPatternAs(UIA_ExpandCollapsePatternId,
+                                          __uuidof(IUIAutomationExpandCollapsePattern),
+                                          reinterpret_cast<void**>(&expand.p))) &&
+        expand.p != nullptr && SUCCEEDED(expand.p->Expand())) {
+        return "expand";
+    }
+    RECT rc = {};
+    if (SUCCEEDED(el->get_CurrentBoundingRectangle(&rc)) && rc.right > rc.left && rc.bottom > rc.top) {
+        sendMouseClickAt((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
+        return "click";
+    }
+    return "";
+}
+
+// Drives EasyEDA Pro's own Route -> Auto Route... -> Run through UI Automation. Electron builds its
+// accessibility tree lazily, so the first lookups are polled. Diagnostics land in outDiag.
+bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& outDiag) {
+    ComApartmentScope com;
+    if (!com.usable()) {
+        outDiag["error"] = "CoInitializeEx failed";
+        return false;
+    }
+    HWND hwnd = findEasyEdaProWindow();
+    if (hwnd == nullptr) {
+        outDiag["error"] = "EasyEDA Pro window not found (no visible easyeda-pro.exe / EasyEDA top-level window)";
+        return false;
+    }
+    if (::IsIconic(hwnd)) ::ShowWindow(hwnd, SW_RESTORE);
+    ::SetForegroundWindow(hwnd);
+
+    ComRelease<IUIAutomation> uia;
+    HRESULT hr = ::CoCreateInstance(kClsidCUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                                    __uuidof(IUIAutomation), reinterpret_cast<void**>(&uia.p));
+    if (FAILED(hr) || uia.p == nullptr) {
+        outDiag["error"] = "CoCreateInstance(CUIAutomation) failed";
+        return false;
+    }
+    ComRelease<IUIAutomationElement> root;
+    if (FAILED(uia.p->ElementFromHandle(hwnd, &root.p)) || root.p == nullptr) {
+        outDiag["error"] = "IUIAutomation::ElementFromHandle failed for the EasyEDA Pro window";
+        return false;
+    }
+
+    const std::vector<std::wstring> routeNames = {L"Route", L"\u5e03\u7ebf"};
+    const std::vector<std::wstring> autoItemNames = {
+        L"Auto Route...", L"Auto Route\u2026", L"Auto Route", L"Auto Router...", L"Auto Router",
+        L"\u81ea\u52a8\u5e03\u7ebf...", L"\u81ea\u52a8\u5e03\u7ebf\u2026", L"\u81ea\u52a8\u5e03\u7ebf"
+    };
+    const std::vector<std::wstring> runNames = {
+        L"Run", L"Run Auto Route", L"Auto Route", L"\u6267\u884c", L"\u5f00\u59cb\u5e03\u7ebf", L"\u8fd0\u884c"
+    };
+
+    ComRelease<IUIAutomationElement> routeMenu;
+    routeMenu.p = pollUiaElementByName(uia.p, root.p, routeNames, 0, 3000);
+    if (routeMenu.p == nullptr) {
+        outDiag["stage"] = "route_menu_not_found";
+        outDiag["error"] = "UI Automation could not find the Route menu in the EasyEDA Pro window";
+        return false;
+    }
+    outDiag["route_menu_method"] = activateUiaElement(routeMenu.p);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    ComRelease<IUIAutomationElement> autoItem;
+    autoItem.p = pollUiaElementByName(uia.p, root.p, autoItemNames, 0, 2000);
+    if (autoItem.p == nullptr) {
+        // Native popup menus are separate top-level windows: search the desktop once.
+        ComRelease<IUIAutomationElement> desktop;
+        if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
+            autoItem.p = findUiaElementByName(uia.p, desktop.p, autoItemNames, UIA_MenuItemControlTypeId);
+        }
+    }
+    if (autoItem.p == nullptr) {
+        outDiag["stage"] = "auto_route_item_not_found";
+        outDiag["error"] = "UI Automation could not find the Auto Route menu item";
+        sendVirtualKey(VK_ESCAPE);
+        return false;
+    }
+    outDiag["auto_route_item_method"] = activateUiaElement(autoItem.p);
+
+    ComRelease<IUIAutomationElement> runBtn;
+    runBtn.p = pollUiaElementByName(uia.p, root.p, runNames, UIA_ButtonControlTypeId, dialogTimeoutMs);
+    if (runBtn.p != nullptr) {
+        outDiag["run_method"] = activateUiaElement(runBtn.p);
+    } else if (::GetForegroundWindow() == hwnd) {
+        // Assumes Run is the Auto Route dialog's default button; unverified until qualified on
+        // Windows, and the caller judges success by the settled track count, not by this path.
+        sendVirtualKey(VK_RETURN);
+        outDiag["run_method"] = "enter_key";
+    } else {
+        outDiag["stage"] = "run_button_not_found";
+        outDiag["error"] = "Auto Route dialog Run button not found and EasyEDA Pro is not the foreground window";
+        return false;
+    }
+    outDiag["stage"] = "triggered";
+    return true;
+}
+#else
+bool triggerEasyEdaNativeAutoRouteWin32(int /*dialogTimeoutMs*/, nlohmann::json& outDiag) {
+    outDiag["error"] = "Win32 UI Automation is only available when aimon-eda-bridge runs on Windows";
+    return false;
+}
+#endif
 
 void closeSocketFd(int fd) {
     if (fd < 0) return;
@@ -1080,6 +1362,7 @@ std::vector<nlohmann::json> EdaRpcServer::remoteToolDescriptors() {
         {"easyeda_sync_sch_to_pcb", "Synchronize schematic into EasyEDA Pro PCB document"},
         {"easyeda_inspect_pcb", "Inspect EasyEDA Pro PCB outline, placements, pads, and unrouted nets"},
         {"easyeda_edit_pcb", "Edit EasyEDA Pro PCB outline, placements, copper pours, tracks, and vias"},
+        {"easyeda_native_autoroute", "Trigger EasyEDA Pro's built-in auto-router (Route > Auto Route > Run) and wait for tracks to settle"},
         {"easyeda_run_drc", "Run live Schematic ERC or PCB DRC inside EasyEDA Pro"},
         {"easyeda_export_jlcpcb", "Export turnkey JLCPCB Gerber ZIP, BOM CSV, CPL CSV, and Specctra .dsn"},
         {"easyeda_invoke_api", "Invoke whitelisted eda.* API call in EasyEDA Pro"},
@@ -2920,10 +3203,104 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
     return {{"ok", false}, {"error", "Unsupported FreeCAD tool: " + toolName}};
 }
 
+nlohmann::json EdaRpcServer::handleEasyEdaNativeAutoRoute(const nlohmann::json& args) {
+    auto argInt = [&args](const char* key, int defVal) -> int {
+        if (!args.is_object() || !args.contains(key) || !args[key].is_number()) return defVal;
+        return static_cast<int>(args[key].get<double>());
+    };
+    const int timeoutMs = std::clamp(argInt("timeout_ms", 120000), 5000, 600000);
+    const int dialogTimeoutMs = std::clamp(argInt("dialog_timeout_ms", 5000), 1000, 30000);
+    const bool allowWin32 = !(args.is_object() && args.contains("allow_win32_ui_automation") &&
+                              args["allow_win32_ui_automation"].is_boolean() &&
+                              !args["allow_win32_ui_automation"].get<bool>());
+
+    // Tier 1: DOM trigger inside the extension (polls tracks itself when it succeeds)
+    nlohmann::json domArgs = args.is_object() ? args : nlohmann::json::object();
+    domArgs["timeout_ms"] = timeoutMs;
+    nlohmann::json domRes;
+    std::string plugErr;
+    if (!callPlugin("easyeda", "easyeda_native_autoroute", domArgs, domRes, plugErr, timeoutMs + 20000)) {
+        return {{"ok", false}, {"triggered", false}, {"error", plugErr}};
+    }
+    if (domRes.is_object() && domRes.contains("triggered") && domRes["triggered"].is_boolean() &&
+        domRes["triggered"].get<bool>()) {
+        domRes["ok"] = true;
+        return domRes;
+    }
+
+    nlohmann::json out = {{"ok", false}, {"triggered", false}, {"dom_attempt", domRes}};
+    if (!allowWin32) {
+        out["error"] = "DOM trigger failed and allow_win32_ui_automation=false";
+        return out;
+    }
+
+    // Copper track count via the plugin (tracks_count covers PrimitiveTrack + copper PrimitiveLine)
+    auto countTracks = [this](int& outCount, std::string& outErr) -> bool {
+        nlohmann::json r;
+        if (!callPlugin("easyeda", "easyeda_inspect_pcb", {{"summary_only", true}}, r, outErr, 30000)) {
+            return false;
+        }
+        if (!r.is_object() || !r.contains("tracks_count") || !r["tracks_count"].is_number()) {
+            outErr = "easyeda_inspect_pcb returned no tracks_count";
+            return false;
+        }
+        outCount = static_cast<int>(r["tracks_count"].get<double>());
+        return true;
+    };
+
+    int beforeTracks = 0;
+    std::string countErr;
+    if (!countTracks(beforeTracks, countErr)) {
+        out["error"] = "Could not read the PCB track count before triggering: " + countErr;
+        return out;
+    }
+
+    // Tier 2: Win32 UI Automation from this process (same Windows user session)
+    nlohmann::json diag = nlohmann::json::object();
+    bool triggered = triggerEasyEdaNativeAutoRouteWin32(dialogTimeoutMs, diag);
+    out["win32"] = diag;
+    if (!triggered) {
+        out["error"] = "Win32 UI Automation trigger failed: " +
+                       (diag.contains("error") && diag["error"].is_string()
+                            ? diag["error"].get<std::string>() : std::string("unknown error"));
+        return out;
+    }
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    int last = beforeTracks;
+    int stableTicks = 0;
+    bool changed = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        int cur = last;
+        if (!countTracks(cur, countErr)) continue;
+        if (cur != last) {
+            last = cur;
+            stableTicks = 0;
+            if (cur != beforeTracks) changed = true;
+        } else {
+            ++stableTicks;
+            if (changed && stableTicks >= 3) break;
+        }
+    }
+    out["ok"] = true;
+    out["triggered"] = true;
+    out["method"] = "win32_uia";
+    out["before_tracks"] = beforeTracks;
+    out["after_tracks"] = last;
+    out["added_tracks"] = last - beforeTracks;
+    out["settled"] = changed && stableTicks >= 3;
+    return out;
+}
+
 nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
                                                const nlohmann::json& args) {
     if (toolName == "easyeda_convert") {
         return EasyEdaConverter::executeTool(args);
+    }
+
+    if (toolName == "easyeda_native_autoroute") {
+        return handleEasyEdaNativeAutoRoute(args);
     }
 
     if (toolName == "easyeda_live_status") {

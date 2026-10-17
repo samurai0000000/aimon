@@ -77,6 +77,12 @@ private:
     void initRuntimeToolsLocked();
     EdaToolRuntimeInfo* findToolInfoLocked(const std::string& component);
 
+    // Zero-token live PCB autoroute: eda_calc_pcb_autoroute(from_active_pcb / pcb_state)
+    // and easyeda_edit_pcb(autoroute: true). Fetches the live PCB (or uses pcb_state),
+    // audits connectivity, routes the unrouted nets, optionally commits and re-audits.
+    nlohmann::json runLiveAutoroute(const std::string& toolName,
+                                    const nlohmann::json& arguments);
+
     mutable std::mutex _mutex;
     EdaBridgeConfig _config;
     EdaAccelerators _accelerators;

@@ -965,6 +965,122 @@ TEST(EdaAccelerators_Unit, CalcPcbAutorouteInterNetClearanceAndGridCeiling) {
     CHECK_TRUE(hugeRes["grid_cells"].value("per_layer", 0LL) <= 640000LL);
 }
 
+TEST(EdaAccelerators_Unit, EdaBridgeLiveAutoroutePcbStateAuditRouteMergeReaudit) {
+    EdaBridgeConfig cfg;
+    cfg.enabled = false; // no Windows bridge: pcb_state path must stay fully local
+    cfg.accelerators.enabled = true;
+    EdaBridge bridge(cfg);
+
+    // easyeda_inspect_pcb-shaped state in mil. SIG (U1.1 -> R1.1) is unrouted. DONE is routed by a
+    // vertical top-layer track at x = 1500 that splits the board, so SIG must detour or via. The
+    // board outline is a 1400 x 400 mil rectangle; no new copper may leave it.
+    const double kXMin = 800.0, kXMax = 2200.0, kYMin = 800.0, kYMax = 1200.0;
+    nlohmann::json state = {
+        {"units", "mil"},
+        {"pads", nlohmann::json::array({
+            {{"id", "p1"}, {"ref", "U1"}, {"pad", "1"}, {"net", "SIG"}, {"x", 1000.0}, {"y", 1000.0},
+             {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+            {{"id", "p2"}, {"ref", "R1"}, {"pad", "1"}, {"net", "SIG"}, {"x", 2000.0}, {"y", 1000.0},
+             {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+            {{"id", "p3"}, {"ref", "U1"}, {"pad", "2"}, {"net", "DONE"}, {"x", 1500.0}, {"y", 850.0},
+             {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+            {{"id", "p4"}, {"ref", "R1"}, {"pad", "2"}, {"net", "DONE"}, {"x", 1500.0}, {"y", 1150.0},
+             {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"id", "t_done"}, {"net", "DONE"}, {"layer", "1"}, {"x1", 1500.0}, {"y1", 850.0},
+             {"x2", 1500.0}, {"y2", 1150.0}, {"width", 10.0}}
+        })},
+        {"vias", nlohmann::json::array()},
+        {"board_outline", nlohmann::json::array({
+            {{"x1", kXMin}, {"y1", kYMin}, {"x2", kXMax}, {"y2", kYMin}},
+            {{"x1", kXMax}, {"y1", kYMin}, {"x2", kXMax}, {"y2", kYMax}},
+            {{"x1", kXMax}, {"y1", kYMax}, {"x2", kXMin}, {"y2", kYMax}},
+            {{"x1", kXMin}, {"y1", kYMax}, {"x2", kXMin}, {"y2", kYMin}}
+        })}
+    };
+
+    // 1. Route and merge into the supplied state
+    nlohmann::json res = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", state}, {"apply_to_pcb", true}, {"grid_step_mm", 0.1}
+    });
+    CHECK_TRUE_TEXT(res.value("ok", false), res.dump().c_str());
+    STRCMP_EQUAL("live_autoroute", res.value("mode", "").c_str());
+    STRCMP_EQUAL("pcb_state", res.value("source", "").c_str());
+    STRCMP_EQUAL("auto", res.value("engine", "").c_str());
+    CHECK_EQUAL(1, res["pre_route_audit"].value("unrouted_nets_count", -1));
+    CHECK_EQUAL(4, res.value("board_outline_keepouts", 0));
+    CHECK_TRUE(res.value("committed", false));
+    STRCMP_EQUAL("pcb_state", res.value("commit_target", "").c_str());
+    CHECK_EQUAL(1, static_cast<int>(res["routed_nets"].size()));
+    STRCMP_EQUAL("SIG", res["routed_nets"][0].get<std::string>().c_str());
+    CHECK_EQUAL(0, static_cast<int>(res["routed_nets_still_open"].size()));
+    CHECK_EQUAL(0, res["post_route_audit"].value("unrouted_nets_count", -1));
+    CHECK_EQUAL(0, res["post_route_audit"].value("dangling_tracks_count", -1));
+    CHECK_TRUE(res["post_route_audit"].value("all_connected", false));
+    CHECK_EQUAL(0, res["autoroute"].value("drc_violations", -1));
+
+    const nlohmann::json& merged = res["pcb_state"];
+    const int addedTracks = res.value("added_tracks_count", 0);
+    CHECK_TRUE(addedTracks >= 1);
+    CHECK_EQUAL(1 + addedTracks, static_cast<int>(merged["tracks"].size()));
+    STRCMP_EQUAL("t_done", merged["tracks"][0].value("id", "").c_str());
+    STRCMP_EQUAL("autoroute_t1", merged["tracks"][1].value("id", "").c_str());
+    for (size_t i = 1; i < merged["tracks"].size(); ++i) {
+        const auto& t = merged["tracks"][i];
+        STRCMP_EQUAL("SIG", t.value("net", "").c_str());
+        for (const char* k : {"x1", "x2"}) {
+            double x = t.value(k, -1.0);
+            CHECK_TRUE_TEXT(x > kXMin && x < kXMax, t.dump().c_str());
+        }
+        for (const char* k : {"y1", "y2"}) {
+            double y = t.value(k, -1.0);
+            CHECK_TRUE_TEXT(y > kYMin && y < kYMax, t.dump().c_str());
+        }
+    }
+    CHECK_TRUE(merged["connectivity_audit"].value("all_connected", false));
+
+    // 2. Preview only: same routes returned, nothing merged
+    nlohmann::json preview = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", state}, {"apply_to_pcb", false}, {"grid_step_mm", 0.1}
+    });
+    CHECK_TRUE_TEXT(preview.value("ok", false), preview.dump().c_str());
+    CHECK_FALSE(preview.value("committed", true));
+    CHECK_FALSE(preview.contains("pcb_state"));
+    CHECK_EQUAL(addedTracks, static_cast<int>(preview["tracks"].size()));
+
+    // 3. Net filter naming only an already-routed net: nothing to do, reported back
+    nlohmann::json filtered = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", state}, {"nets", nlohmann::json::array({"DONE"})}
+    });
+    CHECK_TRUE_TEXT(filtered.value("ok", false), filtered.dump().c_str());
+    CHECK_EQUAL(0, static_cast<int>(filtered["routed_nets"].size()));
+    CHECK_EQUAL(1, static_cast<int>(filtered["requested_nets_not_unrouted"].size()));
+    STRCMP_EQUAL("DONE", filtered["requested_nets_not_unrouted"][0].get<std::string>().c_str());
+
+    // 4. Invalid engine and GUI-only engine against an offline state are rejected
+    nlohmann::json badEngine = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", state}, {"engine", "freerouting"}
+    });
+    CHECK_FALSE(badEngine.value("ok", true));
+    CHECK_TRUE(badEngine.value("error", "").find("engine must be one of") != std::string::npos);
+    nlohmann::json nativeOffline = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", state}, {"engine", "easyeda_native"}
+    });
+    CHECK_FALSE(nativeOffline.value("ok", true));
+    CHECK_TRUE(nativeOffline.value("error", "").find("offline pcb_state") != std::string::npos);
+
+    // 5. Classic request (nets with pad objects) still goes straight to the accelerator
+    nlohmann::json classic = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"units", "mil"},
+        {"nets", nlohmann::json::array({
+            {{"name", "SIG"}, {"pads", nlohmann::json::array({state["pads"][0], state["pads"][1]})}}
+        })}
+    });
+    CHECK_TRUE_TEXT(classic.value("ok", false), classic.dump().c_str());
+    CHECK_FALSE(classic.contains("mode"));
+}
+
 TEST(EdaAccelerators_Unit, CalcSchematicErcAuditNominalTJunctionNegatedYAndFaults) {
     EdaAccelerators acc(_accCfg);
     bool ok = false;

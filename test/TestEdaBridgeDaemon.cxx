@@ -1902,7 +1902,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnfo
     CHECK_TRUE(srv.isBridgeEnabled("kicad"));
     CHECK_TRUE(srv.isBridgeEnabled("freecad"));
     CHECK_FALSE(srv.isDisallowExports());
-    CHECK_EQUAL(30, static_cast<int>(srv.enabledRemoteToolDescriptors().size()));
+    CHECK_EQUAL(31, static_cast<int>(srv.enabledRemoteToolDescriptors().size()));
 
     // Verify plugin/status dynamically updates active_document in eda/status
     {
@@ -1950,7 +1950,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnfo
         ::close(sock);
     }
 
-    // Disable EasyEDA bridge: 11 easyeda_* tools removed -> 19 tools remain
+    // Disable EasyEDA bridge: 12 easyeda_* tools removed -> 19 tools remain
     srv.setBridgeEnabled("easyeda", false);
     CHECK_FALSE(srv.isBridgeEnabled("easyeda"));
     auto toolsNoEe = srv.enabledRemoteToolDescriptors();
@@ -2000,7 +2000,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnfo
     srv.setBridgeEnabled("freecad", false);
     CHECK_FALSE(srv.isBridgeEnabled("kicad"));
     CHECK_FALSE(srv.isBridgeEnabled("freecad"));
-    CHECK_EQUAL(12, static_cast<int>(srv.enabledRemoteToolDescriptors().size())); // 11 easyeda + 1 status
+    CHECK_EQUAL(13, static_cast<int>(srv.enabledRemoteToolDescriptors().size())); // 12 easyeda + 1 status
 
     CHECK_FALSE(srv.dispatchToolCall("kicad_search_library", {{"query", "R"}}).value("ok", true));
     CHECK_FALSE(srv.dispatchToolCall("freecad_live_status", nlohmann::json::object()).value("ok", true));

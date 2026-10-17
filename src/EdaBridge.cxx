@@ -1200,8 +1200,546 @@ EdaBridgeStatus EdaBridge::probeNow() {
     return getStatus();
 }
 
+namespace {
+
+// Type-safe readers: nlohmann::json::value() throws when the stored type differs from the
+// default's type, so tool arguments are read through these helpers instead.
+bool jsonFlag(const nlohmann::json& obj, const char* key, bool defVal) {
+    if (!obj.is_object()) return defVal;
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_boolean()) return defVal;
+    return it->get<bool>();
+}
+
+int jsonInt(const nlohmann::json& obj, const char* key, int defVal) {
+    if (!obj.is_object()) return defVal;
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_number()) return defVal;
+    return static_cast<int>(it->get<double>());
+}
+
+double jsonNum(const nlohmann::json& obj, const char* key, double defVal) {
+    if (!obj.is_object()) return defVal;
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_number()) return defVal;
+    return it->get<double>();
+}
+
+std::string jsonStr(const nlohmann::json& obj, const char* key, const std::string& defVal) {
+    if (!obj.is_object()) return defVal;
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_string()) return defVal;
+    return it->get<std::string>();
+}
+
+std::string toLowerAscii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return s;
+}
+
+std::string toUpperAscii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+    return s;
+}
+
+// eda_calc_pcb_autoroute is dispatched to the live pipeline instead of the stateless
+// calculator when the caller asks for it explicitly, supplies a pcb_state snapshot, omits
+// nets[], or passes nets[] as plain net-name strings.
+bool isLiveAutorouteRequest(const nlohmann::json& args) {
+    if (!args.is_object()) return false;
+    if (jsonFlag(args, "from_active_pcb", false)) return true;
+    if (args.contains("pcb_state") && args["pcb_state"].is_object()) return true;
+    if (args.contains("apply_to_pcb") || args.contains("engine")) return true;
+    auto it = args.find("nets");
+    if (it == args.end()) return true;
+    if (!it->is_array() || it->empty()) return false;
+    for (const auto& n : *it) {
+        if (!n.is_string()) return false;
+    }
+    return true;
+}
+
+nlohmann::json compactConnectivityAudit(const nlohmann::json& audit) {
+    nlohmann::json out = nlohmann::json::object();
+    if (!audit.is_object()) return out;
+    for (const char* k : {"all_connected", "total_nets", "fully_routed_nets", "unrouted_nets_count",
+                          "dangling_tracks_count", "unassigned_pads_count", "summary"}) {
+        if (audit.contains(k)) out[k] = audit[k];
+    }
+    nlohmann::json unrouted = nlohmann::json::array();
+    if (audit.contains("unrouted_nets") && audit["unrouted_nets"].is_array()) {
+        for (const auto& u : audit["unrouted_nets"]) {
+            if (!u.is_object()) continue;
+            unrouted.push_back({
+                {"net", jsonStr(u, "net", "")},
+                {"island_count", jsonInt(u, "island_count", 0)}
+            });
+        }
+    }
+    out["unrouted_nets"] = std::move(unrouted);
+    return out;
+}
+
+std::set<std::string> unroutedNetNamesOf(const nlohmann::json& audit) {
+    std::set<std::string> names;
+    if (audit.is_object() && audit.contains("unrouted_nets") && audit["unrouted_nets"].is_array()) {
+        for (const auto& u : audit["unrouted_nets"]) {
+            std::string n = jsonStr(u, "net", "");
+            if (!n.empty()) names.insert(n);
+        }
+    }
+    return names;
+}
+
+// Every board-outline segment becomes a zero-width keepout on all copper layers; the router
+// inflates it by clearance + half track (or half via), so no route can cross or hug the edge.
+nlohmann::json boardOutlineKeepouts(const nlohmann::json& state) {
+    nlohmann::json keepouts = nlohmann::json::array();
+    if (!state.is_object() || !state.contains("board_outline") || !state["board_outline"].is_array()) {
+        return keepouts;
+    }
+    for (const auto& seg : state["board_outline"]) {
+        if (!seg.is_object()) continue;
+        bool complete = true;
+        for (const char* k : {"x1", "y1", "x2", "y2"}) {
+            if (!seg.contains(k) || !seg[k].is_number()) complete = false;
+        }
+        if (!complete) continue;
+        double x1 = seg["x1"].get<double>();
+        double y1 = seg["y1"].get<double>();
+        double x2 = seg["x2"].get<double>();
+        double y2 = seg["y2"].get<double>();
+        keepouts.push_back({
+            {"x_min", std::min(x1, x2)},
+            {"x_max", std::max(x1, x2)},
+            {"y_min", std::min(y1, y2)},
+            {"y_max", std::max(y1, y2)},
+            {"layer", "MultiLayer"}
+        });
+    }
+    return keepouts;
+}
+
+} // anonymous namespace
+
+nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
+                                           const nlohmann::json& arguments) {
+    const auto startTp = std::chrono::steady_clock::now();
+    const bool viaEditPcb = (toolName == "easyeda_edit_pcb");
+    const std::string component = viaEditPcb ? "easyeda" : "accelerators";
+    nlohmann::json result = {
+        {"ok", false},
+        {"tool", toolName},
+        {"mode", "live_autoroute"}
+    };
+    auto finish = [&](bool ok, const std::string& summary, const std::string& error) -> nlohmann::json {
+        int elapsedMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTp).count());
+        result["ok"] = ok;
+        result["elapsed_ms"] = elapsedMs;
+        if (!summary.empty()) result["summary"] = summary;
+        if (!error.empty()) result["error"] = error;
+        recordToolCall(component, toolName, "live PCB autoroute", elapsedMs, ok, summary, error);
+        return result;
+    };
+
+    std::string engine = "auto";
+    if (arguments.contains("engine")) {
+        if (!arguments["engine"].is_string()) {
+            return finish(false, "", "engine must be one of \"auto\", \"easyeda_native\", \"cpp_steiner\"");
+        }
+        engine = toLowerAscii(arguments["engine"].get<std::string>());
+    }
+    if (engine != "auto" && engine != "easyeda_native" && engine != "cpp_steiner") {
+        return finish(false, "", "engine must be one of \"auto\", \"easyeda_native\", \"cpp_steiner\" (got \"" +
+                                 engine + "\")");
+    }
+    result["engine"] = engine;
+
+    const bool hasState = arguments.contains("pcb_state") && arguments["pcb_state"].is_object();
+    const bool applyToPcb = jsonFlag(arguments, "apply_to_pcb", viaEditPcb);
+    const bool nativeFirst = (engine == "easyeda_native") ||
+                             (engine == "auto" && jsonFlag(arguments, "native_first", false));
+    const bool allowDrcViolations = jsonFlag(arguments, "allow_drc_violations", false);
+    const std::string pcbUuid = jsonStr(arguments, "pcb_uuid", "");
+    result["source"] = hasState ? "pcb_state" : "active_pcb";
+    result["apply_to_pcb"] = applyToPcb;
+
+    if (hasState && nativeFirst) {
+        return finish(false, "", "engine \"easyeda_native\" / native_first drives the live EasyEDA Pro GUI and "
+                                 "cannot run against an offline pcb_state");
+    }
+
+    EdaAccelerators accCopy;
+    bool accEnabled = true;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        accEnabled = _config.accelerators.enabled;
+        accCopy = _accelerators;
+    }
+    if (!accEnabled) {
+        return finish(false, "", "Local CPU accelerators are disabled in configuration "
+                                 "(required for the connectivity audit and cpp_steiner routing)");
+    }
+
+    auto withPcbUuid = [&pcbUuid](nlohmann::json a) -> nlohmann::json {
+        if (!pcbUuid.empty()) a["pcb_uuid"] = pcbUuid;
+        return a;
+    };
+
+    // ---- 0. easyeda_edit_pcb(autoroute: true): apply any other requested edits first ------
+    if (viaEditPcb) {
+        static const char* const kEditKeys[] = {
+            "outline", "board_outline", "placements", "move_components", "place_components",
+            "footprints", "modify_pads", "pad_nets", "delete_primitives", "tracks", "add_tracks",
+            "vias", "add_vias", "zones", "copper_pours"
+        };
+        nlohmann::json editArgs = nlohmann::json::object();
+        bool hasEdits = false;
+        for (const char* k : kEditKeys) {
+            if (arguments.contains(k)) {
+                editArgs[k] = arguments[k];
+                hasEdits = true;
+            }
+        }
+        if (hasEdits) {
+            if (hasState) {
+                return finish(false, "", "easyeda_edit_pcb(autoroute: true) with pcb_state cannot be combined "
+                                         "with other edit operations; apply the edits first, then autoroute");
+            }
+            for (const char* k : {"units", "preserve_connections"}) {
+                if (arguments.contains(k)) editArgs[k] = arguments[k];
+            }
+            nlohmann::json editRes = callTool("easyeda_edit_pcb", withPcbUuid(editArgs));
+            result["pre_edit"] = editRes;
+            if (!jsonFlag(editRes, "ok", false)) {
+                return finish(false, "", "Pre-route easyeda_edit_pcb operations failed: " +
+                                         jsonStr(editRes, "error", "unknown error"));
+            }
+        }
+    }
+
+    // ---- 1. Optional EasyEDA Pro native auto-router ---------------------------------------
+    if (nativeFirst) {
+        int natTimeout = std::clamp(jsonInt(arguments, "native_timeout_ms", 120000), 5000, 600000);
+        nlohmann::json natRes = callTool("easyeda_native_autoroute",
+                                         withPcbUuid({{"timeout_ms", natTimeout}}));
+        bool nativeTriggered = jsonFlag(natRes, "triggered", false);
+        result["native"] = natRes;
+        if (engine == "easyeda_native" && !nativeTriggered) {
+            return finish(false, "", "EasyEDA Pro native auto-router could not be triggered: " +
+                                     jsonStr(natRes, "error", "DOM and Win32 UI Automation triggers both failed"));
+        }
+    }
+
+    // ---- 2. PCB state (live, zero LLM tokens) and connectivity audit ----------------------
+    auto fetchLiveState = [&](const nlohmann::json& inspArgs, nlohmann::json& outState,
+                              std::string& outErr) -> bool {
+        outState = callTool("easyeda_inspect_pcb", withPcbUuid(inspArgs));
+        if (!outState.is_object() || !jsonFlag(outState, "ok", false)) {
+            outErr = jsonStr(outState, "error", "easyeda_inspect_pcb failed");
+            return false;
+        }
+        return true;
+    };
+
+    nlohmann::json state;
+    if (hasState) {
+        state = arguments["pcb_state"];
+    } else {
+        std::string err;
+        if (!fetchLiveState({{"include_raw_primitives", true}}, state, err)) {
+            return finish(false, "", "Failed to read the active EasyEDA Pro PCB: " + err);
+        }
+    }
+    std::string units = toLowerAscii(jsonStr(state, "units", "mil"));
+    if (units != "mm" && units != "mil") units = "mil";
+    if (!state.contains("units")) state["units"] = units;
+
+    bool auditOk = false;
+    std::string auditSummary;
+    nlohmann::json preAudit = accCopy.calcPcbConnectivityAudit(state, auditOk, auditSummary);
+
+    if (engine == "easyeda_native") {
+        int unrouted = jsonInt(preAudit, "unrouted_nets_count", -1);
+        result["post_route_audit"] = compactConnectivityAudit(preAudit);
+        return finish(unrouted == 0,
+                      "EasyEDA Pro native auto-router finished • " + std::to_string(unrouted) +
+                      " unrouted nets remain",
+                      unrouted == 0 ? "" : "Unrouted nets remain after the native auto-router");
+    }
+    result["pre_route_audit"] = compactConnectivityAudit(preAudit);
+
+    // ---- 3. Select nets: unrouted per audit, optional filter, fewest islands first --------
+    std::set<std::string> netFilter;
+    if (arguments.contains("nets") && arguments["nets"].is_array()) {
+        for (const auto& n : arguments["nets"]) {
+            if (n.is_string() && !n.get<std::string>().empty()) netFilter.insert(n.get<std::string>());
+        }
+    }
+    struct Candidate {
+        std::string name;
+        int islands = 2;
+        double distMm = 0.0;
+    };
+    std::vector<Candidate> cands;
+    const std::set<std::string> preUnrouted = unroutedNetNamesOf(preAudit);
+    if (preAudit.contains("unrouted_nets") && preAudit["unrouted_nets"].is_array()) {
+        for (const auto& u : preAudit["unrouted_nets"]) {
+            std::string name = jsonStr(u, "net", "");
+            if (name.empty()) continue;
+            if (!netFilter.empty() && netFilter.count(name) == 0) continue;
+            Candidate c;
+            c.name = name;
+            c.islands = jsonInt(u, "island_count", 2);
+            if (u.contains("airwire") && u["airwire"].is_object()) {
+                c.distMm = jsonNum(u["airwire"], "distance_mm", 0.0);
+            }
+            cands.push_back(std::move(c));
+        }
+    }
+    std::stable_sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.islands != b.islands) return a.islands < b.islands;
+        return a.distMm < b.distMm;
+    });
+    nlohmann::json notUnrouted = nlohmann::json::array();
+    for (const auto& f : netFilter) {
+        if (preUnrouted.count(f) == 0) notUnrouted.push_back(f);
+    }
+    if (!notUnrouted.empty()) result["requested_nets_not_unrouted"] = notUnrouted;
+    if (cands.empty()) {
+        result["routed_nets"] = nlohmann::json::array();
+        result["added_tracks_count"] = 0;
+        result["added_vias_count"] = 0;
+        result["committed"] = false;
+        return finish(true, "No unrouted nets to route", "");
+    }
+
+    // ---- 4. Build the calcPcbAutoroute request from live primitives ----------------------
+    std::map<std::string, nlohmann::json> padsByNet;
+    std::map<std::string, std::string> netByUpper;
+    nlohmann::json allPads = nlohmann::json::array();
+    if (state.contains("pads") && state["pads"].is_array()) {
+        for (const auto& p : state["pads"]) {
+            if (!p.is_object()) continue;
+            allPads.push_back(p);
+            std::string n = jsonStr(p, "net", "");
+            if (n.empty()) continue;
+            auto& bucket = padsByNet[n];
+            if (!bucket.is_array()) bucket = nlohmann::json::array();
+            bucket.push_back(p);
+            netByUpper.emplace(toUpperAscii(n), n);
+        }
+    }
+    nlohmann::json netsReq = nlohmann::json::array();
+    nlohmann::json skipped = nlohmann::json::array();
+    std::vector<std::string> requestedOrder;
+    for (const auto& c : cands) {
+        auto it = padsByNet.find(c.name);
+        if (it == padsByNet.end()) {
+            auto up = netByUpper.find(toUpperAscii(c.name));
+            if (up != netByUpper.end()) it = padsByNet.find(up->second);
+        }
+        if (it == padsByNet.end() || it->second.size() < 2) {
+            skipped.push_back({{"net", c.name}, {"reason", "fewer than 2 pads carry this net on the PCB"}});
+            continue;
+        }
+        netsReq.push_back({{"name", it->first}, {"pads", it->second}});
+        requestedOrder.push_back(it->first);
+    }
+    if (!skipped.empty()) result["skipped_nets"] = skipped;
+    if (netsReq.empty()) {
+        return finish(false, "", "None of the unrouted nets has two or more net-assigned pads on the PCB");
+    }
+
+    nlohmann::json req = {
+        {"units", units},
+        {"nets", netsReq},
+        {"all_pads", allPads},
+        {"existing_tracks", (state.contains("tracks") && state["tracks"].is_array())
+                                ? state["tracks"] : nlohmann::json::array()},
+        {"existing_vias", (state.contains("vias") && state["vias"].is_array())
+                              ? state["vias"] : nlohmann::json::array()}
+    };
+    for (const char* k : {"track_width_mm", "clearance_mm", "via_size_mm", "via_diameter_mm",
+                          "via_drill_mm", "grid_step_mm", "max_ripup_passes", "rules", "board",
+                          "obstacles"}) {
+        if (arguments.contains(k)) req[k] = arguments[k];
+    }
+    nlohmann::json keepouts = (arguments.contains("keepouts") && arguments["keepouts"].is_array())
+        ? arguments["keepouts"] : nlohmann::json::array();
+    if (jsonFlag(arguments, "respect_board_outline", true)) {
+        nlohmann::json edge = boardOutlineKeepouts(state);
+        result["board_outline_keepouts"] = static_cast<int>(edge.size());
+        for (auto& k : edge) keepouts.push_back(std::move(k));
+    }
+    if (!keepouts.empty()) req["keepouts"] = std::move(keepouts);
+
+    bool arOk = false;
+    std::string arSummary;
+    nlohmann::json ar = accCopy.calcPcbAutoroute(req, arOk, arSummary);
+    if (!ar.is_object() || ar.contains("error")) {
+        return finish(false, "", "calcPcbAutoroute failed: " + jsonStr(ar, "error", arSummary));
+    }
+    nlohmann::json tracks = (ar.contains("tracks") && ar["tracks"].is_array()) ? ar["tracks"] : nlohmann::json::array();
+    nlohmann::json vias = (ar.contains("vias") && ar["vias"].is_array()) ? ar["vias"] : nlohmann::json::array();
+    nlohmann::json arCompact = ar;
+    arCompact.erase("tracks");
+    arCompact.erase("vias");
+    result["autoroute"] = arCompact;
+
+    std::set<std::string> failedNets;
+    if (ar.contains("unrouted_net_names") && ar["unrouted_net_names"].is_array()) {
+        for (const auto& n : ar["unrouted_net_names"]) {
+            if (n.is_string()) failedNets.insert(n.get<std::string>());
+        }
+    }
+    nlohmann::json routedNets = nlohmann::json::array();
+    for (const auto& n : requestedOrder) {
+        if (failedNets.count(n) == 0) routedNets.push_back(n);
+    }
+    result["routed_nets"] = routedNets;
+    result["unrouted_net_names"] = nlohmann::json(std::vector<std::string>(failedNets.begin(), failedNets.end()));
+    result["added_tracks_count"] = static_cast<int>(tracks.size());
+    result["added_vias_count"] = static_cast<int>(vias.size());
+    const int drcViolations = jsonInt(ar, "drc_violations", 0);
+
+    if (!applyToPcb) {
+        result["committed"] = false;
+        result["tracks"] = tracks;
+        result["vias"] = vias;
+        return finish(arOk, arSummary + " • not applied (apply_to_pcb=false)",
+                      arOk ? "" : "Some nets could not be routed cleanly; see unrouted_net_names / autoroute.drc_violations");
+    }
+    if (drcViolations > 0 && !allowDrcViolations) {
+        result["committed"] = false;
+        result["tracks"] = tracks;
+        result["vias"] = vias;
+        return finish(false, arSummary, "Refusing to commit: router reported " + std::to_string(drcViolations) +
+                                        " clearance violations among new tracks/vias "
+                                        "(pass allow_drc_violations: true to override)");
+    }
+    if (tracks.empty() && vias.empty()) {
+        result["committed"] = false;
+        return finish(false, arSummary, "No net could be routed; nothing to commit");
+    }
+
+    // ---- 5. Commit and re-audit -----------------------------------------------------------
+    nlohmann::json postAudit;
+    if (hasState) {
+        nlohmann::json merged = state;
+        if (!merged.contains("tracks") || !merged["tracks"].is_array()) merged["tracks"] = nlohmann::json::array();
+        if (!merged.contains("vias") || !merged["vias"].is_array()) merged["vias"] = nlohmann::json::array();
+        size_t seq = 0;
+        for (const auto& t : tracks) {
+            nlohmann::json copy = t;
+            copy["id"] = "autoroute_t" + std::to_string(++seq);
+            merged["tracks"].push_back(std::move(copy));
+        }
+        seq = 0;
+        for (const auto& v : vias) {
+            nlohmann::json copy = v;
+            copy["id"] = "autoroute_v" + std::to_string(++seq);
+            merged["vias"].push_back(std::move(copy));
+        }
+        merged["tracks_count"] = static_cast<int>(merged["tracks"].size());
+        merged["vias_count"] = static_cast<int>(merged["vias"].size());
+        bool postOk = false;
+        std::string postSummary;
+        postAudit = accCopy.calcPcbConnectivityAudit(merged, postOk, postSummary);
+        merged["connectivity_audit"] = postAudit;
+        result["pcb_state"] = std::move(merged);
+        result["committed"] = true;
+        result["commit_target"] = "pcb_state";
+    } else {
+        // Router output always carries *_mm keys plus mil bare keys; commit in mil canvas units.
+        // Chunked so each plugin round-trip stays well inside the bridge RPC timeout.
+        constexpr size_t kCommitChunk = 80;
+        int committedTracks = 0;
+        int committedVias = 0;
+        std::string commitErr;
+        auto commitChunks = [&](const char* key, const nlohmann::json& items, int& counter,
+                                const char* countKey) -> bool {
+            for (size_t i = 0; i < items.size(); i += kCommitChunk) {
+                nlohmann::json chunk = nlohmann::json::array();
+                for (size_t j = i; j < std::min(items.size(), i + kCommitChunk); ++j) {
+                    chunk.push_back(items[j]);
+                }
+                nlohmann::json er = callTool("easyeda_edit_pcb", withPcbUuid({{"units", "mil"}, {key, chunk}}));
+                if (!jsonFlag(er, "ok", false)) {
+                    commitErr = jsonStr(er, "error", "easyeda_edit_pcb failed");
+                    return false;
+                }
+                counter += jsonInt(er, countKey, static_cast<int>(chunk.size()));
+            }
+            return true;
+        };
+        bool commitOk = commitChunks("tracks", tracks, committedTracks, "added_tracks") &&
+                        commitChunks("vias", vias, committedVias, "added_vias");
+        result["committed"] = commitOk;
+        result["commit_target"] = "active_pcb";
+        result["committed_tracks"] = committedTracks;
+        result["committed_vias"] = committedVias;
+
+        nlohmann::json post;
+        std::string postErr;
+        if (fetchLiveState({{"summary_only", true}}, post, postErr)) {
+            postAudit = (post.contains("connectivity_audit") && post["connectivity_audit"].is_object())
+                ? post["connectivity_audit"] : nlohmann::json::object();
+        } else {
+            result["post_route_audit_error"] = postErr;
+        }
+        if (!commitOk) {
+            result["post_route_audit"] = compactConnectivityAudit(postAudit);
+            return finish(false, arSummary, "Commit to EasyEDA Pro failed after " + std::to_string(committedTracks) +
+                                            " tracks / " + std::to_string(committedVias) + " vias: " + commitErr);
+        }
+    }
+
+    result["post_route_audit"] = compactConnectivityAudit(postAudit);
+    const std::set<std::string> postUnrouted = unroutedNetNamesOf(postAudit);
+    nlohmann::json stillOpen = nlohmann::json::array();
+    for (const auto& n : routedNets) {
+        if (postUnrouted.count(n.get<std::string>()) > 0) stillOpen.push_back(n);
+    }
+    result["routed_nets_still_open"] = stillOpen;
+    const bool auditAvailable = postAudit.is_object() && postAudit.contains("unrouted_nets_count");
+    const int postUnroutedCount = jsonInt(postAudit, "unrouted_nets_count", -1);
+    std::string summary = arSummary + " • committed " + std::to_string(tracks.size()) + " tracks / " +
+                          std::to_string(vias.size()) + " vias • post-route unrouted nets: " +
+                          (auditAvailable ? std::to_string(postUnroutedCount) : std::string("unknown"));
+    if (!auditAvailable) {
+        return finish(false, summary, "Routes were committed but the post-route connectivity audit is unavailable");
+    }
+    if (!stillOpen.empty()) {
+        return finish(false, summary, std::to_string(stillOpen.size()) +
+                                      " routed nets are still reported open by the post-route audit");
+    }
+    return finish(arOk, summary, arOk ? "" : "Some nets could not be routed; see unrouted_net_names");
+}
+
 nlohmann::json EdaBridge::callTool(const std::string& toolName,
                                    const nlohmann::json& arguments) {
+    // "refs" / "component_refs" are accepted as aliases for "references" on inspect tools
+    if (arguments.is_object() && !arguments.contains("references") &&
+        (toolName == "easyeda_inspect_pcb" || toolName == "easyeda_inspect_schematic")) {
+        for (const char* alias : {"refs", "component_refs"}) {
+            auto it = arguments.find(alias);
+            if (it != arguments.end() && it->is_array()) {
+                nlohmann::json aliased = arguments;
+                aliased["references"] = *it;
+                aliased.erase(std::string(alias));
+                return callTool(toolName, aliased);
+            }
+        }
+    }
+    if ((toolName == "eda_calc_pcb_autoroute" && isLiveAutorouteRequest(arguments)) ||
+        (toolName == "easyeda_edit_pcb" && jsonFlag(arguments, "autoroute", false))) {
+        return runLiveAutoroute(toolName, arguments);
+    }
+
     auto startTp = std::chrono::steady_clock::now();
 
     if (EdaAccelerators::isAcceleratorTool(toolName)) {
@@ -1407,6 +1945,11 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
         targetHost = cfg.resolvedHostFor(cfg.easyeda.host);
         targetPort = cfg.resolvedPortFor(cfg.easyeda.port);
         timeoutMs = cfg.easyeda.timeoutMs;
+        // The native auto-router blocks the plugin until routing settles; give the RPC the
+        // caller's routing budget plus margin for the DOM / Win32 UI Automation trigger.
+        if (toolName == "easyeda_native_autoroute") {
+            timeoutMs = std::max(timeoutMs, jsonInt(remoteArgs, "timeout_ms", 120000) + 30000);
+        }
     } else if (comp == "kicad") {
         targetHost = cfg.resolvedHostFor(cfg.kicad.host);
         targetPort = cfg.resolvedPortFor(cfg.kicad.port);
@@ -3323,7 +3866,7 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
         } else if (remoteArgs.contains("pad_nets") && remoteArgs["pad_nets"].is_array()) {
             modPadsArr = &remoteArgs["pad_nets"];
         }
-        if (modPadsArr != nullptr && !rpcResult.contains("modified_pads")) {
+        if (modPadsArr != nullptr && jsonInt(rpcResult, "modified_pads", 0) == 0) {
             std::map<std::pair<std::string, std::string>, std::string> padIdByRefNum;
             bool needRefPadLookup = false;
             for (const auto& mp : *modPadsArr) {
@@ -3385,7 +3928,7 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
 
         // 3. place_components
         if (remoteArgs.contains("place_components") && remoteArgs["place_components"].is_array() &&
-            !rpcResult.contains("placed_components")) {
+            jsonInt(rpcResult, "placed_components", 0) == 0) {
             int placedCompCount = 0;
             nlohmann::json placedDetails = nlohmann::json::array();
             for (const auto& pc : remoteArgs["place_components"]) {

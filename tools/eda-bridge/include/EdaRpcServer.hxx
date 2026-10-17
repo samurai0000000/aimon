@@ -138,6 +138,8 @@ private:
     nlohmann::json handleKiCadTool(const std::string& toolName, const nlohmann::json& args);
     nlohmann::json handleFreeCadTool(const std::string& toolName, const nlohmann::json& args);
     nlohmann::json handleEasyEdaTool(const std::string& toolName, const nlohmann::json& args);
+    // easyeda_native_autoroute: plugin DOM trigger, then Win32 UI Automation, then settle polling
+    nlohmann::json handleEasyEdaNativeAutoRoute(const nlohmann::json& args);
 
     EdaRpcServerOptions _options;
     mutable std::mutex _allowedRootMutex;

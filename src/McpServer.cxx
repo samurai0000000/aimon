@@ -59,10 +59,10 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "eda_calc_pcb_autoroute",
             "accelerators",
-            "PathFinder negotiated-congestion N-layer (2/4/6-layer EasyEDA/KiCad) 45-degree A* PCB trace & via router with obstacle-complete pad/keepout/pour avoidance, incremental existing_tracks/existing_vias, and multi-pass rip-up-and-reroute.",
+            "PathFinder negotiated-congestion N-layer (2/4/6-layer EasyEDA/KiCad) 45-degree A* PCB trace & via router with obstacle-complete pad/keepout/pour avoidance, incremental existing_tracks/existing_vias, and multi-pass rip-up-and-reroute. Live mode: from_active_pcb reads the open EasyEDA Pro PCB, routes only nets the connectivity audit reports open, and apply_to_pcb commits tracks/vias with post-route audit closure.",
             {
                 {"board", {{"type", "object"}, {"description", "Board outline and routing grid settings ({width_mm, height_mm, layers, layer_style})"}}},
-                {"nets", {{"type", "array"}, {"description", "Nets with pad coordinates ({name, width_mm, clearance_mm, pads[]})"}}},
+                {"nets", {{"type", "array"}, {"description", "Nets with pad coordinates ({name, width_mm, clearance_mm, pads[]}); in live mode an optional array of net-name strings restricting which open nets are routed"}}},
                 {"all_pads", {{"type", "array"}, {"description", "Optional foreign/all PCB pads ({net, x_mm, y_mm, w_mm, h_mm, rotation_deg, layer})"}}},
                 {"obstacles", {{"type", "array"}, {"description", "Keepout or obstacle rectangles"}}},
                 {"keepouts", {{"type", "array"}, {"description", "Keepout regions ({layer, x_min, y_min, x_max, y_max, clearance_mm})"}}},
@@ -70,7 +70,21 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
                 {"zones", {{"type", "array"}, {"description", "Alias for copper pours ({net, layer, polygon, x_min, y_min, x_max, y_max})"}}},
                 {"existing_tracks", {{"type", "array"}, {"description", "Existing routed tracks for incremental routing"}}},
                 {"existing_vias", {{"type", "array"}, {"description", "Existing vias for incremental routing"}}},
-                {"max_ripup_passes", {{"type", "integer"}, {"description", "Maximum rip-up-and-reroute passes (default: 4)"}}}
+                {"max_ripup_passes", {{"type", "integer"}, {"description", "Maximum rip-up-and-reroute passes (default: 4)"}}},
+                {"from_active_pcb", {{"type", "boolean"}, {"default", false}, {"description", "Live mode: read pads/tracks/vias/outline from the active EasyEDA Pro PCB and route only nets the connectivity audit reports as unrouted"}}},
+                {"pcb_state", {{"type", "object"}, {"description", "Offline live-mode input: an easyeda_inspect_pcb-shaped state ({units, pads, tracks, vias, board_outline}); with apply_to_pcb the routed state is returned instead of mutating EasyEDA"}}},
+                {"apply_to_pcb", {{"type", "boolean"}, {"default", false}, {"description", "Live mode: commit routed tracks/vias to the PCB (refused when the router reports DRC violations unless allow_drc_violations)"}}},
+                {"engine", {{"type", "string"}, {"default", "auto"}, {"description", "Live mode routing engine: auto (C++ router, optional native_first), easyeda_native (EasyEDA Pro built-in auto-router), or cpp_steiner"}}},
+                {"native_first", {{"type", "boolean"}, {"default", false}, {"description", "With engine=auto, trigger the EasyEDA Pro native auto-router first, then close remaining open nets with the C++ router"}}},
+                {"native_timeout_ms", {{"type", "integer"}, {"default", 120000}, {"description", "Native auto-router completion timeout in ms (clamped 5000..600000)"}}},
+                {"respect_board_outline", {{"type", "boolean"}, {"default", true}, {"description", "Convert board outline segments into routing keepouts (default: true)"}}},
+                {"allow_drc_violations", {{"type", "boolean"}, {"default", false}, {"description", "Commit routes even when the router reports DRC violations (default: false)"}}},
+                {"pcb_uuid", {{"type", "string"}, {"description", "Optional PCB document UUID forwarded to every live inspect/edit call (the plugin opens that PCB document before operating)"}}},
+                {"track_width_mm", {{"type", "number"}, {"description", "Default track width in mm"}}},
+                {"clearance_mm", {{"type", "number"}, {"description", "Default copper clearance in mm"}}},
+                {"via_diameter_mm", {{"type", "number"}, {"description", "Via pad diameter in mm"}}},
+                {"via_drill_mm", {{"type", "number"}, {"description", "Via drill diameter in mm"}}},
+                {"grid_step_mm", {{"type", "number"}, {"description", "Routing grid step in mm"}}}
             },
             {}
         },
@@ -367,7 +381,7 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
             "Read live schematic components, wires, pins, and automatic erc_audit from EasyEDA Pro with optional reference/net/summary filtering.",
             {
                 {"schematic_path", {{"type", "string"}, {"description", "Optional schematic file path fallback"}}},
-                {"references", {{"type", "array"}, {"description", "Optional list of component designators to filter (e.g. ['XT1', 'R16'])"}}},
+                {"references", {{"type", "array"}, {"description", "Optional list of component designators to filter (e.g. ['XT1', 'R16']); aliases: refs, component_refs"}}},
                 {"nets", {{"type", "array"}, {"description", "Optional list of net names to filter components and wires (e.g. ['SDA', 'GND'])"}}},
                 {"component_types", {{"type", "array"}, {"description", "Optional component types to include (e.g. ['part', 'netflag'])"}}},
                 {"include_pins", {{"type", "boolean"}, {"default", true}, {"description", "Include component pin arrays (default: true)"}}},
@@ -412,7 +426,7 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
             "easyeda",
             "Inspect EasyEDA Pro PCB board outline, component placements, pads, tracks, vias, copper pours, and full-board connectivity_audit with optional reference/net/summary filtering.",
             {
-                {"references", {{"type", "array"}, {"description", "Optional list of component designators to filter (e.g. ['C35', 'U1'])"}}},
+                {"references", {{"type", "array"}, {"description", "Optional list of component designators to filter (e.g. ['C35', 'U1']); aliases: refs, component_refs"}}},
                 {"nets", {{"type", "array"}, {"description", "Optional list of net names to filter pads, tracks, vias, and pours (e.g. ['GND', '+5V'])"}}},
                 {"include_raw_primitives", {{"type", "boolean"}, {"default", false}, {"description", "Include full unfiltered pads, tracks, vias, and pours arrays (default: false)"}}},
                 {"summary_only", {{"type", "boolean"}, {"default", false}, {"description", "Return counts and connectivity_audit only without primitive arrays (default: false)"}}}
@@ -436,7 +450,11 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
                 {"add_tracks", {{"type", "array"}, {"description", "Declarative PCB trace segments ({net, layer, x1, y1, x2, y2, width})"}}},
                 {"vias", {{"type", "array"}, {"description", "PCB vias"}}},
                 {"add_vias", {{"type", "array"}, {"description", "Declarative PCB vias ({net, x, y, drill, size})"}}},
-                {"zones", {{"type", "array"}, {"description", "Copper pour regions"}}}
+                {"zones", {{"type", "array"}, {"description", "Copper pour regions"}}},
+                {"autoroute", {{"type", "boolean"}, {"default", false}, {"description", "After applying the other edits, route all nets the connectivity audit reports open and commit tracks/vias (accepts the eda_calc_pcb_autoroute live-mode keys: engine, native_first, nets, respect_board_outline, allow_drc_violations, pcb_uuid, rule keys)"}}},
+                {"engine", {{"type", "string"}, {"default", "auto"}, {"description", "Autoroute engine: auto, easyeda_native, or cpp_steiner"}}},
+                {"native_first", {{"type", "boolean"}, {"default", false}, {"description", "With autoroute and engine=auto, run the EasyEDA Pro native auto-router before the C++ router"}}},
+                {"allow_drc_violations", {{"type", "boolean"}, {"default", false}, {"description", "Commit autoroute output even when the router reports DRC violations"}}}
             },
             {}
         },

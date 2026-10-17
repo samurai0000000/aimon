@@ -1832,10 +1832,34 @@ var edaEsbuildExportName = (function () {
         }
 
         const delPrims = (args && args.delete_primitives) || [];
+        const skippedChildPrimitives = [];
         if (Array.isArray(delPrims) && delPrims.length > 0 && typeof eda !== "undefined") {
+            // Footprint child sub-primitives ("<componentId>e<digits>", e.g. pads) must never be
+            // deleted individually: that silently breaks the footprint. Delete the component instead.
+            const componentIds = {};
+            if (eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.getAll === "function") {
+                try {
+                    const comps = await eda.pcb_PrimitiveComponent.getAll();
+                    if (Array.isArray(comps)) {
+                        for (const c of comps) {
+                            const cid = String(callGetter(c, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            if (cid) componentIds[cid] = true;
+                        }
+                    }
+                } catch (err) {
+                }
+            }
             const ids = delPrims.map(function (d) {
                 return (d && typeof d === "object") ? String(d.id || d.primitive_id || "") : String(d || "");
-            }).filter(Boolean);
+            }).filter(function (id) {
+                if (!id) return false;
+                const lastE = id.lastIndexOf("e");
+                if (lastE > 0 && /^[0-9]+$/.test(id.slice(lastE + 1)) && componentIds[id.slice(0, lastE)]) {
+                    skippedChildPrimitives.push(id);
+                    return false;
+                }
+                return true;
+            });
             if (ids.length > 0) {
                 if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.delete === "function") {
                     try { await eda.pcb_PrimitiveTrack.delete(ids); } catch (err) {}
@@ -1954,11 +1978,183 @@ var edaEsbuildExportName = (function () {
             created_pads: createdPads,
             modified_pads: modifiedPads,
             deleted_primitives: deletedPrimitives,
+            skipped_child_primitives: skippedChildPrimitives,
             added_zones: addedZones,
             added_tracks: addedTracks,
             added_vias: addedVias,
             rubber_banded_tracks: rubberBandedTracks,
             rubber_banded_tracks_count: rubberBandedTracks.length
+        };
+    }
+
+    // ---- EasyEDA Pro native auto-router (Route -> Auto Route -> Run) -----------------------
+    // Best effort: extensions normally run in a sandboxed iframe, so window.top.document is
+    // expected to throw. In that case the bridge falls back to Win32 UI Automation.
+    const ROUTE_MENU_LABELS = ["Route", "布线"];
+    const AUTO_ROUTE_ITEM_LABELS = ["Auto Route...", "Auto Route…", "Auto Route", "Auto Router...",
+        "Auto Router", "自动布线...", "自动布线…", "自动布线"];
+    const RUN_BUTTON_LABELS = ["Run", "Run Auto Route", "Auto Route", "执行", "开始布线", "运行"];
+
+    function sleepMs(ms) {
+        return new Promise(function (resolve) { setTimeout(resolve, ms); });
+    }
+
+    async function countCopperTracks() {
+        let n = 0;
+        try {
+            if (typeof eda !== "undefined" && eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.getAll === "function") {
+                const raw = await eda.pcb_PrimitiveLine.getAll();
+                if (Array.isArray(raw)) {
+                    for (const ln of raw) {
+                        if (isCopperLayer(callGetter(ln, "getState_Layer", "layer", "", ""))) n += 1;
+                    }
+                }
+            }
+        } catch (err) {
+            logDiag("countCopperTracks error: " + String(err));
+        }
+        return n;
+    }
+
+    function collectAccessibleDocuments() {
+        const docs = [];
+        const tryPush = function (getter, label) {
+            try {
+                const d = getter();
+                if (d && typeof d.querySelectorAll === "function" &&
+                    !docs.some(function (x) { return x.doc === d; })) {
+                    docs.push({ doc: d, label: label });
+                }
+            } catch (err) {
+                // Cross-origin frame access throws SecurityError: not accessible from this sandbox
+            }
+        };
+        tryPush(function () { return document; }, "document");
+        tryPush(function () { return window.parent.document; }, "parent");
+        tryPush(function () { return window.top.document; }, "top");
+        return docs;
+    }
+
+    function normalizedText(node) {
+        return String((node && node.textContent) || "").replace(/\s+/g, " ").trim();
+    }
+
+    // First element (document order) whose whole trimmed text equals one of the labels, then
+    // descend to the deepest child carrying the same text so the click lands on the handler.
+    function findElementByText(doc, selector, labels, exclude) {
+        let nodes = [];
+        try {
+            nodes = doc.querySelectorAll(selector);
+        } catch (err) {
+            return null;
+        }
+        for (const node of nodes) {
+            if (exclude && node === exclude) continue;
+            const txt = normalizedText(node);
+            if (!txt || txt.length > 40 || labels.indexOf(txt) < 0) continue;
+            let target = node;
+            let descended = true;
+            while (descended) {
+                descended = false;
+                for (const child of target.children || []) {
+                    if (normalizedText(child) === txt) {
+                        target = child;
+                        descended = true;
+                        break;
+                    }
+                }
+            }
+            return target;
+        }
+        return null;
+    }
+
+    function clickElement(el) {
+        const view = (el.ownerDocument && el.ownerDocument.defaultView) || null;
+        for (const type of ["mousedown", "mouseup", "click"]) {
+            try {
+                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: view }));
+            } catch (err) {
+            }
+        }
+    }
+
+    async function handleNativeAutoRoute(args) {
+        const timeoutMs = Math.min(Math.max(Number((args && args.timeout_ms) || 120000), 5000), 600000);
+        if (typeof eda === "undefined") {
+            return { ok: false, triggered: false, error: "EasyEDA Pro eda API is unavailable" };
+        }
+        await ensureDocumentOpen("pcb", args && args.pcb_uuid, null);
+        const beforeTracks = await countCopperTracks();
+        const docs = collectAccessibleDocuments();
+        const attempts = [];
+        let triggeredDoc = "";
+        for (const entry of docs) {
+            const routeMenu = findElementByText(entry.doc,
+                "[role='menuitem'],[role='button'],button,li,a,span,div", ROUTE_MENU_LABELS, null);
+            if (!routeMenu) {
+                attempts.push({ document: entry.label, stage: "route_menu_not_found" });
+                continue;
+            }
+            clickElement(routeMenu);
+            await sleepMs(400);
+            const autoItem = findElementByText(entry.doc,
+                "[role='menuitem'],li,a,span,div", AUTO_ROUTE_ITEM_LABELS, routeMenu);
+            if (!autoItem) {
+                attempts.push({ document: entry.label, stage: "auto_route_item_not_found" });
+                continue;
+            }
+            clickElement(autoItem);
+            let runBtn = null;
+            for (let i = 0; i < 25 && !runBtn; i += 1) {
+                await sleepMs(200);
+                runBtn = findElementByText(entry.doc, "button,[role='button']", RUN_BUTTON_LABELS, autoItem);
+            }
+            if (!runBtn) {
+                attempts.push({ document: entry.label, stage: "run_button_not_found" });
+                continue;
+            }
+            clickElement(runBtn);
+            triggeredDoc = entry.label;
+            break;
+        }
+        if (!triggeredDoc) {
+            return {
+                ok: true,
+                triggered: false,
+                needs_win32_ui_automation: true,
+                before_tracks: beforeTracks,
+                accessible_documents: docs.map(function (d) { return d.label; }),
+                attempts: attempts
+            };
+        }
+
+        const deadline = Date.now() + timeoutMs;
+        let last = beforeTracks;
+        let stableTicks = 0;
+        let changed = false;
+        while (Date.now() < deadline) {
+            await sleepMs(1500);
+            const cur = await countCopperTracks();
+            if (cur !== last) {
+                last = cur;
+                stableTicks = 0;
+                if (cur !== beforeTracks) changed = true;
+            } else {
+                stableTicks += 1;
+                if (changed && stableTicks >= 3) break;
+            }
+        }
+        return {
+            ok: true,
+            triggered: true,
+            method: "dom",
+            document: triggeredDoc,
+            before_tracks: beforeTracks,
+            after_tracks: last,
+            added_tracks: last - beforeTracks,
+            settled: changed && stableTicks >= 3,
+            attempts: attempts
         };
     }
 
@@ -2129,6 +2325,8 @@ var edaEsbuildExportName = (function () {
                 return await handleInspectPcb(args);
             case "easyeda_edit_pcb":
                 return await handleEditPcb(args);
+            case "easyeda_native_autoroute":
+                return await handleNativeAutoRoute(args);
             case "easyeda_run_drc":
                 return await handleRunDrc(args);
             case "easyeda_export_jlcpcb":

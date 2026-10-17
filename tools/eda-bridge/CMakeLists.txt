@@ -109,7 +109,7 @@ if(AIMON_EDA_BRIDGE_WITH_QT)
 endif()
 
 if(WIN32)
-    target_link_libraries(aimon-eda-bridge PRIVATE ws2_32 advapi32 user32 shell32 ole32 uuid)
+    target_link_libraries(aimon-eda-bridge PRIVATE ws2_32 advapi32 user32 shell32 ole32 oleaut32 uuid)
 
     add_executable(aimon-installer-stub
         src/WindowsInstallerMain.cxx
