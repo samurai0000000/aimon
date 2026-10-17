@@ -178,6 +178,103 @@ int main() {
         RC_ASSERT(res.value("ring_teeth", 0) == zs + 2 * zp);
     });
 
+    ok &= rc::check("calcSchematicErcAudit handles empty, wired, and unwired randomized schematics", []() {
+        const int pairCount = *rc::gen::inRange(0, 5);
+        const bool connectAll = *rc::gen::arbitrary<bool>();
+        const bool negateY = *rc::gen::arbitrary<bool>();
+
+        nlohmann::json comps = nlohmann::json::array();
+        nlohmann::json wires = nlohmann::json::array();
+
+        for (int i = 0; i < pairCount; ++i) {
+            double y = 100.0 + i * 100.0;
+            double pinY = negateY ? -y : y;
+            comps.push_back({
+                {"id", "cA_" + std::to_string(i)},
+                {"reference", "R" + std::to_string(i * 2 + 1)},
+                {"value", "10k"},
+                {"component_type", "part"},
+                {"footprint", "R0603"},
+                {"unique_id", "uidA_" + std::to_string(i)},
+                {"x", 100.0},
+                {"y", y},
+                {"pins", nlohmann::json::array({
+                    {{"id", "pA_" + std::to_string(i)}, {"number", "1"}, {"name", "1"}, {"net", ""}, {"x", 100.0}, {"y", pinY}, {"no_connected", false}}
+                })}
+            });
+            comps.push_back({
+                {"id", "cB_" + std::to_string(i)},
+                {"reference", "R" + std::to_string(i * 2 + 2)},
+                {"value", "10k"},
+                {"component_type", "part"},
+                {"footprint", "R0603"},
+                {"unique_id", "uidB_" + std::to_string(i)},
+                {"x", 200.0},
+                {"y", y},
+                {"pins", nlohmann::json::array({
+                    {{"id", "pB_" + std::to_string(i)}, {"number", "1"}, {"name", "1"}, {"net", ""}, {"x", 200.0}, {"y", y}, {"no_connected", false}}
+                })}
+            });
+            if (connectAll) {
+                wires.push_back({
+                    {"id", "w_" + std::to_string(i)},
+                    {"net", "NET_" + std::to_string(i)},
+                    {"line", nlohmann::json::array({{100.0, y}, {200.0, y}})}
+                });
+            }
+        }
+
+        EdaAccelerators acc;
+        bool success = false;
+        std::string summary;
+        nlohmann::json res = acc.calcSchematicErcAudit({{"components", comps}, {"wires", wires}}, success, summary);
+        RC_ASSERT(success);
+        RC_ASSERT(res.value("ok", false));
+        RC_ASSERT(res.value("total_part_components", -1) == pairCount * 2);
+        if (pairCount == 0 || connectAll) {
+            RC_ASSERT(res.value("unconnected_pins_count", -1) == 0);
+            RC_ASSERT(res.value("passed", false));
+        } else {
+            RC_ASSERT(res.value("unconnected_pins_count", 0) == pairCount * 2);
+            RC_ASSERT(!res.value("passed", true));
+        }
+    });
+
+    ok &= rc::check("calcPcbConnectivityAudit connects same-net pads inside copper pour polygon and respects large pad dimensions", []() {
+        const int spanMm = *rc::gen::inRange(10, 60);
+        const bool includePour = *rc::gen::arbitrary<bool>();
+        const double padSizeMm = *rc::gen::inRange(20, 40) / 10.0; // 2.0 to 4.0 mm
+
+        nlohmann::json pads = nlohmann::json::array({
+            {{"id", "p1"}, {"ref", "J1"}, {"pad", "1"}, {"net", "GND"}, {"x", 5.0}, {"y", 5.0}, {"layer", "TopLayer"}, {"size_x", padSizeMm}, {"size_y", padSizeMm}},
+            {{"id", "p2"}, {"ref", "J2"}, {"pad", "1"}, {"net", "GND"}, {"x", 5.0 + spanMm}, {"y", 5.0}, {"layer", "TopLayer"}, {"width", padSizeMm}, {"height", padSizeMm}}
+        });
+        nlohmann::json pours = nlohmann::json::array();
+        if (includePour) {
+            pours.push_back({
+                {"id", "z1"},
+                {"net", "GND"},
+                {"layer", "TopLayer"},
+                {"polygon", nlohmann::json::array({
+                    {0.0, 0.0}, {10.0 + spanMm, 0.0}, {10.0 + spanMm, 10.0}, {0.0, 10.0}
+                })}
+            });
+        }
+
+        EdaAccelerators acc;
+        bool success = false;
+        std::string summary;
+        nlohmann::json res = acc.calcPcbConnectivityAudit({
+            {"units", "mm"},
+            {"pads", pads},
+            {"tracks", nlohmann::json::array()},
+            {"pours", pours}
+        }, success, summary);
+        RC_ASSERT(success);
+        RC_ASSERT(res.value("all_connected", false) == includePour);
+        RC_ASSERT(res.value("unrouted_nets_count", -1) == (includePour ? 0 : 1));
+    });
+
     return ok ? 0 : 1;
 }
 

@@ -97,6 +97,7 @@ bool EdaAccelerators::isAcceleratorTool(const std::string& toolName) {
            toolName == "eda_calc_pcb_placement" ||
            toolName == "eda_calc_pcb_autoroute" ||
            toolName == "eda_calc_pcb_connectivity_audit" ||
+           toolName == "eda_calc_schematic_erc_audit" ||
            toolName == "eda_calc_electrical_synth" ||
            toolName == "cad_calc_robot_kinematics_statics" ||
            toolName == "cad_calc_mechanism_synth" ||
@@ -116,7 +117,16 @@ nlohmann::json EdaAccelerators::executeTool(const std::string& toolName,
     if (toolName == "eda_calc_pcb_autoroute") {
         return calcPcbAutoroute(args, outSuccess, outSummary);
     }
+    if (toolName == "eda_calc_schematic_erc_audit") {
+        return calcSchematicErcAudit(args, outSuccess, outSummary);
+    }
     if (toolName == "eda_calc_pcb_connectivity_audit") {
+        if (args.is_object() &&
+            (args.value("target", "") == "schematic" ||
+             (args.contains("wires") && !args.contains("pads") &&
+              !args.contains("tracks") && !args.contains("footprints")))) {
+            return calcSchematicErcAudit(args, outSuccess, outSummary);
+        }
         return calcPcbConnectivityAudit(args, outSuccess, outSummary);
     }
     if (toolName == "eda_calc_electrical_synth") {
@@ -1875,6 +1885,17 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         double diameter = 0.6;
         double drill = 0.3;
     };
+    struct AuditPour {
+        std::string id;
+        std::string net;
+        std::string layer;
+        std::vector<std::pair<double, double>> poly;
+        bool hasBbox = false;
+        double xMin = 0.0;
+        double yMin = 0.0;
+        double xMax = 0.0;
+        double yMax = 0.0;
+    };
 
     std::string units = args.value("units", "");
     bool isMilUnits = (units == "mil");
@@ -1891,18 +1912,27 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         }
     }
 
-    const double defaultPadSize = isMilUnits ? (0.6 / 0.0254) : 0.6;
-    const double minPadSize = isMilUnits ? (0.1 / 0.0254) : 0.1;
-    const double defaultTrackWidth = isMilUnits ? (0.25 / 0.0254) : 0.25;
-    const double minTrackWidth = isMilUnits ? (0.05 / 0.0254) : 0.05;
-    const double defaultViaDia = isMilUnits ? (0.6 / 0.0254) : 0.6;
-    const double minViaDia = isMilUnits ? (0.2 / 0.0254) : 0.2;
-    const double defaultViaDrill = isMilUnits ? (0.3 / 0.0254) : 0.3;
-    const double minViaDrill = isMilUnits ? (0.1 / 0.0254) : 0.1;
-    const double touchTol = isMilUnits ? (0.08 / 0.0254) : 0.08;
+    const double mmToCoord = isMilUnits ? (1.0 / 0.0254) : 1.0;
+    const double defaultPadSize = 0.6 * mmToCoord;
+    const double minPadSize = 0.1 * mmToCoord;
+    const double defaultTrackWidth = 0.25 * mmToCoord;
+    const double minTrackWidth = 0.05 * mmToCoord;
+    const double defaultViaDia = 0.6 * mmToCoord;
+    const double minViaDia = 0.2 * mmToCoord;
+    const double defaultViaDrill = 0.3 * mmToCoord;
+    const double minViaDrill = 0.1 * mmToCoord;
+    const double touchTol = 0.08 * mmToCoord;
 
     std::vector<AuditPad> allPads;
     std::set<std::string> pcbRefs;
+
+    auto extractPositiveNumber = [](const nlohmann::json& obj, const char* key) -> double {
+        if (obj.contains(key) && obj[key].is_number()) {
+            double v = obj[key].get<double>();
+            if (v > 0.0) return v;
+        }
+        return 0.0;
+    };
 
     auto ingestPadObj = [&](const nlohmann::json& p, const std::string& parentRef) {
         if (!p.is_object()) return;
@@ -1913,8 +1943,31 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         ap.net = p.value("net", "");
         ap.x = p.value("x", p.value("x_mm", 0.0));
         ap.y = p.value("y", p.value("y_mm", 0.0));
-        ap.sx = std::max(minPadSize, p.value("size_x", p.value("width_mm", defaultPadSize)));
-        ap.sy = std::max(minPadSize, p.value("size_y", p.value("height_mm", defaultPadSize)));
+
+        double rawSx = extractPositiveNumber(p, "size_x");
+        if (rawSx <= 0.0) rawSx = extractPositiveNumber(p, "width");
+        if (rawSx <= 0.0) {
+            double wMm = extractPositiveNumber(p, "width_mm");
+            if (wMm > 0.0) rawSx = wMm * mmToCoord;
+        }
+        double rawSy = extractPositiveNumber(p, "size_y");
+        if (rawSy <= 0.0) rawSy = extractPositiveNumber(p, "height");
+        if (rawSy <= 0.0) {
+            double hMm = extractPositiveNumber(p, "height_mm");
+            if (hMm > 0.0) rawSy = hMm * mmToCoord;
+        }
+        double holeDia = extractPositiveNumber(p, "hole_diameter");
+        if (holeDia <= 0.0) holeDia = extractPositiveNumber(p, "drill");
+        if (holeDia <= 0.0) {
+            double dMm = extractPositiveNumber(p, "drill_mm");
+            if (dMm > 0.0) holeDia = dMm * mmToCoord;
+        }
+        if (holeDia > 0.0) {
+            rawSx = std::max(rawSx, holeDia);
+            rawSy = std::max(rawSy, holeDia);
+        }
+        ap.sx = std::max(minPadSize, (rawSx > 0.0) ? rawSx : defaultPadSize);
+        ap.sy = std::max(minPadSize, (rawSy > 0.0) ? rawSy : defaultPadSize);
         ap.layer = canonicalLayer(p, "TopLayer");
         if (!ap.ref.empty()) pcbRefs.insert(ap.ref);
         allPads.push_back(ap);
@@ -2006,6 +2059,92 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         }
     }
 
+    std::vector<AuditPour> allPours;
+    for (const char* pourKey : {"pours", "zones"}) {
+        if (!args.contains(pourKey) || !args[pourKey].is_array()) continue;
+        for (const auto& z : args[pourKey]) {
+            if (!z.is_object()) continue;
+            AuditPour ap;
+            ap.id = z.value("id", "pour_" + std::to_string(allPours.size() + 1));
+            ap.net = z.value("net", "");
+            ap.layer = canonicalLayer(z, "TopLayer");
+
+            for (const char* polyKey : {"polygon", "points", "outline"}) {
+                if (z.contains(polyKey) && z[polyKey].is_array()) {
+                    for (const auto& pt : z[polyKey]) {
+                        if (pt.is_array() && pt.size() >= 2 && pt[0].is_number() && pt[1].is_number()) {
+                            ap.poly.push_back({pt[0].get<double>(), pt[1].get<double>()});
+                        } else if (pt.is_object() && pt.contains("x") && pt.contains("y") &&
+                                   pt["x"].is_number() && pt["y"].is_number()) {
+                            ap.poly.push_back({pt["x"].get<double>(), pt["y"].get<double>()});
+                        }
+                    }
+                    if (!ap.poly.empty()) break;
+                }
+            }
+
+            if (z.contains("x_min") && z.contains("y_min") && z.contains("x_max") && z.contains("y_max") &&
+                z["x_min"].is_number() && z["y_min"].is_number() &&
+                z["x_max"].is_number() && z["y_max"].is_number()) {
+                ap.hasBbox = true;
+                ap.xMin = z["x_min"].get<double>();
+                ap.yMin = z["y_min"].get<double>();
+                ap.xMax = z["x_max"].get<double>();
+                ap.yMax = z["y_max"].get<double>();
+            } else if (z.contains("bbox") && z["bbox"].is_object()) {
+                const auto& bb = z["bbox"];
+                if (bb.contains("x_min") && bb.contains("y_min") && bb.contains("x_max") && bb.contains("y_max")) {
+                    ap.hasBbox = true;
+                    ap.xMin = bb.value("x_min", 0.0);
+                    ap.yMin = bb.value("y_min", 0.0);
+                    ap.xMax = bb.value("x_max", 0.0);
+                    ap.yMax = bb.value("y_max", 0.0);
+                }
+            } else if (!ap.poly.empty()) {
+                ap.hasBbox = true;
+                ap.xMin = ap.xMax = ap.poly[0].first;
+                ap.yMin = ap.yMax = ap.poly[0].second;
+                for (const auto& pt : ap.poly) {
+                    ap.xMin = std::min(ap.xMin, pt.first);
+                    ap.xMax = std::max(ap.xMax, pt.first);
+                    ap.yMin = std::min(ap.yMin, pt.second);
+                    ap.yMax = std::max(ap.yMax, pt.second);
+                }
+            }
+
+            if (!ap.net.empty() && (ap.poly.size() >= 3 || ap.hasBbox)) {
+                allPours.push_back(ap);
+            }
+        }
+    }
+
+    auto pointInOrNearPour = [&](const AuditPour& pour, double px, double py, double radius) -> bool {
+        if (pour.hasBbox) {
+            if (px < pour.xMin - radius || px > pour.xMax + radius ||
+                py < pour.yMin - radius || py > pour.yMax + radius) {
+                return false;
+            }
+        }
+        if (pour.poly.size() >= 3) {
+            bool inside = false;
+            size_t n = pour.poly.size();
+            for (size_t i = 0, j = n - 1; i < n; j = i++) {
+                double xi = pour.poly[i].first;
+                double yi = pour.poly[i].second;
+                double xj = pour.poly[j].first;
+                double yj = pour.poly[j].second;
+                bool intersect = ((yi > py) != (yj > py)) &&
+                                 (px < (xj - xi) * (py - yi) / ((yj - yi) + ((yj >= yi) ? 1e-15 : -1e-15)) + xi);
+                if (intersect) inside = !inside;
+                if (distPointToSeg(px, py, xj, yj, xi, yi) <= radius) {
+                    return true;
+                }
+            }
+            return inside;
+        }
+        return pour.hasBbox;
+    };
+
     // 1. Unassigned pads (ignoring mechanical mounting holes H*, MH*, MP)
     nlohmann::json unassignedPadsJson = nlohmann::json::array();
     std::map<std::string, std::vector<size_t>> netPadsMap;
@@ -2029,7 +2168,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         }
     }
 
-    // 2. Per-net 3D Layer-Aware Union-Find connectivity analysis
+    // 2. Per-net 3D Layer-Aware Union-Find connectivity analysis (including copper pours/zones)
     int totalNets = 0;
     int fullyRoutedNets = 0;
     nlohmann::json unroutedNetsJson = nlohmann::json::array();
@@ -2052,11 +2191,18 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                 viaIndices.push_back(i);
             }
         }
+        std::vector<size_t> pourIndices;
+        for (size_t i = 0; i < allPours.size(); ++i) {
+            if (allPours[i].net == netName) {
+                pourIndices.push_back(i);
+            }
+        }
 
         size_t nP = padIndices.size();
         size_t nT = trkIndices.size();
         size_t nV = viaIndices.size();
-        size_t totalNodes = nP + nT + nV;
+        size_t nZ = pourIndices.size();
+        size_t totalNodes = nP + nT + nV + nZ;
         std::vector<size_t> ufParent(totalNodes);
         for (size_t i = 0; i < totalNodes; ++i) ufParent[i] = i;
 
@@ -2152,6 +2298,35 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             }
         }
 
+        // Copper Pour / Zone unions (Pad-to-Pour, Track-to-Pour, Via-to-Pour)
+        for (size_t z = 0; z < nZ; ++z) {
+            const auto& pour = allPours[pourIndices[z]];
+            size_t pourNode = nP + nT + nV + z;
+            for (size_t i = 0; i < nP; ++i) {
+                const auto& pa = allPads[padIndices[i]];
+                if (!layersMatch(pa.layer, pour.layer)) continue;
+                double ra = 0.5 * std::max(pa.sx, pa.sy);
+                if (pointInOrNearPour(pour, pa.x, pa.y, ra + touchTol)) {
+                    ufUnion(i, pourNode);
+                }
+            }
+            for (size_t j = 0; j < nT; ++j) {
+                const auto& trk = allTracks[trkIndices[j]];
+                if (!layersMatch(trk.layer, pour.layer)) continue;
+                double rt = 0.5 * trk.width + touchTol;
+                if (pointInOrNearPour(pour, trk.x1, trk.y1, rt) ||
+                    pointInOrNearPour(pour, trk.x2, trk.y2, rt)) {
+                    ufUnion(nP + j, pourNode);
+                }
+            }
+            for (size_t k = 0; k < nV; ++k) {
+                const auto& via = allVias[viaIndices[k]];
+                if (pointInOrNearPour(pour, via.x, via.y, 0.5 * via.diameter + touchTol)) {
+                    ufUnion(nP + nT + k, pourNode);
+                }
+            }
+        }
+
         std::map<size_t, std::vector<size_t>> islands;
         for (size_t i = 0; i < nP; ++i) {
             islands[ufFind(i)].push_back(padIndices[i]);
@@ -2242,6 +2417,16 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                 }
             }
             if (!anchored) {
+                for (const auto& pour : allPours) {
+                    if (!trk.net.empty() && !pour.net.empty() && trk.net != pour.net) continue;
+                    if (!layersMatch(trk.layer, pour.layer)) continue;
+                    if (pointInOrNearPour(pour, ex, ey, 0.5 * trk.width + touchTol)) {
+                        anchored = true;
+                        break;
+                    }
+                }
+            }
+            if (!anchored) {
                 danglingTracksJson.push_back({
                     {"id", trk.id},
                     {"net", trk.net},
@@ -2253,7 +2438,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         }
     }
 
-    // 4. Schematic-to-PCB component parity check
+    // 4. Schematic-to-PCB component parity check (with multi-sheet deduplication)
     for (const char* compKey : {"pcb_components", "components"}) {
         if (args.contains(compKey) && args[compKey].is_array()) {
             for (const auto& pc : args[compKey]) {
@@ -2265,6 +2450,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
     }
 
     nlohmann::json unsyncedJson = nlohmann::json::array();
+    std::set<std::string> seenSchRefs;
     if (args.contains("schematic_components") && args["schematic_components"].is_array()) {
         for (const auto& sc : args["schematic_components"]) {
             if (!sc.is_object()) continue;
@@ -2272,11 +2458,14 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             std::string compType = sc.value("component_type", sc.value("type", ""));
             std::string fp = sc.value("footprint", "");
             if (ref.empty() || compType == "netport" || compType == "frame" || compType == "power" ||
-                ref.rfind("FRAME", 0) == 0 || ref.rfind("#", 0) == 0 ||
+                compType == "netflag" || ref.rfind("FRAME", 0) == 0 || ref.rfind("#", 0) == 0 ||
                 ref == "GND" || ref == "VCC") {
                 continue;
             }
             if (fp.empty() && !compType.empty() && compType != "part") {
+                continue;
+            }
+            if (!seenSchRefs.insert(ref).second) {
                 continue;
             }
             if (pcbRefs.find(ref) == pcbRefs.end()) {
@@ -2317,6 +2506,517 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         {"unassigned_pads", unassignedPadsJson},
         {"unsynced_schematic_components_count", unsyncedCount},
         {"unsynced_schematic_components", unsyncedJson},
+        {"summary", outSummary}
+    };
+}
+
+nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args,
+                                                      bool& outSuccess,
+                                                      std::string& outSummary) const {
+    if (!args.is_object()) {
+        outSuccess = false;
+        outSummary = "eda_calc_schematic_erc_audit requires a JSON object payload";
+        return {{"ok", false}, {"error", outSummary}};
+    }
+
+    auto distPointToSeg = [](double px, double py,
+                             double x1, double y1,
+                             double x2, double y2) -> double {
+        double dx = x2 - x1;
+        double dy = y2 - y1;
+        double len2 = dx * dx + dy * dy;
+        if (len2 < 1e-12) {
+            return std::hypot(px - x1, py - y1);
+        }
+        double t = std::clamp(((px - x1) * dx + (py - y1) * dy) / len2, 0.0, 1.0);
+        return std::hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+    };
+
+    struct SchWire {
+        std::string id;
+        std::string net;
+        std::vector<std::pair<double, double>> pts;
+    };
+
+    struct SchPin {
+        std::string id;
+        std::string compId;
+        std::string ref;
+        std::string number;
+        std::string name;
+        std::string net;
+        double x = 0.0;
+        double rawY = 0.0;
+        double normY = 0.0;
+        bool noConnected = false;
+        bool isPartPin = true;
+        bool isNetFlag = false;
+        std::string netFlagName;
+        bool touchesWire = false;
+    };
+
+    std::vector<SchWire> wires;
+    bool anyWireVertex = false;
+    bool allWireYNonNegative = true;
+
+    if (args.contains("wires") && args["wires"].is_array()) {
+        for (const auto& w : args["wires"]) {
+            if (!w.is_object()) continue;
+            SchWire sw;
+            sw.id = w.value("id", "w_" + std::to_string(wires.size() + 1));
+            sw.net = w.value("net", "");
+            for (const char* lineKey : {"line", "points"}) {
+                if (w.contains(lineKey) && w[lineKey].is_array()) {
+                    const auto& arr = w[lineKey];
+                    if (!arr.empty() && arr[0].is_number()) {
+                        for (size_t i = 0; i + 1 < arr.size(); i += 2) {
+                            if (arr[i].is_number() && arr[i + 1].is_number()) {
+                                double wx = arr[i].get<double>();
+                                double wy = arr[i + 1].get<double>();
+                                sw.pts.push_back({wx, wy});
+                                anyWireVertex = true;
+                                if (wy < 0.0) allWireYNonNegative = false;
+                            }
+                        }
+                    } else {
+                        for (const auto& pt : arr) {
+                            if (pt.is_array() && pt.size() >= 2 && pt[0].is_number() && pt[1].is_number()) {
+                                double wx = pt[0].get<double>();
+                                double wy = pt[1].get<double>();
+                                sw.pts.push_back({wx, wy});
+                                anyWireVertex = true;
+                                if (wy < 0.0) allWireYNonNegative = false;
+                            } else if (pt.is_object() && pt.contains("x") && pt.contains("y") &&
+                                       pt["x"].is_number() && pt["y"].is_number()) {
+                                double wx = pt["x"].get<double>();
+                                double wy = pt["y"].get<double>();
+                                sw.pts.push_back({wx, wy});
+                                anyWireVertex = true;
+                                if (wy < 0.0) allWireYNonNegative = false;
+                            }
+                        }
+                    }
+                    if (!sw.pts.empty()) break;
+                }
+            }
+            if (sw.pts.empty() && w.contains("x1") && w.contains("y1") &&
+                w.contains("x2") && w.contains("y2")) {
+                double x1 = w.value("x1", 0.0);
+                double y1 = w.value("y1", 0.0);
+                double x2 = w.value("x2", 0.0);
+                double y2 = w.value("y2", 0.0);
+                sw.pts.push_back({x1, y1});
+                sw.pts.push_back({x2, y2});
+                anyWireVertex = true;
+                if (y1 < 0.0 || y2 < 0.0) allWireYNonNegative = false;
+            }
+            if (sw.pts.size() >= 2) {
+                wires.push_back(sw);
+            }
+        }
+    }
+
+    int totalPartComponents = 0;
+    int totalPartPins = 0;
+    nlohmann::json componentIssuesJson = nlohmann::json::array();
+    std::map<std::string, int> partRefCounts;
+    std::vector<SchPin> pins;
+
+    if (args.contains("components") && args["components"].is_array()) {
+        for (const auto& c : args["components"]) {
+            if (!c.is_object()) continue;
+            std::string cid = c.value("id", "");
+            std::string ref = c.value("reference", c.value("ref", c.value("designator", "")));
+            std::string val = c.value("value", c.value("name", ""));
+            std::string compType = c.value("component_type", c.value("type", ""));
+            std::string fp = c.value("footprint", "");
+            std::string uid = c.value("unique_id", c.value("uniqueId", ""));
+            double cx = c.value("x", 0.0);
+            double cy = c.value("y", 0.0);
+
+            bool isFrame = (compType == "frame" || ref.rfind("FRAME", 0) == 0);
+            if (isFrame) continue;
+
+            bool isNetFlag = (compType == "netflag" || compType == "netport" || compType == "power" ||
+                              ref.rfind("#", 0) == 0 || ref == "GND" || ref == "VCC");
+            bool isPart = (!isNetFlag && (compType == "part" || compType.empty()));
+
+            if (isPart) {
+                ++totalPartComponents;
+                if (ref.empty() || ref.find('?') != std::string::npos) {
+                    componentIssuesJson.push_back({
+                        {"id", cid},
+                        {"reference", ref},
+                        {"issue", "unannotated_designator"},
+                        {"x", cx},
+                        {"y", cy}
+                    });
+                } else {
+                    if (++partRefCounts[ref] > 1) {
+                        componentIssuesJson.push_back({
+                            {"id", cid},
+                            {"reference", ref},
+                            {"issue", "duplicate_designator"},
+                            {"x", cx},
+                            {"y", cy}
+                        });
+                    }
+                }
+                if (uid.empty()) {
+                    componentIssuesJson.push_back({
+                        {"id", cid},
+                        {"reference", ref},
+                        {"issue", "missing_unique_id"},
+                        {"x", cx},
+                        {"y", cy}
+                    });
+                }
+                if (fp.empty()) {
+                    componentIssuesJson.push_back({
+                        {"id", cid},
+                        {"reference", ref},
+                        {"issue", "missing_footprint"},
+                        {"x", cx},
+                        {"y", cy}
+                    });
+                }
+            }
+
+            if (c.contains("pins") && c["pins"].is_array()) {
+                for (const auto& p : c["pins"]) {
+                    if (!p.is_object()) continue;
+                    SchPin sp;
+                    sp.id = p.value("id", cid + "_" + p.value("number", ""));
+                    sp.compId = cid;
+                    sp.ref = ref;
+                    sp.number = p.value("number", p.value("pin_number", ""));
+                    sp.name = p.value("name", p.value("pin_name", ""));
+                    sp.net = p.value("net", "");
+                    sp.x = p.value("x", cx);
+                    sp.rawY = p.value("y", cy);
+                    sp.normY = (sp.rawY < 0.0 && ((anyWireVertex && allWireYNonNegative) || cy > 0.0))
+                                   ? std::fabs(sp.rawY)
+                                   : sp.rawY;
+                    sp.noConnected = p.value("no_connected", p.value("noConnected", false));
+                    sp.isPartPin = isPart;
+                    sp.isNetFlag = isNetFlag;
+                    if (isNetFlag) {
+                        if (!val.empty()) sp.netFlagName = val;
+                        else if (!sp.net.empty()) sp.netFlagName = sp.net;
+                        else if (!sp.name.empty()) sp.netFlagName = sp.name;
+                    }
+                    if (isPart) {
+                        ++totalPartPins;
+                    }
+                    pins.push_back(sp);
+                }
+            } else if (isNetFlag) {
+                SchPin sp;
+                sp.id = cid + "_p1";
+                sp.compId = cid;
+                sp.ref = ref;
+                sp.number = "1";
+                sp.name = val;
+                sp.net = val;
+                sp.x = cx;
+                sp.rawY = cy;
+                sp.normY = (sp.rawY < 0.0 && anyWireVertex && allWireYNonNegative)
+                               ? std::fabs(sp.rawY)
+                               : sp.rawY;
+                sp.noConnected = false;
+                sp.isPartPin = false;
+                sp.isNetFlag = true;
+                sp.netFlagName = val;
+                pins.push_back(sp);
+            }
+        }
+    }
+
+    const double kTol = 1.5;
+    size_t nW = wires.size();
+    size_t nP = pins.size();
+    size_t totalNodes = nW + nP;
+    std::vector<size_t> ufParent(totalNodes);
+    for (size_t i = 0; i < totalNodes; ++i) ufParent[i] = i;
+
+    auto ufFind = [&](size_t x) {
+        size_t r = x;
+        while (ufParent[r] != r) r = ufParent[r];
+        while (ufParent[x] != r) {
+            size_t nxt = ufParent[x];
+            ufParent[x] = r;
+            x = nxt;
+        }
+        return r;
+    };
+    auto ufUnion = [&](size_t a, size_t b) {
+        size_t ra = ufFind(a);
+        size_t rb = ufFind(b);
+        if (ra != rb) ufParent[rb] = ra;
+    };
+
+    auto pointTouchesWire = [&](double px, double py, const SchWire& w) -> bool {
+        for (size_t k = 0; k + 1 < w.pts.size(); ++k) {
+            if (distPointToSeg(px, py, w.pts[k].first, w.pts[k].second,
+                               w.pts[k + 1].first, w.pts[k + 1].second) <= kTol) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto pinMatchesPoint = [&](const SchPin& pin, double px, double py) -> bool {
+        if (std::hypot(pin.x - px, pin.normY - py) <= kTol) return true;
+        if (std::hypot(pin.x - px, pin.rawY - py) <= kTol) return true;
+        return false;
+    };
+
+    auto pinMatchesWire = [&](const SchPin& pin, const SchWire& w) -> bool {
+        if (pointTouchesWire(pin.x, pin.normY, w)) return true;
+        if (std::fabs(pin.normY - pin.rawY) > 1e-6 && pointTouchesWire(pin.x, pin.rawY, w)) {
+            return true;
+        }
+        return false;
+    };
+
+    // 1. Wire-to-Wire union (shared vertices and T-junction mid-segment landings)
+    for (size_t i = 0; i < nW; ++i) {
+        for (size_t j = i + 1; j < nW; ++j) {
+            bool touches = false;
+            for (const auto& pt : wires[i].pts) {
+                if (pointTouchesWire(pt.first, pt.second, wires[j])) {
+                    touches = true;
+                    break;
+                }
+            }
+            if (!touches) {
+                for (const auto& pt : wires[j].pts) {
+                    if (pointTouchesWire(pt.first, pt.second, wires[i])) {
+                        touches = true;
+                        break;
+                    }
+                }
+            }
+            if (touches) {
+                ufUnion(i, j);
+            }
+        }
+    }
+
+    // 2. Pin-to-Wire union
+    for (size_t p = 0; p < nP; ++p) {
+        for (size_t w = 0; w < nW; ++w) {
+            if (pinMatchesWire(pins[p], wires[w])) {
+                ufUnion(nW + p, w);
+                pins[p].touchesWire = true;
+            }
+        }
+    }
+
+    // 3. Pin-to-Pin union (colocated pins)
+    for (size_t i = 0; i < nP; ++i) {
+        for (size_t j = i + 1; j < nP; ++j) {
+            if (pinMatchesPoint(pins[i], pins[j].x, pins[j].normY) ||
+                pinMatchesPoint(pins[i], pins[j].x, pins[j].rawY)) {
+                ufUnion(nW + i, nW + j);
+            }
+        }
+    }
+
+    // Propagate explicit net names & netflags across each DSU component
+    struct IslandData {
+        std::vector<size_t> wireIndices;
+        std::vector<size_t> partPinIndices;
+        std::vector<size_t> netFlagPinIndices;
+        std::set<std::string> netFlagNames;
+        std::set<std::string> explicitNetNames;
+    };
+    std::map<size_t, IslandData> islands;
+    for (size_t w = 0; w < nW; ++w) {
+        size_t r = ufFind(w);
+        islands[r].wireIndices.push_back(w);
+        if (!wires[w].net.empty()) {
+            islands[r].explicitNetNames.insert(wires[w].net);
+        }
+    }
+    for (size_t p = 0; p < nP; ++p) {
+        size_t r = ufFind(nW + p);
+        if (pins[p].isPartPin) {
+            islands[r].partPinIndices.push_back(p);
+        }
+        if (pins[p].isNetFlag) {
+            islands[r].netFlagPinIndices.push_back(p);
+            if (!pins[p].netFlagName.empty()) {
+                islands[r].netFlagNames.insert(pins[p].netFlagName);
+                islands[r].explicitNetNames.insert(pins[p].netFlagName);
+            }
+        }
+        if (!pins[p].net.empty()) {
+            islands[r].explicitNetNames.insert(pins[p].net);
+        }
+    }
+
+    // Count global occurrences of each explicit net name across part pins / netflags
+    std::map<std::string, int> globalNetPinCount;
+    for (const auto& kv : islands) {
+        const auto& isl = kv.second;
+        int pinCount = static_cast<int>(isl.partPinIndices.size() + isl.netFlagPinIndices.size());
+        for (const auto& netName : isl.explicitNetNames) {
+            globalNetPinCount[netName] += pinCount;
+        }
+    }
+
+    // 4. Identify unconnected part pins
+    nlohmann::json unconnectedPinsJson = nlohmann::json::array();
+    for (size_t p = 0; p < nP; ++p) {
+        const auto& pin = pins[p];
+        if (!pin.isPartPin || pin.noConnected) continue;
+        size_t r = ufFind(nW + p);
+        const auto& isl = islands[r];
+        size_t totalIslandPins = isl.partPinIndices.size() + isl.netFlagPinIndices.size();
+        bool connectedByNetName = false;
+        for (const auto& netName : isl.explicitNetNames) {
+            if (!netName.empty() && (globalNetPinCount[netName] >= 2 || !isl.netFlagPinIndices.empty())) {
+                connectedByNetName = true;
+                break;
+            }
+        }
+        if (totalIslandPins < 2 && !connectedByNetName) {
+            unconnectedPinsJson.push_back({
+                {"id", pin.id},
+                {"reference", pin.ref},
+                {"pin_number", pin.number},
+                {"pin_name", pin.name},
+                {"x", pin.x},
+                {"y", pin.normY},
+                {"reason", pin.touchesWire ? "single_pin_net" : "unconnected_pin"}
+            });
+        }
+    }
+
+    // 5. Identify dangling wires
+    nlohmann::json danglingWiresJson = nlohmann::json::array();
+    for (size_t w = 0; w < nW; ++w) {
+        const auto& wire = wires[w];
+        size_t r = ufFind(w);
+        const auto& isl = islands[r];
+        size_t totalIslandPins = isl.partPinIndices.size() + isl.netFlagPinIndices.size();
+
+        std::pair<double, double> eps[2] = {wire.pts.front(), wire.pts.back()};
+        int anchoredEps = 0;
+        std::pair<double, double> unanchoredPt = eps[0];
+
+        for (int ep = 0; ep < 2; ++ep) {
+            double ex = eps[ep].first;
+            double ey = eps[ep].second;
+            bool anchored = false;
+            for (size_t p = 0; p < nP; ++p) {
+                if (pinMatchesPoint(pins[p], ex, ey)) {
+                    anchored = true;
+                    break;
+                }
+            }
+            if (!anchored) {
+                for (size_t otherW = 0; otherW < nW; ++otherW) {
+                    if (otherW == w) continue;
+                    if (pointTouchesWire(ex, ey, wires[otherW])) {
+                        anchored = true;
+                        break;
+                    }
+                }
+            }
+            if (anchored) {
+                ++anchoredEps;
+            } else {
+                unanchoredPt = {ex, ey};
+            }
+        }
+
+        if (totalIslandPins < 2 || anchoredEps < 2) {
+            danglingWiresJson.push_back({
+                {"wire_id", wire.id},
+                {"net", wire.net},
+                {"x", unanchoredPt.first},
+                {"y", unanchoredPt.second},
+                {"reason", (totalIslandPins == 0) ? "isolated_wire" : "unanchored_wire_endpoint"}
+            });
+        }
+    }
+
+    // 6. Net issues (shorted netflags / conflicting net names) and inferred nets
+    nlohmann::json netIssuesJson = nlohmann::json::array();
+    nlohmann::json inferredNetsJson = nlohmann::json::array();
+    int powerShortsCount = 0;
+    int autoNetIdx = 1;
+
+    for (const auto& kv : islands) {
+        const auto& isl = kv.second;
+        if (isl.partPinIndices.empty() && isl.netFlagPinIndices.empty()) continue;
+
+        nlohmann::json pinRefsJson = nlohmann::json::array();
+        for (size_t pIdx : isl.partPinIndices) {
+            pinRefsJson.push_back(pins[pIdx].ref + "." + pins[pIdx].number);
+        }
+
+        if (isl.netFlagNames.size() > 1 || isl.explicitNetNames.size() > 1) {
+            std::string joined;
+            const auto& nameSet = (isl.netFlagNames.size() > 1) ? isl.netFlagNames : isl.explicitNetNames;
+            for (const auto& nm : nameSet) {
+                if (!joined.empty()) joined += "/";
+                joined += nm;
+            }
+            ++powerShortsCount;
+            netIssuesJson.push_back({
+                {"net", joined},
+                {"issue", "shorted_nets"},
+                {"pins", pinRefsJson}
+            });
+        }
+
+        if (!isl.partPinIndices.empty()) {
+            std::string resolvedNet;
+            if (!isl.netFlagNames.empty()) {
+                resolvedNet = *isl.netFlagNames.begin();
+            } else if (!isl.explicitNetNames.empty()) {
+                resolvedNet = *isl.explicitNetNames.begin();
+            } else {
+                resolvedNet = "$NET_" + std::to_string(autoNetIdx++);
+            }
+            inferredNetsJson.push_back({
+                {"name", resolvedNet},
+                {"pins", pinRefsJson}
+            });
+        }
+    }
+
+    int unconnectedCount = static_cast<int>(unconnectedPinsJson.size());
+    int danglingWiresCount = static_cast<int>(danglingWiresJson.size());
+    int compIssuesCount = static_cast<int>(componentIssuesJson.size());
+    int netIssuesCount = static_cast<int>(netIssuesJson.size());
+    bool passed = (unconnectedCount == 0 && danglingWiresCount == 0 &&
+                   compIssuesCount == 0 && powerShortsCount == 0 && netIssuesCount == 0);
+
+    outSuccess = true;
+    outSummary = std::string("Schematic ERC ") + (passed ? "PASSED" : "FAILED") +
+                 " • " + std::to_string(unconnectedCount) + " unconnected pins • " +
+                 std::to_string(danglingWiresCount) + " dangling wires • " +
+                 std::to_string(compIssuesCount) + " component issues • " +
+                 std::to_string(netIssuesCount) + " net issues";
+
+    return {
+        {"ok", true},
+        {"passed", passed},
+        {"total_part_components", totalPartComponents},
+        {"total_pins", totalPartPins},
+        {"unconnected_pins_count", unconnectedCount},
+        {"unconnected_pins", unconnectedPinsJson},
+        {"dangling_wires_count", danglingWiresCount},
+        {"dangling_wires", danglingWiresJson},
+        {"component_issues_count", compIssuesCount},
+        {"component_issues", componentIssuesJson},
+        {"net_issues_count", netIssuesCount},
+        {"net_issues", netIssuesJson},
+        {"inferred_nets", inferredNetsJson},
         {"summary", outSummary}
     };
 }

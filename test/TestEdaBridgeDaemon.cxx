@@ -1032,6 +1032,508 @@ TEST(EdaBridge_LoopbackRpc, All36ToolsExecuteEndToEndAndEnforceFaultInjection) {
     }
 }
 
+TEST(EdaBridge_LoopbackRpc, FilteredInspectionSchematicErcPcbAuditAndDeclarativeEdits) {
+    std::atomic<bool> stopCustom{false};
+    std::string currentDoc = "Sheet1";
+    nlohmann::json lastEditSchArgs = nlohmann::json::object();
+    nlohmann::json lastEditPcbArgs = nlohmann::json::object();
+    std::vector<std::string> invokedApis;
+
+    std::thread customPlug([&]() {
+        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return;
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(_server->boundPluginPort()));
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+            ::close(sock);
+            return;
+        }
+
+        std::string hs =
+            "GET / HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n";
+        ::send(sock, hs.data(), hs.size(), 0);
+        char hbuf[1024];
+        ssize_t hn = ::recv(sock, hbuf, sizeof(hbuf) - 1, 0);
+        if (hn <= 0) {
+            ::close(sock);
+            return;
+        }
+        std::vector<uint8_t> buf;
+        hbuf[hn] = '\0';
+        char* hend = std::strstr(hbuf, "\r\n\r\n");
+        if (hend != nullptr) {
+            size_t hbytes = static_cast<size_t>((hend - hbuf) + 4);
+            if (static_cast<size_t>(hn) > hbytes) {
+                buf.assign(reinterpret_cast<const uint8_t*>(hbuf + hbytes),
+                           reinterpret_cast<const uint8_t*>(hbuf + hn));
+            }
+        }
+
+        nlohmann::json reg = {
+            {"jsonrpc", "2.0"},
+            {"id", "custom-reg-1"},
+            {"method", "plugin/register"},
+            {"params", {{"app", "easyeda"}, {"version", "1.1.3"}, {"active_document", "Sheet1"}}}
+        };
+        auto regFrame = EdaRpcServer::encodeWebSocketFrame(reg.dump(), 0x1, true);
+        ::send(sock, regFrame.data(), regFrame.size(), 0);
+
+        while (!stopCustom.load()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(sock, &rfds);
+            struct timeval tv{};
+            tv.tv_sec = 0;
+            tv.tv_usec = 30000;
+            if (buf.empty()) {
+                int sel = ::select(sock + 1, &rfds, nullptr, nullptr, &tv);
+                if (sel <= 0) continue;
+                uint8_t chunk[4096];
+                ssize_t rn = ::recv(sock, chunk, sizeof(chunk), 0);
+                if (rn <= 0) break;
+                buf.insert(buf.end(), chunk, chunk + rn);
+            }
+
+            bool decodedAny = false;
+            while (!buf.empty()) {
+                size_t consumed = 0;
+                uint8_t opcode = 0;
+                std::string payload, err;
+                if (!EdaRpcServer::decodeWebSocketFrame(buf.data(), buf.size(), consumed, opcode, payload, err)) {
+                    break;
+                }
+                decodedAny = true;
+                buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(consumed));
+                if (opcode != 0x1 && opcode != 0x2) continue;
+
+                nlohmann::json msg = nlohmann::json::parse(payload, nullptr, false);
+                if (msg.is_discarded() || !msg.is_object() || msg.value("method", "") != "tools/call") continue;
+
+                std::string tName = msg["params"].value("name", "");
+                nlohmann::json tArgs = msg["params"].value("arguments", nlohmann::json::object());
+                nlohmann::json res = {
+                    {"ok", true},
+                    {"active_document", currentDoc}
+                };
+
+                if (tName == "easyeda_inspect_schematic") {
+                    if (currentDoc == "Sheet2") {
+                        res["document"] = {{"uuid", "doc_sheet2"}, {"title", "Sheet2"}};
+                        res["components"] = nlohmann::json::array({
+                            {
+                                {"id", "e_c35"},
+                                {"reference", "C35"},
+                                {"value", "10uF"},
+                                {"component_type", "part"},
+                                {"footprint", "C_0603"},
+                                {"unique_id", "uid_c35"},
+                                {"x", 200.0},
+                                {"y", 200.0},
+                                {"pins", nlohmann::json::array({
+                                    {{"id", "c35_p1"}, {"number", "1"}, {"name", "1"}, {"net", "+5V"}, {"x", 200.0}, {"y", 180.0}},
+                                    {{"id", "c35_p2"}, {"number", "2"}, {"name", "2"}, {"net", "GND"}, {"x", 200.0}, {"y", 220.0}}
+                                })}
+                            },
+                            {
+                                {"id", "e_u2"},
+                                {"reference", "U2"},
+                                {"value", "INA226"},
+                                {"component_type", "part"},
+                                {"footprint", "MSOP-10"},
+                                {"unique_id", "uid_u2"},
+                                {"x", 400.0},
+                                {"y", 200.0},
+                                {"pins", nlohmann::json::array({
+                                    {{"id", "u2_p1"}, {"number", "1"}, {"name", "VCC"}, {"net", "+5V"}, {"x", 380.0}, {"y", 180.0}},
+                                    {{"id", "u2_p2"}, {"number", "2"}, {"name", "GND"}, {"net", "GND"}, {"x", 380.0}, {"y", 220.0}}
+                                })}
+                            }
+                        });
+                        res["wires"] = nlohmann::json::array({
+                            {{"id", "w_s2_1"}, {"net", "+5V"}, {"line", nlohmann::json::array({{200.0, 180.0}, {380.0, 180.0}})}},
+                            {{"id", "w_s2_2"}, {"net", "GND"}, {"line", nlohmann::json::array({{200.0, 220.0}, {380.0, 220.0}})}}
+                        });
+                    } else {
+                        res["document"] = {{"uuid", "doc_sheet1"}, {"title", "Sheet1"}};
+                        res["components"] = nlohmann::json::array({
+                            {
+                                {"id", "e_xt1"},
+                                {"reference", "XT1"},
+                                {"value", "XT30"},
+                                {"component_type", "part"},
+                                {"footprint", "CONN_XT30"},
+                                {"unique_id", "uid_xt1"},
+                                {"x", 100.0},
+                                {"y", 100.0},
+                                {"pins", nlohmann::json::array({
+                                    {{"id", "xt1_p1"}, {"number", "1"}, {"name", "VCC"}, {"net", "VCC"}, {"x", 100.0}, {"y", 100.0}},
+                                    {{"id", "xt1_p2"}, {"number", "2"}, {"name", "GND"}, {"net", "GND"}, {"x", 100.0}, {"y", 200.0}}
+                                })}
+                            },
+                            {
+                                {"id", "e_r16"},
+                                {"reference", "R16"},
+                                {"value", "4.7k"},
+                                {"component_type", "part"},
+                                {"footprint", "R_0603"},
+                                {"unique_id", "uid_r16"},
+                                {"x", 300.0},
+                                {"y", 100.0},
+                                {"pins", nlohmann::json::array({
+                                    {{"id", "r16_p1"}, {"number", "1"}, {"name", "1"}, {"net", "SDA"}, {"x", 300.0}, {"y", 100.0}},
+                                    {{"id", "r16_p2"}, {"number", "2"}, {"name", "2"}, {"net", "VCC"}, {"x", 300.0}, {"y", 200.0}}
+                                })}
+                            },
+                            {
+                                {"id", "e_uc0"},
+                                {"reference", "UC0"},
+                                {"value", "ESP32"},
+                                {"component_type", "part"},
+                                {"footprint", "QFN"},
+                                {"unique_id", "uid_uc0"},
+                                {"x", 400.0},
+                                {"y", 100.0},
+                                {"pins", nlohmann::json::array({
+                                    {{"id", "uc0_p1"}, {"number", "1"}, {"name", "SDA"}, {"net", "SDA"}, {"x", 400.0}, {"y", 100.0}},
+                                    {{"id", "uc0_p2"}, {"number", "2"}, {"name", "IO9"}, {"net", ""}, {"x", 400.0}, {"y", 300.0}}
+                                })}
+                            },
+                            {
+                                {"id", "e_r_unann"},
+                                {"reference", "R?"},
+                                {"value", "10k"},
+                                {"component_type", "part"},
+                                {"footprint", ""},
+                                {"unique_id", ""},
+                                {"x", 500.0},
+                                {"y", 100.0},
+                                {"pins", nlohmann::json::array()}
+                            },
+                            {
+                                {"id", "e_nf_vcc"},
+                                {"reference", "#PWR1"},
+                                {"value", "VCC"},
+                                {"component_type", "netflag"},
+                                {"x", 100.0},
+                                {"y", 100.0},
+                                {"pins", nlohmann::json::array({
+                                    {{"id", "nf_vcc_p1"}, {"number", "1"}, {"name", "VCC"}, {"net", "VCC"}, {"x", 100.0}, {"y", 100.0}}
+                                })}
+                            },
+                            {
+                                {"id", "e_nf_gnd_short"},
+                                {"reference", "#GND1"},
+                                {"value", "GND"},
+                                {"component_type", "netflag"},
+                                {"x", 100.0},
+                                {"y", 100.0},
+                                {"pins", nlohmann::json::array({
+                                    {{"id", "nf_gnd_p1"}, {"number", "1"}, {"name", "GND"}, {"net", "GND"}, {"x", 100.0}, {"y", 100.0}}
+                                })}
+                            }
+                        });
+                        res["wires"] = nlohmann::json::array({
+                            {{"id", "w_sda"}, {"net", "SDA"}, {"line", nlohmann::json::array({{300.0, 100.0}, {400.0, 100.0}})}},
+                            {{"id", "w_vcc"}, {"net", "VCC"}, {"line", nlohmann::json::array({{100.0, 100.0}, {300.0, 200.0}})}},
+                            {{"id", "w_dangling"}, {"net", "ORPHAN"}, {"line", nlohmann::json::array({{700.0, 700.0}, {800.0, 700.0}})}}
+                        });
+                    }
+                    res["components_count"] = static_cast<int>(res["components"].size());
+                    res["wires_count"] = static_cast<int>(res["wires"].size());
+                } else if (tName == "easyeda_run_drc") {
+                    std::string target = tArgs.value("target", "pcb");
+                    res["target"] = target;
+                    if (target == "schematic") {
+                        // Simulate EasyEDA Pro v2.2 blind summary DRC return
+                        res["passed"] = false;
+                        res["violation_count"] = 1;
+                        res["violations"] = nlohmann::json::array({
+                            {{"type", "fatalError"}, {"count", 3}}
+                        });
+                    } else {
+                        res["passed"] = true;
+                        res["violation_count"] = 0;
+                        res["violations"] = nlohmann::json::array();
+                    }
+                } else if (tName == "easyeda_inspect_pcb") {
+                    res["units"] = "mil";
+                    res["components"] = nlohmann::json::array({
+                        {{"id", "pcb_xt1"}, {"reference", "XT1"}, {"value", "XT30"}, {"footprint", "CONN_XT30"}, {"x", 500.0}, {"y", 500.0}, {"layer", "1"}},
+                        {{"id", "pcb_r16"}, {"reference", "R16"}, {"value", "4.7k"}, {"footprint", "R_0603"}, {"x", 700.0}, {"y", 500.0}, {"layer", "1"}},
+                        {{"id", "pcb_uc0"}, {"reference", "UC0"}, {"value", "ESP32"}, {"footprint", "QFN"}, {"x", 900.0}, {"y", 500.0}, {"layer", "1"}},
+                        {{"id", "pcb_c35"}, {"reference", "C35"}, {"value", "10uF"}, {"footprint", "C_0603"}, {"x", 1100.0}, {"y", 500.0}, {"layer", "1"}}
+                    });
+                    // Simulate active PCB tab where eda.sch_PrimitiveComponent.getAll() returns empty []
+                    res["schematic_components"] = nlohmann::json::array();
+                    res["pads"] = nlohmann::json::array({
+                        {{"id", "pad_c35_1"}, {"ref", "C35"}, {"pad", "1"}, {"number", "1"}, {"net", "+5V"}, {"x", 1100.0}, {"y", 480.0}, {"layer", "1"}, {"size_x", 32.0}, {"size_y", 36.0}},
+                        {{"id", "pad_c35_2"}, {"ref", "C35"}, {"pad", "2"}, {"number", "2"}, {"net", "GND"}, {"x", 1100.0}, {"y", 520.0}, {"layer", "1"}, {"size_x", 32.0}, {"size_y", 36.0}},
+                        {{"id", "pad_xt1_2"}, {"ref", "XT1"}, {"pad", "2"}, {"number", "2"}, {"net", "GND"}, {"x", 500.0}, {"y", 520.0}, {"layer", "1"}, {"size_x", 80.0}, {"size_y", 80.0}},
+                        {{"id", "pad_r16_1"}, {"ref", "R16"}, {"pad", "1"}, {"number", "1"}, {"net", "+5V"}, {"x", 700.0}, {"y", 480.0}, {"layer", "1"}, {"size_x", 32.0}, {"size_y", 36.0}}
+                    });
+                    res["tracks"] = nlohmann::json::array({
+                        {{"id", "trk_5v"}, {"net", "+5V"}, {"layer", "1"}, {"width", 12.0}, {"x1", 700.0}, {"y1", 480.0}, {"x2", 1100.0}, {"y2", 480.0}},
+                        {{"id", "trk_gnd_stub"}, {"net", "GND"}, {"layer", "1"}, {"width", 12.0}, {"x1", 1100.0}, {"y1", 520.0}, {"x2", 1050.0}, {"y2", 520.0}}
+                    });
+                    res["vias"] = nlohmann::json::array({
+                        {{"id", "via_gnd_1"}, {"net", "GND"}, {"x", 1050.0}, {"y", 520.0}, {"diameter", 24.0}, {"drill", 12.0}}
+                    });
+                    res["pours"] = nlohmann::json::array({
+                        {
+                            {"id", "pour_gnd_top"},
+                            {"net", "GND"},
+                            {"layer", "1"},
+                            {"polygon", nlohmann::json::array({
+                                {400.0, 400.0}, {1200.0, 400.0}, {1200.0, 600.0}, {400.0, 600.0}
+                            })}
+                        }
+                    });
+                    res["components_count"] = static_cast<int>(res["components"].size());
+                    res["pads_count"] = static_cast<int>(res["pads"].size());
+                    res["tracks_count"] = static_cast<int>(res["tracks"].size());
+                    res["vias_count"] = static_cast<int>(res["vias"].size());
+                    res["pours_count"] = static_cast<int>(res["pours"].size());
+                } else if (tName == "easyeda_edit_schematic") {
+                    lastEditSchArgs = tArgs;
+                    res["placed_components"] = 0;
+                    res["placed_wires"] = 0;
+                    res["placed_labels"] = 0;
+                } else if (tName == "easyeda_edit_pcb") {
+                    lastEditPcbArgs = tArgs;
+                    res["updated_placements"] = tArgs.contains("move_components") ? static_cast<int>(tArgs["move_components"].size()) : 0;
+                    res["added_tracks"] = tArgs.contains("add_tracks") ? static_cast<int>(tArgs["add_tracks"].size()) : 0;
+                    res["added_vias"] = tArgs.contains("add_vias") ? static_cast<int>(tArgs["add_vias"].size()) : 0;
+                } else if (tName == "easyeda_invoke_api") {
+                    std::string apiPath = tArgs.value("api_path", "");
+                    invokedApis.push_back(apiPath);
+                    res["api_path"] = apiPath;
+                    if (apiPath == "eda.lib_Device.search") {
+                        res["result"] = nlohmann::json::array({
+                            {
+                                {"uuid", "dev_uuid_c25804"},
+                                {"libraryUuid", "lib_uuid_szlcsc"},
+                                {"symbolUuid", "sym_uuid_r"},
+                                {"footprintUuid", "fp_uuid_0603"},
+                                {"supplierId", "C25804"}
+                            }
+                        });
+                    } else if (apiPath == "eda.sch_PrimitiveComponent.create") {
+                        res["result"] = {{"primitiveId", "created_sch_comp_1"}};
+                    } else if (apiPath == "eda.pcb_PrimitiveComponent.create") {
+                        res["result"] = {{"primitiveId", "created_pcb_comp_1"}};
+                    } else {
+                        res["result"] = true;
+                    }
+                }
+
+                nlohmann::json reply = {
+                    {"jsonrpc", "2.0"},
+                    {"id", msg["id"]},
+                    {"result", res}
+                };
+                auto outFrame = EdaRpcServer::encodeWebSocketFrame(reply.dump(), 0x1, true);
+                ::send(sock, outFrame.data(), outFrame.size(), 0);
+            }
+            if (!decodedAny) {
+                uint8_t chunk[4096];
+                ssize_t rn = ::recv(sock, chunk, sizeof(chunk), 0);
+                if (rn <= 0) break;
+                buf.insert(buf.end(), chunk, chunk + rn);
+            }
+        }
+        ::close(sock);
+    });
+
+    struct CustomPlugGuard {
+        std::atomic<bool>& stop;
+        std::thread& thr;
+        ~CustomPlugGuard() {
+            stop.store(true);
+            if (thr.joinable()) thr.join();
+        }
+    } guard{stopCustom, customPlug};
+
+    for (int i = 0; i < 40 && !_server->isPluginConnected("easyeda"); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    CHECK_TRUE(_server->isPluginConnected("easyeda"));
+
+    EdaBridge bridge(_cfg);
+
+    // (a) Filtered easyeda_inspect_schematic + automatic erc_audit attachment
+    nlohmann::json schByRef = bridge.callTool("easyeda_inspect_schematic", {
+        {"references", nlohmann::json::array({"XT1", "R16"})},
+        {"component_types", nlohmann::json::array({"part"})},
+        {"include_pins", false},
+        {"include_wires", false}
+    });
+    CHECK_TRUE(schByRef.value("ok", false));
+    CHECK_TRUE(schByRef.contains("erc_audit"));
+    CHECK_FALSE(schByRef["erc_audit"].value("passed", true));
+    CHECK_TRUE(schByRef["erc_audit"].value("unconnected_pins_count", 0) >= 1);
+    CHECK_TRUE(schByRef["erc_audit"].value("dangling_wires_count", 0) >= 1);
+    CHECK_TRUE(schByRef["erc_audit"].value("component_issues_count", 0) >= 1);
+    CHECK_TRUE(schByRef["erc_audit"].value("net_issues_count", 0) >= 1);
+    CHECK_EQUAL(2, static_cast<int>(schByRef["components"].size()));
+    CHECK_FALSE(schByRef["components"][0].contains("pins"));
+    CHECK_FALSE(schByRef.contains("wires"));
+
+    nlohmann::json schByNet = bridge.callTool("easyeda_inspect_schematic", {
+        {"nets", nlohmann::json::array({"SDA"})}
+    });
+    CHECK_TRUE(schByNet.value("ok", false));
+    CHECK_EQUAL(2, static_cast<int>(schByNet["components"].size()));
+    CHECK_EQUAL(1, static_cast<int>(schByNet["wires"].size()));
+    CHECK_EQUAL("SDA", schByNet["wires"][0].value("net", ""));
+
+    nlohmann::json schSummary = bridge.callTool("easyeda_inspect_schematic", {
+        {"summary_only", true}
+    });
+    CHECK_TRUE(schSummary.value("ok", false));
+    CHECK_TRUE(schSummary.contains("erc_audit"));
+    CHECK_FALSE(schSummary.contains("components"));
+    CHECK_FALSE(schSummary.contains("wires"));
+
+    // Also inspect Sheet2 to populate multi-sheet schematic component cache (C35, U2)
+    currentDoc = "Sheet2";
+    nlohmann::json schSheet2 = bridge.callTool("easyeda_inspect_schematic", {
+        {"summary_only", true}
+    });
+    CHECK_TRUE(schSheet2.value("ok", false));
+    currentDoc = "Sheet1";
+
+    // (c) easyeda_run_drc(target="schematic") runs calcSchematicErcAudit (never calcPcbConnectivityAudit)
+    // and populates erc_audit and concrete violations
+    nlohmann::json drcSch = bridge.callTool("easyeda_run_drc", {
+        {"target", "schematic"}
+    });
+    CHECK_TRUE(drcSch.value("ok", false));
+    CHECK_FALSE(drcSch.contains("connectivity_audit"));
+    CHECK_TRUE(drcSch.contains("erc_audit"));
+    CHECK_FALSE(drcSch["erc_audit"].value("passed", true));
+    CHECK_TRUE(drcSch.contains("violations"));
+    bool sawUnconnectedViolation = false;
+    bool sawDanglingViolation = false;
+    bool sawCompIssueViolation = false;
+    bool sawNetIssueViolation = false;
+    for (const auto& v : drcSch["violations"]) {
+        if (!v.is_object()) continue;
+        std::string vType = v.value("type", "");
+        if (vType == "unconnected_pin") sawUnconnectedViolation = true;
+        if (vType == "dangling_wire") sawDanglingViolation = true;
+        if (vType == "component_issue") sawCompIssueViolation = true;
+        if (vType == "net_issue") sawNetIssueViolation = true;
+    }
+    CHECK_TRUE(sawUnconnectedViolation);
+    CHECK_TRUE(sawDanglingViolation);
+    CHECK_TRUE(sawCompIssueViolation);
+    CHECK_TRUE(sawNetIssueViolation);
+
+    // (d) easyeda_edit_schematic defaults units to "mil" and supports declarative operations
+    nlohmann::json editSchRes = bridge.callTool("easyeda_edit_schematic", {
+        {"delete_primitives", nlohmann::json::array({"w_dangling", "e_r_unann"})},
+        {"modify_pins", nlohmann::json::array({
+            {{"pin_id", "uc0_p2"}, {"no_connected", true}}
+        })},
+        {"add_netflags", nlohmann::json::array({
+            {{"net", "GND"}, {"type", "Ground"}, {"x", 400.0}, {"y", 350.0}, {"rotation", 0.0}}
+        })},
+        {"modify_components", nlohmann::json::array({
+            {{"id", "e_r16"}, {"reference", "R16"}, {"value", "10k"}, {"unique_id", "uid_r16_new"}, {"footprint", "R_0603"}}
+        })},
+        {"add_components", nlohmann::json::array({
+            {{"reference", "R17"}, {"value", "10k"}, {"lcsc", "C25804"}, {"unique_id", "uid_r17"}, {"x", 600.0}, {"y", 250.0}}
+        })}
+    });
+    CHECK_TRUE(editSchRes.value("ok", false));
+    CHECK_EQUAL("mil", lastEditSchArgs.value("units", ""));
+    CHECK_EQUAL(2, editSchRes.value("deleted_primitives", 0));
+    CHECK_EQUAL(1, editSchRes.value("modified_pins", 0));
+    CHECK_EQUAL(1, editSchRes.value("added_netflags", 0));
+    CHECK_EQUAL(1, editSchRes.value("modified_components", 0));
+    CHECK_TRUE(editSchRes.value("placed_components", 0) >= 1);
+
+    // Verify _cachedPinNoConnect updated uc0_p2 so subsequent inspect shows no_connected == true
+    nlohmann::json schAfterPinMod = bridge.callTool("easyeda_inspect_schematic", {
+        {"references", nlohmann::json::array({"UC0"})}
+    });
+    CHECK_TRUE(schAfterPinMod.value("ok", false));
+    CHECK_EQUAL(0, schAfterPinMod["erc_audit"].value("unconnected_pins_count", -1));
+
+    // (b) Filtered easyeda_inspect_pcb preserving matching components, pads, tracks, vias, and pours
+    // while computing full-board connectivity_audit (including multi-sheet cached schematic_components and pours)
+    nlohmann::json pcbByRefAndNet = bridge.callTool("easyeda_inspect_pcb", {
+        {"references", nlohmann::json::array({"C35"})},
+        {"nets", nlohmann::json::array({"GND"})}
+    });
+    CHECK_TRUE(pcbByRefAndNet.value("ok", false));
+    CHECK_TRUE(pcbByRefAndNet.contains("connectivity_audit"));
+    // Both +5V (connected by trk_5v) and GND (connected by pour_gnd_top) are fully routed!
+    CHECK_TRUE(pcbByRefAndNet["connectivity_audit"].value("all_connected", false));
+    CHECK_EQUAL(2, pcbByRefAndNet["connectivity_audit"].value("fully_routed_nets", 0));
+    // Multi-sheet schematic cache has XT1, R16, UC0 (from Sheet1) and C35, U2 (from Sheet2);
+    // U2 is missing from PCB components -> unsynced_schematic_components_count == 1 (U2)
+    CHECK_EQUAL(1, pcbByRefAndNet["connectivity_audit"].value("unsynced_schematic_components_count", 0));
+    CHECK_EQUAL("U2", pcbByRefAndNet["connectivity_audit"]["unsynced_schematic_components"][0].value("reference", ""));
+    // Filtered arrays are preserved!
+    CHECK_TRUE(pcbByRefAndNet.contains("components"));
+    CHECK_EQUAL(1, static_cast<int>(pcbByRefAndNet["components"].size()));
+    CHECK_EQUAL("C35", pcbByRefAndNet["components"][0].value("reference", ""));
+    CHECK_TRUE(pcbByRefAndNet.contains("pads"));
+    CHECK_TRUE(pcbByRefAndNet.contains("tracks"));
+    CHECK_TRUE(pcbByRefAndNet.contains("vias"));
+    CHECK_TRUE(pcbByRefAndNet.contains("pours"));
+    CHECK_EQUAL(1, static_cast<int>(pcbByRefAndNet["pours"].size()));
+
+    nlohmann::json pcbSummary = bridge.callTool("easyeda_inspect_pcb", {
+        {"summary_only", true}
+    });
+    CHECK_TRUE(pcbSummary.value("ok", false));
+    CHECK_TRUE(pcbSummary.contains("connectivity_audit"));
+    CHECK_FALSE(pcbSummary.contains("components"));
+    CHECK_FALSE(pcbSummary.contains("pads"));
+    CHECK_FALSE(pcbSummary.contains("tracks"));
+    CHECK_FALSE(pcbSummary.contains("vias"));
+
+    // (e) easyeda_edit_pcb defaults units to "mil" and supports delete_primitives, modify_pads, place_components
+    nlohmann::json editPcbRes = bridge.callTool("easyeda_edit_pcb", {
+        {"delete_primitives", nlohmann::json::array({
+            {{"id", "e1640e5"}, {"type", "line"}},
+            "trk_gnd_stub"
+        })},
+        {"modify_pads", nlohmann::json::array({
+            {{"id", "pad_c35_2"}, {"net", "GND"}}
+        })},
+        {"place_components", nlohmann::json::array({
+            {{"reference", "U2"}, {"lcsc", "C25804"}, {"x", 850.0}, {"y", 600.0}, {"layer", "TopLayer"}, {"rotation", 90.0}}
+        })},
+        {"move_components", nlohmann::json::array({
+            {{"reference", "C35"}, {"x", 1120.0}, {"y", 500.0}, {"rotation", 0.0}, {"layer", "TopLayer"}}
+        })},
+        {"add_tracks", nlohmann::json::array({
+            {{"net", "+5V"}, {"layer", "TopLayer"}, {"x1", 700.0}, {"y1", 480.0}, {"x2", 850.0}, {"y2", 600.0}, {"width", 12.0}}
+        })},
+        {"add_vias", nlohmann::json::array({
+            {{"net", "GND"}, {"x", 850.0}, {"y", 620.0}, {"drill", 12.0}, {"size", 24.0}}
+        })}
+    });
+    CHECK_TRUE(editPcbRes.value("ok", false));
+    CHECK_EQUAL("mil", lastEditPcbArgs.value("units", ""));
+    CHECK_EQUAL(2, editPcbRes.value("deleted_primitives", 0));
+    CHECK_EQUAL(1, editPcbRes.value("modified_pads", 0));
+    CHECK_EQUAL(1, editPcbRes.value("placed_components", 0));
+    CHECK_TRUE(editPcbRes.value("updated_placements", 0) >= 1);
+    CHECK_EQUAL(1, editPcbRes.value("added_tracks", 0));
+    CHECK_EQUAL(1, editPcbRes.value("added_vias", 0));
+}
+
 TEST_GROUP(EdaBridge_GatewayReverse) {
     std::string _ws;
     std::unique_ptr<DynamicToolRegistry> _registry;

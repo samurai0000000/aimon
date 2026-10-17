@@ -628,6 +628,73 @@ TEST(McpServer_EdaProfile, All36ToolsExecuteThroughMcpServerAndUpdateTelemetry) 
     }
 }
 
+TEST(McpServer_EdaProfile, EasyEdaAndAuditSchemasExposeFilteringDeclarativeEditsAndMilDefaults) {
+    json req = {
+        {"jsonrpc", "2.0"},
+        {"id", 202},
+        {"method", "tools/list"},
+        {"params", json::object()}
+    };
+    json res = _mcp->handleMessage(req, "eda");
+    CHECK_TRUE(res.contains("result"));
+    CHECK_TRUE(res["result"].contains("tools"));
+
+    std::map<std::string, json> schemasByName;
+    for (const auto& t : res["result"]["tools"]) {
+        if (t.is_object() && t.contains("name") && t.contains("inputSchema")) {
+            schemasByName[t["name"].get<std::string>()] = t["inputSchema"];
+        }
+    }
+
+    // 1. easyeda_inspect_schematic schema
+    CHECK_TRUE(schemasByName.count("easyeda_inspect_schematic") == 1);
+    const json& inspSchProps = schemasByName["easyeda_inspect_schematic"]["properties"];
+    CHECK_TRUE(inspSchProps.contains("references"));
+    CHECK_TRUE(inspSchProps.contains("nets"));
+    CHECK_TRUE(inspSchProps.contains("component_types"));
+    CHECK_TRUE(inspSchProps.contains("include_pins"));
+    CHECK_TRUE(inspSchProps.contains("include_wires"));
+    CHECK_TRUE(inspSchProps.contains("summary_only"));
+
+    // 2. easyeda_inspect_pcb schema
+    CHECK_TRUE(schemasByName.count("easyeda_inspect_pcb") == 1);
+    const json& inspPcbProps = schemasByName["easyeda_inspect_pcb"]["properties"];
+    CHECK_TRUE(inspPcbProps.contains("references"));
+    CHECK_TRUE(inspPcbProps.contains("nets"));
+    CHECK_TRUE(inspPcbProps.contains("include_raw_primitives"));
+    CHECK_TRUE(inspPcbProps.contains("summary_only"));
+
+    // 3. easyeda_edit_schematic schema
+    CHECK_TRUE(schemasByName.count("easyeda_edit_schematic") == 1);
+    const json& editSchProps = schemasByName["easyeda_edit_schematic"]["properties"];
+    CHECK_TRUE(editSchProps.contains("units"));
+    CHECK_EQUAL("mil", editSchProps["units"].value("default", ""));
+    CHECK_TRUE(editSchProps.contains("add_components"));
+    CHECK_TRUE(editSchProps.contains("modify_components"));
+    CHECK_TRUE(editSchProps.contains("modify_pins"));
+    CHECK_TRUE(editSchProps.contains("add_netflags"));
+    CHECK_TRUE(editSchProps.contains("delete_primitives"));
+    CHECK_TRUE(editSchProps.contains("connect_pins"));
+
+    // 4. easyeda_edit_pcb schema
+    CHECK_TRUE(schemasByName.count("easyeda_edit_pcb") == 1);
+    const json& editPcbProps = schemasByName["easyeda_edit_pcb"]["properties"];
+    CHECK_TRUE(editPcbProps.contains("units"));
+    CHECK_EQUAL("mil", editPcbProps["units"].value("default", ""));
+    CHECK_TRUE(editPcbProps.contains("delete_primitives"));
+    CHECK_TRUE(editPcbProps.contains("modify_pads"));
+    CHECK_TRUE(editPcbProps.contains("place_components"));
+    CHECK_TRUE(editPcbProps.contains("move_components"));
+    CHECK_TRUE(editPcbProps.contains("add_tracks"));
+    CHECK_TRUE(editPcbProps.contains("add_vias"));
+
+    // 5. eda_calc_pcb_connectivity_audit schema
+    CHECK_TRUE(schemasByName.count("eda_calc_pcb_connectivity_audit") == 1);
+    const json& auditProps = schemasByName["eda_calc_pcb_connectivity_audit"]["properties"];
+    CHECK_TRUE(auditProps.contains("pours"));
+    CHECK_TRUE(auditProps.contains("zones"));
+}
+
 TEST_GROUP(WebServer_EdaApi) {
     std::string _ws;
     std::string _oldHome;

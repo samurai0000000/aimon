@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include "ConfigManager.hxx"
@@ -90,6 +91,8 @@ private:
 
     std::vector<EdaToolRuntimeInfo> _toolInfos;
     std::deque<EdaToolCallLogEntry> _recentCalls;
+    std::map<std::string, nlohmann::json> _cachedSchematicComponentsBySheet;
+    std::map<std::string, bool> _cachedPinNoConnect;
 };
 
 } // namespace aimon

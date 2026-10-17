@@ -72,11 +72,13 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "eda_calc_pcb_connectivity_audit",
             "accelerators",
-            "3D layer-aware Union-Find PCB physical connectivity, broken net island, dangling track, unassigned pad & schematic-PCB sync auditor.",
+            "3D layer-aware Union-Find PCB physical connectivity, copper pour/zone polygon & bbox union, broken net island, dangling track, unassigned pad & multi-sheet schematic-PCB sync auditor.",
             {
-                {"pads", {{"type", "array"}, {"description", "PCB pads ({id, ref, pad, net, x, y, layer, size_x, size_y})"}}},
+                {"pads", {{"type", "array"}, {"description", "PCB pads ({id, ref, pad, net, x, y, layer, size_x, size_y, hole_diameter})"}}},
                 {"tracks", {{"type", "array"}, {"description", "PCB track segments ({id, net, layer, x1, y1, x2, y2, width})"}}},
                 {"vias", {{"type", "array"}, {"description", "PCB vias ({id, net, x, y, diameter, drill})"}}},
+                {"pours", {{"type", "array"}, {"description", "Copper pour polygons/bboxes ({id, net, layer, polygon, x_min, y_min, x_max, y_max})"}}},
+                {"zones", {{"type", "array"}, {"description", "Alias for copper pours ({id, net, layer, polygon, x_min, y_min, x_max, y_max})"}}},
                 {"schematic_components", {{"type", "array"}, {"description", "Optional schematic components for parity check"}}},
                 {"pcb_components", {{"type", "array"}, {"description", "Optional PCB components for parity check"}}}
             },
@@ -347,20 +349,34 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "easyeda_inspect_schematic",
             "easyeda",
-            "Read live schematic components, wires, pins, and netlist from EasyEDA Pro.",
+            "Read live schematic components, wires, pins, and automatic erc_audit from EasyEDA Pro with optional reference/net/summary filtering.",
             {
-                {"schematic_path", {{"type", "string"}, {"description", "Optional schematic file path fallback"}}}
+                {"schematic_path", {{"type", "string"}, {"description", "Optional schematic file path fallback"}}},
+                {"references", {{"type", "array"}, {"description", "Optional list of component designators to filter (e.g. ['XT1', 'R16'])"}}},
+                {"nets", {{"type", "array"}, {"description", "Optional list of net names to filter components and wires (e.g. ['SDA', 'GND'])"}}},
+                {"component_types", {{"type", "array"}, {"description", "Optional component types to include (e.g. ['part', 'netflag'])"}}},
+                {"include_pins", {{"type", "boolean"}, {"default", true}, {"description", "Include component pin arrays (default: true)"}}},
+                {"include_wires", {{"type", "boolean"}, {"default", true}, {"description", "Include wire segments array (default: true)"}}},
+                {"summary_only", {{"type", "boolean"}, {"default", false}, {"description", "Return counts and erc_audit only without raw component/wire arrays (default: false)"}}}
             },
             {}
         },
         {
             "easyeda_edit_schematic",
             "easyeda",
-            "Place components, draw orthogonal wires, and add net labels in live EasyEDA Pro schematic.",
+            "Place/modify components, modify pin no_connected state, add netflags, draw orthogonal wires, and delete primitives in live EasyEDA Pro schematic (defaults to 'mil' canvas units).",
             {
+                {"units", {{"type", "string"}, {"default", "mil"}, {"description", "Coordinate units: 'mil' (default, 1:1 EasyEDA canvas units) or 'mm'"}}},
                 {"operations", {{"type", "array"}, {"description", "Schematic primitive operations"}}},
                 {"symbols", {{"type", "array"}, {"description", "Component placements"}}},
-                {"wires", {{"type", "array"}, {"description", "Wire segments"}}}
+                {"add_components", {{"type", "array"}, {"description", "Declarative component placements ({reference, lcsc, uuid, library_uuid, value, unique_id, x, y, rotation, mirror})"}}},
+                {"modify_components", {{"type", "array"}, {"description", "Modify existing schematic components ({id, reference, value, unique_id, footprint})"}}},
+                {"modify_pins", {{"type", "array"}, {"description", "Modify schematic pins ({pin_id, no_connected})"}}},
+                {"add_netflags", {{"type", "array"}, {"description", "Add power/ground netflags ({net, type, x, y, rotation})"}}},
+                {"wires", {{"type", "array"}, {"description", "Wire segments"}}},
+                {"add_wires", {{"type", "array"}, {"description", "Declarative wire segments ({points, x1, y1, x2, y2, net})"}}},
+                {"connect_pins", {{"type", "array"}, {"description", "Auto-wire pin pairs ({from, to, net})"}}},
+                {"delete_primitives", {{"type", "array"}, {"description", "Primitive IDs to delete from schematic"}}}
             },
             {}
         },
@@ -374,19 +390,31 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "easyeda_inspect_pcb",
             "easyeda",
-            "Inspect EasyEDA Pro PCB board outline, component placements, pad coordinates, tracks, and unrouted nets.",
-            nlohmann::json::object(),
+            "Inspect EasyEDA Pro PCB board outline, component placements, pads, tracks, vias, copper pours, and full-board connectivity_audit with optional reference/net/summary filtering.",
+            {
+                {"references", {{"type", "array"}, {"description", "Optional list of component designators to filter (e.g. ['C35', 'U1'])"}}},
+                {"nets", {{"type", "array"}, {"description", "Optional list of net names to filter pads, tracks, vias, and pours (e.g. ['GND', '+5V'])"}}},
+                {"include_raw_primitives", {{"type", "boolean"}, {"default", false}, {"description", "Include full unfiltered pads, tracks, vias, and pours arrays (default: false)"}}},
+                {"summary_only", {{"type", "boolean"}, {"default", false}, {"description", "Return counts and connectivity_audit only without primitive arrays (default: false)"}}}
+            },
             {}
         },
         {
             "easyeda_edit_pcb",
             "easyeda",
-            "Draw board outline, move/rotate/flip footprints, add copper pours, and route tracks/vias in EasyEDA Pro.",
+            "Draw board outline, place/move/rotate/flip footprints, update pad nets, delete primitives, add copper pours, and route tracks/vias in EasyEDA Pro (defaults to 'mil' canvas units).",
             {
+                {"units", {{"type", "string"}, {"default", "mil"}, {"description", "Coordinate units: 'mil' (default, 1:1 EasyEDA canvas units) or 'mm'"}}},
                 {"outline", {{"type", "object"}, {"description", "Board outline dimensions"}}},
                 {"placements", {{"type", "array"}, {"description", "Component placement updates"}}},
+                {"move_components", {{"type", "array"}, {"description", "Move/rotate/flip existing PCB footprints ({id, reference, x, y, rotation, layer})"}}},
+                {"place_components", {{"type", "array"}, {"description", "Instantiate new PCB footprints ({reference, lcsc, uuid, library_uuid, x, y, rotation, layer})"}}},
+                {"modify_pads", {{"type", "array"}, {"description", "Update pad net assignments ({id, net})"}}},
+                {"delete_primitives", {{"type", "array"}, {"description", "Delete PCB tracks, copper lines, vias, or components ({id, type} or primitive ID string)"}}},
                 {"tracks", {{"type", "array"}, {"description", "PCB trace segments"}}},
+                {"add_tracks", {{"type", "array"}, {"description", "Declarative PCB trace segments ({net, layer, x1, y1, x2, y2, width})"}}},
                 {"vias", {{"type", "array"}, {"description", "PCB vias"}}},
+                {"add_vias", {{"type", "array"}, {"description", "Declarative PCB vias ({net, x, y, drill, size})"}}},
                 {"zones", {{"type", "array"}, {"description", "Copper pour regions"}}}
             },
             {}
@@ -394,9 +422,9 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "easyeda_run_drc",
             "easyeda",
-            "Run live Schematic ERC or PCB DRC inside EasyEDA Pro and return structured violations.",
+            "Run live Schematic ERC (with geometric/topological erc_audit) or PCB DRC (with 3D connectivity_audit) inside EasyEDA Pro and return structured violations.",
             {
-                {"target", {{"type", "string"}, {"description", "Check target: pcb (default) or schematic"}}}
+                {"target", {{"type", "string"}, {"default", "pcb"}, {"description", "Check target: pcb (default) or schematic"}}}
             },
             {}
         },

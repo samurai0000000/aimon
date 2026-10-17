@@ -2468,8 +2468,65 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
         }
     }
 
-    if ((toolName == "easyeda_inspect_pcb" || toolName == "easyeda_run_drc") &&
-        plugRes.is_object()) {
+    if (toolName == "easyeda_inspect_schematic" && plugRes.is_object()) {
+        if (!plugRes.contains("erc_audit")) {
+            EdaAccelerators acc;
+            bool ercOk = false;
+            std::string ercSummary;
+            plugRes["erc_audit"] = acc.calcSchematicErcAudit(plugRes, ercOk, ercSummary);
+        }
+    }
+
+    if (toolName == "easyeda_run_drc" && plugRes.is_object() &&
+        args.value("target", "pcb") == "schematic") {
+        plugRes.erase("connectivity_audit");
+        if (!plugRes.contains("erc_audit")) {
+            nlohmann::json schSource = plugRes;
+            if (!schSource.contains("components") || !schSource["components"].is_array()) {
+                nlohmann::json schSnap;
+                std::string schErr;
+                if (callPlugin("easyeda", "easyeda_inspect_schematic",
+                               nlohmann::json::object(), schSnap, schErr, timeoutMs) &&
+                    schSnap.is_object()) {
+                    schSource = schSnap;
+                }
+            }
+            EdaAccelerators acc;
+            bool ercOk = false;
+            std::string ercSummary;
+            plugRes["erc_audit"] = acc.calcSchematicErcAudit(schSource, ercOk, ercSummary);
+        }
+        const auto &ercAudit = plugRes["erc_audit"];
+        if (ercAudit.is_object() &&
+            (!plugRes.contains("violations") || !plugRes["violations"].is_array() ||
+             plugRes["violations"].empty())) {
+            nlohmann::json synthViolations = nlohmann::json::array();
+            for (const auto &dp : ercAudit.value("dangling_pins", nlohmann::json::array())) {
+                synthViolations.push_back({{"category", "dangling_pin"}, {"detail", dp}});
+            }
+            for (const auto &sp : ercAudit.value("single_pin_nets", nlohmann::json::array())) {
+                synthViolations.push_back({{"category", "single_pin_net"}, {"detail", sp}});
+            }
+            for (const auto &dr : ercAudit.value("duplicate_references", nlohmann::json::array())) {
+                synthViolations.push_back({{"category", "duplicate_reference"}, {"reference", dr}});
+            }
+            for (const auto &mf : ercAudit.value("missing_footprints", nlohmann::json::array())) {
+                synthViolations.push_back({{"category", "missing_footprint"}, {"reference", mf}});
+            }
+            for (const auto &ml : ercAudit.value("missing_lcsc", nlohmann::json::array())) {
+                synthViolations.push_back({{"category", "missing_lcsc"}, {"reference", ml}});
+            }
+            for (const auto &pw : ercAudit.value("power_flag_warnings", nlohmann::json::array())) {
+                synthViolations.push_back({{"category", "power_flag_warning"}, {"detail", pw}});
+            }
+            if (!synthViolations.empty()) {
+                plugRes["violations"] = synthViolations;
+                plugRes["violation_count"] = synthViolations.size();
+                plugRes["passed"] = false;
+            }
+        }
+    } else if ((toolName == "easyeda_inspect_pcb" || toolName == "easyeda_run_drc") &&
+               plugRes.is_object()) {
         if (!plugRes.contains("connectivity_audit")) {
             EdaAccelerators acc;
             bool auditOk = false;
@@ -2477,7 +2534,17 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
             plugRes["connectivity_audit"] = acc.calcPcbConnectivityAudit(plugRes, auditOk, auditSummary);
         }
         bool includeRawPrimitives = args.value("include_raw_primitives", false);
-        if (!includeRawPrimitives) {
+        bool summaryOnly = args.value("summary_only", false);
+        bool hasFilter = (args.contains("references") && args["references"].is_array() && !args["references"].empty()) ||
+                         (args.contains("nets") && args["nets"].is_array() && !args["nets"].empty());
+        if (summaryOnly && toolName == "easyeda_inspect_pcb") {
+            plugRes.erase("components");
+            plugRes.erase("tracks");
+            plugRes.erase("pads");
+            plugRes.erase("vias");
+            plugRes.erase("pours");
+            plugRes.erase("schematic_components");
+        } else if (!includeRawPrimitives && (!hasFilter || toolName == "easyeda_run_drc")) {
             plugRes.erase("tracks");
             plugRes.erase("pads");
             plugRes.erase("vias");

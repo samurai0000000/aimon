@@ -61,6 +61,10 @@ public:
                                             bool& outSuccess,
                                             std::string& outSummary) const;
 
+    nlohmann::json calcSchematicErcAudit(const nlohmann::json& args,
+                                         bool& outSuccess,
+                                         std::string& outSummary) const;
+
 private:
     EdaAcceleratorConfig _config;
 };

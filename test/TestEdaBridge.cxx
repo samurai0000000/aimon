@@ -722,6 +722,284 @@ TEST(EdaAccelerators_Unit, CalcPcbAutoroute4LayerEasyEdaAndIncrementalExistingTr
     }
 }
 
+TEST(EdaAccelerators_Unit, CalcSchematicErcAuditNominalTJunctionNegatedYAndFaults) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // 1. Nominal clean schematic:
+    //    - U1 (part) pin 1 at (100, 630), pin 2 at (200, -630) [negated y from sch_PrimitivePin.modify],
+    //      pin 3 at (150, 700) with no_connected: true
+    //    - R1 (part) pin 1 at (200, 630) [colocated with U1.2 after y-sign normalization],
+    //      pin 2 at (300, 630)
+    //    - C1 (part) pin 1 at (250, 630) [lands mid-segment on wire w2 from (200,630) to (300,630) -> T-junction],
+    //      pin 2 at (250, 800)
+    //    - #PWR1 (netflag, value "VCC") pin 1 at (100, 500) wired to U1.1 via w1
+    //    - #PWR2 (netflag, value "GND") pin 1 at (300, 800) wired to R1.2 and C1.2 via w3 + T-junction w4
+    nlohmann::json cleanArgs = {
+        {"components", nlohmann::json::array({
+            {
+                {"id", "e1"},
+                {"reference", "U1"},
+                {"value", "STM32G0"},
+                {"component_type", "part"},
+                {"footprint", "LQFP-32"},
+                {"unique_id", "uid_u1"},
+                {"x", 150.0},
+                {"y", 630.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "u1_p1"}, {"number", "1"}, {"name", "VDD"}, {"net", ""}, {"x", 100.0}, {"y", 630.0}, {"no_connected", false}},
+                    {{"id", "u1_p2"}, {"number", "2"}, {"name", "PA0"}, {"net", ""}, {"x", 200.0}, {"y", -630.0}, {"no_connected", false}},
+                    {{"id", "u1_p3"}, {"number", "3"}, {"name", "NRST"}, {"net", ""}, {"x", 150.0}, {"y", 700.0}, {"no_connected", true}}
+                })}
+            },
+            {
+                {"id", "e2"},
+                {"reference", "R1"},
+                {"value", "10k"},
+                {"component_type", "part"},
+                {"footprint", "R0603"},
+                {"unique_id", "uid_r1"},
+                {"x", 280.0},
+                {"y", 630.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "r1_p1"}, {"number", "1"}, {"name", "1"}, {"net", ""}, {"x", 260.0}, {"y", 630.0}, {"no_connected", false}},
+                    {{"id", "r1_p2"}, {"number", "2"}, {"name", "2"}, {"net", ""}, {"x", 300.0}, {"y", 630.0}, {"no_connected", false}}
+                })}
+            },
+            {
+                {"id", "e3"},
+                {"reference", "C1"},
+                {"value", "100nF"},
+                {"component_type", "part"},
+                {"footprint", "C0603"},
+                {"unique_id", "uid_c1"},
+                {"x", 230.0},
+                {"y", 675.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "c1_p1"}, {"number", "1"}, {"name", "1"}, {"net", ""}, {"x", 230.0}, {"y", 630.0}, {"no_connected", false}},
+                    {{"id", "c1_p2"}, {"number", "2"}, {"name", "2"}, {"net", ""}, {"x", 230.0}, {"y", 720.0}, {"no_connected", false}}
+                })}
+            },
+            {
+                {"id", "nf1"},
+                {"reference", "#PWR1"},
+                {"value", "VCC"},
+                {"component_type", "netflag"},
+                {"footprint", ""},
+                {"unique_id", ""},
+                {"x", 100.0},
+                {"y", 500.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "nf1_p1"}, {"number", "1"}, {"name", "VCC"}, {"net", "VCC"}, {"x", 100.0}, {"y", 500.0}, {"no_connected", false}}
+                })}
+            },
+            {
+                {"id", "nf2"},
+                {"reference", "#PWR2"},
+                {"value", "GND"},
+                {"component_type", "netflag"},
+                {"footprint", ""},
+                {"unique_id", ""},
+                {"x", 300.0},
+                {"y", 800.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "nf2_p1"}, {"number", "1"}, {"name", "GND"}, {"net", "GND"}, {"x", 300.0}, {"y", 800.0}, {"no_connected", false}}
+                })}
+            }
+        })},
+        {"wires", nlohmann::json::array({
+            {{"id", "w1"}, {"net", "VCC"}, {"line", nlohmann::json::array({{100.0, 500.0}, {100.0, 630.0}})}},
+            {{"id", "w2"}, {"net", "PA0_NET"}, {"line", nlohmann::json::array({{200.0, 630.0}, {260.0, 630.0}})}},
+            {{"id", "w3"}, {"net", "GND"}, {"line", nlohmann::json::array({{300.0, 630.0}, {300.0, 800.0}})}},
+            {{"id", "w4"}, {"net", "GND"}, {"line", nlohmann::json::array({{230.0, 720.0}, {300.0, 720.0}})}}
+        })}
+    };
+
+    nlohmann::json cleanRes = acc.calcSchematicErcAudit(cleanArgs, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(cleanRes.value("ok", false));
+    CHECK_TRUE(cleanRes.value("passed", false));
+    CHECK_EQUAL(3, cleanRes.value("total_part_components", 0));
+    CHECK_EQUAL(7, cleanRes.value("total_pins", 0));
+    CHECK_EQUAL(0, cleanRes.value("unconnected_pins_count", -1));
+    CHECK_EQUAL(0, cleanRes.value("dangling_wires_count", -1));
+    CHECK_EQUAL(0, cleanRes.value("component_issues_count", -1));
+    CHECK_EQUAL(0, cleanRes.value("net_issues_count", -1));
+    CHECK_TRUE(cleanRes.contains("inferred_nets"));
+
+    // Also verify executeTool dispatch for eda_calc_schematic_erc_audit
+    bool execOk = false;
+    std::string execSum;
+    nlohmann::json execRes = acc.executeTool("eda_calc_schematic_erc_audit", cleanArgs, execOk, execSum);
+    CHECK_TRUE(execOk);
+    CHECK_TRUE(execRes.value("passed", false));
+
+    // 2. Fault injection:
+    //    - Unconnected pin on U1.2 (no_connected: false, not touching any wire/pin)
+    //    - Dangling wire w_dangling with only 1 connected endpoint (or isolated stub)
+    //    - Component issues:
+    //      * R? unannotated designator
+    //      * Duplicate designator U1
+    //      * Missing unique_id on U1_dup
+    //      * Missing footprint on R?
+    //    - Net issues:
+    //      * Power rail short: VCC and GND netflags shorted onto the same wire w_short
+    nlohmann::json faultArgs = {
+        {"components", nlohmann::json::array({
+            {
+                {"id", "f_u1"},
+                {"reference", "U1"},
+                {"value", "MCU"},
+                {"component_type", "part"},
+                {"footprint", "QFN-32"},
+                {"unique_id", "uid_1"},
+                {"x", 100.0},
+                {"y", 100.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "fu1_p1"}, {"number", "1"}, {"name", "VCC"}, {"net", ""}, {"x", 100.0}, {"y", 100.0}, {"no_connected", false}},
+                    {{"id", "fu1_p2"}, {"number", "2"}, {"name", "FLOATING"}, {"net", ""}, {"x", 500.0}, {"y", 500.0}, {"no_connected", false}}
+                })}
+            },
+            {
+                {"id", "f_u1_dup"},
+                {"reference", "U1"},
+                {"value", "MCU_DUP"},
+                {"component_type", "part"},
+                {"footprint", "QFN-32"},
+                {"unique_id", ""},
+                {"x", 200.0},
+                {"y", 100.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "fu1d_p1"}, {"number", "1"}, {"name", "GND"}, {"net", ""}, {"x", 200.0}, {"y", 100.0}, {"no_connected", false}}
+                })}
+            },
+            {
+                {"id", "f_r_unannot"},
+                {"reference", "R?"},
+                {"value", "10k"},
+                {"component_type", "part"},
+                {"footprint", ""},
+                {"unique_id", "uid_r"},
+                {"x", 300.0},
+                {"y", 300.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "fr_p1"}, {"number", "1"}, {"name", "1"}, {"net", ""}, {"x", 300.0}, {"y", 300.0}, {"no_connected", true}}
+                })}
+            },
+            {
+                {"id", "f_nf_vcc"},
+                {"reference", "#PWR1"},
+                {"value", "VCC"},
+                {"component_type", "netflag"},
+                {"footprint", ""},
+                {"unique_id", ""},
+                {"x", 100.0},
+                {"y", 100.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "fnf1"}, {"number", "1"}, {"name", "VCC"}, {"net", "VCC"}, {"x", 100.0}, {"y", 100.0}, {"no_connected", false}}
+                })}
+            },
+            {
+                {"id", "f_nf_gnd"},
+                {"reference", "#PWR2"},
+                {"value", "GND"},
+                {"component_type", "netflag"},
+                {"footprint", ""},
+                {"unique_id", ""},
+                {"x", 200.0},
+                {"y", 100.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "fnf2"}, {"number", "1"}, {"name", "GND"}, {"net", "GND"}, {"x", 200.0}, {"y", 100.0}, {"no_connected", false}}
+                })}
+            }
+        })},
+        {"wires", nlohmann::json::array({
+            {{"id", "w_short"}, {"net", ""}, {"line", nlohmann::json::array({{100.0, 100.0}, {200.0, 100.0}})}},
+            {{"id", "w_dangling"}, {"net", ""}, {"line", nlohmann::json::array({{700.0, 700.0}, {750.0, 700.0}})}}
+        })}
+    };
+
+    bool faultOk = false;
+    std::string faultSummary;
+    nlohmann::json faultRes = acc.calcSchematicErcAudit(faultArgs, faultOk, faultSummary);
+    CHECK_TRUE(faultOk);
+    CHECK_TRUE(faultRes.value("ok", false));
+    CHECK_FALSE(faultRes.value("passed", true));
+    CHECK_EQUAL(1, faultRes.value("unconnected_pins_count", 0));
+    CHECK_EQUAL("fu1_p2", faultRes["unconnected_pins"][0].value("id", ""));
+    CHECK_EQUAL(1, faultRes.value("dangling_wires_count", 0));
+    CHECK_EQUAL("w_dangling", faultRes["dangling_wires"][0].value("wire_id", ""));
+    CHECK_TRUE(faultRes.value("component_issues_count", 0) >= 4);
+    CHECK_TRUE(faultRes.value("net_issues_count", 0) >= 1);
+}
+
+TEST(EdaAccelerators_Unit, CalcPcbConnectivityAuditCopperPoursPadSizesAndMultiSheetSync) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // 1. Copper pour on BottomLayer for net "GND" connects two pads (J1.2 at 5,5 and C1.2 at 25,15)
+    //    without any track between them, and also anchors a track endpoint landing inside the pour!
+    // 2. Large XT30 pad (J1.1 at 5,15 with width: 2.5, height: 2.5 mm) captures a track endpoint
+    //    at (6.1, 15.0) [1.1 mm from pad center, which is > old 0.38 mm radius but <= 1.25 + 0.125 + 0.08 mm].
+    // 3. Pad outside the pour polygon on net "SIG_OUT" (U1.4 at 35,35 vs R1.2 at 45,35) remains disconnected.
+    // 4. Multi-sheet schematic_components contains duplicate references across sheets ("J1" twice, "XT_MISSING" twice)
+    //    and deduplicates them so unsynced_schematic_components_count is 1 ("XT_MISSING").
+    nlohmann::json args = {
+        {"units", "mm"},
+        {"pads", nlohmann::json::array({
+            {{"id", "p_gnd1"}, {"ref", "J1"}, {"pad", "2"}, {"net", "GND"}, {"x", 5.0}, {"y", 5.0}, {"layer", "BottomLayer"}, {"size_x", 0.6}, {"size_y", 0.6}},
+            {{"id", "p_gnd2"}, {"ref", "C1"}, {"pad", "2"}, {"net", "GND"}, {"x", 25.0}, {"y", 15.0}, {"layer", "BottomLayer"}, {"size_x", 0.6}, {"size_y", 0.6}},
+            {{"id", "p_xt1"}, {"ref", "J1"}, {"pad", "1"}, {"net", "VBAT"}, {"x", 5.0}, {"y", 15.0}, {"layer", "MultiLayer"}, {"width", 2.5}, {"height", 2.5}},
+            {{"id", "p_xt2"}, {"ref", "C1"}, {"pad", "1"}, {"net", "VBAT"}, {"x", 15.0}, {"y", 15.0}, {"layer", "TopLayer"}, {"size_x", 0.8}, {"size_y", 0.8}},
+            {{"id", "p_out1"}, {"ref", "U1"}, {"pad", "4"}, {"net", "SIG_OUT"}, {"x", 35.0}, {"y", 35.0}, {"layer", "BottomLayer"}, {"size_x", 0.6}, {"size_y", 0.6}},
+            {{"id", "p_out2"}, {"ref", "R1"}, {"pad", "2"}, {"net", "SIG_OUT"}, {"x", 45.0}, {"y", 35.0}, {"layer", "BottomLayer"}, {"size_x", 0.6}, {"size_y", 0.6}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"id", "t_vbat"}, {"net", "VBAT"}, {"layer", "TopLayer"}, {"x1", 6.1}, {"y1", 15.0}, {"x2", 15.0}, {"y2", 15.0}, {"width", 0.25}}
+        })},
+        {"vias", nlohmann::json::array()},
+        {"pours", nlohmann::json::array({
+            {
+                {"id", "pour_gnd_bot"},
+                {"net", "GND"},
+                {"layer", "BottomLayer"},
+                {"polygon", nlohmann::json::array({
+                    {0.0, 0.0}, {30.0, 0.0}, {30.0, 20.0}, {0.0, 20.0}
+                })}
+            }
+        })},
+        {"pcb_components", nlohmann::json::array({
+            {{"reference", "J1"}},
+            {{"reference", "C1"}},
+            {{"reference", "U1"}},
+            {{"reference", "R1"}}
+        })},
+        {"schematic_components", nlohmann::json::array({
+            {{"reference", "J1"}, {"value", "XT30"}, {"footprint", "XT30"}},
+            {{"reference", "J1"}, {"value", "XT30"}, {"footprint", "XT30"}},
+            {{"reference", "C1"}, {"value", "100nF"}, {"footprint", "C0603"}},
+            {{"reference", "U1"}, {"value", "MCU"}, {"footprint", "QFN-32"}},
+            {{"reference", "R1"}, {"value", "10k"}, {"footprint", "R0603"}},
+            {{"reference", "XT_MISSING"}, {"value", "CONN"}, {"footprint", "HDR-2"}},
+            {{"reference", "XT_MISSING"}, {"value", "CONN"}, {"footprint", "HDR-2"}}
+        })}
+    };
+
+    nlohmann::json res = acc.calcPcbConnectivityAudit(args, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(res.value("ok", false));
+    CHECK_EQUAL(3, res.value("total_nets", 0));
+    // Both GND (via pour) and VBAT (via large pad radius) are routed; only SIG_OUT is unrouted
+    CHECK_EQUAL(2, res.value("fully_routed_nets", 0));
+    CHECK_EQUAL(1, res.value("unrouted_nets_count", 0));
+    CHECK_EQUAL("SIG_OUT", res["unrouted_nets"][0].value("net", ""));
+    CHECK_EQUAL(0, res.value("dangling_tracks_count", -1));
+    CHECK_EQUAL(1, res.value("unsynced_schematic_components_count", 0));
+    CHECK_EQUAL("XT_MISSING", res["unsynced_schematic_components"][0].value("reference", ""));
+}
+
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {
         if (std::strcmp(av[i], "--negative-control") == 0) {
