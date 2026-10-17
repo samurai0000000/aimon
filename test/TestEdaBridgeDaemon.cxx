@@ -499,7 +499,7 @@ TEST(EdaBridge_PluginRelay, WebSocketMultiFrameContinuationAndPluginChunkReassem
             {"jsonrpc", "2.0"},
             {"id", "frag-reg-1"},
             {"method", "plugin/register"},
-            {"params", {{"app", "easyeda"}, {"version", "1.1.4"}, {"active_document", "servosense.epro"}}}
+            {"params", {{"app", "easyeda"}, {"version", "1.1.5"}, {"active_document", "servosense.epro"}}}
         };
         auto regFrame = EdaRpcServer::encodeWebSocketFrame(reg.dump(), 0x1, true);
         ::send(sock, regFrame.data(), regFrame.size(), 0);
@@ -1663,7 +1663,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     EdaBridgeAppSettings loaded;
     CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgFile, loaded, err));
     CHECK_TRUE(err.empty());
-    STRCMP_EQUAL("1.1.4", loaded.version.c_str());
+    STRCMP_EQUAL("1.1.5", loaded.version.c_str());
     CHECK_EQUAL(orig.enableEasyEda, loaded.enableEasyEda);
     CHECK_EQUAL(orig.enableKiCad, loaded.enableKiCad);
     CHECK_EQUAL(orig.enableFreeCad, loaded.enableFreeCad);
@@ -1728,7 +1728,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeployment) {
-    CHECK_EQUAL("1.1.4", EdaBridgeAppSettings().version);
+    CHECK_EQUAL("1.1.5", EdaBridgeAppSettings().version);
 
     std::vector<uint8_t> zipBytes = EdaBridgeAppConfig::buildEasyEdaEextZipBytes();
     CHECK_TRUE(zipBytes.size() > 512);
@@ -1745,7 +1745,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(zipView.find("edaEsbuildExportName") != std::string::npos);
     CHECK_TRUE(zipView.find("eda.sys_WebSocket") != std::string::npos);
     CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
-    CHECK_TRUE(zipView.find("1.1.4") != std::string::npos);
+    CHECK_TRUE(zipView.find("1.1.5") != std::string::npos);
     CHECK_TRUE(zipView.find("8d4c91f2a70e4c6b9b24e31f6a821100") != std::string::npos);
     CHECK_TRUE(zipView.find("check(false, false, true)") != std::string::npos);
     CHECK_TRUE(zipView.find("getAllPinsByPrimitiveId") != std::string::npos);
@@ -1795,7 +1795,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream kcIfs(kcDir + "/KiCadAimonBridge.py");
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(kcContent.find("1.1.4") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.5") != std::string::npos);
         CHECK_TRUE(kcContent.find("*.Cu") != std::string::npos);
         CHECK_TRUE(kcContent.find("GetAttribute") != std::string::npos);
     }
@@ -1810,7 +1810,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream fcIfs(fcDir + "/AimonFreeCadBridge.py");
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(fcContent.find("1.1.4") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.5") != std::string::npos);
     }
 
     // 3a. Re-run when destination files are identical -> do NOT overwrite (alreadyDeployed == true)
@@ -1838,7 +1838,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(kcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(kcContent.find("1.1.4") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.5") != std::string::npos);
     }
 
     CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir2, err, "", false, &fcAlready));
@@ -1848,7 +1848,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(fcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(fcContent.find("1.1.4") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.5") != std::string::npos);
     }
 
     // 4. Test customTargetDir (simulating QFileDialog user selection)
@@ -2587,6 +2587,14 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, LiveGuiPluginCanvasEnrichmentAndPytho
             << "    'part_name': 'ServoArm', 'obstacle_name': 'BaseBracket', 'min_deg': -30.0, 'max_deg': 30.0, 'step_deg': 15.0\n"
             << "})\n"
             << "assert joint_res.get('ok') is True and joint_res.get('animated_in_gui') is True, f'FreeCAD joint failed: {joint_res}'\n"
+            << "insp_res = fc_client.dispatch_tool('freecad_inspect_document', {\n"
+            << "    'spec': {'expected_bbox_mm': [50.0, 30.0, 20.0], 'bbox_tolerance_mm': 1.0, 'expected_volume_mm3': 3750.0, 'volume_tolerance_pct': 10.0, 'require_watertight_manifold': True},\n"
+            << "    'compare_previous': True\n"
+            << "})\n"
+            << "assert insp_res.get('ok') is True and 'spec_validation' in insp_res and insp_res['spec_validation'].get('passed') is True, f'FreeCAD spec validation failed: {insp_res}'\n"
+            << "assert 'volumetric_diff' in insp_res and insp_res['volumetric_diff'].get('shared_volume_mm3', 0.0) > 0.0, f'FreeCAD volumetric diff missing: {insp_res}'\n"
+            << "rnd_res = fc_client.dispatch_tool('freecad_render_view', {'views': ['top', 'front', 'right', 'iso']})\n"
+            << "assert rnd_res.get('ok') is True and rnd_res.get('view_matrix_complete') is True, f'FreeCAD 4-view render failed: {rnd_res}'\n"
             << "print('PYTHON_PLUGIN_VERIFICATION_OK')\n";
     }
 
@@ -2598,6 +2606,269 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, LiveGuiPluginCanvasEnrichmentAndPytho
     }
     CHECK_EQUAL(0, pyRes.exitCode);
     CHECK_TRUE(pyRes.stdoutText.find("PYTHON_PLUGIN_VERIFICATION_OK") != std::string::npos);
+}
+
+TEST(EdaBridge_UnifiedAppConfigAndToggles, PreSyncDryRunDiffOnKiCadAndEasyEdaDaemon) {
+    // 1. Test KiCadSchematicEditor::syncSchematicToPcb with dry_run: true on real files
+    std::string schPath = _ws + "/dryrun_test.kicad_sch";
+    std::string pcbPath = _ws + "/dryrun_test.kicad_pcb";
+
+    // Author schematic with U1, R1 (footprint R_0805), C1 (new), R? (unannotated), U2 (missing footprint)
+    nlohmann::json schEditRes = KiCadSchematicEditor::applySchematicEdits({
+        {"schematic_path", schPath},
+        {"components", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "STM32"}, {"symbol", "Device:U"}, {"footprint", "Package_QFP:LQFP-48"}, {"x", 50.0}, {"y", 50.0}},
+            {{"reference", "R1"}, {"value", "10k"}, {"symbol", "Device:R"}, {"footprint", "Resistor_SMD:R_0805_2012Metric"}, {"x", 80.0}, {"y", 50.0}},
+            {{"reference", "C1"}, {"value", "100nF"}, {"symbol", "Device:C"}, {"footprint", "Capacitor_SMD:C_0402_1005Metric"}, {"x", 100.0}, {"y", 50.0}},
+            {{"reference", "R?"}, {"value", "4.7k"}, {"symbol", "Device:R"}, {"footprint", "Resistor_SMD:R_0603_1608Metric"}, {"x", 120.0}, {"y", 50.0}},
+            {{"reference", "U2"}, {"value", "LDO"}, {"symbol", "Device:U"}, {"footprint", ""}, {"x", 140.0}, {"y", 50.0}}
+        })}
+    });
+    CHECK_TRUE(schEditRes.value("ok", false));
+
+    // Seed initial PCB with U1, R1 (with older footprint R_0603), and obsolete R99 + orphaned track on OLD_NET
+    nlohmann::json initPcbRes = KiCadSchematicEditor::applyPcbEdits({
+        {"pcb_path", pcbPath},
+        {"board_outline", {{"width_mm", 50.0}, {"height_mm", 40.0}}},
+        {"placements", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "STM32"}, {"footprint", "Package_QFP:LQFP-48"}, {"x_mm", 20.0}, {"y_mm", 20.0}},
+            {{"reference", "R1"}, {"value", "10k"}, {"footprint", "Resistor_SMD:R_0603_1608Metric"}, {"x_mm", 10.0}, {"y_mm", 10.0}},
+            {{"reference", "R99"}, {"value", "1k"}, {"footprint", "Resistor_SMD:R_0603_1608Metric"}, {"x_mm", 35.0}, {"y_mm", 10.0}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"x1", 10.0}, {"y1", 10.0}, {"x2", 35.0}, {"y2", 10.0}, {"width_mm", 0.25}, {"layer", "F.Cu"}, {"net", "OLD_NET"}}
+        })}
+    });
+    CHECK_TRUE(initPcbRes.value("ok", false));
+
+    std::string pcbBefore;
+    {
+        std::ifstream ifs(pcbPath);
+        pcbBefore.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    }
+
+    EdaRpcServerOptions opts;
+    opts.listenHost = "127.0.0.1";
+    opts.port = 0;
+    opts.pluginPort = 0;
+    opts.allowedRoot = _ws;
+    EdaRpcServer srv(opts);
+
+    nlohmann::json dryRes = srv.dispatchToolCall("kicad_sync_sch_to_pcb", {
+        {"schematic_path", schPath},
+        {"pcb_path", pcbPath},
+        {"dry_run", true}
+    });
+    CHECK_TRUE(dryRes.value("ok", false));
+    CHECK_TRUE(dryRes.value("dry_run", false));
+    CHECK_FALSE(dryRes.value("synced", true));
+    CHECK_FALSE(dryRes.value("ready_to_sync", true));
+    auto toAdd = dryRes.value("components_to_add", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(toAdd.size()));
+    if (!toAdd.empty()) {
+        CHECK_EQUAL("C1", toAdd[0].value("reference", ""));
+    }
+    auto toRemove = dryRes.value("components_to_remove", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(toRemove.size()));
+    if (!toRemove.empty()) {
+        CHECK_EQUAL("R99", toRemove[0].value("reference", ""));
+    }
+    auto fpMis = dryRes.value("footprint_mismatches", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(fpMis.size()));
+    if (!fpMis.empty()) {
+        CHECK_EQUAL("R1", fpMis[0].value("reference", ""));
+    }
+    auto unann = dryRes.value("unannotated_references", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(unann.size()));
+    if (!unann.empty()) {
+        CHECK_EQUAL("R?", unann[0].get<std::string>());
+    }
+    auto missFp = dryRes.value("missing_footprints", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(missFp.size()));
+    if (!missFp.empty()) {
+        CHECK_EQUAL("U2", missFp[0].get<std::string>());
+    }
+    auto orphanTrk = dryRes.value("orphaned_tracks", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(orphanTrk.size()));
+    if (!orphanTrk.empty()) {
+        CHECK_EQUAL("OLD_NET", orphanTrk[0].value("net", ""));
+    }
+
+    // Verify PCB file on disk was NOT mutated during dry_run
+    std::string pcbAfter;
+    {
+        std::ifstream ifs(pcbPath);
+        pcbAfter.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    }
+    CHECK_EQUAL(pcbBefore, pcbAfter);
+}
+
+TEST(EdaBridge_UnifiedAppConfigAndToggles, AgentCadSpecValidationVolumetricDiffFourViewAndEasyEdaApiIntrospection) {
+    EdaRpcServerOptions opts;
+    opts.listenHost = "127.0.0.1";
+    opts.port = 0;
+    opts.pluginPort = 0;
+    opts.authSecret = "env3-secret";
+    opts.allowedRoot = _ws;
+
+    EdaRpcServer srv(opts);
+    CHECK_TRUE(srv.start());
+
+    MockWebSocketEasyEdaPlugin eePlugin;
+    CHECK_TRUE(eePlugin.start(srv.boundPluginPort()));
+    for (int i = 0; i < 30 && !srv.isPluginConnected("easyeda"); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK_TRUE(srv.isPluginConnected("easyeda"));
+
+    EdaBridgeConfig cfg;
+    cfg.enabled = true;
+    cfg.mode = "client";
+    cfg.host = "127.0.0.1";
+    cfg.port = srv.boundPort();
+    cfg.pluginPort = srv.boundPluginPort();
+    cfg.authSecret = "env3-secret";
+    cfg.linuxPathPrefix = _ws;
+    cfg.windowsPathPrefix = _ws;
+
+    EdaBridge bridge(cfg);
+
+    // 1. Generate initial 3D CAD document (50 x 30 x 20 mm -> volume = 50*30*20*0.42 = 12600 mm^3)
+    std::string cadDoc = _ws + "/servo_mount.FCStd";
+    nlohmann::json gen1 = bridge.callTool("freecad_generate_cad", {
+        {"document_path", cadDoc},
+        {"body_name", "ServoMount"},
+        {"length_mm", 50.0},
+        {"width_mm", 30.0},
+        {"height_mm", 20.0}
+    });
+    CHECK_TRUE(gen1.value("ok", false));
+
+    // 2. Nominal spec contract validation (all constraints satisfied)
+    nlohmann::json inspPass = bridge.callTool("freecad_inspect_document", {
+        {"document_path", cadDoc},
+        {"spec", {
+            {"expected_bbox_mm", nlohmann::json::array({50.0, 30.0, 20.0})},
+            {"bbox_tolerance_mm", 0.5},
+            {"expected_volume_mm3", 12600.0},
+            {"volume_tolerance_pct", 5.0},
+            {"expected_holes_count", 1},
+            {"require_watertight_manifold", true}
+        }}
+    });
+    CHECK_TRUE(inspPass.value("ok", false));
+    CHECK_TRUE(inspPass.contains("spec_validation"));
+    CHECK_TRUE(inspPass["spec_validation"].value("passed", false));
+    CHECK_TRUE(inspPass["spec_validation"].value("manifold_valid", false));
+    CHECK_TRUE(inspPass["spec_validation"].value("bbox_matched", false));
+    CHECK_TRUE(inspPass["spec_validation"].value("volume_matched", false));
+    CHECK_TRUE(inspPass["spec_validation"].value("holes_matched", false));
+    CHECK_EQUAL(0, static_cast<int>(inspPass["spec_validation"]["violations"].size()));
+
+    // 3. Fault/violation spec contract validation (wrong bbox and hole count)
+    nlohmann::json inspFail = bridge.callTool("freecad_inspect_document", {
+        {"document_path", cadDoc},
+        {"spec", {
+            {"expected_bbox_mm", nlohmann::json::array({80.0, 30.0, 20.0})},
+            {"bbox_tolerance_mm", 0.5},
+            {"expected_holes_count", 4}
+        }}
+    });
+    CHECK_TRUE(inspFail.value("ok", false));
+    CHECK_TRUE(inspFail.contains("spec_validation"));
+    CHECK_FALSE(inspFail["spec_validation"].value("passed", true));
+    CHECK_FALSE(inspFail["spec_validation"].value("bbox_matched", true));
+    CHECK_FALSE(inspFail["spec_validation"].value("holes_matched", true));
+    CHECK_TRUE(inspFail["spec_validation"]["violations"].size() >= 2);
+
+    // 4. Modify CAD geometry (60 x 30 x 20 mm -> volume = 15120 mm^3) and compute volumetric boolean diff
+    nlohmann::json gen2 = bridge.callTool("freecad_generate_cad", {
+        {"document_path", cadDoc},
+        {"body_name", "ServoMount"},
+        {"length_mm", 60.0},
+        {"width_mm", 30.0},
+        {"height_mm", 20.0}
+    });
+    CHECK_TRUE(gen2.value("ok", false));
+
+    nlohmann::json inspDiff = bridge.callTool("freecad_inspect_document", {
+        {"document_path", cadDoc},
+        {"compare_previous", true}
+    });
+    CHECK_TRUE(inspDiff.value("ok", false));
+    CHECK_TRUE(inspDiff.contains("volumetric_diff"));
+    DOUBLES_EQUAL(12600.0, inspDiff["volumetric_diff"].value("shared_volume_mm3", 0.0), 1.0);
+    DOUBLES_EQUAL(2520.0, inspDiff["volumetric_diff"].value("added_volume_mm3", 0.0), 1.0);
+    DOUBLES_EQUAL(0.0, inspDiff["volumetric_diff"].value("removed_volume_mm3", -1.0), 1.0);
+    DOUBLES_EQUAL(2520.0, inspDiff["volumetric_diff"].value("net_volume_delta_mm3", 0.0), 1.0);
+    CHECK_TRUE(inspDiff["volumetric_diff"].value("iou_ratio", 0.0) > 0.7 &&
+               inspDiff["volumetric_diff"].value("iou_ratio", 0.0) < 1.0);
+
+    // 5. 4-View orthographic rendering (lowercase aliases + quad preset + partial view matrix check)
+    nlohmann::json quadRender = bridge.callTool("freecad_render_view", {
+        {"output_dir", _ws + "/renders_quad"},
+        {"views", nlohmann::json::array({"top", "front", "right", "iso"})}
+    });
+    CHECK_TRUE(quadRender.value("ok", false));
+    CHECK_EQUAL(4, quadRender.value("views_count", 0));
+    CHECK_TRUE(quadRender.value("view_matrix_complete", false));
+
+    nlohmann::json partialRender = bridge.callTool("freecad_render_view", {
+        {"output_dir", _ws + "/renders_partial"},
+        {"views", nlohmann::json::array({"top", "front"})}
+    });
+    CHECK_TRUE(partialRender.value("ok", false));
+    CHECK_EQUAL(2, partialRender.value("views_count", 0));
+    CHECK_FALSE(partialRender.value("view_matrix_complete", true));
+
+    // 6. Offline-capable @jlceda/pro-api-types introspection (describe_api & search_api)
+    eePlugin.stop();
+    srv.stop();
+
+    nlohmann::json descRes = bridge.callTool("easyeda_invoke_api", {
+        {"describe_api", "eda.sch_PrimitiveComponent.create"}
+    });
+    CHECK_TRUE(descRes.value("ok", false));
+    CHECK_TRUE(descRes.contains("matched_apis"));
+    CHECK_TRUE(descRes["matched_apis"].is_array());
+    CHECK_TRUE(!descRes["matched_apis"].empty());
+    CHECK_EQUAL("eda.sch_PrimitiveComponent.create", descRes["matched_apis"][0].value("api_path", ""));
+    CHECK_TRUE(descRes["matched_apis"][0].value("notes", "").find("libraryUuid") != std::string::npos);
+
+    nlohmann::json searchRes = bridge.callTool("easyeda_invoke_api", {
+        {"search_api", "PrimitiveWire"}
+    });
+    CHECK_TRUE(searchRes.value("ok", false));
+    CHECK_TRUE(searchRes.value("matched_count", 0) >= 2);
+
+    // 7. Populate >25 tool calls and verify recent_calls ring buffer in easyeda_live_status
+    CHECK_TRUE(srv.start());
+    cfg.port = srv.boundPort();
+    cfg.pluginPort = srv.boundPluginPort();
+    bridge.setConfig(cfg);
+    CHECK_TRUE(eePlugin.start(srv.boundPluginPort()));
+    for (int i = 0; i < 30 && !srv.isPluginConnected("easyeda"); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    for (int i = 0; i < 28; ++i) {
+        bridge.callTool("easyeda_search_library", {{"query", "R_" + std::to_string(i)}});
+    }
+
+    nlohmann::json liveSt = bridge.callTool("easyeda_live_status", nlohmann::json::object());
+    CHECK_TRUE(liveSt.value("ok", false));
+    CHECK_TRUE(liveSt.contains("recent_calls"));
+    CHECK_TRUE(liveSt["recent_calls"].is_array());
+    CHECK_EQUAL(25, static_cast<int>(liveSt["recent_calls"].size()));
+    CHECK_EQUAL(25, liveSt.value("recent_calls_count", 0));
+    CHECK_TRUE(liveSt["recent_calls"][0].contains("timestamp_ms"));
+    CHECK_EQUAL("easyeda_search_library", liveSt["recent_calls"][0].value("tool", ""));
+    CHECK_EQUAL("ok", liveSt["recent_calls"][0].value("status", ""));
+    CHECK_TRUE(liveSt["recent_calls"][0].contains("duration_ms"));
+    CHECK_FALSE(liveSt["recent_calls"][0].value("summary", "").empty());
+
+    eePlugin.stop();
+    srv.stop();
 }
 
 int main(int ac, char** av) {

@@ -693,6 +693,96 @@ TEST(McpServer_EdaProfile, EasyEdaAndAuditSchemasExposeFilteringDeclarativeEdits
     const json& auditProps = schemasByName["eda_calc_pcb_connectivity_audit"]["properties"];
     CHECK_TRUE(auditProps.contains("pours"));
     CHECK_TRUE(auditProps.contains("zones"));
+
+    // 6. Envelope 3: freecad_inspect_document, freecad_render_view, easyeda_invoke_api schemas
+    CHECK_TRUE(schemasByName.count("freecad_inspect_document") == 1);
+    const json& fcInspProps = schemasByName["freecad_inspect_document"]["properties"];
+    CHECK_TRUE(fcInspProps.contains("spec"));
+    CHECK_TRUE(fcInspProps.contains("compare_previous"));
+    CHECK_TRUE(fcInspProps.contains("previous_snapshot"));
+
+    CHECK_TRUE(schemasByName.count("freecad_render_view") == 1);
+    const json& fcRenderProps = schemasByName["freecad_render_view"]["properties"];
+    CHECK_TRUE(fcRenderProps.contains("preset"));
+    CHECK_TRUE(fcRenderProps.contains("four_view"));
+
+    CHECK_TRUE(schemasByName.count("easyeda_invoke_api") == 1);
+    const json& eeInvokeProps = schemasByName["easyeda_invoke_api"]["properties"];
+    CHECK_TRUE(eeInvokeProps.contains("describe_api"));
+    CHECK_TRUE(eeInvokeProps.contains("search_api"));
+}
+
+TEST(McpServer_EdaProfile, McpDispatchesOfflineApiIntrospectionSpecValidationVolumetricDiffAndRecentCalls) {
+    auto callAndParse = [&](const std::string& name, const json& args) -> json {
+        json mcpResp = callMcpTool(*_mcp, name, args, "eda");
+        CHECK_TRUE_TEXT(mcpResp.contains("result"), name.c_str());
+        CHECK_FALSE_TEXT(mcpResp["result"].value("isError", true), name.c_str());
+        std::string txt = mcpResp["result"]["content"][0]["text"].get<std::string>();
+        json parsed = json::parse(txt, nullptr, false);
+        CHECK_FALSE_TEXT(parsed.is_discarded(), name.c_str());
+        CHECK_TRUE_TEXT(parsed.value("ok", false), name.c_str());
+        return parsed;
+    };
+
+    // 1. FreeCAD spec contract + volumetric boolean diff via MCP
+    std::string fcDoc = _ws + "/mcp_spec_part.FCStd";
+    callAndParse("freecad_generate_cad", {
+        {"document_path", fcDoc},
+        {"body_name", "MountLink"},
+        {"length_mm", 40.0},
+        {"width_mm", 20.0},
+        {"height_mm", 10.0}
+    });
+    json insp1 = callAndParse("freecad_inspect_document", {
+        {"document_path", fcDoc},
+        {"spec", {
+            {"expected_bbox_mm", json::array({40.0, 20.0, 10.0})},
+            {"bbox_tolerance_mm", 0.5},
+            {"require_watertight_manifold", true}
+        }}
+    });
+    CHECK_TRUE(insp1.contains("spec_validation"));
+    CHECK_TRUE(insp1["spec_validation"].value("passed", false));
+
+    callAndParse("freecad_generate_cad", {
+        {"document_path", fcDoc},
+        {"body_name", "MountLink"},
+        {"length_mm", 50.0},
+        {"width_mm", 20.0},
+        {"height_mm", 10.0}
+    });
+    json insp2 = callAndParse("freecad_inspect_document", {
+        {"document_path", fcDoc},
+        {"compare_previous", true}
+    });
+    CHECK_TRUE(insp2.contains("volumetric_diff"));
+    CHECK_TRUE(insp2["volumetric_diff"].value("added_volume_mm3", 0.0) > 0.0);
+
+    // 2. FreeCAD 4-view render via MCP
+    json rnd = callAndParse("freecad_render_view", {
+        {"output_dir", _ws + "/mcp_quad"},
+        {"four_view", true}
+    });
+    CHECK_TRUE(rnd.value("view_matrix_complete", false));
+    CHECK_EQUAL(4, rnd.value("views_count", 0));
+
+    // 3. easyeda_live_status includes recent_calls ring buffer
+    json liveSt = callAndParse("easyeda_live_status", json::object());
+    CHECK_TRUE(liveSt.contains("recent_calls"));
+    CHECK_TRUE(liveSt.value("recent_calls_count", 0) >= 3);
+
+    // 4. Offline @jlceda/pro-api-types introspection works even when EasyEDA plugin disconnects
+    _easyEdaPlugin->stop();
+    json descApi = callAndParse("easyeda_invoke_api", {
+        {"describe_api", "eda.pcb_PrimitiveLine.create"}
+    });
+    CHECK_TRUE(descApi.contains("matched_apis"));
+    CHECK_TRUE(!descApi["matched_apis"].empty());
+
+    json searchApi = callAndParse("easyeda_invoke_api", {
+        {"search_api", "netFlag"}
+    });
+    CHECK_TRUE(searchApi.value("matched_count", 0) >= 1);
 }
 
 TEST_GROUP(WebServer_EdaApi) {

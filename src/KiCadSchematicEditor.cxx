@@ -1770,10 +1770,15 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
     }
 
     nlohmann::json schInspect;
+    if (schSexp.empty() && !schPath.empty()) {
+        std::ifstream ifs(schPath);
+        if (!ifs) {
+            return {{"ok", false}, {"error", "KiCad file not found: " + schPath}};
+        }
+        schSexp.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    }
     if (!schSexp.empty()) {
         schInspect = inspectFile({{"sexp", schSexp}});
-    } else if (!schPath.empty()) {
-        schInspect = inspectFile({{"file_path", schPath}});
     } else {
         return {{"ok", false}, {"error", "kicad_sync_sch_to_pcb requires 'schematic_path', 'schematic_sexp', or 'components'"}};
     }
@@ -1829,9 +1834,13 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
 
     // Map (ref, pin) -> netName from schematic netlist
     std::map<std::pair<std::string, std::string>, std::string> pinNetMap;
+    std::set<std::string> validSchNets;
     if (schInspect.contains("nets") && schInspect["nets"].is_array()) {
         for (const auto& netObj : schInspect["nets"]) {
             std::string netName = netObj.value("name", "");
+            if (!netName.empty()) {
+                validSchNets.insert(netName);
+            }
             ensureNetCode(netName);
             if (netObj.contains("nodes") && netObj["nodes"].is_array()) {
                 for (const auto& node : netObj["nodes"]) {
@@ -1845,19 +1854,56 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
         }
     }
 
+    const bool dryRun = arguments.value("dry_run", false);
+    const std::vector<PcbFootprintModel> existingFootprints = footprints;
+    nlohmann::json componentsToAdd = nlohmann::json::array();
+    nlohmann::json componentsToRemove = nlohmann::json::array();
+    nlohmann::json footprintMismatches = nlohmann::json::array();
+    nlohmann::json unannotatedReferences = nlohmann::json::array();
+    nlohmann::json missingFootprints = nlohmann::json::array();
+    nlohmann::json padNetDeltas = nlohmann::json::array();
+    nlohmann::json orphanedTracks = nlohmann::json::array();
+    std::set<std::string> schRefsSet;
+
     int syncedCount = 0;
     int autoGridIdx = 0;
     if (schInspect.contains("components") && schInspect["components"].is_array()) {
         for (const auto& comp : schInspect["components"]) {
             std::string ref = comp.value("reference", "");
             if (ref.empty() || ref[0] == '#') continue;
+            schRefsSet.insert(ref);
             std::string val = comp.value("value", ref);
-            std::string fpName = comp.value("footprint", "Resistor_SMD:R_0603_1608Metric");
+            std::string rawFpName = comp.value("footprint", "");
+            if (ref.find('?') != std::string::npos) {
+                unannotatedReferences.push_back(ref);
+            }
+            if (rawFpName.empty()) {
+                missingFootprints.push_back(ref);
+            }
+            std::string fpName = rawFpName.empty() ? "Resistor_SMD:R_0603_1608Metric" : rawFpName;
             std::string lcsc = comp.value("lcsc", "");
 
             auto fpIt = std::find_if(footprints.begin(), footprints.end(), [&](const PcbFootprintModel& f) {
                 return f.reference == ref;
             });
+
+            if (fpIt == footprints.end()) {
+                if (ref.find('?') == std::string::npos && !rawFpName.empty()) {
+                    componentsToAdd.push_back({
+                        {"reference", ref},
+                        {"value", val},
+                        {"footprint", rawFpName}
+                    });
+                }
+            } else {
+                if (!rawFpName.empty() && !fpIt->footprint.empty() && rawFpName != fpIt->footprint) {
+                    footprintMismatches.push_back({
+                        {"reference", ref},
+                        {"schematic_footprint", rawFpName},
+                        {"pcb_footprint", fpIt->footprint}
+                    });
+                }
+            }
 
             PcbFootprintModel fpModel;
             if (fpIt != footprints.end()) {
@@ -1885,6 +1931,7 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
                     std::string explicitNet = sp.value("net", "");
                     if (!explicitNet.empty()) {
                         pinNetMap[{ref, pNum}] = explicitNet;
+                        validSchNets.insert(explicitNet);
                         ensureNetCode(explicitNet);
                     }
                     auto padIt = std::find_if(fpModel.pads.begin(), fpModel.pads.end(), [&](const PcbPadModel& pd) {
@@ -1903,6 +1950,16 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
 
             for (auto& pad : fpModel.pads) {
                 auto nmIt = pinNetMap.find({ref, pad.number});
+                std::string newNet = (nmIt != pinNetMap.end()) ? nmIt->second : "";
+                if (fpIt != footprints.end() && pad.netName != newNet &&
+                    (!pad.netName.empty() || !newNet.empty())) {
+                    padNetDeltas.push_back({
+                        {"reference", ref},
+                        {"pad", pad.number},
+                        {"old_net", pad.netName},
+                        {"new_net", newNet}
+                    });
+                }
                 if (nmIt != pinNetMap.end()) {
                     pad.netName = nmIt->second;
                     pad.netCode = ensureNetCode(pad.netName);
@@ -1916,6 +1973,48 @@ nlohmann::json KiCadSchematicEditor::syncSchematicToPcb(const nlohmann::json& ar
             }
             ++syncedCount;
         }
+    }
+
+    for (const auto& oldFp : existingFootprints) {
+        if (!oldFp.reference.empty() && schRefsSet.find(oldFp.reference) == schRefsSet.end()) {
+            componentsToRemove.push_back({
+                {"reference", oldFp.reference},
+                {"value", oldFp.value},
+                {"footprint", oldFp.footprint}
+            });
+        }
+    }
+
+    for (const auto& t : tracks) {
+        if (!t.netName.empty() && validSchNets.find(t.netName) == validSchNets.end()) {
+            orphanedTracks.push_back({
+                {"layer", t.layer},
+                {"net", t.netName},
+                {"x1", t.x1},
+                {"y1", t.y1},
+                {"x2", t.x2},
+                {"y2", t.y2}
+            });
+        }
+    }
+
+    if (dryRun) {
+        const bool readyToSync = unannotatedReferences.empty() && missingFootprints.empty();
+        return {
+            {"ok", true},
+            {"dry_run", true},
+            {"synced", false},
+            {"ready_to_sync", readyToSync},
+            {"schematic_path", schPath},
+            {"pcb_path", pcbPath},
+            {"components_to_add", componentsToAdd},
+            {"components_to_remove", componentsToRemove},
+            {"footprint_mismatches", footprintMismatches},
+            {"unannotated_references", unannotatedReferences},
+            {"missing_footprints", missingFootprints},
+            {"pad_net_deltas", padNetDeltas},
+            {"orphaned_tracks", orphanedTracks}
+        };
     }
 
     std::string pcbSexp = serializePcbSexp(netByCode, outlineW, outlineH, outline,

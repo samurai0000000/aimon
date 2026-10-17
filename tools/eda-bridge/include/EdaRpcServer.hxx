@@ -174,6 +174,7 @@ private:
 
     mutable std::mutex _docStateMutex;
     std::map<std::string, nlohmann::json> _freecadDocs;
+    std::map<std::string, nlohmann::json> _freecadPrevDocs;
 };
 
 } // namespace aimon

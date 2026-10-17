@@ -12,7 +12,7 @@ import socket
 import threading
 import time
 
-BRIDGE_VERSION = "1.1.4"
+BRIDGE_VERSION = "1.1.5"
 
 try:
     import FreeCAD
@@ -83,6 +83,8 @@ class AimonFreeCadBridgeClient:
         self._gui_queue = queue.Queue()
         self._gui_timer = None
         self._gui_pump_active = False
+        self._prev_doc_snapshot = None
+        self._last_holes_count = 0
 
     def _setup_gui_pump(self):
         if QtCore is None or self._gui_timer is not None:
@@ -154,7 +156,7 @@ class AimonFreeCadBridgeClient:
                     return f"{v[0]}.{v[1]}.{v[2]}"
             except Exception:
                 pass
-        return "1.1.4"
+        return "1.1.5"
 
     def _active_doc_name(self):
         if HAS_FREECAD and getattr(FreeCAD, "ActiveDocument", None) is not None:
@@ -174,7 +176,7 @@ class AimonFreeCadBridgeClient:
                 view = gui_doc.ActiveView
                 if view is not None:
                     vmode = str(view_mode or "Isometric").lower()
-                    if vmode == "isometric" and hasattr(view, "viewIsometric"):
+                    if vmode in ("isometric", "iso", "axonometric") and hasattr(view, "viewIsometric"):
                         view.viewIsometric()
                     elif vmode == "front" and hasattr(view, "viewFront"):
                         view.viewFront()
@@ -393,6 +395,126 @@ class AimonFreeCadBridgeClient:
             except Exception:
                 pass
 
+    def _capture_current_doc_snapshot(self):
+        if not HAS_FREECAD or getattr(FreeCAD, "ActiveDocument", None) is None:
+            return None
+        doc = FreeCAD.ActiveDocument
+        total_vol = 0.0
+        xs_min, ys_min, zs_min = [], [], []
+        xs_max, ys_max, zs_max = [], [], []
+        for obj in getattr(doc, "Objects", []):
+            if hasattr(obj, "Shape") and obj.Shape is not None:
+                total_vol += float(getattr(obj.Shape, "Volume", 0.0))
+                bb = getattr(obj.Shape, "BoundBox", None)
+                if bb is not None:
+                    xs_min.append(float(bb.XMin))
+                    ys_min.append(float(bb.YMin))
+                    zs_min.append(float(bb.ZMin))
+                    xs_max.append(float(bb.XMax))
+                    ys_max.append(float(bb.YMax))
+                    zs_max.append(float(bb.ZMax))
+        if not xs_min:
+            return None
+        return {
+            "volume_mm3": total_vol,
+            "bbox_mm": [
+                max(xs_max) - min(xs_min),
+                max(ys_max) - min(ys_min),
+                max(zs_max) - min(zs_min),
+            ],
+            "holes_count": int(getattr(self, "_last_holes_count", 0)),
+        }
+
+    def _evaluate_spec_and_diff(self, args, total_vol, doc_bbox_mm, manifold_valid, holes_count):
+        out = {}
+        spec_cfg = args.get("spec")
+        if isinstance(spec_cfg, dict):
+            violations = []
+            req_manifold = bool(spec_cfg.get("require_watertight_manifold", True))
+            manifold_ok = (not req_manifold) or manifold_valid
+            if not manifold_ok:
+                violations.append("Document contains non-manifold or non-watertight solid bodies")
+
+            bbox_matched = True
+            exp_bbox = spec_cfg.get("expected_bbox_mm")
+            bbox_tol = float(spec_cfg.get("bbox_tolerance_mm", 0.5))
+            if isinstance(exp_bbox, (list, tuple)) and len(exp_bbox) >= 3 and len(doc_bbox_mm) >= 3:
+                for axis_idx, axis_name in enumerate(("X", "Y", "Z")):
+                    actual_dim = float(doc_bbox_mm[axis_idx])
+                    target_dim = float(exp_bbox[axis_idx])
+                    if abs(actual_dim - target_dim) > bbox_tol:
+                        bbox_matched = False
+                        violations.append(
+                            f"Bounding box {axis_name} dimension {actual_dim:.3f} mm outside target {target_dim:.3f} +/- {bbox_tol:.3f} mm"
+                        )
+
+            volume_matched = True
+            if "expected_volume_mm3" in spec_cfg:
+                exp_vol = float(spec_cfg["expected_volume_mm3"])
+                vol_tol_pct = float(spec_cfg.get("volume_tolerance_pct", 5.0))
+                allowed_delta = abs(exp_vol) * (vol_tol_pct / 100.0)
+                if abs(total_vol - exp_vol) > allowed_delta:
+                    volume_matched = False
+                    violations.append(
+                        f"Volume {total_vol:.3f} mm3 outside target {exp_vol:.3f} mm3 +/- {vol_tol_pct:.2f}%"
+                    )
+
+            holes_matched = True
+            if "expected_holes_count" in spec_cfg:
+                exp_holes = int(spec_cfg["expected_holes_count"])
+                if holes_count != exp_holes:
+                    holes_matched = False
+                    violations.append(
+                        f"Holes count {holes_count} does not match expected {exp_holes}"
+                    )
+
+            out["spec_validation"] = {
+                "passed": bool(manifold_ok and bbox_matched and volume_matched and holes_matched),
+                "manifold_valid": bool(manifold_valid),
+                "bbox_matched": bool(bbox_matched),
+                "volume_matched": bool(volume_matched),
+                "holes_matched": bool(holes_matched),
+                "actual_bbox_mm": list(doc_bbox_mm),
+                "actual_volume_mm3": float(total_vol),
+                "actual_holes_count": int(holes_count),
+                "violations": violations,
+            }
+
+        if bool(args.get("compare_previous", False)) or isinstance(args.get("previous_snapshot"), dict):
+            prev_snap = args.get("previous_snapshot")
+            if not isinstance(prev_snap, dict):
+                prev_snap = getattr(self, "_prev_doc_snapshot", None)
+            if not isinstance(prev_snap, dict):
+                prev_snap = {"volume_mm3": total_vol, "bbox_mm": list(doc_bbox_mm)}
+            prev_vol = float(prev_snap.get("volume_mm3", total_vol))
+            prev_bbox = prev_snap.get("bbox_mm")
+            if isinstance(prev_bbox, (list, tuple)) and len(prev_bbox) >= 3 and len(doc_bbox_mm) >= 3:
+                cur_box_vol = max(1e-6, float(doc_bbox_mm[0]) * float(doc_bbox_mm[1]) * float(doc_bbox_mm[2]))
+                prev_box_vol = max(1e-6, float(prev_bbox[0]) * float(prev_bbox[1]) * float(prev_bbox[2]))
+                inter_box_vol = (
+                    max(0.0, min(float(doc_bbox_mm[0]), float(prev_bbox[0])))
+                    * max(0.0, min(float(doc_bbox_mm[1]), float(prev_bbox[1])))
+                    * max(0.0, min(float(doc_bbox_mm[2]), float(prev_bbox[2])))
+                )
+                box_overlap_ratio = min(1.0, inter_box_vol / max(1e-6, min(cur_box_vol, prev_box_vol)))
+                shared_vol = min(total_vol, prev_vol) * box_overlap_ratio
+            else:
+                shared_vol = min(total_vol, prev_vol)
+            shared_vol = max(0.0, min(shared_vol, total_vol, prev_vol))
+            added_vol = max(0.0, total_vol - shared_vol)
+            removed_vol = max(0.0, prev_vol - shared_vol)
+            net_delta = total_vol - prev_vol
+            union_vol = total_vol + prev_vol - shared_vol
+            iou_ratio = (shared_vol / union_vol) if union_vol > 1e-9 else 1.0
+            out["volumetric_diff"] = {
+                "shared_volume_mm3": float(shared_vol),
+                "added_volume_mm3": float(added_vol),
+                "removed_volume_mm3": float(removed_vol),
+                "net_volume_delta_mm3": float(net_delta),
+                "iou_ratio": float(iou_ratio),
+            }
+        return out
+
     def _generate_cad_live(self, args):
         body_name = str(args.get("body_name", args.get("name", "RobotLink")))
         doc_name = str(args.get("document_name", args.get("doc_name", "RobotCad")))
@@ -406,6 +528,10 @@ class AimonFreeCadBridgeClient:
                 "body_name": body_name,
                 "volume_mm3": length_mm * width_mm * height_mm,
             }
+
+        prev_snap = self._capture_current_doc_snapshot()
+        if prev_snap is not None:
+            self._prev_doc_snapshot = prev_snap
 
         doc = FreeCAD.ActiveDocument
         if doc is None:
@@ -421,6 +547,7 @@ class AimonFreeCadBridgeClient:
 
         created_bodies = []
         total_volume = 0.0
+        explicit_holes = 0
 
         script_code = args.get("script")
         if isinstance(script_code, str) and script_code.strip():
@@ -444,6 +571,9 @@ class AimonFreeCadBridgeClient:
             for idx, p_spec in enumerate(parts_spec):
                 if not isinstance(p_spec, dict):
                     continue
+                h_list = p_spec.get("holes") or p_spec.get("boolean_cuts") or []
+                if isinstance(h_list, list):
+                    explicit_holes += len(h_list)
                 p_name = str(p_spec.get("name", p_spec.get("body_name", f"{body_name}_{idx + 1}" if len(parts_spec) > 1 else body_name)))
                 shape = self._build_shape_from_spec(p_spec)
                 feature = doc.addObject("Part::Feature", p_name)
@@ -452,6 +582,7 @@ class AimonFreeCadBridgeClient:
                 feature.Shape = shape
                 self._apply_feature_transform_and_style(feature, p_spec)
 
+        self._last_holes_count = explicit_holes
         doc.recompute()
         self._refresh_gui_viewport(view_mode=args.get("view", "Isometric"), fit_all=True)
 
@@ -478,6 +609,9 @@ class AimonFreeCadBridgeClient:
             total_volume = length_mm * width_mm * height_mm
         mass_kg = (total_volume * 1e-3) * 1.27 * 1e-3
 
+        if self._prev_doc_snapshot is None:
+            self._prev_doc_snapshot = self._capture_current_doc_snapshot()
+
         return {
             "ok": True,
             "live_gui": True,
@@ -488,6 +622,7 @@ class AimonFreeCadBridgeClient:
             "bounding_box": bbox_out,
             "bodies_count": len(created_bodies),
             "bodies": created_bodies,
+            "holes_count": explicit_holes,
         }
 
     def _assemble_joint_live(self, args):
@@ -630,26 +765,61 @@ class AimonFreeCadBridgeClient:
         if tool_name == "freecad_inspect_document":
             def _do_inspect():
                 bodies = []
+                total_vol = 0.0
+                xs_min, ys_min, zs_min = [], [], []
+                xs_max, ys_max, zs_max = [], [], []
+                manifold_valid = True
                 if HAS_FREECAD and FreeCAD.ActiveDocument is not None:
                     for obj in FreeCAD.ActiveDocument.Objects:
                         if hasattr(obj, "Shape") and obj.Shape is not None:
                             bb = obj.Shape.BoundBox
+                            vol = float(obj.Shape.Volume)
+                            wt = bool(obj.Shape.isClosed())
+                            is_val = bool(obj.Shape.isValid()) if hasattr(obj.Shape, "isValid") else wt
+                            if not (wt and is_val):
+                                manifold_valid = False
+                            total_vol += vol
+                            xs_min.append(float(bb.XMin))
+                            ys_min.append(float(bb.YMin))
+                            zs_min.append(float(bb.ZMin))
+                            xs_max.append(float(bb.XMax))
+                            ys_max.append(float(bb.YMax))
+                            zs_max.append(float(bb.ZMax))
                             bodies.append({
                                 "name": obj.Name,
                                 "label": getattr(obj, "Label", obj.Name),
-                                "volume_mm3": float(obj.Shape.Volume),
-                                "watertight": bool(obj.Shape.isClosed()),
+                                "volume_mm3": vol,
+                                "watertight": wt,
                                 "bounding_box": {
                                     "x_min": bb.XMin, "y_min": bb.YMin, "z_min": bb.ZMin,
                                     "x_max": bb.XMax, "y_max": bb.YMax, "z_max": bb.ZMax,
                                 },
                             })
-                return {
+                if xs_min:
+                    doc_bbox_mm = [
+                        max(xs_max) - min(xs_min),
+                        max(ys_max) - min(ys_min),
+                        max(zs_max) - min(zs_min),
+                    ]
+                else:
+                    doc_bbox_mm = list(args.get("bbox_mm", [0.0, 0.0, 0.0]))
+                holes_count = int(args.get("holes_count", getattr(self, "_last_holes_count", 0)))
+                res = {
                     "ok": True,
                     "active_document": self._active_doc_name(),
                     "bodies_count": len(bodies),
                     "bodies": bodies,
+                    "volume_mm3": total_vol,
+                    "bbox_mm": doc_bbox_mm,
+                    "holes_count": holes_count,
                 }
+                res.update(self._evaluate_spec_and_diff(args, total_vol, doc_bbox_mm, manifold_valid, holes_count))
+                self._prev_doc_snapshot = {
+                    "volume_mm3": total_vol,
+                    "bbox_mm": doc_bbox_mm,
+                    "holes_count": holes_count,
+                }
+                return res
             return self._run_on_gui_thread(_do_inspect)
 
         if tool_name == "freecad_generate_cad":
@@ -657,6 +827,9 @@ class AimonFreeCadBridgeClient:
 
         if tool_name == "freecad_edit_parameters":
             def _do_edit_params():
+                prev_snap = self._capture_current_doc_snapshot()
+                if prev_snap is not None:
+                    self._prev_doc_snapshot = prev_snap
                 params = dict(args.get("parameters") or {})
                 if HAS_FREECAD and FreeCAD.ActiveDocument is not None:
                     doc = FreeCAD.ActiveDocument
@@ -700,15 +873,22 @@ class AimonFreeCadBridgeClient:
                                 non_manifold += 1
                 wall_mm = float(args.get("wall_thickness_mm", 2.0))
                 min_wall_mm = float(args.get("min_wall_thickness_mm", 1.2))
-                return {
+                manifold_ok = bool(watertight and non_manifold == 0)
+                res = {
                     "ok": True,
                     "active_document": self._active_doc_name(),
-                    "is_manifold": watertight and non_manifold == 0,
-                    "watertight": watertight and non_manifold == 0,
+                    "is_manifold": manifold_ok,
+                    "watertight": manifold_ok,
                     "non_manifold_edges": non_manifold,
                     "min_wall_thickness_mm": wall_mm,
-                    "printability_pass": watertight and non_manifold == 0 and wall_mm >= min_wall_mm,
+                    "printability_pass": manifold_ok and wall_mm >= min_wall_mm,
                 }
+                cur_snap = self._capture_current_doc_snapshot() or {}
+                total_vol = float(args.get("volume_mm3", cur_snap.get("volume_mm3", 0.0)))
+                doc_bbox_mm = list(args.get("bbox_mm", cur_snap.get("bbox_mm", [0.0, 0.0, 0.0])))
+                holes_count = int(args.get("holes_count", getattr(self, "_last_holes_count", 0)))
+                res.update(self._evaluate_spec_and_diff(args, total_vol, doc_bbox_mm, manifold_ok, holes_count))
+                return res
             return self._run_on_gui_thread(_do_printability)
 
         if tool_name == "freecad_render_view":
@@ -716,11 +896,22 @@ class AimonFreeCadBridgeClient:
                 out_dir = str(args.get("output_dir", ""))
                 width = int(args.get("width", 1280))
                 height = int(args.get("height", 960))
-                views = args.get("views") or ["Isometric", "Front", "Top", "Right"]
+                if args.get("views"):
+                    views = list(args.get("views"))
+                elif str(args.get("preset", "")).lower() == "quad" or bool(args.get("four_view", False)):
+                    views = ["top", "front", "right", "iso"]
+                else:
+                    views = ["Isometric", "Front", "Top", "Right"]
                 if out_dir:
                     os.makedirs(out_dir, exist_ok=True)
                 rendered = []
+                norm_views = set()
                 for v in views:
+                    vl = str(v).strip().lower()
+                    if vl in ("iso", "isometric", "axonometric"):
+                        norm_views.add("iso")
+                    elif vl in ("top", "front", "right"):
+                        norm_views.add(vl)
                     self._refresh_gui_viewport(view_mode=v, fit_all=True)
                     fpath = os.path.join(out_dir, f"view_{v}.png") if out_dir else ""
                     if fpath and HAS_FREECAD_GUI and FreeCADGui is not None:
@@ -737,6 +928,7 @@ class AimonFreeCadBridgeClient:
                     "active_document": self._active_doc_name(),
                     "views_count": len(rendered),
                     "views": rendered,
+                    "view_matrix_complete": {"top", "front", "right", "iso"}.issubset(norm_views),
                 }
             return self._run_on_gui_thread(_do_render)
 

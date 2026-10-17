@@ -11,7 +11,7 @@ import socket
 import threading
 import time
 
-BRIDGE_VERSION = "1.1.4"
+BRIDGE_VERSION = "1.1.5"
 
 try:
     import pcbnew

@@ -59,20 +59,25 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "eda_calc_pcb_autoroute",
             "accelerators",
-            "PathFinder negotiated-congestion N-layer (2/4/6-layer EasyEDA/KiCad) 45-degree A* PCB trace & via router with incremental existing_tracks/existing_vias.",
+            "PathFinder negotiated-congestion N-layer (2/4/6-layer EasyEDA/KiCad) 45-degree A* PCB trace & via router with obstacle-complete pad/keepout/pour avoidance, incremental existing_tracks/existing_vias, and multi-pass rip-up-and-reroute.",
             {
                 {"board", {{"type", "object"}, {"description", "Board outline and routing grid settings ({width_mm, height_mm, layers, layer_style})"}}},
                 {"nets", {{"type", "array"}, {"description", "Nets with pad coordinates ({name, width_mm, clearance_mm, pads[]})"}}},
+                {"all_pads", {{"type", "array"}, {"description", "Optional foreign/all PCB pads ({net, x_mm, y_mm, w_mm, h_mm, rotation_deg, layer})"}}},
                 {"obstacles", {{"type", "array"}, {"description", "Keepout or obstacle rectangles"}}},
+                {"keepouts", {{"type", "array"}, {"description", "Keepout regions ({layer, x_min, y_min, x_max, y_max, clearance_mm})"}}},
+                {"pours", {{"type", "array"}, {"description", "Foreign copper pour polygons/bboxes ({net, layer, polygon, x_min, y_min, x_max, y_max})"}}},
+                {"zones", {{"type", "array"}, {"description", "Alias for copper pours ({net, layer, polygon, x_min, y_min, x_max, y_max})"}}},
                 {"existing_tracks", {{"type", "array"}, {"description", "Existing routed tracks for incremental routing"}}},
-                {"existing_vias", {{"type", "array"}, {"description", "Existing vias for incremental routing"}}}
+                {"existing_vias", {{"type", "array"}, {"description", "Existing vias for incremental routing"}}},
+                {"max_ripup_passes", {{"type", "integer"}, {"description", "Maximum rip-up-and-reroute passes (default: 4)"}}}
             },
             {}
         },
         {
             "eda_calc_pcb_connectivity_audit",
             "accelerators",
-            "3D layer-aware Union-Find PCB physical connectivity, copper pour/zone polygon & bbox union, broken net island, dangling track, unassigned pad & multi-sheet schematic-PCB sync auditor.",
+            "3D layer-aware Union-Find PCB physical connectivity, copper pour/zone polygon & bbox union, broken net island, dangling track, unassigned pad, IC decoupling distance & multi-sheet schematic-PCB sync auditor.",
             {
                 {"pads", {{"type", "array"}, {"description", "PCB pads ({id, ref, pad, net, x, y, layer, size_x, size_y, hole_diameter})"}}},
                 {"tracks", {{"type", "array"}, {"description", "PCB track segments ({id, net, layer, x1, y1, x2, y2, width})"}}},
@@ -80,7 +85,8 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
                 {"pours", {{"type", "array"}, {"description", "Copper pour polygons/bboxes ({id, net, layer, polygon, x_min, y_min, x_max, y_max})"}}},
                 {"zones", {{"type", "array"}, {"description", "Alias for copper pours ({id, net, layer, polygon, x_min, y_min, x_max, y_max})"}}},
                 {"schematic_components", {{"type", "array"}, {"description", "Optional schematic components for parity check"}}},
-                {"pcb_components", {{"type", "array"}, {"description", "Optional PCB components for parity check"}}}
+                {"pcb_components", {{"type", "array"}, {"description", "Optional PCB components for parity check"}}},
+                {"max_decoupling_distance_mm", {{"type", "number"}, {"description", "Maximum allowed distance in mm from IC power pin to decoupling capacitor pad on same net (default: 5.0)"}}}
             },
             {}
         },
@@ -171,10 +177,11 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "kicad_sync_sch_to_pcb",
             "kicad",
-            "Synchronize schematic netlist and .kicad_mod footprints from .kicad_sch into .kicad_pcb.",
+            "Synchronize schematic netlist and .kicad_mod footprints from .kicad_sch into .kicad_pcb (or preview diff with dry_run: true).",
             {
                 {"schematic_path", {{"type", "string"}, {"description", "Source .kicad_sch file path"}}},
-                {"pcb_path", {{"type", "string"}, {"description", "Target .kicad_pcb file path"}}}
+                {"pcb_path", {{"type", "string"}, {"description", "Target .kicad_pcb file path"}}},
+                {"dry_run", {{"type", "boolean"}, {"default", false}, {"description", "Preview pre-sync netlist/footprint diff without mutating .kicad_pcb (default: false)"}}}
             },
             {"schematic_path", "pcb_path"}
         },
@@ -243,9 +250,12 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "freecad_inspect_document",
             "freecad",
-            "Inspect FreeCAD bodies, Spreadsheet parameters, bounding boxes, CoM, inertia tensor, hole axes, and LCS frames.",
+            "Inspect FreeCAD bodies, Spreadsheet parameters, bounding boxes, CoM, inertia tensor, hole axes, LCS frames, agentcad spec_validation contracts, and 3D boolean volumetric_diff.",
             {
-                {"document_path", {{"type", "string"}, {"description", "Optional path to .FCStd document"}}}
+                {"document_path", {{"type", "string"}, {"description", "Optional path to .FCStd document"}}},
+                {"spec", {{"type", "object"}, {"description", "Optional agentcad verification contract ({expected_bbox_mm, bbox_tolerance_mm, expected_volume_mm3, volume_tolerance_pct, expected_holes_count, require_watertight_manifold})"}}},
+                {"compare_previous", {{"type", "boolean"}, {"default", false}, {"description", "Compute 3D boolean volumetric_diff (shared/added/removed volume and IoU) against the previous CAD snapshot"}}},
+                {"previous_snapshot", {{"type", "object"}, {"description", "Optional explicit baseline snapshot ({volume_mm3, bbox_mm}) for volumetric_diff comparison"}}}
             },
             {}
         },
@@ -256,7 +266,8 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
             {
                 {"document_path", {{"type", "string"}, {"description", "Target .FCStd or .step path"}}},
                 {"script", {{"type", "string"}, {"description", "CSG / Part / PartDesign Python script (must not reference Face1..N, Edge1..N, Vertex1..N)"}}},
-                {"primitives", {{"type", "array"}, {"description", "Declarative 3D primitive/feature list"}}}
+                {"primitives", {{"type", "array"}, {"description", "Declarative 3D primitive/feature list"}}},
+                {"parts", {{"type", "array"}, {"description", "Multi-part declarative CSG specification list"}}}
             },
             {}
         },
@@ -287,22 +298,26 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "freecad_analyze_printability",
             "freecad",
-            "Validate 3D-printability (manifold watertightness, non-manifold edges, minimum wall thickness, overhang angles).",
+            "Validate 3D-printability (manifold watertightness, non-manifold edges, minimum wall thickness, overhang angles, and optional agentcad spec_validation / volumetric_diff).",
             {
                 {"document_path", {{"type", "string"}, {"description", "Path to .FCStd or mesh file"}}},
                 {"min_wall_thickness_mm", {{"type", "number"}, {"description", "Minimum required wall thickness in mm"}}},
-                {"max_overhang_deg", {{"type", "number"}, {"description", "Maximum unsupported overhang angle in degrees"}}}
+                {"max_overhang_deg", {{"type", "number"}, {"description", "Maximum unsupported overhang angle in degrees"}}},
+                {"spec", {{"type", "object"}, {"description", "Optional agentcad verification contract ({expected_bbox_mm, bbox_tolerance_mm, expected_volume_mm3, volume_tolerance_pct, expected_holes_count, require_watertight_manifold})"}}},
+                {"compare_previous", {{"type", "boolean"}, {"default", false}, {"description", "Compute 3D boolean volumetric_diff against the previous CAD snapshot"}}}
             },
             {}
         },
         {
             "freecad_render_view",
             "freecad",
-            "Render multi-angle (Isometric, Front, Top, Right) PNG snapshots for visual AI shape review.",
+            "Render multi-angle 4-view orthographic/isometric (top, front, right, iso) PNG snapshots for visual AI shape verification.",
             {
                 {"document_path", {{"type", "string"}, {"description", "Optional path to .FCStd document"}}},
                 {"output_dir", {{"type", "string"}, {"description", "Directory to write rendered PNG images"}}},
-                {"views", {{"type", "array"}, {"description", "View angles to render (e.g. ['Isometric', 'Front', 'Top', 'Right'])"}}}
+                {"views", {{"type", "array"}, {"description", "View angles to render (e.g. ['top', 'front', 'right', 'iso'])"}}},
+                {"preset", {{"type", "string"}, {"description", "Optional view matrix preset: 'quad' renders ['top', 'front', 'right', 'iso'] and verifies view_matrix_complete"}}},
+                {"four_view", {{"type", "boolean"}, {"default", false}, {"description", "Render standard 4-view orthographic+isometric inspection matrix"}}}
             },
             {}
         },
@@ -332,7 +347,7 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "easyeda_live_status",
             "easyeda",
-            "Check live EasyEDA Pro desktop extension attachment on AppPluginRelay (:3893) and active project/document.",
+            "Check live EasyEDA Pro desktop extension attachment on AppPluginRelay (:3893), active project/document, and 25-call recent_calls telemetry ring buffer.",
             nlohmann::json::object(),
             {}
         },
@@ -364,13 +379,16 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "easyeda_edit_schematic",
             "easyeda",
-            "Place/modify components, modify pin no_connected state, add netflags, draw orthogonal wires, and delete primitives in live EasyEDA Pro schematic (defaults to 'mil' canvas units).",
+            "Place/modify components (with optional near_reference/auto_place 50-mil grid collision-free placement and preserve_connections wire rubber-banding), auto-annotate designators (annotate_schematic), wire pins to nets via outward stubs (connect_to_net), modify pin no_connected state, add netflags, draw orthogonal wires, and delete primitives in live EasyEDA Pro schematic (defaults to 'mil' canvas units).",
             {
                 {"units", {{"type", "string"}, {"default", "mil"}, {"description", "Coordinate units: 'mil' (default, 1:1 EasyEDA canvas units) or 'mm'"}}},
+                {"preserve_connections", {{"type", "boolean"}, {"default", false}, {"description", "Stretch attached schematic wires when moving components in modify_components (default: false)"}}},
                 {"operations", {{"type", "array"}, {"description", "Schematic primitive operations"}}},
                 {"symbols", {{"type", "array"}, {"description", "Component placements"}}},
-                {"add_components", {{"type", "array"}, {"description", "Declarative component placements ({reference, lcsc, uuid, library_uuid, value, unique_id, x, y, rotation, mirror})"}}},
-                {"modify_components", {{"type", "array"}, {"description", "Modify existing schematic components ({id, reference, value, unique_id, footprint})"}}},
+                {"add_components", {{"type", "array"}, {"description", "Declarative component placements ({reference, lcsc, uuid, library_uuid, value, unique_id, x, y, near_reference, auto_place, rotation, mirror})"}}},
+                {"annotate_schematic", {{"type", "boolean"}, {"description", "Deterministically assign sequential designators (R1..Rn, C1..Cn, U1..Un) to unannotated or duplicate components and verify readback"}}},
+                {"connect_to_net", {{"type", "array"}, {"description", "Outward 50-mil grid wire stub + net label/netflag router ({reference, pin_number, net, stub_length_mils, use_netflag})"}}},
+                {"modify_components", {{"type", "array"}, {"description", "Modify existing schematic components ({id, reference, value, unique_id, footprint, x, y, rotation, preserve_connections})"}}},
                 {"modify_pins", {{"type", "array"}, {"description", "Modify schematic pins ({pin_id, no_connected})"}}},
                 {"add_netflags", {{"type", "array"}, {"description", "Add power/ground netflags ({net, type, x, y, rotation})"}}},
                 {"wires", {{"type", "array"}, {"description", "Wire segments"}}},
@@ -383,8 +401,10 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "easyeda_sync_sch_to_pcb",
             "easyeda",
-            "Synchronize schematic changes, footprints, and netlist into the EasyEDA Pro PCB document.",
-            nlohmann::json::object(),
+            "Synchronize schematic changes, footprints, and netlist into the EasyEDA Pro PCB document (or preview diff with dry_run: true).",
+            {
+                {"dry_run", {{"type", "boolean"}, {"default", false}, {"description", "Preview pre-sync netlist/footprint diff without mutating the PCB (default: false)"}}}
+            },
             {}
         },
         {
@@ -402,12 +422,13 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "easyeda_edit_pcb",
             "easyeda",
-            "Draw board outline, place/move/rotate/flip footprints, update pad nets, delete primitives, add copper pours, and route tracks/vias in EasyEDA Pro (defaults to 'mil' canvas units).",
+            "Draw board outline, place/move/rotate/flip footprints (with optional preserve_connections track rubber-banding), update pad nets, delete primitives, add copper pours, and route tracks/vias in EasyEDA Pro (defaults to 'mil' canvas units).",
             {
                 {"units", {{"type", "string"}, {"default", "mil"}, {"description", "Coordinate units: 'mil' (default, 1:1 EasyEDA canvas units) or 'mm'"}}},
+                {"preserve_connections", {{"type", "boolean"}, {"default", false}, {"description", "Stretch attached PCB tracks when moving footprints in move_components/placements (default: false)"}}},
                 {"outline", {{"type", "object"}, {"description", "Board outline dimensions"}}},
                 {"placements", {{"type", "array"}, {"description", "Component placement updates"}}},
-                {"move_components", {{"type", "array"}, {"description", "Move/rotate/flip existing PCB footprints ({id, reference, x, y, rotation, layer})"}}},
+                {"move_components", {{"type", "array"}, {"description", "Move/rotate/flip existing PCB footprints ({id, reference, x, y, rotation, layer, preserve_connections})"}}},
                 {"place_components", {{"type", "array"}, {"description", "Instantiate new PCB footprints ({reference, lcsc, uuid, library_uuid, x, y, rotation, layer})"}}},
                 {"modify_pads", {{"type", "array"}, {"description", "Update pad net assignments ({id, net})"}}},
                 {"delete_primitives", {{"type", "array"}, {"description", "Delete PCB tracks, copper lines, vias, or components ({id, type} or primitive ID string)"}}},
@@ -440,12 +461,14 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
         {
             "easyeda_invoke_api",
             "easyeda",
-            "Invoke whitelisted eda.<module>.<method> API calls inside EasyEDA Pro (eda.sch_*, eda.pcb_*, eda.lib_*, eda.dmt_*, eda.drc_*, eda.sys_Document*).",
+            "Invoke whitelisted eda.<module>.<method> API calls inside EasyEDA Pro or introspect @jlceda/pro-api-types signatures offline via describe_api / search_api.",
             {
                 {"api_path", {{"type", "string"}, {"description", "Whitelisted API path (e.g. eda.sch_PrimitiveComponent.getAll)"}}},
-                {"args", {{"type", "array"}, {"description", "Arguments array"}}}
+                {"args", {{"type", "array"}, {"description", "Arguments array"}}},
+                {"describe_api", {{"type", "string"}, {"description", "Offline @jlceda/pro-api-types API signature lookup by path (e.g. 'eda.pcb_PrimitiveVia.create')"}}},
+                {"search_api", {{"type", "string"}, {"description", "Offline @jlceda/pro-api-types API keyword search (e.g. 'PrimitiveLine')"}}}
             },
-            {"api_path"}
+            {}
         },
         {
             "easyeda_convert",

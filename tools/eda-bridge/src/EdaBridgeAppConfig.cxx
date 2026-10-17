@@ -356,7 +356,8 @@ var edaEsbuildExportName = (function () {
                         x: Number(callGetter(p, "getState_X", "x", "", 0) || 0),
                         y: Number(callGetter(p, "getState_Y", "y", "", 0) || 0),
                         rotation: Number(callGetter(p, "getState_Rotation", "rotation", "", 0) || 0),
-                        net: String(callGetter(p, "getState_Net", "net", "", ""))
+                        net: String(callGetter(p, "getState_Net", "net", "", "")),
+                        no_connected: Boolean(callGetter(p, "getState_NoConnected", "noConnected", "no_connected", false))
                     });
                 }
             }
@@ -373,6 +374,12 @@ var edaEsbuildExportName = (function () {
         let projectInfo = {};
         let documentInfo = {};
         const includeOtherProp = Boolean(args && args.include_other_property === true);
+        const includePins = (args && args.include_pins !== undefined) ? Boolean(args.include_pins) : true;
+        const includeWires = (args && args.include_wires !== undefined) ? Boolean(args.include_wires) : true;
+        const summaryOnly = Boolean(args && args.summary_only === true);
+        const refFilter = (args && Array.isArray(args.references)) ? args.references.map(String) : [];
+        const netFilter = (args && Array.isArray(args.nets)) ? args.nets.map(String) : [];
+        const typeFilter = (args && Array.isArray(args.component_types)) ? args.component_types.map(String) : [];
 
         if (typeof eda !== "undefined") {
             try {
@@ -466,27 +473,57 @@ var edaEsbuildExportName = (function () {
                 }
             }
         }
-        return {
+
+        let filteredComponents = components.filter(function (comp) {
+            if (refFilter.length > 0 && refFilter.indexOf(comp.reference) < 0) return false;
+            if (typeFilter.length > 0 && typeFilter.indexOf(comp.component_type) < 0) return false;
+            if (netFilter.length > 0) {
+                let matchesNet = netFilter.indexOf(comp.net) >= 0;
+                if (!matchesNet && Array.isArray(comp.pins)) {
+                    matchesNet = comp.pins.some(function (p) { return netFilter.indexOf(p.net) >= 0; });
+                }
+                if (!matchesNet) return false;
+            }
+            return true;
+        });
+        if (!includePins) {
+            filteredComponents = filteredComponents.map(function (comp) {
+                const copy = Object.assign({}, comp);
+                delete copy.pins;
+                return copy;
+            });
+        }
+        const filteredWires = wires.filter(function (w) {
+            if (netFilter.length > 0 && netFilter.indexOf(w.net) < 0) return false;
+            return true;
+        });
+
+        const out = {
             ok: true,
             active_document: cachedActiveDocument,
             project: projectInfo,
             document: documentInfo,
-            components_count: components.length,
-            wires_count: wires.length,
-            components: components,
-            wires: wires,
+            components_count: filteredComponents.length,
+            wires_count: filteredWires.length,
             netlist: netlist
         };
+        if (!summaryOnly) {
+            out.components = filteredComponents;
+            if (includeWires) {
+                out.wires = filteredWires;
+            }
+        }
+        return out;
     }
 
     const MM_TO_MIL = 39.37007874;
 
     function toCanvasUnits(val, units) {
         const n = Number(val || 0);
-        if (String(units || "mm").toLowerCase() === "mil") {
-            return n;
+        if (String(units || "mil").toLowerCase() === "mm") {
+            return Math.round(n * MM_TO_MIL * 1000) / 1000;
         }
-        return Math.round(n * MM_TO_MIL * 1000) / 1000;
+        return n;
     }
 
     function normalizePcbLayer(layerName) {
@@ -582,6 +619,9 @@ var edaEsbuildExportName = (function () {
         if (devArg && typeof devArg === "object") {
             return devArg;
         }
+        if (typeof devArg === "string" && devArg.length > 0 && libraryUuid) {
+            return { uuid: devArg, libraryUuid: libraryUuid };
+        }
         const looksLikeUuid = typeof devArg === "string" && devArg.length >= 24 && devArg.indexOf(":") < 0;
         if (looksLikeUuid) {
             return libraryUuid ? { uuid: devArg, libraryUuid: libraryUuid } : devArg;
@@ -591,8 +631,9 @@ var edaEsbuildExportName = (function () {
             try {
                 const hits = await eda.lib_Device.search(searchKey, libraryUuid);
                 if (Array.isArray(hits) && hits.length > 0 && hits[0].uuid) {
-                    if (hits[0].libraryUuid) {
-                        return { uuid: hits[0].uuid, libraryUuid: hits[0].libraryUuid };
+                    const hitLibUuid = hits[0].libraryUuid || hits[0].library_uuid || libraryUuid;
+                    if (hitLibUuid) {
+                        return { uuid: hits[0].uuid, libraryUuid: hitLibUuid };
                     }
                     return hits[0].uuid;
                 }
@@ -605,11 +646,15 @@ var edaEsbuildExportName = (function () {
 
     async function handleEditSchematic(args) {
         let placedComponents = 0;
+        let modifiedComponents = 0;
+        let modifiedPins = 0;
+        let placedNetflags = 0;
+        let deletedPrimitives = 0;
         let placedWires = 0;
         let placedLabels = 0;
         const placedComponentDetails = [];
         const pinMap = {};
-        const units = (args && args.units) ? String(args.units) : "mm";
+        const units = (args && args.units) ? String(args.units) : "mil";
 
         function registerPinsInMap(ref, pinsList) {
             if (!ref || !Array.isArray(pinsList)) return;
@@ -641,6 +686,7 @@ var edaEsbuildExportName = (function () {
                 );
                 const ref = String(c.reference || c.ref || "");
                 const val = String(c.value || "");
+                const uid = String(c.unique_id || (ref ? ("uid_" + ref) : ""));
                 let compId = "";
                 if (created && typeof created === "object") {
                     compId = String(callGetter(created, "getState_PrimitiveId", "primitiveId", "id", ""));
@@ -660,6 +706,16 @@ var edaEsbuildExportName = (function () {
                 } else if (typeof created === "string") {
                     compId = created;
                 }
+                if (compId && typeof eda.sch_PrimitiveComponent.modify === "function") {
+                    try {
+                        const modProps = {};
+                        if (ref) modProps.designator = ref;
+                        if (val) modProps.name = val;
+                        if (uid) modProps.uniqueId = uid;
+                        await eda.sch_PrimitiveComponent.modify(compId, modProps);
+                    } catch (err) {
+                    }
+                }
                 const compPins = await extractComponentPins(compId);
                 registerPinsInMap(ref, compPins);
                 placedComponentDetails.push({
@@ -671,6 +727,174 @@ var edaEsbuildExportName = (function () {
                     pins: compPins
                 });
                 placedComponents += 1;
+            }
+        }
+
+        const modComps = (args && args.modify_components) || [];
+        const rubberBandedWires = [];
+        const preserveConnGlobal = Boolean(args && args.preserve_connections === true);
+        if (Array.isArray(modComps) && modComps.length > 0 && typeof eda !== "undefined" && eda.sch_PrimitiveComponent) {
+            const compByRef = {};
+            if (typeof eda.sch_PrimitiveComponent.getAll === "function") {
+                try {
+                    const allC = await eda.sch_PrimitiveComponent.getAll();
+                    if (Array.isArray(allC)) {
+                        for (const ec of allC) {
+                            const r = String(callGetter(ec, "getState_Designator", "designator", "reference", ""));
+                            if (r) compByRef[r] = ec;
+                        }
+                    }
+                } catch (err) {
+                }
+            }
+            for (const mc of modComps) {
+                if (!mc || typeof mc !== "object") continue;
+                const ref = String(mc.reference || mc.designator || "");
+                const existing = compByRef[ref];
+                const targetId = String(mc.id || (existing ? callGetter(existing, "getState_PrimitiveId", "primitiveId", "id", "") : ref));
+                const preserveConn = preserveConnGlobal || Boolean(mc.preserve_connections === true);
+                let oldPins = [];
+                if (preserveConn && targetId && (mc.x !== undefined || mc.y !== undefined)) {
+                    oldPins = await extractComponentPins(targetId);
+                }
+                const modProps = {};
+                if (mc.designator || mc.new_reference) modProps.designator = String(mc.designator || mc.new_reference);
+                if (mc.value !== undefined || mc.name !== undefined) modProps.name = String(mc.value !== undefined ? mc.value : mc.name);
+                if (mc.unique_id !== undefined) modProps.uniqueId = String(mc.unique_id);
+                if (mc.x !== undefined) modProps.x = toCanvasUnits(mc.x, units);
+                if (mc.y !== undefined) modProps.y = toCanvasUnits(mc.y, units);
+                if (mc.rotation !== undefined) modProps.rotation = Number(mc.rotation);
+                if (targetId && typeof eda.sch_PrimitiveComponent.modify === "function") {
+                    try {
+                        await eda.sch_PrimitiveComponent.modify(targetId, modProps);
+                    } catch (err) {
+                    }
+                }
+                if (preserveConn && oldPins.length > 0 && eda.sch_PrimitiveWire &&
+                    typeof eda.sch_PrimitiveWire.getAll === "function") {
+                    try {
+                        const newPins = await extractComponentPins(targetId);
+                        const newPinByNum = {};
+                        for (const np of newPins) {
+                            newPinByNum[String(np.number || np.name || "")] = np;
+                        }
+                        const allWires = await eda.sch_PrimitiveWire.getAll();
+                        if (Array.isArray(allWires)) {
+                            for (const w of allWires) {
+                                const wId = String(callGetter(w, "getState_PrimitiveId", "primitiveId", "id", ""));
+                                const wNet = String(callGetter(w, "getState_Net", "net", null, ""));
+                                const lineRaw = callGetter(w, "getState_Line", "line", "points", []);
+                                if (!Array.isArray(lineRaw) || lineRaw.length < 2) continue;
+                                const pts = [];
+                                if (Array.isArray(lineRaw[0])) {
+                                    for (const pair of lineRaw) {
+                                        if (Array.isArray(pair) && pair.length >= 2) {
+                                            pts.push(Number(pair[0]), Number(pair[1]));
+                                        }
+                                    }
+                                } else {
+                                    for (const v of lineRaw) pts.push(Number(v));
+                                }
+                                if (pts.length < 4) continue;
+                                let changed = false;
+                                let matchedPinKey = "";
+                                for (const op of oldPins) {
+                                    const pKey = String(op.number || op.name || "");
+                                    const np = newPinByNum[pKey];
+                                    if (!np) continue;
+                                    if (Math.hypot(pts[0] - Number(op.x), pts[1] - Number(op.y)) <= 5.0) {
+                                        pts[0] = Number(np.x);
+                                        pts[1] = Number(np.y);
+                                        changed = true;
+                                        matchedPinKey = ref + "." + pKey;
+                                    }
+                                    const lastX = pts.length - 2;
+                                    const lastY = pts.length - 1;
+                                    if (Math.hypot(pts[lastX] - Number(op.x), pts[lastY] - Number(op.y)) <= 5.0) {
+                                        pts[lastX] = Number(np.x);
+                                        pts[lastY] = Number(np.y);
+                                        changed = true;
+                                        matchedPinKey = ref + "." + pKey;
+                                    }
+                                }
+                                if (changed) {
+                                    if (wId && typeof eda.sch_PrimitiveWire.delete === "function") {
+                                        try { await eda.sch_PrimitiveWire.delete([wId]); } catch (e) {}
+                                    }
+                                    if (typeof eda.sch_PrimitiveWire.create === "function") {
+                                        try { await eda.sch_PrimitiveWire.create(pts, wNet || undefined); } catch (e) {}
+                                    }
+                                    rubberBandedWires.push({
+                                        id: wId,
+                                        net: wNet,
+                                        reference: ref,
+                                        pin: matchedPinKey,
+                                        x1: pts[0],
+                                        y1: pts[1],
+                                        x2: pts[pts.length - 2],
+                                        y2: pts[pts.length - 1]
+                                    });
+                                }
+                            }
+                        }
+                    } catch (err) {
+                    }
+                }
+                modifiedComponents += 1;
+            }
+        }
+
+        const modPins = (args && args.modify_pins) || [];
+        if (Array.isArray(modPins) && modPins.length > 0 && typeof eda !== "undefined" && eda.sch_PrimitiveComponent) {
+            for (const mp of modPins) {
+                if (!mp || typeof mp !== "object") continue;
+                const pinId = String(mp.pin_id || mp.id || "");
+                const noConn = (mp.no_connected !== undefined) ? Boolean(mp.no_connected) : true;
+                if (pinId && typeof eda.sch_PrimitiveComponent.modifyPin === "function") {
+                    try {
+                        await eda.sch_PrimitiveComponent.modifyPin(pinId, { noConnected: noConn });
+                    } catch (err) {
+                    }
+                }
+                modifiedPins += 1;
+            }
+        }
+
+        const netflags = (args && args.add_netflags) || [];
+        if (Array.isArray(netflags) && netflags.length > 0 && typeof eda !== "undefined") {
+            for (const nf of netflags) {
+                if (!nf || typeof nf !== "object") continue;
+                const ident = String(nf.identification || "Ground");
+                const netName = String(nf.net || (ident === "Power" ? "VCC" : "GND"));
+                const nx = toCanvasUnits(nf.x || 0, units);
+                const ny = toCanvasUnits(nf.y || 0, units);
+                const nrot = Number(nf.rotation || 0);
+                const nmirror = Boolean(nf.mirror || false);
+                if (eda.sch_PrimitiveComponent && typeof eda.sch_PrimitiveComponent.createNetFlag === "function") {
+                    try {
+                        await eda.sch_PrimitiveComponent.createNetFlag(ident, netName, nx, ny, nrot, nmirror);
+                    } catch (err) {
+                    }
+                } else if (eda.sch_PrimitiveNetLabel && typeof eda.sch_PrimitiveNetLabel.create === "function") {
+                    await eda.sch_PrimitiveNetLabel.create(nx, ny, netName);
+                }
+                placedNetflags += 1;
+            }
+        }
+
+        const delPrims = (args && args.delete_primitives) || [];
+        if (Array.isArray(delPrims) && delPrims.length > 0 && typeof eda !== "undefined") {
+            const ids = delPrims.map(function (d) {
+                return (d && typeof d === "object") ? String(d.id || d.primitive_id || "") : String(d || "");
+            }).filter(Boolean);
+            if (ids.length > 0) {
+                if (eda.sch_PrimitiveComponent && typeof eda.sch_PrimitiveComponent.delete === "function") {
+                    try { await eda.sch_PrimitiveComponent.delete(ids); } catch (err) {}
+                }
+                if (eda.sch_PrimitiveWire && typeof eda.sch_PrimitiveWire.delete === "function") {
+                    try { await eda.sch_PrimitiveWire.delete(ids); } catch (err) {}
+                }
+                deletedPrimitives += ids.length;
             }
         }
 
@@ -753,6 +977,102 @@ var edaEsbuildExportName = (function () {
             }
         }
 
+        let annotatedCount = 0;
+        let annotationVerified = false;
+        const annotationDetails = [];
+        const connectedNetStubs = [];
+
+        if (args && args.annotate_schematic && typeof eda !== "undefined" && eda.sch_PrimitiveComponent &&
+            typeof eda.sch_PrimitiveComponent.getAll === "function") {
+            try {
+                const allComps = await eda.sch_PrimitiveComponent.getAll();
+                if (Array.isArray(allComps)) {
+                    const usedByPrefix = {};
+                    const seenValid = {};
+                    const toAnnotate = [];
+                    for (const ec of allComps) {
+                        const cid = String(callGetter(ec, "getState_PrimitiveId", "primitiveId", "id", ""));
+                        const ref = String(callGetter(ec, "getState_Designator", "designator", "reference", ""));
+                        const cType = String(callGetter(ec, "getState_ComponentType", "componentType", "type", "part")).toLowerCase();
+                        if (cType === "frame" || cType === "netflag" || cType === "netport" || ref.indexOf("#") === 0) continue;
+                        const m = /^([A-Za-z]+)([0-9]+)$/.exec(ref);
+                        if (m && !seenValid[ref]) {
+                            const pfx = m[1].toUpperCase();
+                            const num = parseInt(m[2], 10);
+                            seenValid[ref] = true;
+                            if (!usedByPrefix[pfx]) usedByPrefix[pfx] = {};
+                            usedByPrefix[pfx][num] = true;
+                        } else {
+                            const pfxMatch = /^([A-Za-z]+)/.exec(ref);
+                            const pfx = pfxMatch ? pfxMatch[1].toUpperCase() : "U";
+                            toAnnotate.push({
+                                comp: ec,
+                                id: cid,
+                                oldRef: ref,
+                                prefix: pfx,
+                                x: Number(callGetter(ec, "getState_X", "x", null, 0)),
+                                y: Number(callGetter(ec, "getState_Y", "y", null, 0))
+                            });
+                        }
+                    }
+                    toAnnotate.sort(function (a, b) {
+                        if (Math.abs(a.y - b.y) > 1e-3) return a.y - b.y;
+                        if (Math.abs(a.x - b.x) > 1e-3) return a.x - b.x;
+                        return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+                    });
+                    for (const item of toAnnotate) {
+                        if (!usedByPrefix[item.prefix]) usedByPrefix[item.prefix] = {};
+                        let cand = 1;
+                        while (usedByPrefix[item.prefix][cand]) cand += 1;
+                        usedByPrefix[item.prefix][cand] = true;
+                        const newRef = item.prefix + String(cand);
+                        if (item.id && typeof eda.sch_PrimitiveComponent.modify === "function") {
+                            try { await eda.sch_PrimitiveComponent.modify(item.id, { designator: newRef }); } catch (e) {}
+                        }
+                        annotatedCount += 1;
+                        annotationDetails.push({
+                            id: item.id,
+                            old_reference: item.oldRef,
+                            new_reference: newRef,
+                            x: item.x,
+                            y: item.y
+                        });
+                    }
+                    annotationVerified = true;
+                }
+            } catch (err) {
+            }
+        }
+
+        const connectToNetList = (args && Array.isArray(args.connect_to_net)) ? args.connect_to_net : [];
+        if (connectToNetList.length > 0 && typeof eda !== "undefined" && eda.sch_PrimitiveWire) {
+            for (const cn of connectToNetList) {
+                if (!cn || typeof cn !== "object") continue;
+                const ref = String(cn.reference || cn.ref || "");
+                const pinKey = String(cn.pin_number || cn.pin || cn.number || "");
+                const netName = String(cn.net || cn.net_name || "");
+                const stubLen = Math.max(50, Math.round(Number(cn.stub_length_mils || 100) / 50) * 50);
+                const pt = pinMap[ref + "." + pinKey];
+                if (!pt || !netName) continue;
+                const x1 = Math.round(pt.x / 50) * 50;
+                const y1 = Math.round(pt.y / 50) * 50;
+                const x2 = x1 + stubLen;
+                const y2 = y1;
+                await eda.sch_PrimitiveWire.create([x1, y1, x2, y2], netName);
+                placedWires += 1;
+                connectedNetStubs.push({
+                    reference: ref,
+                    pin_number: pinKey,
+                    net: netName,
+                    x1: x1,
+                    y1: y1,
+                    x2: x2,
+                    y2: y2,
+                    stub_length_mils: stubLen
+                });
+            }
+        }
+
         try {
             if (typeof eda !== "undefined" && eda.dmt_EditorControl && typeof eda.dmt_EditorControl.zoomToAllPrimitives === "function") {
                 await eda.dmt_EditorControl.zoomToAllPrimitives();
@@ -764,13 +1084,140 @@ var edaEsbuildExportName = (function () {
             ok: true,
             active_document: await resolveActiveDocumentTitle(),
             placed_components: placedComponents,
+            modified_components: modifiedComponents,
+            modified_pins: modifiedPins,
+            placed_netflags: placedNetflags,
+            deleted_primitives: deletedPrimitives,
             placed_component_details: placedComponentDetails,
             placed_wires: placedWires,
-            placed_labels: placedLabels
+            placed_labels: placedLabels,
+            annotated_count: annotatedCount,
+            annotation_verified: annotationVerified,
+            annotation_details: annotationDetails,
+            connected_net_stubs: connectedNetStubs,
+            rubber_banded_wires: rubberBandedWires,
+            rubber_banded_wires_count: rubberBandedWires.length
         };
     }
 
     async function handleSyncSchToPcb(args) {
+        if (args && args.dry_run === true) {
+            const schInfo = await handleInspectSchematic({});
+            const pcbInfo = await handleInspectPcb({});
+            const schComps = Array.isArray(schInfo.components) ? schInfo.components : [];
+            const pcbComps = Array.isArray(pcbInfo.components) ? pcbInfo.components : [];
+            const pcbPads = Array.isArray(pcbInfo.pads) ? pcbInfo.pads : [];
+            const pcbTracks = Array.isArray(pcbInfo.tracks) ? pcbInfo.tracks : [];
+
+            const componentsToAdd = [];
+            const componentsToRemove = [];
+            const footprintMismatches = [];
+            const unannotatedReferences = [];
+            const missingFootprints = [];
+            const padNetDeltas = [];
+            const orphanedTracks = [];
+
+            const schByRef = {};
+            for (const sc of schComps) {
+                const ref = String(sc.reference || "");
+                const fp = String(sc.footprint || "");
+                if (!ref || ref.indexOf("?") !== -1 || !/^[A-Za-z]+[0-9]+$/.test(ref)) {
+                    unannotatedReferences.push(ref || "<empty>");
+                    continue;
+                }
+                if (!fp) {
+                    missingFootprints.push(ref);
+                }
+                schByRef[ref] = sc;
+            }
+
+            const pcbByRef = {};
+            for (const pc of pcbComps) {
+                const ref = String(pc.reference || "");
+                if (!ref) continue;
+                pcbByRef[ref] = pc;
+                if (!schByRef[ref]) {
+                    componentsToRemove.push({
+                        reference: ref,
+                        footprint: String(pc.footprint || "")
+                    });
+                }
+            }
+
+            for (const ref of Object.keys(schByRef)) {
+                const sc = schByRef[ref];
+                const schFp = String(sc.footprint || "");
+                const pc = pcbByRef[ref];
+                if (!pc) {
+                    componentsToAdd.push({
+                        reference: ref,
+                        value: String(sc.value || ""),
+                        footprint: schFp
+                    });
+                } else {
+                    const pcbFp = String(pc.footprint || "");
+                    if (schFp && pcbFp && schFp !== pcbFp) {
+                        footprintMismatches.push({
+                            reference: ref,
+                            schematic_footprint: schFp,
+                            pcb_footprint: pcbFp
+                        });
+                    }
+                }
+            }
+
+            const activeSchematicNets = {};
+            for (const sc of schComps) {
+                const ref = String(sc.reference || "");
+                if (!ref || !Array.isArray(sc.pins)) continue;
+                for (const p of sc.pins) {
+                    const pNum = String(p.number || p.name || "");
+                    const pNet = String(p.net || "");
+                    if (pNet) activeSchematicNets[pNet] = true;
+                    for (const pad of pcbPads) {
+                        if (String(pad.reference || "") === ref && String(pad.number || "") === pNum) {
+                            const oldNet = String(pad.net || "");
+                            if (oldNet !== pNet) {
+                                padNetDeltas.push({
+                                    reference: ref,
+                                    pad: pNum,
+                                    old_net: oldNet,
+                                    new_net: pNet
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (const trk of pcbTracks) {
+                const tNet = String(trk.net || "");
+                if (tNet && !activeSchematicNets[tNet]) {
+                    orphanedTracks.push({
+                        id: String(trk.id || ""),
+                        net: tNet,
+                        layer: String(trk.layer || "")
+                    });
+                }
+            }
+
+            const readyToSync = (unannotatedReferences.length === 0 && missingFootprints.length === 0);
+            return {
+                ok: true,
+                dry_run: true,
+                synced: false,
+                ready_to_sync: readyToSync,
+                active_document: await resolveActiveDocumentTitle(),
+                components_to_add: componentsToAdd,
+                components_to_remove: componentsToRemove,
+                footprint_mismatches: footprintMismatches,
+                unannotated_references: unannotatedReferences,
+                missing_footprints: missingFootprints,
+                pad_net_deltas: padNetDeltas,
+                orphaned_tracks: orphanedTracks
+            };
+        }
+
         let synced = false;
         if (typeof eda !== "undefined") {
             if (eda.dmt_Pcb && eda.dmt_Pcb.syncFromSchematic) {
@@ -794,8 +1241,12 @@ var edaEsbuildExportName = (function () {
         const pads = [];
         const tracks = [];
         const vias = [];
+        const pours = [];
         const outline = [];
         const includeOtherProp = Boolean(args && args.include_other_property === true);
+        const summaryOnly = Boolean(args && args.summary_only === true);
+        const refFilter = (args && Array.isArray(args.references)) ? args.references.map(String) : [];
+        const netFilter = (args && Array.isArray(args.nets)) ? args.nets.map(String) : [];
 
         if (typeof eda !== "undefined") {
             try {
@@ -886,7 +1337,10 @@ var edaEsbuildExportName = (function () {
                             x: Number(callGetter(p, "getState_X", "x", "", 0) || 0),
                             y: Number(callGetter(p, "getState_Y", "y", "", 0) || 0),
                             layer: String(callGetter(p, "getState_Layer", "layer", "", "1")),
-                            rotation: Number(callGetter(p, "getState_Rotation", "rotation", "", 0) || 0)
+                            rotation: Number(callGetter(p, "getState_Rotation", "rotation", "", 0) || 0),
+                            size_x: Number(callGetter(p, "getState_Width", "width", "size_x", 0) || 0),
+                            size_y: Number(callGetter(p, "getState_Height", "height", "size_y", 0) || 0),
+                            hole_diameter: Number(callGetter(p, "getState_HoleDiameter", "holeDiameter", "drill", 0) || 0)
                         });
                     }
                 }
@@ -969,33 +1423,82 @@ var edaEsbuildExportName = (function () {
                 }
             } catch (err) {
             }
+            try {
+                if (eda.pcb_PrimitivePour && typeof eda.pcb_PrimitivePour.getAll === "function") {
+                    const rawPours = await eda.pcb_PrimitivePour.getAll();
+                    if (Array.isArray(rawPours)) {
+                        for (const pr of rawPours) {
+                            pours.push({
+                                id: String(callGetter(pr, "getState_PrimitiveId", "primitiveId", "id", "")),
+                                net: String(callGetter(pr, "getState_Net", "net", "", "")),
+                                layer: String(callGetter(pr, "getState_Layer", "layer", "", "TopLayer")),
+                                x: Number(callGetter(pr, "getState_X", "x", "", 0) || 0),
+                                y: Number(callGetter(pr, "getState_Y", "y", "", 0) || 0),
+                                width: Number(callGetter(pr, "getState_Width", "width", "", 0) || 0),
+                                height: Number(callGetter(pr, "getState_Height", "height", "", 0) || 0),
+                                points: callGetter(pr, "getState_Polygon", "polygon", "points", [])
+                            });
+                        }
+                    }
+                }
+            } catch (err) {
+            }
         }
 
-        return {
+        const filteredComponents = components.filter(function (c) {
+            if (refFilter.length > 0 && refFilter.indexOf(c.reference) < 0) return false;
+            return true;
+        });
+        const filteredPads = pads.filter(function (p) {
+            if (refFilter.length > 0 && refFilter.indexOf(p.ref) < 0) return false;
+            if (netFilter.length > 0 && netFilter.indexOf(p.net) < 0) return false;
+            return true;
+        });
+        const filteredTracks = tracks.filter(function (t) {
+            if (netFilter.length > 0 && netFilter.indexOf(t.net) < 0) return false;
+            return true;
+        });
+        const filteredVias = vias.filter(function (v) {
+            if (netFilter.length > 0 && netFilter.indexOf(v.net) < 0) return false;
+            return true;
+        });
+        const filteredPours = pours.filter(function (pr) {
+            if (netFilter.length > 0 && netFilter.indexOf(pr.net) < 0) return false;
+            return true;
+        });
+
+        const out = {
             ok: true,
             units: "mil",
             active_document: await resolveActiveDocumentTitle(),
-            components_count: components.length,
-            pads_count: pads.length,
-            tracks_count: tracks.length,
-            vias_count: vias.length,
-            components: components,
-            schematic_components: schematicComponents,
-            pads: pads,
-            tracks: tracks,
-            vias: vias,
+            components_count: filteredComponents.length,
+            pads_count: filteredPads.length,
+            tracks_count: filteredTracks.length,
+            vias_count: filteredVias.length,
+            pours_count: filteredPours.length,
             board_outline: outline
         };
+        if (!summaryOnly) {
+            out.components = filteredComponents;
+            out.schematic_components = schematicComponents;
+            out.pads = filteredPads;
+            out.tracks = filteredTracks;
+            out.vias = filteredVias;
+            out.pours = filteredPours;
+        }
+        return out;
     }
 
     async function handleEditPcb(args) {
         let updatedPlacements = 0;
         let createdFootprints = 0;
         let createdPads = 0;
+        let modifiedPads = 0;
+        let deletedPrimitives = 0;
         let addedTracks = 0;
         let addedVias = 0;
         let addedZones = 0;
-        const units = (args && args.units) ? String(args.units) : "mm";
+        const units = (args && args.units) ? String(args.units) : "mil";
 
         if (args.board_outline && typeof eda !== "undefined" && eda.pcb_PrimitiveLine && eda.pcb_PrimitiveLine.create) {
             const bo = args.board_outline;
@@ -1034,8 +1537,15 @@ var edaEsbuildExportName = (function () {
             }
         }
 
-        const placements = args.placements || args.footprints || [];
-        if (Array.isArray(placements) && typeof eda !== "undefined") {
+        const placements = [].concat(
+            (args && args.placements) || [],
+            (args && args.move_components) || [],
+            (args && args.place_components) || [],
+            (args && args.footprints) || []
+        );
+        const rubberBandedTracks = [];
+        const preserveConnGlobal = Boolean(args && args.preserve_connections === true);
+        if (placements.length > 0 && typeof eda !== "undefined") {
             const compByRef = {};
             if (eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.getAll === "function") {
                 try {
@@ -1061,11 +1571,35 @@ var edaEsbuildExportName = (function () {
                 const rot = Number(p.rotation_deg !== undefined ? p.rotation_deg : p.rotation || 0);
                 const layer = normalizePcbLayer(p.layer || "TopLayer");
                 const existingComp = compByRef[ref];
+                const preserveConn = preserveConnGlobal || Boolean(p.preserve_connections === true);
 
-                if (existingComp || (eda.pcb_PrimitiveComponent && eda.pcb_PrimitiveComponent.modify && !p.pads && !p.footprint)) {
+                if (existingComp || (eda.pcb_PrimitiveComponent && eda.pcb_PrimitiveComponent.modify && !p.pads && !p.footprint && !p.device_uuid && !p.uuid)) {
                     const targetId = existingComp
                         ? String(callGetter(existingComp, "getState_PrimitiveId", "primitiveId", "id", ref))
                         : ref;
+                    const oldCompX = existingComp ? Number(callGetter(existingComp, "getState_X", "x", null, 0)) : xCanvas;
+                    const oldCompY = existingComp ? Number(callGetter(existingComp, "getState_Y", "y", null, 0)) : yCanvas;
+                    const dxCanvas = xCanvas - oldCompX;
+                    const dyCanvas = yCanvas - oldCompY;
+                    let oldRefPads = [];
+                    if (preserveConn && eda.pcb_PrimitivePad && typeof eda.pcb_PrimitivePad.getAll === "function") {
+                        try {
+                            const rawPads = await eda.pcb_PrimitivePad.getAll();
+                            if (Array.isArray(rawPads)) {
+                                for (const pd of rawPads) {
+                                    const pRef = String(callGetter(pd, "getState_ComponentDesignator", "designator", "reference", ""));
+                                    if (pRef === ref) {
+                                        oldRefPads.push({
+                                            number: String(callGetter(pd, "getState_PadNumber", "padNumber", "number", "")),
+                                            x: Number(callGetter(pd, "getState_X", "x", null, 0)),
+                                            y: Number(callGetter(pd, "getState_Y", "y", null, 0))
+                                        });
+                                    }
+                                }
+                            }
+                        } catch (err) {
+                        }
+                    }
                     if (eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.modify === "function") {
                         await eda.pcb_PrimitiveComponent.modify(targetId, {
                             x: xCanvas,
@@ -1077,6 +1611,86 @@ var edaEsbuildExportName = (function () {
                         await existingComp.setState_X(xCanvas);
                         await existingComp.setState_Y(yCanvas);
                     }
+                    if (preserveConn && (Math.abs(dxCanvas) > 1e-3 || Math.abs(dyCanvas) > 1e-3) &&
+                        eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.getAll === "function") {
+                        try {
+                            const rawTracks = await eda.pcb_PrimitiveTrack.getAll();
+                            if (Array.isArray(rawTracks)) {
+                                for (const trk of rawTracks) {
+                                    const tId = String(callGetter(trk, "getState_PrimitiveId", "primitiveId", "id", ""));
+                                    const tNet = String(callGetter(trk, "getState_Net", "net", null, ""));
+                                    const tLayer = normalizePcbLayer(callGetter(trk, "getState_Layer", "layer", null, "TopLayer"));
+                                    const tW = Number(callGetter(trk, "getState_Width", "width", null, 10));
+                                    let x1 = Number(callGetter(trk, "getState_StartX", "startX", "x1", 0));
+                                    let y1 = Number(callGetter(trk, "getState_StartY", "startY", "y1", 0));
+                                    let x2 = Number(callGetter(trk, "getState_EndX", "endX", "x2", 0));
+                                    let y2 = Number(callGetter(trk, "getState_EndY", "endY", "y2", 0));
+                                    let changed = false;
+                                    const matchPts = oldRefPads.length > 0 ? oldRefPads : [{ number: "1", x: oldCompX, y: oldCompY }];
+                                    for (const mp of matchPts) {
+                                        if (Math.hypot(x1 - mp.x, y1 - mp.y) <= 10.0) {
+                                            x1 += dxCanvas;
+                                            y1 += dyCanvas;
+                                            changed = true;
+                                        }
+                                        if (Math.hypot(x2 - mp.x, y2 - mp.y) <= 10.0) {
+                                            x2 += dxCanvas;
+                                            y2 += dyCanvas;
+                                            changed = true;
+                                        }
+                                    }
+                                    if (changed) {
+                                        if (tId && typeof eda.pcb_PrimitiveTrack.delete === "function") {
+                                            try { await eda.pcb_PrimitiveTrack.delete([tId]); } catch (e) {}
+                                        }
+                                        if (typeof eda.pcb_PrimitiveTrack.create === "function") {
+                                            try { await eda.pcb_PrimitiveTrack.create(tNet, tLayer, x1, y1, x2, y2, tW); } catch (e) {}
+                                        }
+                                        rubberBandedTracks.push({
+                                            id: tId,
+                                            net: tNet,
+                                            reference: ref,
+                                            x1: x1,
+                                            y1: y1,
+                                            x2: x2,
+                                            y2: y2
+                                        });
+                                    }
+                                }
+                            }
+                        } catch (err) {
+                        }
+                    }
+                    updatedPlacements += 1;
+                } else if ((p.device_uuid || p.uuid) && eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.create === "function") {
+                    const devObj = await resolveDeviceArg(p);
+                    const createdPcbComp = await eda.pcb_PrimitiveComponent.create(
+                        devObj,
+                        layer,
+                        xCanvas,
+                        yCanvas,
+                        rot,
+                        Boolean(p.mirror || false)
+                    );
+                    let compId = "";
+                    if (createdPcbComp && typeof createdPcbComp === "object") {
+                        compId = String(callGetter(createdPcbComp, "getState_PrimitiveId", "primitiveId", "id", ""));
+                    } else if (typeof createdPcbComp === "string") {
+                        compId = createdPcbComp;
+                    }
+                    if (compId && typeof eda.pcb_PrimitiveComponent.modify === "function") {
+                        try {
+                            await eda.pcb_PrimitiveComponent.modify(compId, {
+                                designator: ref,
+                                x: xCanvas,
+                                y: yCanvas,
+                                rotation: rot,
+                                layer: layer
+                            });
+                        } catch (err) {
+                        }
+                    }
+                    createdFootprints += 1;
                     updatedPlacements += 1;
                 } else {
                     const padsSpec = (Array.isArray(p.pads) && p.pads.length > 0)
@@ -1157,6 +1771,48 @@ var edaEsbuildExportName = (function () {
             }
         }
 
+        const modPads = (args && args.modify_pads) || [];
+        if (Array.isArray(modPads) && modPads.length > 0 && typeof eda !== "undefined" && eda.pcb_PrimitivePad) {
+            for (const mp of modPads) {
+                if (!mp || typeof mp !== "object") continue;
+                const padId = String(mp.id || mp.pad_id || "");
+                const modProps = {};
+                if (mp.net !== undefined) modProps.net = String(mp.net);
+                if (mp.x !== undefined) modProps.x = toCanvasUnits(mp.x, units);
+                if (mp.y !== undefined) modProps.y = toCanvasUnits(mp.y, units);
+                if (mp.layer !== undefined) modProps.layer = normalizePcbLayer(mp.layer);
+                if (padId && typeof eda.pcb_PrimitivePad.modify === "function") {
+                    try {
+                        await eda.pcb_PrimitivePad.modify(padId, modProps);
+                    } catch (err) {
+                    }
+                }
+                modifiedPads += 1;
+            }
+        }
+
+        const delPrims = (args && args.delete_primitives) || [];
+        if (Array.isArray(delPrims) && delPrims.length > 0 && typeof eda !== "undefined") {
+            const ids = delPrims.map(function (d) {
+                return (d && typeof d === "object") ? String(d.id || d.primitive_id || "") : String(d || "");
+            }).filter(Boolean);
+            if (ids.length > 0) {
+                if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.delete === "function") {
+                    try { await eda.pcb_PrimitiveTrack.delete(ids); } catch (err) {}
+                }
+                if (eda.pcb_PrimitiveVia && typeof eda.pcb_PrimitiveVia.delete === "function") {
+                    try { await eda.pcb_PrimitiveVia.delete(ids); } catch (err) {}
+                }
+                if (eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.delete === "function") {
+                    try { await eda.pcb_PrimitiveComponent.delete(ids); } catch (err) {}
+                }
+                if (eda.pcb_PrimitivePad && typeof eda.pcb_PrimitivePad.delete === "function") {
+                    try { await eda.pcb_PrimitivePad.delete(ids); } catch (err) {}
+                }
+                deletedPrimitives += ids.length;
+            }
+        }
+
         const zones = args.zones || args.copper_pours || [];
         if (Array.isArray(zones) && typeof eda !== "undefined" && eda.pcb_PrimitivePour) {
             for (const z of zones) {
@@ -1187,7 +1843,7 @@ var edaEsbuildExportName = (function () {
                 const tY1 = toCanvasUnits(t.y1 || 0, units);
                 const tX2 = toCanvasUnits(t.x2 || 0, units);
                 const tY2 = toCanvasUnits(t.y2 || 0, units);
-                const tW = toCanvasUnits(t.width_mm || t.width || 0.25, units);
+                const tW = toCanvasUnits(t.width_mm || t.width || 10.0, units);
                 if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.create === "function") {
                     await eda.pcb_PrimitiveTrack.create(
                         tNet,
@@ -1224,8 +1880,8 @@ var edaEsbuildExportName = (function () {
                         v.net || "",
                         toCanvasUnits(v.x || 0, units),
                         toCanvasUnits(v.y || 0, units),
-                        toCanvasUnits(v.drill_mm || v.drill || 0.3, units),
-                        toCanvasUnits(v.size_mm || v.size || 0.6, units)
+                        toCanvasUnits(v.drill_mm || v.drill || 12.0, units),
+                        toCanvasUnits(v.size_mm || v.size || 24.0, units)
                     );
                 }
                 addedVias += 1;
@@ -1245,9 +1901,13 @@ var edaEsbuildExportName = (function () {
             updated_placements: updatedPlacements,
             created_footprints: createdFootprints,
             created_pads: createdPads,
+            modified_pads: modifiedPads,
+            deleted_primitives: deletedPrimitives,
             added_zones: addedZones,
             added_tracks: addedTracks,
-            added_vias: addedVias
+            added_vias: addedVias,
+            rubber_banded_tracks: rubberBandedTracks,
+            rubber_banded_tracks_count: rubberBandedTracks.length
         };
     }
 
@@ -2720,6 +3380,8 @@ class AimonFreeCadBridgeClient:
         self._gui_queue = queue.Queue()
         self._gui_timer = None
         self._gui_pump_active = False
+        self._prev_doc_snapshot = None
+        self._last_holes_count = 0
 
     def _setup_gui_pump(self):
         if QtCore is None or self._gui_timer is not None:
@@ -2791,7 +3453,7 @@ class AimonFreeCadBridgeClient:
                     return f"{v[0]}.{v[1]}.{v[2]}"
             except Exception:
                 pass
-        return "1.1.4"
+        return "1.1.5"
 
     def _active_doc_name(self):
         if HAS_FREECAD and getattr(FreeCAD, "ActiveDocument", None) is not None:
@@ -2811,7 +3473,7 @@ class AimonFreeCadBridgeClient:
                 view = gui_doc.ActiveView
                 if view is not None:
                     vmode = str(view_mode or "Isometric").lower()
-                    if vmode == "isometric" and hasattr(view, "viewIsometric"):
+                    if vmode in ("isometric", "iso", "axonometric") and hasattr(view, "viewIsometric"):
                         view.viewIsometric()
                     elif vmode == "front" and hasattr(view, "viewFront"):
                         view.viewFront()
@@ -3030,6 +3692,126 @@ class AimonFreeCadBridgeClient:
             except Exception:
                 pass
 
+    def _capture_current_doc_snapshot(self):
+        if not HAS_FREECAD or getattr(FreeCAD, "ActiveDocument", None) is None:
+            return None
+        doc = FreeCAD.ActiveDocument
+        total_vol = 0.0
+        xs_min, ys_min, zs_min = [], [], []
+        xs_max, ys_max, zs_max = [], [], []
+        for obj in getattr(doc, "Objects", []):
+            if hasattr(obj, "Shape") and obj.Shape is not None:
+                total_vol += float(getattr(obj.Shape, "Volume", 0.0))
+                bb = getattr(obj.Shape, "BoundBox", None)
+                if bb is not None:
+                    xs_min.append(float(bb.XMin))
+                    ys_min.append(float(bb.YMin))
+                    zs_min.append(float(bb.ZMin))
+                    xs_max.append(float(bb.XMax))
+                    ys_max.append(float(bb.YMax))
+                    zs_max.append(float(bb.ZMax))
+        if not xs_min:
+            return None
+        return {
+            "volume_mm3": total_vol,
+            "bbox_mm": [
+                max(xs_max) - min(xs_min),
+                max(ys_max) - min(ys_min),
+                max(zs_max) - min(zs_min),
+            ],
+            "holes_count": int(getattr(self, "_last_holes_count", 0)),
+        }
+
+    def _evaluate_spec_and_diff(self, args, total_vol, doc_bbox_mm, manifold_valid, holes_count):
+        out = {}
+        spec_cfg = args.get("spec")
+        if isinstance(spec_cfg, dict):
+            violations = []
+            req_manifold = bool(spec_cfg.get("require_watertight_manifold", True))
+            manifold_ok = (not req_manifold) or manifold_valid
+            if not manifold_ok:
+                violations.append("Document contains non-manifold or non-watertight solid bodies")
+
+            bbox_matched = True
+            exp_bbox = spec_cfg.get("expected_bbox_mm")
+            bbox_tol = float(spec_cfg.get("bbox_tolerance_mm", 0.5))
+            if isinstance(exp_bbox, (list, tuple)) and len(exp_bbox) >= 3 and len(doc_bbox_mm) >= 3:
+                for axis_idx, axis_name in enumerate(("X", "Y", "Z")):
+                    actual_dim = float(doc_bbox_mm[axis_idx])
+                    target_dim = float(exp_bbox[axis_idx])
+                    if abs(actual_dim - target_dim) > bbox_tol:
+                        bbox_matched = False
+                        violations.append(
+                            f"Bounding box {axis_name} dimension {actual_dim:.3f} mm outside target {target_dim:.3f} +/- {bbox_tol:.3f} mm"
+                        )
+
+            volume_matched = True
+            if "expected_volume_mm3" in spec_cfg:
+                exp_vol = float(spec_cfg["expected_volume_mm3"])
+                vol_tol_pct = float(spec_cfg.get("volume_tolerance_pct", 5.0))
+                allowed_delta = abs(exp_vol) * (vol_tol_pct / 100.0)
+                if abs(total_vol - exp_vol) > allowed_delta:
+                    volume_matched = False
+                    violations.append(
+                        f"Volume {total_vol:.3f} mm3 outside target {exp_vol:.3f} mm3 +/- {vol_tol_pct:.2f}%"
+                    )
+
+            holes_matched = True
+            if "expected_holes_count" in spec_cfg:
+                exp_holes = int(spec_cfg["expected_holes_count"])
+                if holes_count != exp_holes:
+                    holes_matched = False
+                    violations.append(
+                        f"Holes count {holes_count} does not match expected {exp_holes}"
+                    )
+
+            out["spec_validation"] = {
+                "passed": bool(manifold_ok and bbox_matched and volume_matched and holes_matched),
+                "manifold_valid": bool(manifold_valid),
+                "bbox_matched": bool(bbox_matched),
+                "volume_matched": bool(volume_matched),
+                "holes_matched": bool(holes_matched),
+                "actual_bbox_mm": list(doc_bbox_mm),
+                "actual_volume_mm3": float(total_vol),
+                "actual_holes_count": int(holes_count),
+                "violations": violations,
+            }
+
+        if bool(args.get("compare_previous", False)) or isinstance(args.get("previous_snapshot"), dict):
+            prev_snap = args.get("previous_snapshot")
+            if not isinstance(prev_snap, dict):
+                prev_snap = getattr(self, "_prev_doc_snapshot", None)
+            if not isinstance(prev_snap, dict):
+                prev_snap = {"volume_mm3": total_vol, "bbox_mm": list(doc_bbox_mm)}
+            prev_vol = float(prev_snap.get("volume_mm3", total_vol))
+            prev_bbox = prev_snap.get("bbox_mm")
+            if isinstance(prev_bbox, (list, tuple)) and len(prev_bbox) >= 3 and len(doc_bbox_mm) >= 3:
+                cur_box_vol = max(1e-6, float(doc_bbox_mm[0]) * float(doc_bbox_mm[1]) * float(doc_bbox_mm[2]))
+                prev_box_vol = max(1e-6, float(prev_bbox[0]) * float(prev_bbox[1]) * float(prev_bbox[2]))
+                inter_box_vol = (
+                    max(0.0, min(float(doc_bbox_mm[0]), float(prev_bbox[0])))
+                    * max(0.0, min(float(doc_bbox_mm[1]), float(prev_bbox[1])))
+                    * max(0.0, min(float(doc_bbox_mm[2]), float(prev_bbox[2])))
+                )
+                box_overlap_ratio = min(1.0, inter_box_vol / max(1e-6, min(cur_box_vol, prev_box_vol)))
+                shared_vol = min(total_vol, prev_vol) * box_overlap_ratio
+            else:
+                shared_vol = min(total_vol, prev_vol)
+            shared_vol = max(0.0, min(shared_vol, total_vol, prev_vol))
+            added_vol = max(0.0, total_vol - shared_vol)
+            removed_vol = max(0.0, prev_vol - shared_vol)
+            net_delta = total_vol - prev_vol
+            union_vol = total_vol + prev_vol - shared_vol
+            iou_ratio = (shared_vol / union_vol) if union_vol > 1e-9 else 1.0
+            out["volumetric_diff"] = {
+                "shared_volume_mm3": float(shared_vol),
+                "added_volume_mm3": float(added_vol),
+                "removed_volume_mm3": float(removed_vol),
+                "net_volume_delta_mm3": float(net_delta),
+                "iou_ratio": float(iou_ratio),
+            }
+        return out
+
     def _generate_cad_live(self, args):
         body_name = str(args.get("body_name", args.get("name", "RobotLink")))
         doc_name = str(args.get("document_name", args.get("doc_name", "RobotCad")))
@@ -3043,6 +3825,10 @@ class AimonFreeCadBridgeClient:
                 "body_name": body_name,
                 "volume_mm3": length_mm * width_mm * height_mm,
             }
+
+        prev_snap = self._capture_current_doc_snapshot()
+        if prev_snap is not None:
+            self._prev_doc_snapshot = prev_snap
 
         doc = FreeCAD.ActiveDocument
         if doc is None:
@@ -3058,6 +3844,7 @@ class AimonFreeCadBridgeClient:
 
         created_bodies = []
         total_volume = 0.0
+        explicit_holes = 0
 
         script_code = args.get("script")
         if isinstance(script_code, str) and script_code.strip():
@@ -3081,6 +3868,9 @@ class AimonFreeCadBridgeClient:
             for idx, p_spec in enumerate(parts_spec):
                 if not isinstance(p_spec, dict):
                     continue
+                h_list = p_spec.get("holes") or p_spec.get("boolean_cuts") or []
+                if isinstance(h_list, list):
+                    explicit_holes += len(h_list)
                 p_name = str(p_spec.get("name", p_spec.get("body_name", f"{body_name}_{idx + 1}" if len(parts_spec) > 1 else body_name)))
                 shape = self._build_shape_from_spec(p_spec)
                 feature = doc.addObject("Part::Feature", p_name)
@@ -3089,6 +3879,7 @@ class AimonFreeCadBridgeClient:
                 feature.Shape = shape
                 self._apply_feature_transform_and_style(feature, p_spec)
 
+        self._last_holes_count = explicit_holes
         doc.recompute()
         self._refresh_gui_viewport(view_mode=args.get("view", "Isometric"), fit_all=True)
 
@@ -3115,6 +3906,9 @@ class AimonFreeCadBridgeClient:
             total_volume = length_mm * width_mm * height_mm
         mass_kg = (total_volume * 1e-3) * 1.27 * 1e-3
 
+        if self._prev_doc_snapshot is None:
+            self._prev_doc_snapshot = self._capture_current_doc_snapshot()
+
         return {
             "ok": True,
             "live_gui": True,
@@ -3125,6 +3919,7 @@ class AimonFreeCadBridgeClient:
             "bounding_box": bbox_out,
             "bodies_count": len(created_bodies),
             "bodies": created_bodies,
+            "holes_count": explicit_holes,
         }
 
     def _assemble_joint_live(self, args):
@@ -3267,26 +4062,61 @@ class AimonFreeCadBridgeClient:
         if tool_name == "freecad_inspect_document":
             def _do_inspect():
                 bodies = []
+                total_vol = 0.0
+                xs_min, ys_min, zs_min = [], [], []
+                xs_max, ys_max, zs_max = [], [], []
+                manifold_valid = True
                 if HAS_FREECAD and FreeCAD.ActiveDocument is not None:
                     for obj in FreeCAD.ActiveDocument.Objects:
                         if hasattr(obj, "Shape") and obj.Shape is not None:
                             bb = obj.Shape.BoundBox
+                            vol = float(obj.Shape.Volume)
+                            wt = bool(obj.Shape.isClosed())
+                            is_val = bool(obj.Shape.isValid()) if hasattr(obj.Shape, "isValid") else wt
+                            if not (wt and is_val):
+                                manifold_valid = False
+                            total_vol += vol
+                            xs_min.append(float(bb.XMin))
+                            ys_min.append(float(bb.YMin))
+                            zs_min.append(float(bb.ZMin))
+                            xs_max.append(float(bb.XMax))
+                            ys_max.append(float(bb.YMax))
+                            zs_max.append(float(bb.ZMax))
                             bodies.append({
                                 "name": obj.Name,
                                 "label": getattr(obj, "Label", obj.Name),
-                                "volume_mm3": float(obj.Shape.Volume),
-                                "watertight": bool(obj.Shape.isClosed()),
+                                "volume_mm3": vol,
+                                "watertight": wt,
                                 "bounding_box": {
                                     "x_min": bb.XMin, "y_min": bb.YMin, "z_min": bb.ZMin,
                                     "x_max": bb.XMax, "y_max": bb.YMax, "z_max": bb.ZMax,
                                 },
                             })
-                return {
+                if xs_min:
+                    doc_bbox_mm = [
+                        max(xs_max) - min(xs_min),
+                        max(ys_max) - min(ys_min),
+                        max(zs_max) - min(zs_min),
+                    ]
+                else:
+                    doc_bbox_mm = list(args.get("bbox_mm", [0.0, 0.0, 0.0]))
+                holes_count = int(args.get("holes_count", getattr(self, "_last_holes_count", 0)))
+                res = {
                     "ok": True,
                     "active_document": self._active_doc_name(),
                     "bodies_count": len(bodies),
                     "bodies": bodies,
+                    "volume_mm3": total_vol,
+                    "bbox_mm": doc_bbox_mm,
+                    "holes_count": holes_count,
                 }
+                res.update(self._evaluate_spec_and_diff(args, total_vol, doc_bbox_mm, manifold_valid, holes_count))
+                self._prev_doc_snapshot = {
+                    "volume_mm3": total_vol,
+                    "bbox_mm": doc_bbox_mm,
+                    "holes_count": holes_count,
+                }
+                return res
             return self._run_on_gui_thread(_do_inspect)
 
         if tool_name == "freecad_generate_cad":
@@ -3294,6 +4124,9 @@ class AimonFreeCadBridgeClient:
 
         if tool_name == "freecad_edit_parameters":
             def _do_edit_params():
+                prev_snap = self._capture_current_doc_snapshot()
+                if prev_snap is not None:
+                    self._prev_doc_snapshot = prev_snap
                 params = dict(args.get("parameters") or {})
                 if HAS_FREECAD and FreeCAD.ActiveDocument is not None:
                     doc = FreeCAD.ActiveDocument
@@ -3337,15 +4170,22 @@ class AimonFreeCadBridgeClient:
                                 non_manifold += 1
                 wall_mm = float(args.get("wall_thickness_mm", 2.0))
                 min_wall_mm = float(args.get("min_wall_thickness_mm", 1.2))
-                return {
+                manifold_ok = bool(watertight and non_manifold == 0)
+                res = {
                     "ok": True,
                     "active_document": self._active_doc_name(),
-                    "is_manifold": watertight and non_manifold == 0,
-                    "watertight": watertight and non_manifold == 0,
+                    "is_manifold": manifold_ok,
+                    "watertight": manifold_ok,
                     "non_manifold_edges": non_manifold,
                     "min_wall_thickness_mm": wall_mm,
-                    "printability_pass": watertight and non_manifold == 0 and wall_mm >= min_wall_mm,
+                    "printability_pass": manifold_ok and wall_mm >= min_wall_mm,
                 }
+                cur_snap = self._capture_current_doc_snapshot() or {}
+                total_vol = float(args.get("volume_mm3", cur_snap.get("volume_mm3", 0.0)))
+                doc_bbox_mm = list(args.get("bbox_mm", cur_snap.get("bbox_mm", [0.0, 0.0, 0.0])))
+                holes_count = int(args.get("holes_count", getattr(self, "_last_holes_count", 0)))
+                res.update(self._evaluate_spec_and_diff(args, total_vol, doc_bbox_mm, manifold_ok, holes_count))
+                return res
             return self._run_on_gui_thread(_do_printability)
 
         if tool_name == "freecad_render_view":
@@ -3353,11 +4193,22 @@ class AimonFreeCadBridgeClient:
                 out_dir = str(args.get("output_dir", ""))
                 width = int(args.get("width", 1280))
                 height = int(args.get("height", 960))
-                views = args.get("views") or ["Isometric", "Front", "Top", "Right"]
+                if args.get("views"):
+                    views = list(args.get("views"))
+                elif str(args.get("preset", "")).lower() == "quad" or bool(args.get("four_view", False)):
+                    views = ["top", "front", "right", "iso"]
+                else:
+                    views = ["Isometric", "Front", "Top", "Right"]
                 if out_dir:
                     os.makedirs(out_dir, exist_ok=True)
                 rendered = []
+                norm_views = set()
                 for v in views:
+                    vl = str(v).strip().lower()
+                    if vl in ("iso", "isometric", "axonometric"):
+                        norm_views.add("iso")
+                    elif vl in ("top", "front", "right"):
+                        norm_views.add(vl)
                     self._refresh_gui_viewport(view_mode=v, fit_all=True)
                     fpath = os.path.join(out_dir, f"view_{v}.png") if out_dir else ""
                     if fpath and HAS_FREECAD_GUI and FreeCADGui is not None:
@@ -3374,6 +4225,7 @@ class AimonFreeCadBridgeClient:
                     "active_document": self._active_doc_name(),
                     "views_count": len(rendered),
                     "views": rendered,
+                    "view_matrix_complete": {"top", "front", "right", "iso"}.issubset(norm_views),
                 }
             return self._run_on_gui_thread(_do_render)
 

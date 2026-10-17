@@ -1000,6 +1000,652 @@ TEST(EdaAccelerators_Unit, CalcPcbConnectivityAuditCopperPoursPadSizesAndMultiSh
     CHECK_EQUAL("XT_MISSING", res["unsynced_schematic_components"][0].value("reference", ""));
 }
 
+TEST(EdaAccelerators_Unit, CalcSchematicErcAuditTJunctionToleranceAndFiveLayerSemanticErc) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // 1. T-Junction Segment Anchoring with configurable tolerance & empty-pins netflags:
+    //    - Wire w_trunk from U1.1 (100, 100) to R1.1 (300, 100)
+    //    - Wire w_tbranch has endpoint (200, 102.0) [2.0 mil from w_trunk midpoint (200, 100)]
+    //      and endpoint (200, 200) landing on netflag #PWR_VCC (which has "pins": [] as returned by EasyEDA)
+    //    - Wire w_true_dangle has endpoint (250, 100) on w_trunk and endpoint (250, 50) in free space
+    nlohmann::json tjArgs = {
+        {"tolerance", 2.5},
+        {"components", nlohmann::json::array({
+            {
+                {"id", "c_u1"},
+                {"reference", "U1"},
+                {"value", "Sensor"},
+                {"component_type", "part"},
+                {"footprint", "SOT-23"},
+                {"unique_id", "uid_u1"},
+                {"x", 80.0},
+                {"y", 100.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "u1_1"}, {"number", "1"}, {"name", "OUT"}, {"net", ""}, {"x", 100.0}, {"y", 100.0}}
+                })}
+            },
+            {
+                {"id", "c_r1"},
+                {"reference", "R1"},
+                {"value", "10k"},
+                {"component_type", "part"},
+                {"footprint", "R0603"},
+                {"unique_id", "uid_r1"},
+                {"x", 320.0},
+                {"y", 100.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "r1_1"}, {"number", "1"}, {"name", "1"}, {"net", ""}, {"x", 300.0}, {"y", 100.0}}
+                })}
+            },
+            {
+                {"id", "nf_vcc"},
+                {"reference", "#PWR1"},
+                {"value", "+3V3"},
+                {"component_type", "netflag"},
+                {"x", 200.0},
+                {"y", 200.0},
+                {"pins", nlohmann::json::array()}
+            }
+        })},
+        {"wires", nlohmann::json::array({
+            {{"id", "w_trunk"}, {"net", "+3V3"}, {"line", nlohmann::json::array({{100.0, 100.0}, {300.0, 100.0}})}},
+            {{"id", "w_tbranch"}, {"net", "+3V3"}, {"line", nlohmann::json::array({{200.0, 102.0}, {200.0, 200.0}})}},
+            {{"id", "w_true_dangle"}, {"net", "+3V3"}, {"line", nlohmann::json::array({{250.0, 100.0}, {250.0, 50.0}})}}
+        })}
+    };
+
+    nlohmann::json tjRes = acc.calcSchematicErcAudit(tjArgs, ok, summary);
+    CHECK_TRUE(ok);
+    // w_tbranch must be anchored (NOT in dangling_wires), while w_true_dangle MUST be flagged!
+    CHECK_EQUAL(1, tjRes.value("dangling_wires_count", -1));
+    CHECK_EQUAL("w_true_dangle", tjRes["dangling_wires"][0].value("wire_id", ""));
+    CHECK_EQUAL("unanchored_wire_endpoint", tjRes["dangling_wires"][0].value("reason", ""));
+    DOUBLES_EQUAL(250.0, tjRes["dangling_wires"][0].value("x", 0.0), 0.1);
+    DOUBLES_EQUAL(50.0, tjRes["dangling_wires"][0].value("y", 0.0), 0.1);
+
+    // 2. 5-Layer Semantic Schematic ERC Faults:
+    //    - single_pin_nets: "SPI_MISO_ORPHAN" only connected to U1.4 (while "+3V3" and "GND" power nets and NC pin U1.5 are ignored)
+    //    - overlapping_components: R2 rotated 90 deg at (510, 300) overlaps U2 bbox at (500, 300)
+    //    - pullup_issues: "I2C_SDA" has pull-up R_PU to +3V3 (OK), but "I2C_SCL" and "nRST" lack pull-up resistors!
+    //    - decoupling_issues: U1 (on +3V3 and GND) has C_DEC between +3V3 and GND (OK),
+    //                         but U2 (on +5V and GND) has NO decoupling capacitor on +5V!
+    //    - voltage_domain_issues: wire w_vshort shorts "+5V" and "+3V3" on the same net island!
+    nlohmann::json semFaultArgs = {
+        {"components", nlohmann::json::array({
+            {
+                {"id", "u1_id"},
+                {"reference", "U1"},
+                {"value", "STM32G0"},
+                {"component_type", "part"},
+                {"footprint", "LQFP-32"},
+                {"unique_id", "uid_u1"},
+                {"x", 100.0},
+                {"y", 100.0},
+                {"width", 80.0},
+                {"height", 80.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "u1_p1"}, {"number", "1"}, {"name", "VDD"}, {"net", "+3V3"}, {"x", 60.0}, {"y", 80.0}},
+                    {{"id", "u1_p2"}, {"number", "2"}, {"name", "GND"}, {"net", "GND"}, {"x", 60.0}, {"y", 120.0}},
+                    {{"id", "u1_p3"}, {"number", "3"}, {"name", "SDA"}, {"net", "I2C_SDA"}, {"x", 140.0}, {"y", 80.0}},
+                    {{"id", "u1_p4"}, {"number", "4"}, {"name", "MISO"}, {"net", "SPI_MISO_ORPHAN"}, {"x", 140.0}, {"y", 100.0}},
+                    {{"id", "u1_p5"}, {"number", "5"}, {"name", "SWO"}, {"net", "UNUSED_NC"}, {"x", 140.0}, {"y", 120.0}, {"no_connected", true}},
+                    {{"id", "u1_p6"}, {"number", "6"}, {"name", "SCL"}, {"net", "I2C_SCL"}, {"x", 140.0}, {"y", 140.0}},
+                    {{"id", "u1_p7"}, {"number", "7"}, {"name", "nRST"}, {"net", "MCU_nRST"}, {"x", 100.0}, {"y", 60.0}}
+                })}
+            },
+            {
+                {"id", "r_pu_id"},
+                {"reference", "R1"},
+                {"value", "4.7k"},
+                {"component_type", "part"},
+                {"footprint", "R0603"},
+                {"unique_id", "uid_r1"},
+                {"x", 250.0},
+                {"y", 80.0},
+                {"width", 40.0},
+                {"height", 20.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "r1_p1"}, {"number", "1"}, {"name", "1"}, {"net", "I2C_SDA"}, {"x", 230.0}, {"y", 80.0}},
+                    {{"id", "r1_p2"}, {"number", "2"}, {"name", "2"}, {"net", "+3V3"}, {"x", 270.0}, {"y", 80.0}}
+                })}
+            },
+            {
+                {"id", "c_dec_id"},
+                {"reference", "C1"},
+                {"value", "100nF"},
+                {"component_type", "part"},
+                {"footprint", "C0603"},
+                {"unique_id", "uid_c1"},
+                {"x", 250.0},
+                {"y", 200.0},
+                {"width", 20.0},
+                {"height", 40.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "c1_p1"}, {"number", "1"}, {"name", "1"}, {"net", "+3V3"}, {"x", 250.0}, {"y", 180.0}},
+                    {{"id", "c1_p2"}, {"number", "2"}, {"name", "2"}, {"net", "GND"}, {"x", 250.0}, {"y", 220.0}}
+                })}
+            },
+            {
+                {"id", "u2_id"},
+                {"reference", "U2"},
+                {"value", "INA226"},
+                {"component_type", "part"},
+                {"footprint", "MSOP-10"},
+                {"unique_id", "uid_u2"},
+                {"x", 500.0},
+                {"y", 300.0},
+                {"width", 80.0},
+                {"height", 60.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "u2_p1"}, {"number", "1"}, {"name", "VS"}, {"net", "+5V"}, {"x", 460.0}, {"y", 280.0}},
+                    {{"id", "u2_p2"}, {"number", "2"}, {"name", "GND"}, {"net", "GND"}, {"x", 460.0}, {"y", 320.0}},
+                    {{"id", "u2_p3"}, {"number", "3"}, {"name", "SDA"}, {"net", "I2C_SDA"}, {"x", 540.0}, {"y", 280.0}},
+                    {{"id", "u2_p4"}, {"number", "4"}, {"name", "SCL"}, {"net", "I2C_SCL"}, {"x", 540.0}, {"y", 300.0}},
+                    {{"id", "u2_p5"}, {"number", "5"}, {"name", "RST"}, {"net", "MCU_nRST"}, {"x", 540.0}, {"y", 320.0}}
+                })}
+            },
+            {
+                {"id", "r2_overlap_id"},
+                {"reference", "R2"},
+                {"value", "10k"},
+                {"component_type", "part"},
+                {"footprint", "R0603"},
+                {"unique_id", "uid_r2"},
+                {"x", 510.0},
+                {"y", 300.0},
+                {"width", 60.0},
+                {"height", 20.0},
+                {"rotation", 90.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "r2_p1"}, {"number", "1"}, {"name", "1"}, {"net", "+3V3"}, {"x", 510.0}, {"y", 270.0}},
+                    {{"id", "r2_p2"}, {"number", "2"}, {"name", "2"}, {"net", "GND"}, {"x", 510.0}, {"y", 330.0}}
+                })}
+            },
+            {
+                {"id", "nf_5v_short"},
+                {"reference", "#PWR_5V"},
+                {"value", "+5V"},
+                {"component_type", "netflag"},
+                {"x", 700.0},
+                {"y", 100.0},
+                {"pins", nlohmann::json::array()}
+            },
+            {
+                {"id", "nf_3v3_short"},
+                {"reference", "#PWR_3V3"},
+                {"value", "+3V3"},
+                {"component_type", "netflag"},
+                {"x", 800.0},
+                {"y", 100.0},
+                {"pins", nlohmann::json::array()}
+            }
+        })},
+        {"wires", nlohmann::json::array({
+            {{"id", "w_vshort"}, {"net", ""}, {"line", nlohmann::json::array({{700.0, 100.0}, {800.0, 100.0}})}}
+        })}
+    };
+
+    nlohmann::json semRes = acc.calcSchematicErcAudit(semFaultArgs, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_FALSE(semRes.value("passed", true));
+
+    // Layer 2a: single_pin_nets catches SPI_MISO_ORPHAN on U1.4
+    CHECK_EQUAL(1, semRes.value("single_pin_nets_count", 0));
+    CHECK_EQUAL(1, static_cast<int>(semRes["single_pin_nets"].size()));
+    CHECK_EQUAL("SPI_MISO_ORPHAN", semRes["single_pin_nets"][0].value("net", ""));
+    CHECK_EQUAL("U1", semRes["single_pin_nets"][0]["pin"].value("reference", ""));
+    CHECK_EQUAL("4", semRes["single_pin_nets"][0]["pin"].value("pin_number", ""));
+
+    // Layer 2b: overlapping_components catches U2 and R2 collision
+    CHECK_EQUAL(1, semRes.value("overlapping_components_count", 0));
+    CHECK_EQUAL(1, static_cast<int>(semRes["overlapping_components"].size()));
+    CHECK_EQUAL("U2", semRes["overlapping_components"][0].value("reference_a", ""));
+    CHECK_EQUAL("R2", semRes["overlapping_components"][0].value("reference_b", ""));
+    CHECK_TRUE(semRes["overlapping_components"][0].contains("bbox_a"));
+    CHECK_TRUE(semRes["overlapping_components"][0].contains("bbox_b"));
+
+    // Layer 3: pullup_issues catches I2C_SCL and MCU_nRST (while I2C_SDA has R1 pull-up)
+    CHECK_EQUAL(2, semRes.value("pullup_issues_count", 0));
+    bool sawSclPullup = false;
+    bool sawNrstPullup = false;
+    for (const auto& pi : semRes["pullup_issues"]) {
+        if (pi.value("net", "") == "I2C_SCL") sawSclPullup = true;
+        if (pi.value("net", "") == "MCU_nRST") sawNrstPullup = true;
+    }
+    CHECK_TRUE(sawSclPullup);
+    CHECK_TRUE(sawNrstPullup);
+
+    // Layer 4: decoupling_issues catches U2 on +5V (while U1 on +3V3 is decoupled by C1)
+    CHECK_EQUAL(1, semRes.value("decoupling_issues_count", 0));
+    CHECK_EQUAL("U2", semRes["decoupling_issues"][0].value("reference", ""));
+    CHECK_EQUAL("+5V", semRes["decoupling_issues"][0].value("supply_net", ""));
+
+    // Layer 5: voltage_domain_issues catches +5V shorted to +3V3
+    CHECK_TRUE(semRes.value("voltage_domain_issues_count", 0) >= 1);
+}
+
+TEST(EdaAccelerators_Unit, EasyEdaEditSchematicConnectToNetAutoPlaceAndAnnotate) {
+    EdaBridgeConfig cfg;
+    cfg.enabled = true;
+    cfg.mode = "gateway";
+    cfg.easyeda.enabled = true;
+    EdaBridge bridge(cfg);
+
+    // Test next-gen schematic edit operations:
+    // 1) near_reference / auto_place places C? and R? near U1 on a collision-free 50-mil grid coordinate
+    // 2) annotate_schematic deterministically assigns R1, R2 and C1 to unannotated/duplicate parts and verifies readback
+    // 3) connect_to_net creates outward 50-mil snapped wire stubs (avoiding U1's body and other pins) + netflags/labels
+    nlohmann::json schState = {
+        {"active_document", "MainSheet"},
+        {"components", nlohmann::json::array({
+            {
+                {"id", "comp_u1"},
+                {"reference", "U1"},
+                {"value", "ESP32-S3"},
+                {"component_type", "part"},
+                {"footprint", "QFN-56"},
+                {"unique_id", "uid_u1"},
+                {"x", 500.0},
+                {"y", 500.0},
+                {"width", 100.0},
+                {"height", 100.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "u1_p1"}, {"number", "1"}, {"name", "VDD"}, {"net", ""}, {"x", 450.0}, {"y", 450.0}},
+                    {{"id", "u1_p2"}, {"number", "2"}, {"name", "GND"}, {"net", ""}, {"x", 450.0}, {"y", 550.0}},
+                    {{"id", "u1_p3"}, {"number", "3"}, {"name", "SDA"}, {"net", ""}, {"x", 550.0}, {"y", 450.0}},
+                    {{"id", "u1_p4"}, {"number", "4"}, {"name", "SCL"}, {"net", ""}, {"x", 550.0}, {"y", 550.0}}
+                })}
+            },
+            {
+                {"id", "comp_r_dup"},
+                {"reference", "R?"},
+                {"value", "4.7k"},
+                {"component_type", "part"},
+                {"footprint", "R0603"},
+                {"unique_id", ""},
+                {"x", 800.0},
+                {"y", 400.0},
+                {"width", 40.0},
+                {"height", 20.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "rdup_1"}, {"number", "1"}, {"name", "1"}, {"net", ""}, {"x", 780.0}, {"y", 400.0}},
+                    {{"id", "rdup_2"}, {"number", "2"}, {"name", "2"}, {"net", ""}, {"x", 820.0}, {"y", 400.0}}
+                })}
+            }
+        })},
+        {"wires", nlohmann::json::array()}
+    };
+
+    nlohmann::json editRes = bridge.callTool("easyeda_edit_schematic", {
+        {"schematic_state", schState},
+        {"add_components", nlohmann::json::array({
+            {
+                {"reference", "C?"},
+                {"value", "100nF"},
+                {"footprint", "C0603"},
+                {"near_reference", "U1"},
+                {"width", 40.0},
+                {"height", 20.0}
+            },
+            {
+                {"reference", "R?"},
+                {"value", "4.7k"},
+                {"footprint", "R0603"},
+                {"auto_place", true},
+                {"width", 40.0},
+                {"height", 20.0}
+            }
+        })},
+        {"annotate_schematic", true},
+        {"connect_to_net", nlohmann::json::array({
+            {{"reference", "U1"}, {"pin_number", "1"}, {"net", "+3V3"}, {"stub_length_mils", 100.0}, {"use_netflag", true}},
+            {{"reference", "U1"}, {"pin_number", "2"}, {"net", "GND"}, {"stub_length_mils", 100.0}},
+            {{"reference", "U1"}, {"pin_number", "3"}, {"net", "I2C_SDA"}, {"stub_length_mils", 100.0}},
+            {{"reference", "U1"}, {"pin_number", "4"}, {"net", "I2C_SCL"}, {"stub_length_mils", 100.0}}
+        })}
+    });
+
+    CHECK_TRUE(editRes.value("ok", false));
+    CHECK_EQUAL(2, editRes.value("placed_components", 0));
+    CHECK_TRUE(editRes.contains("placed_component_details"));
+    for (const auto& pd : editRes["placed_component_details"]) {
+        double px = pd.value("x", -1.0);
+        double py = pd.value("y", -1.0);
+        CHECK_TRUE(std::fabs(px / 50.0 - std::round(px / 50.0)) < 1e-4);
+        CHECK_TRUE(std::fabs(py / 50.0 - std::round(py / 50.0)) < 1e-4);
+    }
+
+    // Verify annotate_schematic assigned R1, R2, C1 and verified readback
+    CHECK_TRUE(editRes.value("annotated_count", 0) >= 3);
+    CHECK_TRUE(editRes.value("annotation_verified", false));
+
+    // Verify connect_to_net generated 4 outward 100-mil stubs without crossing U1 body [450..550, 450..550]
+    CHECK_TRUE(editRes.contains("connected_net_stubs"));
+    CHECK_EQUAL(4, static_cast<int>(editRes["connected_net_stubs"].size()));
+    for (const auto& stub : editRes["connected_net_stubs"]) {
+        double x1 = stub.value("x1", 0.0);
+        double y1 = stub.value("y1", 0.0);
+        double x2 = stub.value("x2", 0.0);
+        double y2 = stub.value("y2", 0.0);
+        DOUBLES_EQUAL(100.0, std::hypot(x2 - x1, y2 - y1), 1e-3);
+        CHECK_TRUE(std::fabs(x2 / 50.0 - std::round(x2 / 50.0)) < 1e-4);
+        CHECK_TRUE(std::fabs(y2 / 50.0 - std::round(y2 / 50.0)) < 1e-4);
+        // Outward stub tip (x2, y2) must lie strictly outside U1's [450..550, 450..550] box
+        bool outsideBody = (x2 < 450.0 || x2 > 550.0 || y2 < 450.0 || y2 > 550.0);
+        CHECK_TRUE(outsideBody);
+    }
+}
+
+TEST(EdaAccelerators_Unit, EdaBridge_PreSyncDiffAndConnectedMove) {
+    EdaBridgeConfig cfg;
+    cfg.enabled = true;
+    cfg.mode = "gateway";
+    cfg.easyeda.enabled = true;
+    EdaBridge bridge(cfg);
+
+    // 1. Pre-Sync Netlist Diff (dry_run: true) on easyeda_sync_sch_to_pcb
+    nlohmann::json schState = {
+        {"active_document", "Sheet_Main"},
+        {"components", nlohmann::json::array({
+            {
+                {"id", "u1"},
+                {"reference", "U1"},
+                {"value", "STM32F103"},
+                {"footprint", "LQFP-48"},
+                {"x", 500.0},
+                {"y", 500.0},
+                {"pins", nlohmann::json::array({
+                    {{"number", "1"}, {"name", "VDD"}, {"net", "+3V3"}, {"x", 450.0}, {"y", 500.0}},
+                    {{"number", "2"}, {"name", "VSS"}, {"net", "GND"}, {"x", 550.0}, {"y", 500.0}}
+                })}
+            },
+            {
+                {"id", "r1"},
+                {"reference", "R1"},
+                {"value", "10k"},
+                {"footprint", "R0805"},
+                {"x", 700.0},
+                {"y", 500.0},
+                {"pins", nlohmann::json::array({
+                    {{"number", "1"}, {"name", "1"}, {"net", "+3V3"}, {"x", 680.0}, {"y", 500.0}},
+                    {{"number", "2"}, {"name", "2"}, {"net", "I2C_SDA"}, {"x", 720.0}, {"y", 500.0}}
+                })}
+            },
+            {
+                {"id", "c1"},
+                {"reference", "C1"},
+                {"value", "100nF"},
+                {"footprint", "C0402"},
+                {"x", 800.0},
+                {"y", 500.0},
+                {"pins", nlohmann::json::array({
+                    {{"number", "1"}, {"name", "1"}, {"net", "+3V3"}, {"x", 780.0}, {"y", 500.0}},
+                    {{"number", "2"}, {"name", "2"}, {"net", "GND"}, {"x", 820.0}, {"y", 500.0}}
+                })}
+            },
+            {
+                {"id", "r_unann"},
+                {"reference", "R?"},
+                {"value", "4.7k"},
+                {"footprint", "R0603"},
+                {"x", 900.0},
+                {"y", 500.0}
+            },
+            {
+                {"id", "u2_nofp"},
+                {"reference", "U2"},
+                {"value", "AMS1117"},
+                {"footprint", ""},
+                {"x", 1000.0},
+                {"y", 500.0}
+            }
+        })},
+        {"wires", nlohmann::json::array({
+            {{"id", "w1"}, {"x1", 300.0}, {"y1", 500.0}, {"x2", 450.0}, {"y2", 500.0}, {"net", "+3V3"}},
+            {{"id", "w2"}, {"x1", 550.0}, {"y1", 500.0}, {"x2", 650.0}, {"y2", 500.0}, {"net", "GND"}}
+        })}
+    };
+
+    nlohmann::json pcbState = {
+        {"components", nlohmann::json::array({
+            {
+                {"reference", "U1"},
+                {"footprint", "LQFP-48"},
+                {"x_mm", 20.0},
+                {"y_mm", 20.0},
+                {"pads", nlohmann::json::array({
+                    {{"number", "1"}, {"net", "+3V3"}, {"x_mm", 18.0}, {"y_mm", 20.0}},
+                    {{"number", "2"}, {"net", "GND"}, {"x_mm", 22.0}, {"y_mm", 20.0}}
+                })}
+            },
+            {
+                {"reference", "R1"},
+                {"footprint", "R0603"},
+                {"x_mm", 10.0},
+                {"y_mm", 10.0},
+                {"pads", nlohmann::json::array({
+                    {{"number", "1"}, {"net", "+3V3"}, {"x_mm", 9.2}, {"y_mm", 10.0}},
+                    {{"number", "2"}, {"net", "OLD_NET"}, {"x_mm", 10.8}, {"y_mm", 10.0}}
+                })}
+            },
+            {
+                {"reference", "R99"},
+                {"footprint", "R0603"},
+                {"x_mm", 30.0},
+                {"y_mm", 10.0},
+                {"pads", nlohmann::json::array({
+                    {{"number", "1"}, {"net", "OLD_NET"}, {"x_mm", 29.2}, {"y_mm", 10.0}},
+                    {{"number", "2"}, {"net", "GND"}, {"x_mm", 30.8}, {"y_mm", 10.0}}
+                })}
+            }
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"id", "trk1"}, {"x1", 5.0}, {"y1", 10.0}, {"x2", 9.2}, {"y2", 10.0}, {"layer", "F.Cu"}, {"net", "+3V3"}},
+            {{"id", "trk2"}, {"x1", 10.8}, {"y1", 10.0}, {"x2", 29.2}, {"y2", 10.0}, {"layer", "F.Cu"}, {"net", "OLD_NET"}}
+        })}
+    };
+
+    nlohmann::json diffRes = bridge.callTool("easyeda_sync_sch_to_pcb", {
+        {"dry_run", true},
+        {"schematic_state", schState},
+        {"pcb_state", pcbState}
+    });
+    CHECK_TRUE(diffRes.value("ok", false));
+    CHECK_TRUE(diffRes.value("dry_run", false));
+    CHECK_FALSE(diffRes.value("synced", true));
+    CHECK_FALSE(diffRes.value("ready_to_sync", true));
+    auto toAdd = diffRes.value("components_to_add", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(toAdd.size()));
+    if (!toAdd.empty()) {
+        CHECK_EQUAL("C1", toAdd[0].value("reference", ""));
+    }
+    auto toRemove = diffRes.value("components_to_remove", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(toRemove.size()));
+    if (!toRemove.empty()) {
+        CHECK_EQUAL("R99", toRemove[0].value("reference", ""));
+    }
+    auto fpMis = diffRes.value("footprint_mismatches", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(fpMis.size()));
+    if (!fpMis.empty()) {
+        CHECK_EQUAL("R1", fpMis[0].value("reference", ""));
+        CHECK_EQUAL("R0805", fpMis[0].value("schematic_footprint", ""));
+        CHECK_EQUAL("R0603", fpMis[0].value("pcb_footprint", ""));
+    }
+    auto unann = diffRes.value("unannotated_references", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(unann.size()));
+    if (!unann.empty()) {
+        CHECK_EQUAL("R?", unann[0].get<std::string>());
+    }
+    auto missFp = diffRes.value("missing_footprints", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(missFp.size()));
+    if (!missFp.empty()) {
+        CHECK_EQUAL("U2", missFp[0].get<std::string>());
+    }
+    auto padDeltas = diffRes.value("pad_net_deltas", nlohmann::json::array());
+    CHECK_TRUE(padDeltas.size() >= 1);
+    auto orphanTrk = diffRes.value("orphaned_tracks", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(orphanTrk.size()));
+    if (!orphanTrk.empty()) {
+        CHECK_EQUAL("OLD_NET", orphanTrk[0].value("net", ""));
+    }
+
+    // 2. Connected Move (preserve_connections: true) on easyeda_edit_schematic
+    nlohmann::json schMoveRes = bridge.callTool("easyeda_edit_schematic", {
+        {"schematic_state", schState},
+        {"preserve_connections", true},
+        {"modify_components", nlohmann::json::array({
+            {{"reference", "U1"}, {"x", 600.0}, {"y", 550.0}, {"preserve_connections", true}}
+        })}
+    });
+    CHECK_TRUE(schMoveRes.value("ok", false));
+    CHECK_EQUAL(2, schMoveRes.value("rubber_banded_wires_count", 0));
+    auto rbWires = schMoveRes.value("rubber_banded_wires", nlohmann::json::array());
+    CHECK_EQUAL(2, static_cast<int>(rbWires.size()));
+    if (rbWires.size() >= 2) {
+        // U1 moved by (+100, +50), so pin 1 moved from (450, 500) to (550, 550) and pin 2 moved from (550, 500) to (650, 550)
+        DOUBLES_EQUAL(550.0, rbWires[0].value("x2", 0.0), 1e-3);
+        DOUBLES_EQUAL(550.0, rbWires[0].value("y2", 0.0), 1e-3);
+        DOUBLES_EQUAL(650.0, rbWires[1].value("x1", 0.0), 1e-3);
+        DOUBLES_EQUAL(550.0, rbWires[1].value("y1", 0.0), 1e-3);
+    }
+
+    // 3. Connected Move (preserve_connections: true) on easyeda_edit_pcb
+    nlohmann::json pcbMoveRes = bridge.callTool("easyeda_edit_pcb", {
+        {"pcb_state", pcbState},
+        {"preserve_connections", true},
+        {"move_components", nlohmann::json::array({
+            {{"reference", "R1"}, {"x_mm", 15.0}, {"y_mm", 12.0}, {"preserve_connections", true}}
+        })}
+    });
+    CHECK_TRUE(pcbMoveRes.value("ok", false));
+    CHECK_EQUAL(2, pcbMoveRes.value("rubber_banded_tracks_count", 0));
+    auto rbTracks = pcbMoveRes.value("rubber_banded_tracks", nlohmann::json::array());
+    CHECK_EQUAL(2, static_cast<int>(rbTracks.size()));
+    if (rbTracks.size() >= 2) {
+        // R1 moved by (+5.0, +2.0) mm: pad 1 moved from (9.2, 10.0) -> (14.2, 12.0), pad 2 moved from (10.8, 10.0) -> (15.8, 12.0)
+        DOUBLES_EQUAL(14.2, rbTracks[0].value("x2", 0.0), 1e-3);
+        DOUBLES_EQUAL(12.0, rbTracks[0].value("y2", 0.0), 1e-3);
+        DOUBLES_EQUAL(15.8, rbTracks[1].value("x1", 0.0), 1e-3);
+        DOUBLES_EQUAL(12.0, rbTracks[1].value("y1", 0.0), 1e-3);
+    }
+}
+
+TEST(EdaAccelerators_Unit, EdaAccelerators_RipUpAutorouteAndDecouplingAudit) {
+    EdaAccelerators accel;
+    bool ok = false;
+    std::string err;
+
+    // 1. T-corridor ordering trap on single layer (layers=1):
+    // NET_B pad 1 at (5.0, 2.0) is inside a U-shaped keepout pocket whose ONLY exit is north through (5.0, 2.8).
+    // NET_A is listed first in nets[] with pads at (3.0, 2.8) and (7.0, 2.8).
+    // A naive single-pass router routes NET_A straight across y=2.8, blocking NET_B's only escape!
+    // Multi-pass rip-up-and-reroute must rip up NET_A, route NET_B out of the pocket to (5.0, 4.0),
+    // and reroute NET_A around the pocket so both nets route with 0 DRC violations.
+    nlohmann::json routeArgs = {
+        {"board", {{"width_mm", 10.0}, {"height_mm", 6.0}, {"layers", 1}}},
+        {"rules", {{"track_width_mm", 0.2}, {"clearance_mm", 0.15}, {"grid_step_mm", 0.2}, {"max_ripup_passes", 6}}},
+        {"keepouts", nlohmann::json::array({
+            {{"x_mm", 4.0}, {"y_mm", 1.2}, {"w_mm", 0.4}, {"h_mm", 1.6}, {"layer", 0}},
+            {{"x_mm", 4.0}, {"y_mm", 1.2}, {"w_mm", 2.0}, {"h_mm", 0.4}, {"layer", 0}},
+            {{"x_mm", 5.6}, {"y_mm", 1.2}, {"w_mm", 0.4}, {"h_mm", 1.6}, {"layer", 0}}
+        })},
+        {"all_pads", nlohmann::json::array({
+            {{"x_mm", 5.0}, {"y_mm", 5.2}, {"w_mm", 1.2}, {"h_mm", 0.6}, {"rotation_deg", 90.0}, {"layer", 0}, {"net", "FOREIGN_NET"}}
+        })},
+        {"nets", nlohmann::json::array({
+            {
+                {"name", "NET_A"},
+                {"pads", nlohmann::json::array({
+                    {{"x_mm", 3.0}, {"y_mm", 2.8}, {"w_mm", 0.4}, {"h_mm", 0.4}, {"layer", "F.Cu"}},
+                    {{"x_mm", 7.0}, {"y_mm", 2.8}, {"w_mm", 0.4}, {"h_mm", 0.4}, {"layer", "F.Cu"}}
+                })}
+            },
+            {
+                {"name", "NET_B"},
+                {"pads", nlohmann::json::array({
+                    {{"x_mm", 5.0}, {"y_mm", 2.0}, {"w_mm", 0.4}, {"h_mm", 0.4}, {"layer", "F.Cu"}},
+                    {{"x_mm", 5.0}, {"y_mm", 4.0}, {"w_mm", 0.4}, {"h_mm", 0.4}, {"layer", "F.Cu"}}
+                })}
+            }
+        })}
+    };
+
+    nlohmann::json routeRes = accel.calcPcbAutoroute(routeArgs, ok, err);
+    CHECK_TRUE(ok);
+    CHECK_EQUAL(2, routeRes.value("total_nets", 0));
+    CHECK_EQUAL(2, routeRes.value("routed_nets", 0));
+    CHECK_EQUAL(0, routeRes.value("unrouted_nets", -1));
+    CHECK_EQUAL(0, routeRes.value("drc_violations", -1));
+    CHECK_TRUE(routeRes.value("ripup_passes_used", 0) >= 1);
+    CHECK_TRUE(routeRes.value("rerouted_nets_count", 0) >= 1);
+
+    // 2. Decoupling capacitor distance audit (> 5.0 mm warning)
+    nlohmann::json auditArgs = {
+        {"max_decoupling_distance_mm", 5.0},
+        {"footprints", nlohmann::json::array({
+            {
+                {"reference", "U1"},
+                {"x_mm", 10.0},
+                {"y_mm", 10.0},
+                {"pads", nlohmann::json::array({
+                    {{"number", "1"}, {"net", "+3V3"}, {"x_mm", 10.0}, {"y_mm", 10.0}},
+                    {{"number", "2"}, {"net", "GND"}, {"x_mm", 11.0}, {"y_mm", 10.0}}
+                })}
+            },
+            {
+                {"reference", "C1"},
+                {"x_mm", 22.0},
+                {"y_mm", 10.0},
+                {"pads", nlohmann::json::array({
+                    {{"number", "1"}, {"net", "+3V3"}, {"x_mm", 22.0}, {"y_mm", 10.0}},
+                    {{"number", "2"}, {"net", "GND"}, {"x_mm", 23.0}, {"y_mm", 10.0}}
+                })}
+            },
+            {
+                {"reference", "U2"},
+                {"x_mm", 35.0},
+                {"y_mm", 10.0},
+                {"pads", nlohmann::json::array({
+                    {{"number", "1"}, {"net", "VDD_1V8"}, {"x_mm", 35.0}, {"y_mm", 10.0}},
+                    {{"number", "2"}, {"net", "GND"}, {"x_mm", 36.0}, {"y_mm", 10.0}}
+                })}
+            },
+            {
+                {"reference", "C2"},
+                {"x_mm", 37.0},
+                {"y_mm", 10.0},
+                {"pads", nlohmann::json::array({
+                    {{"number", "1"}, {"net", "VDD_1V8"}, {"x_mm", 37.0}, {"y_mm", 10.0}},
+                    {{"number", "2"}, {"net", "GND"}, {"x_mm", 38.0}, {"y_mm", 10.0}}
+                })}
+            }
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"x1", 10.0}, {"y1", 10.0}, {"x2", 22.0}, {"y2", 10.0}, {"width_mm", 0.25}, {"layer", "F.Cu"}, {"net", "+3V3"}},
+            {{"x1", 11.0}, {"y1", 10.0}, {"x2", 23.0}, {"y2", 10.0}, {"width_mm", 0.25}, {"layer", "F.Cu"}, {"net", "GND"}},
+            {{"x1", 23.0}, {"y1", 10.0}, {"x2", 36.0}, {"y2", 10.0}, {"width_mm", 0.25}, {"layer", "F.Cu"}, {"net", "GND"}},
+            {{"x1", 36.0}, {"y1", 10.0}, {"x2", 38.0}, {"y2", 10.0}, {"width_mm", 0.25}, {"layer", "F.Cu"}, {"net", "GND"}},
+            {{"x1", 35.0}, {"y1", 10.0}, {"x2", 37.0}, {"y2", 10.0}, {"width_mm", 0.25}, {"layer", "F.Cu"}, {"net", "VDD_1V8"}}
+        })}
+    };
+
+    nlohmann::json auditRes = accel.calcPcbConnectivityAudit(auditArgs, ok, err);
+    CHECK_TRUE(ok);
+    CHECK_TRUE(auditRes.value("ok", false));
+    CHECK_EQUAL(1, auditRes.value("decoupling_distance_warnings_count", 0));
+    auto decWarns = auditRes.value("decoupling_distance_warnings", nlohmann::json::array());
+    CHECK_EQUAL(1, static_cast<int>(decWarns.size()));
+    if (!decWarns.empty()) {
+        CHECK_EQUAL("U1", decWarns[0].value("ic_reference", ""));
+        CHECK_EQUAL("C1", decWarns[0].value("cap_reference", ""));
+        CHECK_EQUAL("+3V3", decWarns[0].value("net", ""));
+        DOUBLES_EQUAL(12.0, decWarns[0].value("distance_mm", 0.0), 1e-2);
+    }
+}
+
+
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {
         if (std::strcmp(av[i], "--negative-control") == 0) {

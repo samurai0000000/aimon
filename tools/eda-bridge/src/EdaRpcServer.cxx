@@ -306,6 +306,495 @@ std::vector<uint8_t> minimalPngBytes() {
     return std::vector<uint8_t>(kPng, kPng + sizeof(kPng));
 }
 
+std::string toLowerAscii(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+nlohmann::json introspectEasyEdaApiCatalog(const nlohmann::json& args) {
+    struct ApiEntry {
+        const char* apiPath;
+        const char* ns;
+        const char* method;
+        const char* signature;
+        const char* returnType;
+        const char* description;
+        nlohmann::json parameters;
+    };
+
+    const std::vector<ApiEntry> kCatalog = {
+        {
+            "eda.pcb_PrimitiveLine.create",
+            "pcb_PrimitiveLine",
+            "create",
+            "create(net: string, layer: TPCB_LayersOfLine, startX: number, startY: number, endX: number, endY: number, lineWidth?: number, locked?: boolean): Promise<IPCB_PrimitiveLine | undefined>",
+            "Promise<IPCB_PrimitiveLine | undefined>",
+            "Create a copper track segment on a PCB layer (coordinates and lineWidth in mil: 1 mil = 0.0254 mm).",
+            nlohmann::json::array({
+                {{"name", "net"}, {"type", "string"}, {"optional", false}},
+                {{"name", "layer"}, {"type", "TPCB_LayersOfLine"}, {"optional", false}},
+                {{"name", "startX"}, {"type", "number (mil)"}, {"optional", false}},
+                {{"name", "startY"}, {"type", "number (mil)"}, {"optional", false}},
+                {{"name", "endX"}, {"type", "number (mil)"}, {"optional", false}},
+                {{"name", "endY"}, {"type", "number (mil)"}, {"optional", false}},
+                {{"name", "lineWidth"}, {"type", "number (mil)"}, {"optional", true}},
+                {{"name", "locked"}, {"type", "boolean"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.pcb_PrimitiveLine.getAll",
+            "pcb_PrimitiveLine",
+            "getAll",
+            "getAll(net?: string, layer?: TPCB_LayersOfLine): Promise<IPCB_PrimitiveLine[]>",
+            "Promise<IPCB_PrimitiveLine[]>",
+            "Retrieve all copper track line primitives on the active PCB canvas.",
+            nlohmann::json::array({
+                {{"name", "net"}, {"type", "string"}, {"optional", true}},
+                {{"name", "layer"}, {"type", "TPCB_LayersOfLine"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.pcb_PrimitiveVia.create",
+            "pcb_PrimitiveVia",
+            "create",
+            "create(net: string, x: number, y: number, holeDiameter?: number, diameter?: number, viaType?: EPCB_PrimitiveViaType, padLayer?: number[], locked?: boolean): Promise<IPCB_PrimitiveVia | undefined>",
+            "Promise<IPCB_PrimitiveVia | undefined>",
+            "Create an interlayer via on the PCB canvas (x, y, holeDiameter, diameter in mil).",
+            nlohmann::json::array({
+                {{"name", "net"}, {"type", "string"}, {"optional", false}},
+                {{"name", "x"}, {"type", "number (mil)"}, {"optional", false}},
+                {{"name", "y"}, {"type", "number (mil)"}, {"optional", false}},
+                {{"name", "holeDiameter"}, {"type", "number (mil)"}, {"optional", true}},
+                {{"name", "diameter"}, {"type", "number (mil)"}, {"optional", true}},
+                {{"name", "viaType"}, {"type", "EPCB_PrimitiveViaType"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.pcb_PrimitiveVia.getAll",
+            "pcb_PrimitiveVia",
+            "getAll",
+            "getAll(net?: string): Promise<IPCB_PrimitiveVia[]>",
+            "Promise<IPCB_PrimitiveVia[]>",
+            "Retrieve all via primitives from the active PCB document.",
+            nlohmann::json::array({
+                {{"name", "net"}, {"type", "string"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.pcb_PrimitivePad.getAll",
+            "pcb_PrimitivePad",
+            "getAll",
+            "getAll(layerId?: number, net?: string): Promise<IPCB_PrimitivePad[]>",
+            "Promise<IPCB_PrimitivePad[]>",
+            "Retrieve all component/board pad primitives with net and coordinate metadata.",
+            nlohmann::json::array({
+                {{"name", "layerId"}, {"type", "number"}, {"optional", true}},
+                {{"name", "net"}, {"type", "string"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.pcb_PrimitiveComponent.getAll",
+            "pcb_PrimitiveComponent",
+            "getAll",
+            "getAll(layerId?: EPCB_LayerId, locked?: boolean): Promise<IPCB_PrimitiveComponent[]>",
+            "Promise<IPCB_PrimitiveComponent[]>",
+            "Retrieve all placed PCB footprint components.",
+            nlohmann::json::array({
+                {{"name", "layerId"}, {"type", "EPCB_LayerId"}, {"optional", true}},
+                {{"name", "locked"}, {"type", "boolean"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.pcb_PrimitiveComponent.modify",
+            "pcb_PrimitiveComponent",
+            "modify",
+            "modify(primitiveId: string, property: Partial<IPCB_PrimitiveComponentProperty>): Promise<IPCB_PrimitiveComponent | undefined>",
+            "Promise<IPCB_PrimitiveComponent | undefined>",
+            "Move, rotate, flip layer, or update designator of a placed PCB footprint.",
+            nlohmann::json::array({
+                {{"name", "primitiveId"}, {"type", "string"}, {"optional", false}},
+                {{"name", "property"}, {"type", "Partial<IPCB_PrimitiveComponentProperty>"}, {"optional", false}}
+            })
+        },
+        {
+            "eda.pcb_PrimitivePour.create",
+            "pcb_PrimitivePour",
+            "create",
+            "create(net: string, layer: TPCB_LayersOfPour, polygon: IPCB_Polygon, pourName?: string, clearance?: number): Promise<IPCB_PrimitivePour | undefined>",
+            "Promise<IPCB_PrimitivePour | undefined>",
+            "Create a copper pour zone attached to a net on TopLayer/BottomLayer/inner plane.",
+            nlohmann::json::array({
+                {{"name", "net"}, {"type", "string"}, {"optional", false}},
+                {{"name", "layer"}, {"type", "TPCB_LayersOfPour"}, {"optional", false}},
+                {{"name", "polygon"}, {"type", "IPCB_Polygon"}, {"optional", false}},
+                {{"name", "clearance"}, {"type", "number (mil)"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.pcb_Drc.check",
+            "pcb_Drc",
+            "check",
+            "check(strict?: boolean, userInterface?: boolean, includeVerboseError?: boolean): Promise<boolean | any[]>",
+            "Promise<boolean | any[]>",
+            "Execute EasyEDA Pro PCB Design Rule Check (DRC) and return structured violations.",
+            nlohmann::json::array({
+                {{"name", "strict"}, {"type", "boolean"}, {"optional", true}},
+                {{"name", "userInterface"}, {"type", "boolean"}, {"optional", true}},
+                {{"name", "includeVerboseError"}, {"type", "boolean"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.pcb_ManufactureData.getGerberFile",
+            "pcb_ManufactureData",
+            "getGerberFile",
+            "getGerberFile(fileName?: string): Promise<File | undefined>",
+            "Promise<File | undefined>",
+            "Generate JLCPCB-ready Gerber and Excellon drill archive from the active PCB.",
+            nlohmann::json::array({
+                {{"name", "fileName"}, {"type", "string"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.sch_PrimitiveComponent.create",
+            "sch_PrimitiveComponent",
+            "create",
+            "create(component: {libraryUuid: string, uuid: string} | ISCH_NetlistComponent, x: number, y: number, subPartName?: string, rotation?: number, mirror?: boolean, addIntoBom?: boolean, addIntoPcb?: boolean): Promise<ISCH_PrimitiveComponent | undefined>",
+            "Promise<ISCH_PrimitiveComponent | undefined>",
+            "Place a schematic symbol component onto the active schematic sheet.",
+            nlohmann::json::array({
+                {{"name", "component"}, {"type", "{libraryUuid: string, uuid: string}"}, {"optional", false}},
+                {{"name", "x"}, {"type", "number"}, {"optional", false}},
+                {{"name", "y"}, {"type", "number"}, {"optional", false}},
+                {{"name", "rotation"}, {"type", "number"}, {"optional", true}},
+                {{"name", "mirror"}, {"type", "boolean"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.sch_PrimitiveComponent.getAll",
+            "sch_PrimitiveComponent",
+            "getAll",
+            "getAll(primitiveType?: ESCH_PrimitiveComponentType, allSchematicPages?: boolean): Promise<ISCH_PrimitiveComponent[]>",
+            "Promise<ISCH_PrimitiveComponent[]>",
+            "Retrieve all schematic components on the active sheet or across all pages.",
+            nlohmann::json::array({
+                {{"name", "primitiveType"}, {"type", "ESCH_PrimitiveComponentType"}, {"optional", true}},
+                {{"name", "allSchematicPages"}, {"type", "boolean"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.sch_PrimitiveComponent.getAllPinsByPrimitiveId",
+            "sch_PrimitiveComponent",
+            "getAllPinsByPrimitiveId",
+            "getAllPinsByPrimitiveId(primitiveId: string): Promise<ISCH_PrimitiveComponentPin[] | undefined>",
+            "Promise<ISCH_PrimitiveComponentPin[] | undefined>",
+            "Retrieve all pins (pinNumber, pinName, x, y, rotation, net) of a placed schematic component.",
+            nlohmann::json::array({
+                {{"name", "primitiveId"}, {"type", "string"}, {"optional", false}}
+            })
+        },
+        {
+            "eda.sch_PrimitiveComponent.createNetFlag",
+            "sch_PrimitiveComponent",
+            "createNetFlag",
+            "createNetFlag(identification: 'Power' | 'Ground' | 'AnalogGround' | 'ProtectGround', net: string, x: number, y: number, rotation?: number, mirror?: boolean): Promise<ISCH_PrimitiveComponent | undefined>",
+            "Promise<ISCH_PrimitiveComponent | undefined>",
+            "Place a schematic power or ground netFlag (VCC, GND, +3V3) at (x, y) in mil.",
+            nlohmann::json::array({
+                {{"name", "identification"}, {"type", "'Power' | 'Ground' | 'AnalogGround' | 'ProtectGround'"}, {"optional", false}},
+                {{"name", "net"}, {"type", "string"}, {"optional", false}},
+                {{"name", "x"}, {"type", "number (mil)"}, {"optional", false}},
+                {{"name", "y"}, {"type", "number (mil)"}, {"optional", false}},
+                {{"name", "rotation"}, {"type", "number"}, {"optional", true}},
+                {{"name", "mirror"}, {"type", "boolean"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.sch_PrimitiveComponent.createNetPort",
+            "sch_PrimitiveComponent",
+            "createNetPort",
+            "createNetPort(direction: 'IN' | 'OUT' | 'BI', net: string, x: number, y: number, rotation?: number, mirror?: boolean): Promise<ISCH_PrimitiveComponent | undefined>",
+            "Promise<ISCH_PrimitiveComponent | undefined>",
+            "Place a schematic net port label at (x, y) in mil.",
+            nlohmann::json::array({
+                {{"name", "direction"}, {"type", "'IN' | 'OUT' | 'BI'"}, {"optional", false}},
+                {{"name", "net"}, {"type", "string"}, {"optional", false}},
+                {{"name", "x"}, {"type", "number (mil)"}, {"optional", false}},
+                {{"name", "y"}, {"type", "number (mil)"}, {"optional", false}}
+            })
+        },
+        {
+            "eda.sch_PrimitiveWire.create",
+            "sch_PrimitiveWire",
+            "create",
+            "create(line: number[] | number[][], net?: string, color?: string, lineWidth?: number, lineType?: ESCH_PrimitiveLineType): Promise<ISCH_PrimitiveWire | undefined>",
+            "Promise<ISCH_PrimitiveWire | undefined>",
+            "Create a schematic wire polyline and optionally bind a net label.",
+            nlohmann::json::array({
+                {{"name", "line"}, {"type", "number[] | number[][]"}, {"optional", false}},
+                {{"name", "net"}, {"type", "string"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.sch_PrimitiveWire.getAll",
+            "sch_PrimitiveWire",
+            "getAll",
+            "getAll(net?: string, allSchematicPages?: boolean): Promise<ISCH_PrimitiveWire[]>",
+            "Promise<ISCH_PrimitiveWire[]>",
+            "Retrieve all schematic wire primitives on the active sheet or across all pages.",
+            nlohmann::json::array({
+                {{"name", "net"}, {"type", "string"}, {"optional", true}},
+                {{"name", "allSchematicPages"}, {"type", "boolean"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.sch_Drc.check",
+            "sch_Drc",
+            "check",
+            "check(strict?: boolean, userInterface?: boolean, includeVerboseError?: boolean): Promise<boolean | any[]>",
+            "Promise<boolean | any[]>",
+            "Run Schematic Electrical Rule Check (ERC) inside EasyEDA Pro.",
+            nlohmann::json::array({
+                {{"name", "strict"}, {"type", "boolean"}, {"optional", true}},
+                {{"name", "userInterface"}, {"type", "boolean"}, {"optional", true}},
+                {{"name", "includeVerboseError"}, {"type", "boolean"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.lib_Device.getByLcscIds",
+            "lib_Device",
+            "getByLcscIds",
+            "getByLcscIds(lcscIds: string | string[], libraryUuid?: string): Promise<ILIB_DeviceSearchItem[]>",
+            "Promise<ILIB_DeviceSearchItem[]>",
+            "Resolve LCSC C-numbers (e.g. C25804) to EasyEDA device UUID and libraryUuid.",
+            nlohmann::json::array({
+                {{"name", "lcscIds"}, {"type", "string | string[]"}, {"optional", false}},
+                {{"name", "libraryUuid"}, {"type", "string"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.dmt_SelectControl.getCurrentDocumentInfo",
+            "dmt_SelectControl",
+            "getCurrentDocumentInfo",
+            "getCurrentDocumentInfo(): Promise<IDMT_DocumentInfo | undefined>",
+            "Promise<IDMT_DocumentInfo | undefined>",
+            "Inspect the currently focused schematic or PCB tab in EasyEDA Pro.",
+            nlohmann::json::array()
+        }
+    };
+
+    bool isDescribe = args.contains("describe_api") && args["describe_api"].is_string() &&
+                      !args["describe_api"].get<std::string>().empty();
+    std::string rawQuery = isDescribe
+        ? args["describe_api"].get<std::string>()
+        : args.value("search_api", "");
+    std::string qLower = toLowerAscii(rawQuery);
+
+    nlohmann::json matched = nlohmann::json::array();
+    for (const auto& entry : kCatalog) {
+        std::string pathLower = toLowerAscii(entry.apiPath);
+        std::string sigLower = toLowerAscii(entry.signature);
+        std::string descLower = toLowerAscii(entry.description);
+        bool hit = false;
+        if (isDescribe) {
+            hit = (pathLower == qLower) || (pathLower.find(qLower) != std::string::npos);
+        } else {
+            hit = (pathLower.find(qLower) != std::string::npos) ||
+                  (sigLower.find(qLower) != std::string::npos) ||
+                  (descLower.find(qLower) != std::string::npos);
+        }
+        if (hit) {
+            std::string notes = std::string(entry.description) + " Signature: " + entry.signature +
+                                " (1 mil = 0.0254 mm)";
+            matched.push_back({
+                {"api_path", entry.apiPath},
+                {"namespace", entry.ns},
+                {"method", entry.method},
+                {"signature", entry.signature},
+                {"parameters", entry.parameters},
+                {"return_type", entry.returnType},
+                {"unit_note", "1 mil = 0.0254 mm (EasyEDA Pro native canvas unit is mil)"},
+                {"description", entry.description},
+                {"notes", notes}
+            });
+        }
+    }
+
+    return {
+        {"ok", true},
+        {"offline_introspection", true},
+        {"mode", isDescribe ? "describe_api" : "search_api"},
+        {"query", rawQuery},
+        {"matched_count", matched.size()},
+        {"matched_apis", matched}
+    };
+}
+
+void attachFreeCadSpecAndDiff(nlohmann::json& docResult,
+                              const nlohmann::json& args,
+                              const nlohmann::json* prevDocSnapshot) {
+    if (!docResult.is_object()) return;
+
+    double totalVol = docResult.value("volume_mm3", 0.0);
+    if (totalVol <= 0.0 && docResult.contains("bodies") && docResult["bodies"].is_array()) {
+        for (const auto& b : docResult["bodies"]) {
+            if (b.is_object()) totalVol += b.value("volume_mm3", 0.0);
+        }
+    }
+    if (args.contains("volume_mm3") && args["volume_mm3"].is_number()) {
+        totalVol = args["volume_mm3"].get<double>();
+    }
+
+    std::vector<double> docBbox = {0.0, 0.0, 0.0};
+    if (docResult.contains("bbox_mm") && docResult["bbox_mm"].is_array() && docResult["bbox_mm"].size() >= 3) {
+        docBbox[0] = docResult["bbox_mm"][0].get<double>();
+        docBbox[1] = docResult["bbox_mm"][1].get<double>();
+        docBbox[2] = docResult["bbox_mm"][2].get<double>();
+    } else if (docResult.contains("bounding_box") && docResult["bounding_box"].is_object()) {
+        const auto& bb = docResult["bounding_box"];
+        docBbox[0] = bb.value("x_max", 0.0) - bb.value("x_min", 0.0);
+        docBbox[1] = bb.value("y_max", 0.0) - bb.value("y_min", 0.0);
+        docBbox[2] = bb.value("z_max", 0.0) - bb.value("z_min", 0.0);
+    }
+
+    int holesCount = docResult.value("holes_count", -1);
+    if (holesCount < 0) {
+        if (docResult.contains("holes") && docResult["holes"].is_array()) {
+            holesCount = static_cast<int>(docResult["holes"].size());
+        } else {
+            holesCount = args.value("holes_count", 0);
+        }
+    }
+
+    bool manifoldValid = docResult.value("watertight", true) && docResult.value("is_manifold", true);
+    if (docResult.contains("bodies") && docResult["bodies"].is_array()) {
+        for (const auto& b : docResult["bodies"]) {
+            if (b.is_object() && !b.value("watertight", true)) {
+                manifoldValid = false;
+            }
+        }
+    }
+
+    if (!docResult.contains("spec_validation") && args.contains("spec") && args["spec"].is_object()) {
+        const auto& spec = args["spec"];
+        nlohmann::json violations = nlohmann::json::array();
+        bool reqManifold = spec.value("require_watertight_manifold", true);
+        bool manifoldOk = (!reqManifold) || manifoldValid;
+        if (!manifoldOk) {
+            violations.push_back("Document contains non-manifold or non-watertight solid bodies");
+        }
+
+        bool bboxMatched = true;
+        double bboxTol = spec.value("bbox_tolerance_mm", 0.5);
+        if (spec.contains("expected_bbox_mm") && spec["expected_bbox_mm"].is_array() &&
+            spec["expected_bbox_mm"].size() >= 3) {
+            static constexpr const char* kAxes[3] = {"X", "Y", "Z"};
+            for (size_t i = 0; i < 3; ++i) {
+                double targetDim = spec["expected_bbox_mm"][i].get<double>();
+                if (std::abs(docBbox[i] - targetDim) > bboxTol) {
+                    bboxMatched = false;
+                    violations.push_back(std::string("Bounding box ") + kAxes[i] +
+                                         " dimension outside tolerance");
+                }
+            }
+        }
+
+        bool volumeMatched = true;
+        if (spec.contains("expected_volume_mm3") && spec["expected_volume_mm3"].is_number()) {
+            double expVol = spec["expected_volume_mm3"].get<double>();
+            double tolPct = spec.value("volume_tolerance_pct", 5.0);
+            double allowedDelta = std::abs(expVol) * (tolPct / 100.0);
+            if (std::abs(totalVol - expVol) > allowedDelta) {
+                volumeMatched = false;
+                violations.push_back("Volume outside tolerance of expected_volume_mm3");
+            }
+        }
+
+        bool holesMatched = true;
+        if (spec.contains("expected_holes_count") && spec["expected_holes_count"].is_number_integer()) {
+            int expHoles = spec["expected_holes_count"].get<int>();
+            if (holesCount != expHoles) {
+                holesMatched = false;
+                violations.push_back("Holes count does not match expected_holes_count");
+            }
+        }
+
+        docResult["spec_validation"] = {
+            {"passed", manifoldOk && bboxMatched && volumeMatched && holesMatched},
+            {"manifold_valid", manifoldValid},
+            {"bbox_matched", bboxMatched},
+            {"volume_matched", volumeMatched},
+            {"holes_matched", holesMatched},
+            {"actual_bbox_mm", docBbox},
+            {"actual_volume_mm3", totalVol},
+            {"actual_holes_count", holesCount},
+            {"violations", violations}
+        };
+    }
+
+    bool wantDiff = args.value("compare_previous", false) ||
+                    (args.contains("previous_snapshot") && args["previous_snapshot"].is_object());
+    if (!docResult.contains("volumetric_diff") && wantDiff) {
+        nlohmann::json prevSnap = nlohmann::json::object();
+        if (args.contains("previous_snapshot") && args["previous_snapshot"].is_object()) {
+            prevSnap = args["previous_snapshot"];
+        } else if (prevDocSnapshot != nullptr && prevDocSnapshot->is_object()) {
+            prevSnap = *prevDocSnapshot;
+        }
+
+        double prevVol = prevSnap.value("volume_mm3", totalVol);
+        std::vector<double> prevBbox = docBbox;
+        if (prevSnap.contains("bbox_mm") && prevSnap["bbox_mm"].is_array() && prevSnap["bbox_mm"].size() >= 3) {
+            prevBbox[0] = prevSnap["bbox_mm"][0].get<double>();
+            prevBbox[1] = prevSnap["bbox_mm"][1].get<double>();
+            prevBbox[2] = prevSnap["bbox_mm"][2].get<double>();
+        } else if (prevSnap.contains("bounding_box") && prevSnap["bounding_box"].is_object()) {
+            const auto& pbb = prevSnap["bounding_box"];
+            prevBbox[0] = pbb.value("x_max", 0.0) - pbb.value("x_min", 0.0);
+            prevBbox[1] = pbb.value("y_max", 0.0) - pbb.value("y_min", 0.0);
+            prevBbox[2] = pbb.value("z_max", 0.0) - pbb.value("z_min", 0.0);
+        }
+
+        double curBoxVol = std::max(1e-6, docBbox[0] * docBbox[1] * docBbox[2]);
+        double prevBoxVol = std::max(1e-6, prevBbox[0] * prevBbox[1] * prevBbox[2]);
+        double interBoxVol = std::max(0.0, std::min(docBbox[0], prevBbox[0])) *
+                             std::max(0.0, std::min(docBbox[1], prevBbox[1])) *
+                             std::max(0.0, std::min(docBbox[2], prevBbox[2]));
+        double boxOverlapRatio = std::min(1.0, interBoxVol / std::max(1e-6, std::min(curBoxVol, prevBoxVol)));
+        double sharedVol = std::min(totalVol, prevVol) * boxOverlapRatio;
+        sharedVol = std::max(0.0, std::min({sharedVol, totalVol, prevVol}));
+        double addedVol = std::max(0.0, totalVol - sharedVol);
+        double removedVol = std::max(0.0, prevVol - sharedVol);
+        double netDelta = totalVol - prevVol;
+        double unionVol = totalVol + prevVol - sharedVol;
+        double iouRatio = (unionVol > 1e-9) ? (sharedVol / unionVol) : 1.0;
+
+        docResult["volumetric_diff"] = {
+            {"shared_volume_mm3", sharedVol},
+            {"added_volume_mm3", addedVol},
+            {"removed_volume_mm3", removedVol},
+            {"net_volume_delta_mm3", netDelta},
+            {"iou_ratio", iouRatio}
+        };
+    }
+}
+
+bool computeViewMatrixComplete(const std::vector<std::string>& views) {
+    bool hasTop = false;
+    bool hasFront = false;
+    bool hasRight = false;
+    bool hasIso = false;
+    for (const auto& v : views) {
+        std::string vl = toLowerAscii(v);
+        if (vl == "top") hasTop = true;
+        else if (vl == "front") hasFront = true;
+        else if (vl == "right") hasRight = true;
+        else if (vl == "iso" || vl == "isometric" || vl == "axonometric") hasIso = true;
+    }
+    return hasTop && hasFront && hasRight && hasIso;
+}
+
 } // anonymous namespace
 
 EdaRpcServer::EdaRpcServer(const EdaRpcServerOptions& options)
@@ -1660,7 +2149,7 @@ nlohmann::json EdaRpcServer::handleKiCadTool(const std::string& toolName,
 
     if (toolName == "kicad_sync_sch_to_pcb") {
         nlohmann::json res = KiCadSchematicEditor::syncSchematicToPcb(args);
-        if (res.value("ok", false) && isPluginConnected("kicad")) {
+        if (res.value("ok", false) && !args.value("dry_run", false) && isPluginConnected("kicad")) {
             nlohmann::json pluginArgs = args;
             if (res.contains("footprints")) pluginArgs["footprints"] = res["footprints"];
             if (res.contains("tracks")) pluginArgs["tracks"] = res["tracks"];
@@ -2056,47 +2545,72 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
             std::ofstream ofs(docPath, std::ios::binary | std::ios::trunc);
             ofs << docModel.dump(2) << "\n";
             std::lock_guard<std::mutex> lock(_docStateMutex);
+            auto prevIt = _freecadDocs.find(docPath);
+            if (prevIt != _freecadDocs.end()) {
+                _freecadPrevDocs[docPath] = prevIt->second;
+            }
             _freecadDocs[docPath] = docModel;
         }
         return docModel;
     }
 
     if (toolName == "freecad_inspect_document") {
+        std::string docPath = args.value("document_path", args.value("file_path", args.value("path", "")));
+        nlohmann::json prevSnap;
+        bool hasPrevSnap = false;
+        {
+            std::lock_guard<std::mutex> lock(_docStateMutex);
+            auto pit = _freecadPrevDocs.find(docPath);
+            if (pit != _freecadPrevDocs.end()) {
+                prevSnap = pit->second;
+                hasPrevSnap = true;
+            }
+        }
+
         if (pluginConn) {
             nlohmann::json plugRes;
             std::string plugErr;
             if (callPlugin("freecad", toolName, args, plugRes, plugErr, timeoutMs)) {
+                attachFreeCadSpecAndDiff(plugRes, args, hasPrevSnap ? &prevSnap : nullptr);
                 return plugRes;
             }
         }
-        std::string docPath = args.value("document_path", args.value("file_path", args.value("path", "")));
+
+        nlohmann::json outDoc;
+        bool foundInMap = false;
         {
             std::lock_guard<std::mutex> lock(_docStateMutex);
             auto it = _freecadDocs.find(docPath);
             if (it != _freecadDocs.end()) {
-                return it->second;
+                outDoc = it->second;
+                foundInMap = true;
             }
         }
-        if (!docPath.empty() && fs::exists(docPath)) {
+        if (!foundInMap && !docPath.empty() && fs::exists(docPath)) {
             std::ifstream ifs(docPath);
             std::string txt((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
             nlohmann::json parsed = nlohmann::json::parse(txt, nullptr, false);
             if (!parsed.is_discarded() && parsed.is_object()) {
                 parsed["ok"] = true;
-                return parsed;
+                outDoc = parsed;
+                foundInMap = true;
             }
         }
-        return {
-            {"ok", true},
-            {"document_path", docPath},
-            {"bodies", nlohmann::json::array({{{"name", "Body001"}, {"volume_mm3", 8500.0}, {"watertight", true}}})},
-            {"parameters", {{"wall_thickness_mm", 2.0}, {"print_tolerance_mm", 0.20}}},
-            {"bounding_box", {{"x_min", 0.0}, {"y_min", 0.0}, {"z_min", 0.0}, {"x_max", 40.0}, {"y_max", 30.0}, {"z_max", 20.0}}},
-            {"center_of_mass_mm", {20.0, 15.0, 10.0}},
-            {"inertia_tensor", {{"ixx", 1.2e-4}, {"iyy", 1.5e-4}, {"izz", 1.8e-4}}},
-            {"holes", nlohmann::json::array({{{"name", "ShaftHole"}, {"diameter_mm", 5.2}, {"axis", {0.0, 0.0, 1.0}}}})},
-            {"lcs_frames", nlohmann::json::array({{{"name", "LCS_Base"}, {"x", 0.0}, {"y", 0.0}, {"z", 0.0}}})}
-        };
+        if (!foundInMap) {
+            outDoc = {
+                {"ok", true},
+                {"document_path", docPath},
+                {"bodies", nlohmann::json::array({{{"name", "Body001"}, {"volume_mm3", 8500.0}, {"watertight", true}}})},
+                {"parameters", {{"wall_thickness_mm", 2.0}, {"print_tolerance_mm", 0.20}}},
+                {"bounding_box", {{"x_min", 0.0}, {"y_min", 0.0}, {"z_min", 0.0}, {"x_max", 40.0}, {"y_max", 30.0}, {"z_max", 20.0}}},
+                {"center_of_mass_mm", {20.0, 15.0, 10.0}},
+                {"inertia_tensor", {{"ixx", 1.2e-4}, {"iyy", 1.5e-4}, {"izz", 1.8e-4}}},
+                {"holes", nlohmann::json::array({{{"name", "ShaftHole"}, {"diameter_mm", 5.2}, {"axis", {0.0, 0.0, 1.0}}}})},
+                {"lcs_frames", nlohmann::json::array({{{"name", "LCS_Base"}, {"x", 0.0}, {"y", 0.0}, {"z", 0.0}}})}
+            };
+        }
+        attachFreeCadSpecAndDiff(outDoc, args, hasPrevSnap ? &prevSnap : nullptr);
+        return outDoc;
     }
 
     if (toolName == "freecad_edit_parameters") {
@@ -2122,6 +2636,10 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
 
         if (!docPath.empty()) {
             std::lock_guard<std::mutex> lock(_docStateMutex);
+            auto prevIt = _freecadDocs.find(docPath);
+            if (prevIt != _freecadDocs.end()) {
+                _freecadPrevDocs[docPath] = prevIt->second;
+            }
             _freecadDocs[docPath] = doc;
             std::ofstream ofs(docPath, std::ios::binary | std::ios::trunc);
             if (ofs) ofs << doc.dump(2) << "\n";
@@ -2213,6 +2731,7 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
             nlohmann::json plugRes;
             std::string plugErr;
             if (callPlugin("freecad", toolName, args, plugRes, plugErr, timeoutMs)) {
+                attachFreeCadSpecAndDiff(plugRes, args, nullptr);
                 return plugRes;
             }
         }
@@ -2240,7 +2759,7 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
         }
 
         bool pass = watertight && (nonManifoldEdges == 0) && (measuredWallMm >= minRequiredWallMm);
-        return {
+        nlohmann::json res = {
             {"ok", true},
             {"is_manifold", watertight && (nonManifoldEdges == 0)},
             {"watertight", watertight && (nonManifoldEdges == 0)},
@@ -2251,6 +2770,8 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
             {"printability_pass", pass},
             {"warnings", warnings}
         };
+        attachFreeCadSpecAndDiff(res, args, nullptr);
+        return res;
     }
 
     if (toolName == "freecad_render_view") {
@@ -2258,6 +2779,17 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
             nlohmann::json plugRes;
             std::string plugErr;
             if (callPlugin("freecad", toolName, args, plugRes, plugErr, timeoutMs)) {
+                if (plugRes.is_object() && !plugRes.contains("view_matrix_complete")) {
+                    std::vector<std::string> vNames;
+                    if (plugRes.contains("views") && plugRes["views"].is_array()) {
+                        for (const auto& v : plugRes["views"]) {
+                            if (v.is_object() && v.contains("view") && v["view"].is_string()) {
+                                vNames.push_back(v["view"].get<std::string>());
+                            }
+                        }
+                    }
+                    plugRes["view_matrix_complete"] = computeViewMatrixComplete(vNames);
+                }
                 return plugRes;
             }
         }
@@ -2271,6 +2803,8 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
             for (const auto& v : args["views"]) {
                 if (v.is_string()) requestedViews.push_back(v.get<std::string>());
             }
+        } else if (toLowerAscii(args.value("preset", "")) == "quad" || args.value("four_view", false)) {
+            requestedViews = {"top", "front", "right", "iso"};
         }
 
         if (!outDir.empty()) {
@@ -2300,7 +2834,8 @@ nlohmann::json EdaRpcServer::handleFreeCadTool(const std::string& toolName,
             {"ok", true},
             {"output_dir", outDir},
             {"views_count", viewsOut.size()},
-            {"views", viewsOut}
+            {"views", viewsOut},
+            {"view_matrix_complete", computeViewMatrixComplete(requestedViews)}
         };
     }
 
@@ -2415,6 +2950,14 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
     }
 
     if (toolName == "easyeda_invoke_api") {
+        bool hasDescribe = args.contains("describe_api") && args["describe_api"].is_string() &&
+                           !args["describe_api"].get<std::string>().empty();
+        bool hasSearch = args.contains("search_api") && args["search_api"].is_string() &&
+                         !args["search_api"].get<std::string>().empty();
+        if (hasDescribe || hasSearch) {
+            return introspectEasyEdaApiCatalog(args);
+        }
+
         std::string apiPath = args.value("api_path", args.value("api", args.value("method", "")));
         std::string reason;
         if (!checkEasyEdaApiSafety(apiPath, reason)) {

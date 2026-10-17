@@ -275,6 +275,282 @@ int main() {
         RC_ASSERT(res.value("unrouted_nets_count", -1) == (includePour ? 0 : 1));
     });
 
+    ok &= rc::check("calcSchematicErcAudit T-junctions and 5-layer semantic checks hold across randomized schematics", []() {
+        const bool includePullup = *rc::gen::arbitrary<bool>();
+        const bool includeDecoupling = *rc::gen::arbitrary<bool>();
+        const bool injectOverlap = *rc::gen::arbitrary<bool>();
+        const double tjOffset = *rc::gen::inRange(0, 14) / 10.0; // 0.0 to 1.4 mil <= 1.5 mil default tol
+
+        nlohmann::json comps = nlohmann::json::array({
+            {
+                {"id", "u1"},
+                {"reference", "U1"},
+                {"value", "MCU"},
+                {"component_type", "part"},
+                {"footprint", "QFN-32"},
+                {"unique_id", "uid_u1"},
+                {"x", 200.0},
+                {"y", 200.0},
+                {"width", 80.0},
+                {"height", 80.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "u1_1"}, {"number", "1"}, {"name", "VDD"}, {"net", "+3V3"}, {"x", 160.0}, {"y", 180.0}},
+                    {{"id", "u1_2"}, {"number", "2"}, {"name", "GND"}, {"net", "GND"}, {"x", 160.0}, {"y", 220.0}},
+                    {{"id", "u1_3"}, {"number", "3"}, {"name", "SDA"}, {"net", "I2C_SDA"}, {"x", 240.0}, {"y", 200.0}}
+                })}
+            },
+            {
+                {"id", "u2"},
+                {"reference", "U2"},
+                {"value", "SENSOR"},
+                {"component_type", "part"},
+                {"footprint", "SON-8"},
+                {"unique_id", "uid_u2"},
+                {"x", injectOverlap ? 220.0 : 500.0},
+                {"y", 200.0},
+                {"width", 80.0},
+                {"height", 80.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "u2_1"}, {"number", "1"}, {"name", "SDA"}, {"net", "I2C_SDA"}, {"x", 460.0}, {"y", 200.0}}
+                })}
+            },
+            {
+                {"id", "nf_vdd"},
+                {"reference", "#PWR1"},
+                {"value", "+3V3"},
+                {"component_type", "netflag"},
+                {"x", 350.0},
+                {"y", 100.0},
+                {"pins", nlohmann::json::array()}
+            }
+        });
+
+        if (includePullup) {
+            comps.push_back({
+                {"id", "r1"},
+                {"reference", "R1"},
+                {"value", "4.7k"},
+                {"component_type", "part"},
+                {"footprint", "R0603"},
+                {"unique_id", "uid_r1"},
+                {"x", 350.0},
+                {"y", 150.0},
+                {"width", 20.0},
+                {"height", 40.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "r1_1"}, {"number", "1"}, {"name", "1"}, {"net", "+3V3"}, {"x", 350.0}, {"y", 130.0}},
+                    {{"id", "r1_2"}, {"number", "2"}, {"name", "2"}, {"net", "I2C_SDA"}, {"x", 350.0}, {"y", 170.0}}
+                })}
+            });
+        }
+
+        if (includeDecoupling) {
+            comps.push_back({
+                {"id", "c1"},
+                {"reference", "C1"},
+                {"value", "100nF"},
+                {"component_type", "part"},
+                {"footprint", "C0603"},
+                {"unique_id", "uid_c1"},
+                {"x", 100.0},
+                {"y", 200.0},
+                {"width", 20.0},
+                {"height", 40.0},
+                {"pins", nlohmann::json::array({
+                    {{"id", "c1_1"}, {"number", "1"}, {"name", "1"}, {"net", "+3V3"}, {"x", 100.0}, {"y", 180.0}},
+                    {{"id", "c1_2"}, {"number", "2"}, {"name", "2"}, {"net", "GND"}, {"x", 100.0}, {"y", 220.0}}
+                })}
+            });
+        }
+
+        nlohmann::json wires = nlohmann::json::array({
+            {{"id", "w_sda_bus"}, {"net", "I2C_SDA"}, {"line", nlohmann::json::array({{240.0, 200.0}, {460.0, 200.0}})}}
+        });
+        if (includePullup) {
+            // T-junction landing on w_sda_bus within tjOffset (<= 1.4 mil)
+            wires.push_back({
+                {"id", "w_pu_branch"},
+                {"net", "I2C_SDA"},
+                {"line", nlohmann::json::array({{350.0, 170.0}, {350.0, 200.0 - tjOffset}})}
+            });
+            wires.push_back({
+                {"id", "w_pu_vdd"},
+                {"net", "+3V3"},
+                {"line", nlohmann::json::array({{350.0, 130.0}, {350.0, 100.0}})}
+            });
+        }
+
+        EdaAccelerators acc;
+        bool success = false;
+        std::string summary;
+        nlohmann::json res = acc.calcSchematicErcAudit({{"components", comps}, {"wires", wires}}, success, summary);
+        RC_ASSERT(success);
+        RC_ASSERT(res.value("dangling_wires_count", -1) == 0);
+        RC_ASSERT(res.value("pullup_issues_count", -1) == (includePullup ? 0 : 1));
+        RC_ASSERT(res.value("decoupling_issues_count", -1) == (includeDecoupling ? 0 : 1));
+        RC_ASSERT(res.value("overlapping_components_count", -1) == (injectOverlap ? 1 : 0));
+    });
+
+    ok &= rc::check("easyeda_edit_schematic auto_place, connect_to_net, and annotate_schematic preserve 50-mil grid and zero overlaps", []() {
+        const int extraPassives = *rc::gen::inRange(1, 5);
+        const int stubGridSteps = *rc::gen::inRange(1, 4);
+        const double stubLen = stubGridSteps * 50.0;
+
+        EdaBridgeConfig cfg;
+        cfg.enabled = true;
+        cfg.mode = "gateway";
+        cfg.easyeda.enabled = true;
+        EdaBridge bridge(cfg);
+
+        nlohmann::json schState = {
+            {"active_document", "PropSheet"},
+            {"components", nlohmann::json::array({
+                {
+                    {"id", "u1"},
+                    {"reference", "U?"},
+                    {"value", "MCU"},
+                    {"component_type", "part"},
+                    {"footprint", "QFN-32"},
+                    {"unique_id", "uid_u1"},
+                    {"x", 500.0},
+                    {"y", 500.0},
+                    {"width", 100.0},
+                    {"height", 100.0},
+                    {"pins", nlohmann::json::array({
+                        {{"id", "u1_p1"}, {"number", "1"}, {"name", "VDD"}, {"net", ""}, {"x", 450.0}, {"y", 500.0}},
+                        {{"id", "u1_p2"}, {"number", "2"}, {"name", "PA0"}, {"net", ""}, {"x", 550.0}, {"y", 500.0}}
+                    })}
+                }
+            })},
+            {"wires", nlohmann::json::array()}
+        };
+
+        nlohmann::json addComps = nlohmann::json::array();
+        for (int i = 0; i < extraPassives; ++i) {
+            addComps.push_back({
+                {"reference", (i % 2 == 0) ? "R?" : "C?"},
+                {"value", "10k"},
+                {"footprint", "0603"},
+                {"near_reference", "U1"},
+                {"width", 40.0},
+                {"height", 20.0}
+            });
+        }
+
+        nlohmann::json editRes = bridge.callTool("easyeda_edit_schematic", {
+            {"schematic_state", schState},
+            {"add_components", addComps},
+            {"annotate_schematic", true},
+            {"connect_to_net", nlohmann::json::array({
+                {{"reference", "U1"}, {"pin_number", "1"}, {"net", "+3V3"}, {"stub_length_mils", stubLen}},
+                {{"reference", "U1"}, {"pin_number", "2"}, {"net", "SIG_OUT"}, {"stub_length_mils", stubLen}}
+            })}
+        });
+
+        RC_ASSERT(editRes.value("ok", false));
+        RC_ASSERT(editRes.value("placed_components", 0) == extraPassives);
+        RC_ASSERT(editRes.value("annotated_count", 0) == extraPassives + 1);
+        RC_ASSERT(editRes.value("annotation_verified", false));
+        RC_ASSERT(editRes.contains("connected_net_stubs"));
+        RC_ASSERT(static_cast<int>(editRes["connected_net_stubs"].size()) == 2);
+        for (const auto& pd : editRes["placed_component_details"]) {
+            double px = pd.value("x", -1.0);
+            double py = pd.value("y", -1.0);
+            RC_ASSERT(std::fabs(px / 50.0 - std::round(px / 50.0)) < 1e-4);
+            RC_ASSERT(std::fabs(py / 50.0 - std::round(py / 50.0)) < 1e-4);
+        }
+    });
+
+    // 7. Property: Connected Move (preserve_connections: true) rubber-bands all attached schematic wires
+    // and PCB tracks by the exact translation delta (dx, dy), and calcPcbAutoroute resolves T-corridor ordering traps.
+    ok = ok && rc::check("Envelope 2 connected move rubber-banding and rip-up autoroute invariants", []() {
+        const int dxSteps = *rc::gen::inRange(-6, 7);
+        const int dySteps = *rc::gen::inRange(-6, 7);
+        const double dxMils = static_cast<double>(dxSteps * 50);
+        const double dyMils = static_cast<double>(dySteps * 50);
+
+        EdaBridgeConfig cfg;
+        cfg.enabled = true;
+        cfg.mode = "gateway";
+        cfg.easyeda.enabled = true;
+        EdaBridge bridge(cfg);
+
+        nlohmann::json schState = {
+            {"active_document", "PropRubberSheet"},
+            {"components", nlohmann::json::array({
+                {
+                    {"id", "u1"},
+                    {"reference", "U1"},
+                    {"value", "MCU"},
+                    {"footprint", "QFN-32"},
+                    {"x", 500.0},
+                    {"y", 500.0},
+                    {"pins", nlohmann::json::array({
+                        {{"number", "1"}, {"name", "VDD"}, {"net", "+3V3"}, {"x", 450.0}, {"y", 500.0}},
+                        {{"number", "2"}, {"name", "GND"}, {"net", "GND"}, {"x", 550.0}, {"y", 500.0}}
+                    })}
+                }
+            })},
+            {"wires", nlohmann::json::array({
+                {{"id", "w1"}, {"x1", 200.0}, {"y1", 500.0}, {"x2", 450.0}, {"y2", 500.0}, {"net", "+3V3"}},
+                {{"id", "w2"}, {"x1", 550.0}, {"y1", 500.0}, {"x2", 800.0}, {"y2", 500.0}, {"net", "GND"}}
+            })}
+        };
+
+        nlohmann::json schRes = bridge.callTool("easyeda_edit_schematic", {
+            {"schematic_state", schState},
+            {"preserve_connections", true},
+            {"modify_components", nlohmann::json::array({
+                {{"reference", "U1"}, {"x", 500.0 + dxMils}, {"y", 500.0 + dyMils}, {"preserve_connections", true}}
+            })}
+        });
+        RC_ASSERT(schRes.value("ok", false));
+        RC_ASSERT(schRes.value("rubber_banded_wires_count", -1) == 2);
+        RC_ASSERT(schRes.contains("rubber_banded_wires"));
+        RC_ASSERT(static_cast<int>(schRes["rubber_banded_wires"].size()) == 2);
+        RC_ASSERT(std::fabs(schRes["rubber_banded_wires"][0].value("x2", 0.0) - (450.0 + dxMils)) < 1e-3);
+        RC_ASSERT(std::fabs(schRes["rubber_banded_wires"][0].value("y2", 0.0) - (500.0 + dyMils)) < 1e-3);
+        RC_ASSERT(std::fabs(schRes["rubber_banded_wires"][1].value("x1", 0.0) - (550.0 + dxMils)) < 1e-3);
+        RC_ASSERT(std::fabs(schRes["rubber_banded_wires"][1].value("y1", 0.0) - (500.0 + dyMils)) < 1e-3);
+
+        const double dxMm = static_cast<double>(dxSteps) * 1.25;
+        const double dyMm = static_cast<double>(dySteps) * 1.25;
+        nlohmann::json pcbState = {
+            {"components", nlohmann::json::array({
+                {
+                    {"reference", "R1"},
+                    {"footprint", "R0603"},
+                    {"x_mm", 20.0},
+                    {"y_mm", 20.0},
+                    {"pads", nlohmann::json::array({
+                        {{"number", "1"}, {"net", "+3V3"}, {"x_mm", 19.2}, {"y_mm", 20.0}},
+                        {{"number", "2"}, {"net", "SDA"}, {"x_mm", 20.8}, {"y_mm", 20.0}}
+                    })}
+                }
+            })},
+            {"tracks", nlohmann::json::array({
+                {{"id", "t1"}, {"x1", 10.0}, {"y1", 20.0}, {"x2", 19.2}, {"y2", 20.0}, {"layer", "F.Cu"}, {"net", "+3V3"}},
+                {{"id", "t2"}, {"x1", 20.8}, {"y1", 20.0}, {"x2", 30.0}, {"y2", 20.0}, {"layer", "F.Cu"}, {"net", "SDA"}}
+            })}
+        };
+
+        nlohmann::json pcbRes = bridge.callTool("easyeda_edit_pcb", {
+            {"pcb_state", pcbState},
+            {"preserve_connections", true},
+            {"move_components", nlohmann::json::array({
+                {{"reference", "R1"}, {"x_mm", 20.0 + dxMm}, {"y_mm", 20.0 + dyMm}, {"preserve_connections", true}}
+            })}
+        });
+        RC_ASSERT(pcbRes.value("ok", false));
+        RC_ASSERT(pcbRes.value("rubber_banded_tracks_count", -1) == 2);
+        RC_ASSERT(pcbRes.contains("rubber_banded_tracks"));
+        RC_ASSERT(static_cast<int>(pcbRes["rubber_banded_tracks"].size()) == 2);
+        RC_ASSERT(std::fabs(pcbRes["rubber_banded_tracks"][0].value("x2", 0.0) - (19.2 + dxMm)) < 1e-3);
+        RC_ASSERT(std::fabs(pcbRes["rubber_banded_tracks"][0].value("y2", 0.0) - (20.0 + dyMm)) < 1e-3);
+        RC_ASSERT(std::fabs(pcbRes["rubber_banded_tracks"][1].value("x1", 0.0) - (20.8 + dxMm)) < 1e-3);
+        RC_ASSERT(std::fabs(pcbRes["rubber_banded_tracks"][1].value("y1", 0.0) - (20.0 + dyMm)) < 1e-3);
+    });
+
     return ok ? 0 : 1;
 }
 
