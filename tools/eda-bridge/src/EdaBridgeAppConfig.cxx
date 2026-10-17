@@ -226,7 +226,7 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
 var edaEsbuildExportName = (function () {
     "use strict";
 
-    const BRIDGE_VERSION = "1.1.7";
+    const BRIDGE_VERSION = "1.1.8";
     const DEFAULT_WS_URL = "ws://127.0.0.1:3893";
     const HEARTBEAT_INTERVAL_MS = 10000;
     const ALLOWED_PREFIXES = [
@@ -3723,7 +3723,7 @@ class AimonFreeCadBridgeClient:
                     return f"{v[0]}.{v[1]}.{v[2]}"
             except Exception:
                 pass
-        return "1.1.7"
+        return "1.1.8"
 
     def _active_doc_name(self):
         if HAS_FREECAD and getattr(FreeCAD, "ActiveDocument", None) is not None:

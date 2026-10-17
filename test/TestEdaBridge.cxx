@@ -722,6 +722,249 @@ TEST(EdaAccelerators_Unit, CalcPcbAutoroute4LayerEasyEdaAndIncrementalExistingTr
     }
 }
 
+namespace {
+
+double testPtSegDist(double px, double py, double ax, double ay, double bx, double by) {
+    double vx = bx - ax, vy = by - ay;
+    double len2 = vx * vx + vy * vy;
+    double t = (len2 > 1e-18) ? std::max(0.0, std::min(1.0, ((px - ax) * vx + (py - ay) * vy) / len2)) : 0.0;
+    return std::hypot(px - (ax + t * vx), py - (ay + t * vy));
+}
+
+double testSegSegDist(const nlohmann::json& a, const nlohmann::json& b) {
+    double ax = a["x1_mm"], ay = a["y1_mm"], bx = a["x2_mm"], by = a["y2_mm"];
+    double cx = b["x1_mm"], cy = b["y1_mm"], dx = b["x2_mm"], dy = b["y2_mm"];
+    auto cross = [](double ux, double uy, double vx, double vy) { return ux * vy - uy * vx; };
+    double d1 = cross(dx - cx, dy - cy, ax - cx, ay - cy);
+    double d2 = cross(dx - cx, dy - cy, bx - cx, by - cy);
+    double d3 = cross(bx - ax, by - ay, cx - ax, cy - ay);
+    double d4 = cross(bx - ax, by - ay, dx - ax, dy - ay);
+    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return 0.0;
+    return std::min({testPtSegDist(ax, ay, cx, cy, dx, dy), testPtSegDist(bx, by, cx, cy, dx, dy),
+                     testPtSegDist(cx, cy, ax, ay, bx, by), testPtSegDist(dx, dy, ax, ay, bx, by)});
+}
+
+bool testHasEndpointAt(const nlohmann::json& tracks, const std::string& net, double x, double y, double tol) {
+    for (const auto& t : tracks) {
+        if (t.value("net", "") != net) continue;
+        if ((std::fabs(t.value("x1_mm", 1e9) - x) < tol && std::fabs(t.value("y1_mm", 1e9) - y) < tol) ||
+            (std::fabs(t.value("x2_mm", 1e9) - x) < tol && std::fabs(t.value("y2_mm", 1e9) - y) < tol)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+TEST(EdaAccelerators_Unit, CalcPcbAutorouteSignedMilNumericFourLayerExactSnap) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // EasyEDA Pro style input: mil units, negative y, numeric layer IDs ("1" top, "2" bottom, "15" inner 1).
+    // No board size: the canvas must come from the copper bounding box, not clamp to cell 0.
+    nlohmann::json args = {
+        {"units", "mil"},
+        {"rules", {{"track_width_mm", 0.254}, {"clearance_mm", 0.2}, {"grid_step_mm", 0.1}}},
+        {"nets", nlohmann::json::array({
+            {{"name", "SIG_A"}, {"pads", nlohmann::json::array({
+                {{"x", 1000.0}, {"y", -6000.0}, {"width", 24.0}, {"height", 24.0}, {"layer", "1"}},
+                {{"x", 1600.0}, {"y", -5600.0}, {"width", 24.0}, {"height", 24.0}, {"layer", "2"}}
+            })}},
+            {{"name", "SIG_B"}, {"pads", nlohmann::json::array({
+                {{"x", 1000.0}, {"y", -5600.0}, {"width", 24.0}, {"height", 24.0}, {"layer", "15"}},
+                {{"x", 1600.0}, {"y", -6000.0}, {"width", 24.0}, {"height", 24.0}, {"layer", "1"}}
+            })}}
+        })}
+    };
+    nlohmann::json res = acc.calcPcbAutoroute(args, ok, summary);
+    CHECK_TRUE_TEXT(ok, summary.c_str());
+    CHECK_EQUAL(2, res.value("routed_nets", 0));
+    CHECK_EQUAL(0, res.value("drc_violations", -1));
+    STRCMP_EQUAL("copper_bbox", res["canvas"].value("mode", "").c_str());
+    STRCMP_EQUAL("easyeda_numeric", res.value("layer_style", "").c_str());
+    CHECK_EQUAL(4, res.value("layers", 0));
+    DOUBLES_EQUAL(0.1, res.value("grid_mm", 0.0), 1e-9);
+    CHECK_FALSE(res.value("grid_coarsened", true));
+
+    for (const auto& t : res["tracks"]) {
+        std::string ly = t.value("layer", "");
+        bool numeric = (ly == "1" || ly == "15" || ly == "16" || ly == "2");
+        CHECK_TRUE_TEXT(numeric, ly.c_str());
+        // mil and mm fields agree, and every vertex lies in the negative-y region
+        DOUBLES_EQUAL(t.value("x1_mm", 0.0) / 0.0254, t.value("x1", 0.0), 0.01);
+        DOUBLES_EQUAL(t.value("y2_mm", 0.0) / 0.0254, t.value("y2", 0.0), 0.01);
+        CHECK_TRUE(t.value("y1", 0.0) < -5400.0 && t.value("y1", 0.0) > -6200.0);
+    }
+    // Endpoints snapped to the exact pad centres (mil -> mm), not to the nearest grid cell
+    CHECK_TRUE(testHasEndpointAt(res["tracks"], "SIG_A", 1000.0 * 0.0254, -6000.0 * 0.0254, 1e-3));
+    CHECK_TRUE(testHasEndpointAt(res["tracks"], "SIG_A", 1600.0 * 0.0254, -5600.0 * 0.0254, 1e-3));
+    CHECK_TRUE(testHasEndpointAt(res["tracks"], "SIG_B", 1000.0 * 0.0254, -5600.0 * 0.0254, 1e-3));
+    CHECK_TRUE(testHasEndpointAt(res["tracks"], "SIG_B", 1600.0 * 0.0254, -6000.0 * 0.0254, 1e-3));
+
+    // Explicit units only: anything other than mm/mil is rejected instead of guessed
+    bool badOk = true;
+    nlohmann::json bad = acc.calcPcbAutoroute({{"units", "inch"}, {"nets", nlohmann::json::array()}}, badOk, summary);
+    CHECK_FALSE(badOk);
+    CHECK_FALSE(bad.value("ok", true));
+}
+
+TEST(EdaAccelerators_Unit, CalcPcbAutorouteAllLayerViaClearanceGuard) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // NET_V must go from a top pad at (5,10) to a bottom pad at (6,10). A foreign BottomLayer track
+    // runs vertically at x = 5.5. The bottom pad centre is 0.5 mm from it: legal for a track end
+    // (0.5*(0.25+0.25)+0.2 = 0.45) but NOT for a via (0.5*(0.25+0.6)+0.2 = 0.625). A centre-cell-only
+    // check would drop the via straight onto the bottom pad.
+    nlohmann::json args = {
+        {"board", {{"width_mm", 12.0}, {"height_mm", 20.0}, {"layers", 2}}},
+        {"rules", {{"track_width_mm", 0.25}, {"clearance_mm", 0.2}, {"via_size_mm", 0.6},
+                   {"via_drill_mm", 0.3}, {"grid_step_mm", 0.1}}},
+        {"existing_tracks", nlohmann::json::array({
+            {{"net", "FOREIGN"}, {"layer", "B.Cu"}, {"x1_mm", 5.5}, {"y1_mm", 0.5}, {"x2_mm", 5.5}, {"y2_mm", 19.5}, {"width_mm", 0.25}}
+        })},
+        {"nets", nlohmann::json::array({
+            {{"name", "NET_V"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 5.0}, {"y_mm", 10.0}, {"w_mm", 0.3}, {"h_mm", 0.3}, {"layer", "F.Cu"}},
+                {{"x_mm", 6.0}, {"y_mm", 10.0}, {"w_mm", 0.3}, {"h_mm", 0.3}, {"layer", "B.Cu"}}
+            })}}
+        })}
+    };
+    nlohmann::json res = acc.calcPcbAutoroute(args, ok, summary);
+    CHECK_TRUE_TEXT(ok, summary.c_str());
+    CHECK_EQUAL(0, res.value("drc_violations", -1));
+    CHECK_TRUE(res["vias"].size() >= 1);
+    for (const auto& v : res["vias"]) {
+        double d = testPtSegDist(v["x_mm"], v["y_mm"], 5.5, 0.5, 5.5, 19.5);
+        CHECK_TRUE_TEXT(d >= 0.625 - 1e-6, std::to_string(d).c_str());
+    }
+    // Bottom-layer copper of NET_V never crosses the foreign bottom track
+    for (const auto& t : res["tracks"]) {
+        if (t.value("layer", "") != "B.Cu") continue;
+        nlohmann::json foreign = {{"x1_mm", 5.5}, {"y1_mm", 0.5}, {"x2_mm", 5.5}, {"y2_mm", 19.5}};
+        CHECK_TRUE(testSegSegDist(t, foreign) >= 0.45 - 1e-3);
+    }
+}
+
+TEST(EdaAccelerators_Unit, CalcPcbAutorouteIslandSteinerTJunctionAndAlreadyConnected) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // NET_T: pads at (5,5) and (25,5) are already joined by an existing track; the third pad at
+    // (15,12) must be bridged with a single T-junction onto that track (~7 mm), not chained
+    // pad-to-pad (~11.4 mm). NET_DONE is fully connected by existing copper and needs nothing.
+    nlohmann::json args = {
+        {"board", {{"width_mm", 30.0}, {"height_mm", 20.0}, {"layers", 1}}},
+        {"rules", {{"track_width_mm", 0.25}, {"clearance_mm", 0.2}, {"grid_step_mm", 0.1}}},
+        {"existing_tracks", nlohmann::json::array({
+            {{"net", "NET_T"}, {"layer", "F.Cu"}, {"x1_mm", 5.0}, {"y1_mm", 5.0}, {"x2_mm", 25.0}, {"y2_mm", 5.0}, {"width_mm", 0.25}},
+            {{"net", "NET_DONE"}, {"layer", "F.Cu"}, {"x1_mm", 5.0}, {"y1_mm", 17.0}, {"x2_mm", 25.0}, {"y2_mm", 17.0}, {"width_mm", 0.25}}
+        })},
+        {"nets", nlohmann::json::array({
+            {{"name", "NET_T"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 5.0}, {"y_mm", 5.0}, {"w_mm", 0.6}, {"h_mm", 0.6}, {"layer", "F.Cu"}},
+                {{"x_mm", 25.0}, {"y_mm", 5.0}, {"w_mm", 0.6}, {"h_mm", 0.6}, {"layer", "F.Cu"}},
+                {{"x_mm", 15.0}, {"y_mm", 12.0}, {"w_mm", 0.6}, {"h_mm", 0.6}, {"layer", "F.Cu"}}
+            })}},
+            {{"name", "NET_DONE"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 5.0}, {"y_mm", 17.0}, {"w_mm", 0.6}, {"h_mm", 0.6}, {"layer", "F.Cu"}},
+                {{"x_mm", 25.0}, {"y_mm", 17.0}, {"w_mm", 0.6}, {"h_mm", 0.6}, {"layer", "F.Cu"}}
+            })}}
+        })}
+    };
+    nlohmann::json res = acc.calcPcbAutoroute(args, ok, summary);
+    CHECK_TRUE_TEXT(ok, summary.c_str());
+    CHECK_EQUAL(2, res.value("routed_nets", 0));
+    CHECK_EQUAL(1, res.value("already_connected_nets", 0));
+    CHECK_EQUAL(1, res.value("islands_bridged", 0));
+    CHECK_EQUAL(0, res.value("drc_violations", -1));
+
+    double newLen = 0.0;
+    bool tJunction = false;
+    for (const auto& t : res["tracks"]) {
+        CHECK_EQUAL(std::string("NET_T"), t.value("net", ""));
+        newLen += std::hypot(t.value("x2_mm", 0.0) - t.value("x1_mm", 0.0), t.value("y2_mm", 0.0) - t.value("y1_mm", 0.0));
+        for (const char* k : {"1", "2"}) {
+            double x = t.value(std::string("x") + k + "_mm", 0.0);
+            double y = t.value(std::string("y") + k + "_mm", 0.0);
+            if (std::fabs(y - 5.0) < 1e-6 && x > 6.0 && x < 24.0) tJunction = true;
+        }
+    }
+    CHECK_TRUE_TEXT(tJunction, "bridge must land on the existing NET_T track, not on a pad");
+    CHECK_TRUE_TEXT(newLen < 8.0, std::to_string(newLen).c_str());
+    CHECK_TRUE(testHasEndpointAt(res["tracks"], "NET_T", 15.0, 12.0, 1e-6));
+}
+
+TEST(EdaAccelerators_Unit, CalcPcbAutorouteInterNetClearanceAndGridCeiling) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // Two nets whose straight lines cross: on 2 layers one must via. Every same-layer pair of
+    // different-net tracks must hold 0.5*(w1+w2)+clearance, vias must clear foreign tracks on any
+    // layer by 0.5*(via+w)+clearance, and vias of different nets by via+clearance.
+    nlohmann::json args = {
+        {"board", {{"width_mm", 30.0}, {"height_mm", 14.0}, {"layers", 2}}},
+        {"rules", {{"track_width_mm", 0.25}, {"clearance_mm", 0.2}, {"via_size_mm", 0.6},
+                   {"via_drill_mm", 0.3}, {"grid_step_mm", 0.1}}},
+        {"nets", nlohmann::json::array({
+            {{"name", "N1"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 2.0}, {"y_mm", 5.0}, {"layer", "F.Cu"}}, {{"x_mm", 28.0}, {"y_mm", 8.0}, {"layer", "F.Cu"}}})}},
+            {{"name", "N2"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 2.0}, {"y_mm", 8.0}, {"layer", "F.Cu"}}, {{"x_mm", 28.0}, {"y_mm", 5.0}, {"layer", "F.Cu"}}})}}
+        })}
+    };
+    nlohmann::json res = acc.calcPcbAutoroute(args, ok, summary);
+    CHECK_TRUE_TEXT(ok, summary.c_str());
+    CHECK_EQUAL(0, res.value("drc_violations", -1));
+    const auto& tracks = res["tracks"];
+    const auto& vias = res["vias"];
+    CHECK_TRUE(vias.size() >= 1);
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        for (size_t j = i + 1; j < tracks.size(); ++j) {
+            if (tracks[i]["net"] == tracks[j]["net"] || tracks[i]["layer"] != tracks[j]["layer"]) continue;
+            double d = testSegSegDist(tracks[i], tracks[j]);
+            CHECK_TRUE_TEXT(d >= 0.45 - 1e-3, std::to_string(d).c_str());
+        }
+    }
+    for (const auto& v : vias) {
+        for (const auto& t : tracks) {
+            if (t["net"] == v["net"]) continue;
+            double d = testPtSegDist(v["x_mm"], v["y_mm"], t["x1_mm"], t["y1_mm"], t["x2_mm"], t["y2_mm"]);
+            CHECK_TRUE_TEXT(d >= 0.625 - 1e-3, std::to_string(d).c_str());
+        }
+        for (const auto& u : vias) {
+            if (u["net"] == v["net"]) continue;
+            double d = std::hypot(v.value("x_mm", 0.0) - u.value("x_mm", 0.0), v.value("y_mm", 0.0) - u.value("y_mm", 0.0));
+            CHECK_TRUE(d >= 0.8 - 1e-6);
+        }
+    }
+
+    // 80 x 80 mm at 0.10 mm stays fine (<= 640,000 cells/layer); 120 x 120 mm is coarsened.
+    nlohmann::json big = {
+        {"board", {{"width_mm", 79.8}, {"height_mm", 79.8}, {"layers", 2}}},
+        {"rules", {{"grid_step_mm", 0.1}}},
+        {"nets", nlohmann::json::array({
+            {{"name", "S"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 10.0}, {"y_mm", 10.0}, {"layer", "F.Cu"}}, {{"x_mm", 14.0}, {"y_mm", 10.0}, {"layer", "F.Cu"}}})}}
+        })}
+    };
+    nlohmann::json bigRes = acc.calcPcbAutoroute(big, ok, summary);
+    CHECK_TRUE_TEXT(ok, summary.c_str());
+    DOUBLES_EQUAL(0.1, bigRes.value("grid_mm", 0.0), 1e-9);
+    CHECK_FALSE(bigRes.value("grid_coarsened", true));
+    big["board"]["width_mm"] = 120.0;
+    big["board"]["height_mm"] = 120.0;
+    nlohmann::json hugeRes = acc.calcPcbAutoroute(big, ok, summary);
+    CHECK_TRUE_TEXT(ok, summary.c_str());
+    CHECK_TRUE(hugeRes.value("grid_coarsened", false));
+    CHECK_TRUE(hugeRes["grid_cells"].value("per_layer", 0LL) <= 640000LL);
+}
+
 TEST(EdaAccelerators_Unit, CalcSchematicErcAuditNominalTJunctionNegatedYAndFaults) {
     EdaAccelerators acc(_accCfg);
     bool ok = false;

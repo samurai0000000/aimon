@@ -6,14 +6,18 @@
 
 #include "EdaAccelerators.hxx"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <queue>
 #include <set>
 #include <sstream>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace aimon {
@@ -35,6 +39,96 @@ int toGridCoord(double valMm, double stepMm) {
 double fromGridCoord(int idx, double stepMm) {
     return static_cast<double>(idx) * stepMm;
 }
+
+constexpr double kMmPerMil = 0.0254;
+constexpr double kRouteMarginMm = 2.5;            // 100 mil routing margin around copper bbox
+constexpr int64_t kMaxRouteCellsPerLayer = 640000; // 0.10 mm grid on an 80 x 80 mm board
+constexpr int32_t kCellBlockAll = -1;              // obstacle / keepout / multi-net halo overlap
+
+double pointSegmentDistance(double px, double py, double ax, double ay, double bx, double by) {
+    double vx = bx - ax;
+    double vy = by - ay;
+    double len2 = vx * vx + vy * vy;
+    double t = 0.0;
+    if (len2 > 1e-18) {
+        t = std::clamp(((px - ax) * vx + (py - ay) * vy) / len2, 0.0, 1.0);
+    }
+    return std::hypot(px - (ax + t * vx), py - (ay + t * vy));
+}
+
+void closestPointOnSegment(double px, double py, double ax, double ay, double bx, double by,
+                           double& outX, double& outY) {
+    double vx = bx - ax;
+    double vy = by - ay;
+    double len2 = vx * vx + vy * vy;
+    double t = 0.0;
+    if (len2 > 1e-18) {
+        t = std::clamp(((px - ax) * vx + (py - ay) * vy) / len2, 0.0, 1.0);
+    }
+    outX = ax + t * vx;
+    outY = ay + t * vy;
+}
+
+// Proper (crossing) intersection only; touching/collinear cases yield distance 0 through the
+// endpoint-to-segment checks in segmentSegmentDistance().
+bool segmentsCross(double ax, double ay, double bx, double by,
+                   double cx, double cy, double dx, double dy) {
+    auto cross = [](double ux, double uy, double vx, double vy) { return ux * vy - uy * vx; };
+    double d1 = cross(dx - cx, dy - cy, ax - cx, ay - cy);
+    double d2 = cross(dx - cx, dy - cy, bx - cx, by - cy);
+    double d3 = cross(bx - ax, by - ay, cx - ax, cy - ay);
+    double d4 = cross(bx - ax, by - ay, dx - ax, dy - ay);
+    return ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) &&
+           ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0));
+}
+
+double segmentSegmentDistance(double ax, double ay, double bx, double by,
+                              double cx, double cy, double dx, double dy) {
+    if (segmentsCross(ax, ay, bx, by, cx, cy, dx, dy)) return 0.0;
+    return std::min({pointSegmentDistance(ax, ay, cx, cy, dx, dy),
+                     pointSegmentDistance(bx, by, cx, cy, dx, dy),
+                     pointSegmentDistance(cx, cy, ax, ay, bx, by),
+                     pointSegmentDistance(dx, dy, ax, ay, bx, by)});
+}
+
+// Euclidean distance from a point (in the rectangle's local frame) to an axis-aligned
+// rectangle centred at the origin with half extents (hw, hh). Zero inside.
+double pointRectDistanceLocal(double lx, double ly, double hw, double hh) {
+    double ex = std::max(std::fabs(lx) - hw, 0.0);
+    double ey = std::max(std::fabs(ly) - hh, 0.0);
+    return std::hypot(ex, ey);
+}
+
+double segmentRectDistanceLocal(double ax, double ay, double bx, double by, double hw, double hh) {
+    double best = std::min(pointRectDistanceLocal(ax, ay, hw, hh), pointRectDistanceLocal(bx, by, hw, hh));
+    if (best <= 0.0) return 0.0;
+    const double cxs[4] = {-hw, hw, hw, -hw};
+    const double cys[4] = {-hh, -hh, hh, hh};
+    for (int i = 0; i < 4; ++i) {
+        int j = (i + 1) % 4;
+        best = std::min(best, segmentSegmentDistance(ax, ay, bx, by, cxs[i], cys[i], cxs[j], cys[j]));
+    }
+    return best;
+}
+
+struct DisjointSet {
+    std::vector<int> parent;
+    explicit DisjointSet(size_t n) : parent(n) {
+        std::iota(parent.begin(), parent.end(), 0);
+    }
+    int find(int a) {
+        while (parent[static_cast<size_t>(a)] != a) {
+            parent[static_cast<size_t>(a)] = parent[static_cast<size_t>(parent[static_cast<size_t>(a)])];
+            a = parent[static_cast<size_t>(a)];
+        }
+        return a;
+    }
+    void unite(int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a != b) parent[static_cast<size_t>(b)] = a;
+    }
+};
 
 int layerPriorityForCategory(const std::string& cat) {
     if (cat == "connector" || cat == "input" || cat == "sensor") return 0;
@@ -742,23 +836,91 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
 nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                                                  bool& outSuccess,
                                                  std::string& outSummary) const {
-    if (!args.is_object() || !args.contains("nets") || !args["nets"].is_array()) {
+    auto fail = [&outSuccess, &outSummary](const std::string& msg) -> nlohmann::json {
         outSuccess = false;
-        outSummary = "eda_calc_pcb_autoroute requires nets[] array";
-        return {{"ok", false}, {"error", outSummary}};
+        outSummary = msg;
+        return {{"ok", false}, {"error", msg}};
+    };
+    if (!args.is_object() || !args.contains("nets") || !args["nets"].is_array()) {
+        return fail("eda_calc_pcb_autoroute requires nets[] array");
     }
 
+    // ---- 1. Coordinate units --------------------------------------------------------------
+    // *_mm keys are always millimetres. Bare keys (x, y, x1, width, diameter, drill, size_x, ...)
+    // are read in args.units ("mm" default, or "mil"). There is no magnitude-based guessing.
+    std::string units = "mm";
+    if (args.contains("units")) {
+        if (!args["units"].is_string()) {
+            return fail("eda_calc_pcb_autoroute: units must be \"mm\" or \"mil\"");
+        }
+        units = args["units"].get<std::string>();
+        std::transform(units.begin(), units.end(), units.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    }
+    if (units != "mm" && units != "mil") {
+        return fail("eda_calc_pcb_autoroute: units must be \"mm\" or \"mil\" (got \"" + units + "\")");
+    }
+    const double unitScale = (units == "mil") ? kMmPerMil : 1.0;
+
+    auto readNum = [](const nlohmann::json& o, std::initializer_list<const char*> keys,
+                      double defVal) -> double {
+        if (!o.is_object()) return defVal;
+        for (const char* k : keys) {
+            auto it = o.find(k);
+            if (it != o.end() && it->is_number()) return it->get<double>();
+        }
+        return defVal;
+    };
+    auto readLen = [unitScale](const nlohmann::json& o,
+                               std::initializer_list<const char*> mmKeys,
+                               std::initializer_list<const char*> bareKeys,
+                               double defMm) -> double {
+        if (!o.is_object()) return defMm;
+        for (const char* k : mmKeys) {
+            auto it = o.find(k);
+            if (it != o.end() && it->is_number()) return it->get<double>();
+        }
+        for (const char* k : bareKeys) {
+            auto it = o.find(k);
+            if (it != o.end() && it->is_number()) return it->get<double>() * unitScale;
+        }
+        return defMm;
+    };
+    auto netNameOf = [](const nlohmann::json& o, const std::string& defVal) -> std::string {
+        if (o.is_object() && o.contains("net") && o["net"].is_string()) {
+            return o["net"].get<std::string>();
+        }
+        return defVal;
+    };
+
+    // ---- 2. Board, layer stack and design rules -------------------------------------------
     double boardW = 40.0;
     double boardH = 30.0;
     int numLayers = 2;
+    bool layersExplicit = false;
     bool useEasyEdaNames = false;
+    bool boardOriginGiven = false;
+    double boardOriginX = 0.0;
+    double boardOriginY = 0.0;
     if (args.contains("board") && args["board"].is_object()) {
-        boardW = std::max(5.0, args["board"].value("width_mm", 40.0));
-        boardH = std::max(5.0, args["board"].value("height_mm", 30.0));
-        numLayers = std::clamp(args["board"].value("layers", 2), 1, 6);
-        std::string style = args["board"].value("layer_style", "");
-        if (style == "easyeda" || style == "EasyEDA") {
-            useEasyEdaNames = true;
+        const auto& b = args["board"];
+        boardW = std::max(5.0, readNum(b, {"width_mm"}, 40.0));
+        boardH = std::max(5.0, readNum(b, {"height_mm"}, 30.0));
+        if (b.contains("layers") && b["layers"].is_number()) {
+            numLayers = std::clamp(static_cast<int>(b["layers"].get<double>()), 1, 6);
+            layersExplicit = true;
+        }
+        if (b.contains("layer_style") && b["layer_style"].is_string()) {
+            std::string style = b["layer_style"].get<std::string>();
+            if (style == "easyeda" || style == "EasyEDA") {
+                useEasyEdaNames = true;
+            }
+        }
+        if (b.contains("origin_x_mm") && b["origin_x_mm"].is_number() &&
+            b.contains("origin_y_mm") && b["origin_y_mm"].is_number()) {
+            boardOriginGiven = true;
+            boardOriginX = b["origin_x_mm"].get<double>();
+            boardOriginY = b["origin_y_mm"].get<double>();
         }
     }
 
@@ -781,16 +943,45 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         return defVal;
     };
 
-    if (!useEasyEdaNames) {
-        for (const auto& n : args["nets"]) {
-            if (!n.is_object() || !n.contains("pads") || !n["pads"].is_array()) continue;
-            for (const auto& p : n["pads"]) {
-                if (p.is_object() && isEasyEdaLayerToken(extractLayerStr(p, ""))) {
-                    useEasyEdaNames = true;
-                    break;
-                }
-            }
+    // Detect layer naming style and the deepest inner layer referenced by any primitive.
+    bool useEasyEdaNumeric = false;
+    int innerLayersReferenced = 0;
+    auto scanLayerOf = [&](const nlohmann::json& o) {
+        if (!o.is_object()) return;
+        std::string l = extractLayerStr(o, "");
+        if (l.empty()) return;
+        if (isEasyEdaLayerToken(l)) useEasyEdaNames = true;
+        if (l == "1" || l == "2" || l == "15" || l == "16" || l == "17" || l == "18") {
+            useEasyEdaNumeric = true;
         }
+        int inner = 0;
+        if (l == "15" || l == "InnerLayer1" || l == "In1.Cu") inner = 1;
+        else if (l == "16" || l == "InnerLayer2" || l == "In2.Cu") inner = 2;
+        else if (l == "17" || l == "InnerLayer3" || l == "In3.Cu") inner = 3;
+        else if (l == "18" || l == "InnerLayer4" || l == "In4.Cu") inner = 4;
+        innerLayersReferenced = std::max(innerLayersReferenced, inner);
+    };
+    for (const auto& n : args["nets"]) {
+        if (!n.is_object() || !n.contains("pads") || !n["pads"].is_array()) continue;
+        for (const auto& p : n["pads"]) scanLayerOf(p);
+    }
+    for (const char* key : {"all_pads", "pads", "existing_tracks", "obstacles", "keepouts", "pours", "zones"}) {
+        if (!args.contains(key) || !args[key].is_array()) continue;
+        for (const auto& o : args[key]) scanLayerOf(o);
+    }
+
+    std::vector<std::string> warnings;
+    // Fabricated copper stackups are even (2/4/6): any inner-layer reference implies at least 4 layers.
+    int layersRequired = (innerLayersReferenced > 0) ? innerLayersReferenced + 2 : 0;
+    if (layersRequired % 2 != 0) ++layersRequired;
+    if (layersRequired > numLayers) {
+        if (layersExplicit) {
+            warnings.push_back("board.layers=" + std::to_string(numLayers) +
+                               " but primitives reference inner layer " +
+                               std::to_string(innerLayersReferenced) + "; routing grid expanded to " +
+                               std::to_string(std::min(6, layersRequired)) + " layers");
+        }
+        numLayers = std::min(6, layersRequired);
     }
 
     double trackWidthMm = std::max(0.08, args.value("track_width_mm", 0.25));
@@ -815,14 +1006,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             maxPasses = std::clamp(r["max_ripup_passes"].get<int>(), 1, 50);
         }
     }
-
-    int gxMax = std::max(4, static_cast<int>(std::ceil(boardW / gridMm)));
-    int gyMax = std::max(4, static_cast<int>(std::ceil(boardH / gridMm)));
-    if (gxMax * gyMax > 40000) {
-        gridMm = std::sqrt((boardW * boardH) / 25000.0);
-        gxMax = std::max(4, static_cast<int>(std::ceil(boardW / gridMm)));
-        gyMax = std::max(4, static_cast<int>(std::ceil(boardH / gridMm)));
-    }
+    const double requestedGridMm = gridMm;
 
     // Returns -1 for MultiLayer / PTH pads that span all copper layers
     auto layerNameToIdx = [&](const std::string& l) -> int {
@@ -844,6 +1028,11 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         return 0;
     };
     auto layerIdxToName = [&](int idx) -> std::string {
+        if (useEasyEdaNumeric) {
+            if (idx <= 0) return "1";
+            if (idx == numLayers - 1 && numLayers >= 2) return "2";
+            return std::to_string(14 + idx);
+        }
         if (useEasyEdaNames) {
             if (idx <= 0) return "TopLayer";
             if (idx == numLayers - 1 && numLayers >= 2) return "BottomLayer";
@@ -854,260 +1043,106 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         return "In" + std::to_string(idx) + ".Cu";
     };
 
-    auto nodeIdx = [&](int l, int x, int y) -> size_t {
-        return static_cast<size_t>((l * gyMax + y) * gxMax + x);
-    };
-    size_t totalCells = static_cast<size_t>(numLayers * gxMax * gyMax);
-    std::vector<uint8_t> obstacleMask(totalCells, 0);
-    std::vector<std::string> existingNetOwner(totalCells, "");
-
-    if (args.contains("obstacles") && args["obstacles"].is_array()) {
-        for (const auto& obs : args["obstacles"]) {
-            if (!obs.is_object()) continue;
-            double ox = obs.value("x_mm", obs.value("x", 0.0));
-            double oy = obs.value("y_mm", obs.value("y", 0.0));
-            double ow = obs.value("width_mm", obs.value("w_mm", obs.value("size_x", 1.0))) * 0.5 + clearanceMm;
-            double oh = obs.value("height_mm", obs.value("h_mm", obs.value("size_y", 1.0))) * 0.5 + clearanceMm;
-            int l = layerNameToIdx(extractLayerStr(obs, "F.Cu"));
-            int x0 = std::max(0, toGridCoord(ox - ow, gridMm));
-            int x1 = std::min(gxMax - 1, toGridCoord(ox + ow, gridMm));
-            int y0 = std::max(0, toGridCoord(oy - oh, gridMm));
-            int y1 = std::min(gyMax - 1, toGridCoord(oy + oh, gridMm));
-            for (int ly = 0; ly < numLayers; ++ly) {
-                if (l != -1 && ly != l) continue;
-                for (int y = y0; y <= y1; ++y) {
-                    for (int x = x0; x <= x1; ++x) {
-                        size_t cid = nodeIdx(ly, x, y);
-                        obstacleMask[cid] = 1;
-                        existingNetOwner[cid] = "__OBSTACLE__";
-                    }
-                }
-            }
-        }
-    }
-
-    // Rasterize keepouts[] (supports corner+w_mm/h_mm, x_min/x_max, or center+width_mm/height_mm)
-    if (args.contains("keepouts") && args["keepouts"].is_array()) {
-        for (const auto& ko : args["keepouts"]) {
-            if (!ko.is_object()) continue;
-            double xMin = 0.0, xMax = 0.0, yMin = 0.0, yMax = 0.0;
-            if (ko.contains("x_min") && ko.contains("x_max")) {
-                xMin = ko.value("x_min", 0.0);
-                xMax = ko.value("x_max", 0.0);
-                yMin = ko.value("y_min", 0.0);
-                yMax = ko.value("y_max", 0.0);
-            } else if (ko.contains("w_mm") || ko.contains("h_mm")) {
-                double kx = ko.value("x_mm", ko.value("x", 0.0));
-                double ky = ko.value("y_mm", ko.value("y", 0.0));
-                double kw = ko.value("w_mm", ko.value("width_mm", 1.0));
-                double kh = ko.value("h_mm", ko.value("height_mm", 1.0));
-                xMin = kx;
-                xMax = kx + kw;
-                yMin = ky;
-                yMax = ky + kh;
-            } else {
-                double kx = ko.value("x_mm", ko.value("x", 0.0));
-                double ky = ko.value("y_mm", ko.value("y", 0.0));
-                double kw = ko.value("width_mm", ko.value("size_x", 1.0));
-                double kh = ko.value("height_mm", ko.value("size_y", 1.0));
-                xMin = kx - 0.5 * kw;
-                xMax = kx + 0.5 * kw;
-                yMin = ky - 0.5 * kh;
-                yMax = ky + 0.5 * kh;
-            }
-            double padMargin = clearanceMm + 0.5 * trackWidthMm;
-            int l = layerNameToIdx(extractLayerStr(ko, "MultiLayer"));
-            int x0 = std::max(0, toGridCoord(xMin - padMargin, gridMm));
-            int x1 = std::min(gxMax - 1, toGridCoord(xMax + padMargin, gridMm));
-            int y0 = std::max(0, toGridCoord(yMin - padMargin, gridMm));
-            int y1 = std::min(gyMax - 1, toGridCoord(yMax + padMargin, gridMm));
-            for (int ly = 0; ly < numLayers; ++ly) {
-                if (l != -1 && ly != l) continue;
-                for (int y = y0; y <= y1; ++y) {
-                    for (int x = x0; x <= x1; ++x) {
-                        size_t cid = nodeIdx(ly, x, y);
-                        obstacleMask[cid] = 1;
-                        existingNetOwner[cid] = "__KEEPOUT__";
-                    }
-                }
-            }
-        }
-    }
-
-    // Rasterize pours[] / zones[] as net-owned copper areas
-    for (const char* pourKey : {"pours", "zones"}) {
-        if (!args.contains(pourKey) || !args[pourKey].is_array()) continue;
-        for (const auto& z : args[pourKey]) {
-            if (!z.is_object()) continue;
-            std::string netName = z.value("net", "");
-            int l = layerNameToIdx(extractLayerStr(z, "F.Cu"));
-            double xMin = 0.0, xMax = -1.0, yMin = 0.0, yMax = -1.0;
-            if (z.contains("x_min") && z.contains("x_max")) {
-                xMin = z.value("x_min", 0.0);
-                xMax = z.value("x_max", 0.0);
-                yMin = z.value("y_min", 0.0);
-                yMax = z.value("y_max", 0.0);
-            } else if (z.contains("w_mm") || z.contains("width_mm")) {
-                double zx = z.value("x_mm", z.value("x", 0.0));
-                double zy = z.value("y_mm", z.value("y", 0.0));
-                double zw = z.value("w_mm", z.value("width_mm", 0.0));
-                double zh = z.value("h_mm", z.value("height_mm", 0.0));
-                xMin = zx;
-                xMax = zx + zw;
-                yMin = zy;
-                yMax = zy + zh;
-            }
-            if (xMax >= xMin && yMax >= yMin) {
-                int x0 = std::max(0, toGridCoord(xMin - clearanceMm, gridMm));
-                int x1 = std::min(gxMax - 1, toGridCoord(xMax + clearanceMm, gridMm));
-                int y0 = std::max(0, toGridCoord(yMin - clearanceMm, gridMm));
-                int y1 = std::min(gyMax - 1, toGridCoord(yMax + clearanceMm, gridMm));
-                for (int ly = 0; ly < numLayers; ++ly) {
-                    if (l != -1 && ly != l) continue;
-                    for (int y = y0; y <= y1; ++y) {
-                        for (int x = x0; x <= x1; ++x) {
-                            size_t cid = nodeIdx(ly, x, y);
-                            obstacleMask[cid] = 1;
-                            if (existingNetOwner[cid].empty()) {
-                                existingNetOwner[cid] = netName.empty() ? "__POUR__" : netName;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Rasterize existing_tracks and existing_vias for incremental routing
-    if (args.contains("existing_tracks") && args["existing_tracks"].is_array()) {
-        for (const auto& et : args["existing_tracks"]) {
-            if (!et.is_object()) continue;
-            std::string netName = et.value("net", "");
-            int l = layerNameToIdx(extractLayerStr(et, "F.Cu"));
-            if (l < 0) l = 0;
-            double x1 = et.value("x1_mm", et.value("x1", 0.0));
-            double y1 = et.value("y1_mm", et.value("y1", 0.0));
-            double x2 = et.value("x2_mm", et.value("x2", 0.0));
-            double y2 = et.value("y2_mm", et.value("y2", 0.0));
-            double w = et.value("width_mm", et.value("width", trackWidthMm));
-            double halo = 0.5 * (w + trackWidthMm) + clearanceMm;
-            int haloCells = std::max(1, static_cast<int>(std::ceil(halo / gridMm)));
-
-            double segLen = std::hypot(x2 - x1, y2 - y1);
-            int steps = std::max(1, static_cast<int>(std::ceil(segLen / (gridMm * 0.5))));
-            for (int s = 0; s <= steps; ++s) {
-                double t = static_cast<double>(s) / static_cast<double>(steps);
-                int cx = std::clamp(toGridCoord(x1 + t * (x2 - x1), gridMm), 0, gxMax - 1);
-                int cy = std::clamp(toGridCoord(y1 + t * (y2 - y1), gridMm), 0, gyMax - 1);
-                existingNetOwner[nodeIdx(l, cx, cy)] = netName;
-                for (int dy = -haloCells; dy <= haloCells; ++dy) {
-                    for (int dx = -haloCells; dx <= haloCells; ++dx) {
-                        int nx = cx + dx;
-                        int ny = cy + dy;
-                        if (nx < 0 || nx >= gxMax || ny < 0 || ny >= gyMax) continue;
-                        size_t cid = nodeIdx(l, nx, ny);
-                        if (existingNetOwner[cid].empty()) {
-                            existingNetOwner[cid] = netName;
-                        }
-                        obstacleMask[cid] = 1;
-                    }
-                }
-            }
-        }
-    }
-
-    if (args.contains("existing_vias") && args["existing_vias"].is_array()) {
-        for (const auto& ev : args["existing_vias"]) {
-            if (!ev.is_object()) continue;
-            std::string netName = ev.value("net", "");
-            double vx = ev.value("x_mm", ev.value("x", 0.0));
-            double vy = ev.value("y_mm", ev.value("y", 0.0));
-            double vd = ev.value("size_mm", ev.value("diameter", viaSizeMm));
-            int haloCells = std::max(1, static_cast<int>(std::ceil((0.5 * vd + clearanceMm) / gridMm)));
-            int cx = std::clamp(toGridCoord(vx, gridMm), 0, gxMax - 1);
-            int cy = std::clamp(toGridCoord(vy, gridMm), 0, gyMax - 1);
-            for (int ly = 0; ly < numLayers; ++ly) {
-                for (int dy = -haloCells; dy <= haloCells; ++dy) {
-                    for (int dx = -haloCells; dx <= haloCells; ++dx) {
-                        int nx = cx + dx;
-                        int ny = cy + dy;
-                        if (nx < 0 || nx >= gxMax || ny < 0 || ny >= gyMax) continue;
-                        size_t cid = nodeIdx(ly, nx, ny);
-                        if (existingNetOwner[cid].empty()) {
-                            existingNetOwner[cid] = netName;
-                        }
-                        obstacleMask[cid] = 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // Helper to rasterize a rotated rectangular/oval/circular pad + clearance halo into obstacleMask
-    auto rasterizePadObstacle = [&](const nlohmann::json& p, const std::string& netName) {
-        if (!p.is_object()) return;
-        double px = p.value("x_mm", p.value("x", 0.0));
-        double py = p.value("y_mm", p.value("y", 0.0));
-        double pw = p.value("w_mm", p.value("width_mm", p.value("size_x", p.value("width", trackWidthMm))));
-        double ph = p.value("h_mm", p.value("height_mm", p.value("size_y", p.value("height", trackWidthMm))));
-        double rotDeg = p.value("rotation_deg", p.value("rotation", 0.0));
-        int l = layerNameToIdx(extractLayerStr(p, "F.Cu"));
-        if (p.value("drill_mm", p.value("drill", p.value("hole_diameter", 0.0))) > 0.0) {
-            l = -1;
-        }
-        double rad = rotDeg * kPi / 180.0;
-        double cosR = std::cos(rad);
-        double sinR = std::sin(rad);
-        double margin = clearanceMm + 0.5 * trackWidthMm;
-        double halfW = 0.5 * pw + margin;
-        double halfH = 0.5 * ph + margin;
-        double aabbRx = std::fabs(halfW * cosR) + std::fabs(halfH * sinR);
-        double aabbRy = std::fabs(halfW * sinR) + std::fabs(halfH * cosR);
-        int x0 = std::max(0, toGridCoord(px - aabbRx, gridMm));
-        int x1 = std::min(gxMax - 1, toGridCoord(px + aabbRx, gridMm));
-        int y0 = std::max(0, toGridCoord(py - aabbRy, gridMm));
-        int y1 = std::min(gyMax - 1, toGridCoord(py + aabbRy, gridMm));
-        std::string ownerTag = netName.empty() ? "__FOREIGN_PAD__" : netName;
-        for (int ly = 0; ly < numLayers; ++ly) {
-            if (l != -1 && ly != l) continue;
-            for (int gy = y0; gy <= y1; ++gy) {
-                double wy = fromGridCoord(gy, gridMm) - py;
-                for (int gx = x0; gx <= x1; ++gx) {
-                    double wx = fromGridCoord(gx, gridMm) - px;
-                    double lx = std::fabs(wx * cosR + wy * sinR);
-                    double lyLocal = std::fabs(-wx * sinR + wy * cosR);
-                    if (lx <= halfW + 1e-6 && lyLocal <= halfH + 1e-6) {
-                        size_t cid = nodeIdx(ly, gx, gy);
-                        obstacleMask[cid] = 1;
-                        if (existingNetOwner[cid].empty()) {
-                            existingNetOwner[cid] = ownerTag;
-                        }
-                    }
-                }
-            }
-        }
+    // ---- 3. Parse every primitive once into millimetre geometry ---------------------------
+    std::map<std::string, int32_t> netIdByName;
+    auto netIdFor = [&netIdByName](const std::string& name) -> int32_t {
+        if (name.empty() || name == "__FOREIGN_PAD__") return kCellBlockAll;
+        auto it = netIdByName.find(name);
+        if (it != netIdByName.end()) return it->second;
+        int32_t id = static_cast<int32_t>(netIdByName.size()) + 1;
+        netIdByName.emplace(name, id);
+        return id;
     };
 
-    for (const char* padArrKey : {"all_pads", "pads"}) {
-        if (args.contains(padArrKey) && args[padArrKey].is_array()) {
-            for (const auto& p : args[padArrKey]) {
-                if (!p.is_object()) continue;
-                rasterizePadObstacle(p, p.value("net", "__FOREIGN_PAD__"));
-            }
-        }
-    }
+    struct PadGeom {
+        double x = 0.0;
+        double y = 0.0;
+        double hw = 0.0;
+        double hh = 0.0;
+        double cosR = 1.0;
+        double sinR = 0.0;
+        int layer = 0; // -1 = all copper layers
+        int32_t netId = kCellBlockAll;
+    };
+    struct TrackGeom {
+        double x1 = 0.0;
+        double y1 = 0.0;
+        double x2 = 0.0;
+        double y2 = 0.0;
+        double w = 0.0;
+        int layer = 0;
+        int32_t netId = kCellBlockAll;
+    };
+    struct ViaGeom {
+        double x = 0.0;
+        double y = 0.0;
+        double d = 0.0;
+        int32_t netId = kCellBlockAll;
+    };
+    struct RectGeom {
+        double cx = 0.0;
+        double cy = 0.0;
+        double hw = 0.0;
+        double hh = 0.0;
+        int layer = -1;
+        int32_t ownerId = kCellBlockAll;
+        double margin = 0.0;
+        double viaMargin = -1.0; // < 0: does not block vias
+    };
 
-    struct PadCell {
-        int l = 0; // -1 means MultiLayer (all copper layers)
-        int x = 0;
-        int y = 0;
+    auto parsePad = [&](const nlohmann::json& p, int32_t netId) -> PadGeom {
+        PadGeom g;
+        g.x = readLen(p, {"x_mm"}, {"x"}, 0.0);
+        g.y = readLen(p, {"y_mm"}, {"y"}, 0.0);
+        double w = readLen(p, {"w_mm", "width_mm"}, {"size_x", "width"}, trackWidthMm);
+        double h = readLen(p, {"h_mm", "height_mm"}, {"size_y", "height"}, trackWidthMm);
+        g.hw = 0.5 * std::max(0.0, w);
+        g.hh = 0.5 * std::max(0.0, h);
+        double rad = readNum(p, {"rotation_deg", "rotation"}, 0.0) * kPi / 180.0;
+        g.cosR = std::cos(rad);
+        g.sinR = std::sin(rad);
+        g.layer = layerNameToIdx(extractLayerStr(p, "F.Cu"));
+        if (readLen(p, {"drill_mm"}, {"drill", "hole_diameter"}, 0.0) > 0.0) {
+            g.layer = -1;
+        }
+        g.netId = netId;
+        return g;
+    };
+
+    std::vector<PadGeom> staticPads;
+    std::vector<TrackGeom> tracksIn;
+    std::vector<ViaGeom> viasIn;
+    std::vector<RectGeom> rects;
+
+    struct CopperCell {
+        size_t cid = 0;
+        int island = 0;
+        double ex = 0.0;
+        double ey = 0.0;
+    };
+    struct Bridge {
+        std::vector<size_t> cells;
+        double sx = 0.0;
+        double sy = 0.0;
+        double ex = 0.0;
+        double ey = 0.0;
     };
     struct NetSpec {
         std::string name;
+        int32_t id = 0;
         double widthMm = 0.25;
-        std::vector<PadCell> pads;
-        std::vector<size_t> routedCells;
-        std::vector<std::vector<size_t>> pairPaths;
+        std::vector<PadGeom> pads;
+        std::vector<CopperCell> copper; // seed/goal cells of pad-bearing islands
+        int islandCount = 0;
+        int startIsland = 0;
+        int requiredIslands = 0;
+        int padlessIslands = 0;
+        std::vector<Bridge> bridges;
+        std::vector<size_t> centerCells;
+        std::vector<size_t> viaSites2D;
+        std::vector<size_t> haloCells;
+        std::vector<size_t> viaHalo2D;
+        std::vector<size_t> newVia2D;
         bool routed = false;
     };
 
@@ -1115,315 +1150,936 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
     for (const auto& n : args["nets"]) {
         if (!n.is_object() || !n.contains("pads") || !n["pads"].is_array()) continue;
         NetSpec ns;
-        ns.name = n.value("name", "NET_" + std::to_string(nets.size() + 1));
-        ns.widthMm = std::max(0.08, n.value("width_mm", n.value("track_width_mm", trackWidthMm)));
+        if (n.contains("name") && n["name"].is_string() && !n["name"].get<std::string>().empty()) {
+            ns.name = n["name"].get<std::string>();
+        } else {
+            ns.name = "NET_" + std::to_string(nets.size() + 1);
+        }
+        ns.id = netIdFor(ns.name);
+        ns.widthMm = std::max(0.08, readNum(n, {"width_mm", "track_width_mm"}, trackWidthMm));
         for (const auto& p : n["pads"]) {
             if (!p.is_object()) continue;
-            rasterizePadObstacle(p, ns.name);
-            PadCell pc;
-            pc.l = layerNameToIdx(extractLayerStr(p, "F.Cu"));
-            if (p.value("drill_mm", p.value("drill", p.value("hole_diameter", 0.0))) > 0.0) {
-                pc.l = -1;
-            }
-            pc.x = std::clamp(toGridCoord(p.value("x_mm", p.value("x", 0.0)), gridMm), 0, gxMax - 1);
-            pc.y = std::clamp(toGridCoord(p.value("y_mm", p.value("y", 0.0)), gridMm), 0, gyMax - 1);
-            ns.pads.push_back(pc);
+            PadGeom g = parsePad(p, ns.id);
+            staticPads.push_back(g);
+            ns.pads.push_back(g);
         }
-        if (ns.pads.size() >= 2) nets.push_back(ns);
+        if (ns.pads.size() >= 2) nets.push_back(std::move(ns));
+    }
+    for (const char* padArrKey : {"all_pads", "pads"}) {
+        if (!args.contains(padArrKey) || !args[padArrKey].is_array()) continue;
+        for (const auto& p : args[padArrKey]) {
+            if (!p.is_object()) continue;
+            staticPads.push_back(parsePad(p, netIdFor(netNameOf(p, ""))));
+        }
+    }
+    if (args.contains("existing_tracks") && args["existing_tracks"].is_array()) {
+        for (const auto& et : args["existing_tracks"]) {
+            if (!et.is_object()) continue;
+            TrackGeom t;
+            t.x1 = readLen(et, {"x1_mm"}, {"x1"}, 0.0);
+            t.y1 = readLen(et, {"y1_mm"}, {"y1"}, 0.0);
+            t.x2 = readLen(et, {"x2_mm"}, {"x2"}, 0.0);
+            t.y2 = readLen(et, {"y2_mm"}, {"y2"}, 0.0);
+            t.w = std::max(0.0, readLen(et, {"width_mm"}, {"width"}, trackWidthMm));
+            t.layer = std::max(0, layerNameToIdx(extractLayerStr(et, "F.Cu")));
+            t.netId = netIdFor(netNameOf(et, ""));
+            tracksIn.push_back(t);
+        }
+    }
+    if (args.contains("existing_vias") && args["existing_vias"].is_array()) {
+        for (const auto& ev : args["existing_vias"]) {
+            if (!ev.is_object()) continue;
+            ViaGeom v;
+            v.x = readLen(ev, {"x_mm"}, {"x"}, 0.0);
+            v.y = readLen(ev, {"y_mm"}, {"y"}, 0.0);
+            v.d = std::max(0.0, readLen(ev, {"size_mm", "diameter_mm"}, {"diameter"}, viaSizeMm));
+            v.netId = netIdFor(netNameOf(ev, ""));
+            viasIn.push_back(v);
+        }
+    }
+    if (args.contains("obstacles") && args["obstacles"].is_array()) {
+        for (const auto& obs : args["obstacles"]) {
+            if (!obs.is_object()) continue;
+            RectGeom r;
+            r.cx = readLen(obs, {"x_mm"}, {"x"}, 0.0);
+            r.cy = readLen(obs, {"y_mm"}, {"y"}, 0.0);
+            r.hw = 0.5 * readLen(obs, {"width_mm", "w_mm"}, {"size_x"}, 1.0);
+            r.hh = 0.5 * readLen(obs, {"height_mm", "h_mm"}, {"size_y"}, 1.0);
+            r.layer = layerNameToIdx(extractLayerStr(obs, "F.Cu"));
+            r.ownerId = kCellBlockAll;
+            r.margin = clearanceMm + 0.5 * trackWidthMm;
+            r.viaMargin = clearanceMm + 0.5 * viaSizeMm;
+            rects.push_back(r);
+        }
+    }
+    // keepouts[] support corner+w_mm/h_mm, x_min/x_max, or center+width_mm/height_mm
+    if (args.contains("keepouts") && args["keepouts"].is_array()) {
+        for (const auto& ko : args["keepouts"]) {
+            if (!ko.is_object()) continue;
+            double xMin = 0.0, xMax = 0.0, yMin = 0.0, yMax = 0.0;
+            if (ko.contains("x_min") && ko.contains("x_max")) {
+                xMin = readLen(ko, {}, {"x_min"}, 0.0);
+                xMax = readLen(ko, {}, {"x_max"}, 0.0);
+                yMin = readLen(ko, {}, {"y_min"}, 0.0);
+                yMax = readLen(ko, {}, {"y_max"}, 0.0);
+            } else if (ko.contains("w_mm") || ko.contains("h_mm")) {
+                double kx = readLen(ko, {"x_mm"}, {"x"}, 0.0);
+                double ky = readLen(ko, {"y_mm"}, {"y"}, 0.0);
+                double kw = readLen(ko, {"w_mm", "width_mm"}, {}, 1.0);
+                double kh = readLen(ko, {"h_mm", "height_mm"}, {}, 1.0);
+                xMin = kx;
+                xMax = kx + kw;
+                yMin = ky;
+                yMax = ky + kh;
+            } else {
+                double kx = readLen(ko, {"x_mm"}, {"x"}, 0.0);
+                double ky = readLen(ko, {"y_mm"}, {"y"}, 0.0);
+                double kw = readLen(ko, {"width_mm"}, {"size_x"}, 1.0);
+                double kh = readLen(ko, {"height_mm"}, {"size_y"}, 1.0);
+                xMin = kx - 0.5 * kw;
+                xMax = kx + 0.5 * kw;
+                yMin = ky - 0.5 * kh;
+                yMax = ky + 0.5 * kh;
+            }
+            if (xMax < xMin || yMax < yMin) continue;
+            RectGeom r;
+            r.cx = 0.5 * (xMin + xMax);
+            r.cy = 0.5 * (yMin + yMax);
+            r.hw = 0.5 * (xMax - xMin);
+            r.hh = 0.5 * (yMax - yMin);
+            r.layer = layerNameToIdx(extractLayerStr(ko, "MultiLayer"));
+            r.ownerId = kCellBlockAll;
+            r.margin = clearanceMm + 0.5 * trackWidthMm;
+            r.viaMargin = clearanceMm + 0.5 * viaSizeMm;
+            rects.push_back(r);
+        }
+    }
+    // pours[] / zones[] are net-owned copper areas on their layer. They do not block vias:
+    // EasyEDA / KiCad pours re-flood around vias, so treating planes as via obstacles would
+    // make every inner-plane 4-layer board unroutable.
+    for (const char* pourKey : {"pours", "zones"}) {
+        if (!args.contains(pourKey) || !args[pourKey].is_array()) continue;
+        for (const auto& z : args[pourKey]) {
+            if (!z.is_object()) continue;
+            double xMin = 0.0, xMax = -1.0, yMin = 0.0, yMax = -1.0;
+            if (z.contains("x_min") && z.contains("x_max")) {
+                xMin = readLen(z, {}, {"x_min"}, 0.0);
+                xMax = readLen(z, {}, {"x_max"}, 0.0);
+                yMin = readLen(z, {}, {"y_min"}, 0.0);
+                yMax = readLen(z, {}, {"y_max"}, 0.0);
+            } else if (z.contains("w_mm") || z.contains("width_mm")) {
+                double zx = readLen(z, {"x_mm"}, {"x"}, 0.0);
+                double zy = readLen(z, {"y_mm"}, {"y"}, 0.0);
+                double zw = readLen(z, {"w_mm", "width_mm"}, {}, 0.0);
+                double zh = readLen(z, {"h_mm", "height_mm"}, {}, 0.0);
+                xMin = zx;
+                xMax = zx + zw;
+                yMin = zy;
+                yMax = zy + zh;
+            }
+            if (xMax < xMin || yMax < yMin) continue;
+            RectGeom r;
+            r.cx = 0.5 * (xMin + xMax);
+            r.cy = 0.5 * (yMin + yMax);
+            r.hw = 0.5 * (xMax - xMin);
+            r.hh = 0.5 * (yMax - yMin);
+            r.layer = layerNameToIdx(extractLayerStr(z, "F.Cu"));
+            r.ownerId = netIdFor(netNameOf(z, ""));
+            r.margin = clearanceMm;
+            r.viaMargin = -1.0;
+            rects.push_back(r);
+        }
     }
 
-    // Ensure every net's own pad center cells are owned by that net so pin entry/exit is always legal
+    // ---- 4. Signed canvas origin and fine grid --------------------------------------------
+    // If every copper reference point lies inside [0, W] x [0, H] the legacy board box is kept.
+    // Otherwise (e.g. EasyEDA Pro y in [-6500, -3400] mil) the canvas is the copper bounding box
+    // plus a 2.5 mm routing margin, so negative coordinates never clamp to grid cell 0.
+    double cMinX = std::numeric_limits<double>::infinity();
+    double cMinY = std::numeric_limits<double>::infinity();
+    double cMaxX = -std::numeric_limits<double>::infinity();
+    double cMaxY = -std::numeric_limits<double>::infinity();
+    bool copperInsideBoard = true;
+    bool haveCopper = false;
+    auto addCopperPoint = [&](double x, double y, double ext) {
+        haveCopper = true;
+        cMinX = std::min(cMinX, x - ext);
+        cMinY = std::min(cMinY, y - ext);
+        cMaxX = std::max(cMaxX, x + ext);
+        cMaxY = std::max(cMaxY, y + ext);
+        if (x < -1e-9 || y < -1e-9 || x > boardW + 1e-9 || y > boardH + 1e-9) {
+            copperInsideBoard = false;
+        }
+    };
+    for (const auto& p : staticPads) addCopperPoint(p.x, p.y, std::hypot(p.hw, p.hh));
+    for (const auto& t : tracksIn) {
+        addCopperPoint(t.x1, t.y1, 0.5 * t.w);
+        addCopperPoint(t.x2, t.y2, 0.5 * t.w);
+    }
+    for (const auto& v : viasIn) addCopperPoint(v.x, v.y, 0.5 * v.d);
+
+    double originX = 0.0;
+    double originY = 0.0;
+    double spanX = boardW;
+    double spanY = boardH;
+    std::string canvasMode = "board";
+    if (boardOriginGiven) {
+        originX = boardOriginX;
+        originY = boardOriginY;
+        canvasMode = "board_origin";
+    } else if (haveCopper && !copperInsideBoard) {
+        originX = cMinX - kRouteMarginMm;
+        originY = cMinY - kRouteMarginMm;
+        spanX = std::max(1.0, (cMaxX - cMinX) + 2.0 * kRouteMarginMm);
+        spanY = std::max(1.0, (cMaxY - cMinY) + 2.0 * kRouteMarginMm);
+        canvasMode = "copper_bbox";
+    }
+
+    auto cellsFor = [](double span, double step) -> int {
+        return std::max(4, static_cast<int>(std::ceil(span / step)) + 1);
+    };
+    int gxMax = cellsFor(spanX, gridMm);
+    int gyMax = cellsFor(spanY, gridMm);
+    bool gridCoarsened = false;
+    if (static_cast<int64_t>(gxMax) * gyMax > kMaxRouteCellsPerLayer) {
+        gridMm = std::sqrt((spanX * spanY) / static_cast<double>(kMaxRouteCellsPerLayer));
+        for (int guard = 0; guard < 1000; ++guard) {
+            gxMax = cellsFor(spanX, gridMm);
+            gyMax = cellsFor(spanY, gridMm);
+            if (static_cast<int64_t>(gxMax) * gyMax <= kMaxRouteCellsPerLayer) break;
+            gridMm *= 1.01;
+        }
+        gridCoarsened = true;
+        std::ostringstream w;
+        w << "grid coarsened from " << requestedGridMm << " mm to " << gridMm
+          << " mm to stay within " << kMaxRouteCellsPerLayer << " cells/layer (canvas "
+          << spanX << " x " << spanY << " mm)";
+        warnings.push_back(w.str());
+    }
+
+    const size_t planeCells = static_cast<size_t>(gxMax) * static_cast<size_t>(gyMax);
+    const size_t totalCells = planeCells * static_cast<size_t>(numLayers);
+    auto nodeIdx = [gxMax, gyMax](int l, int x, int y) -> size_t {
+        return (static_cast<size_t>(l) * static_cast<size_t>(gyMax) + static_cast<size_t>(y)) *
+                   static_cast<size_t>(gxMax) + static_cast<size_t>(x);
+    };
+    auto planeIdx = [gxMax](int x, int y) -> size_t {
+        return static_cast<size_t>(y) * static_cast<size_t>(gxMax) + static_cast<size_t>(x);
+    };
+    auto decodeCell = [gxMax, gyMax](size_t cid, int& outL, int& outX, int& outY) {
+        outX = static_cast<int>(cid % static_cast<size_t>(gxMax));
+        size_t rem = cid / static_cast<size_t>(gxMax);
+        outY = static_cast<int>(rem % static_cast<size_t>(gyMax));
+        outL = static_cast<int>(rem / static_cast<size_t>(gyMax));
+    };
+    auto worldX = [&](int gx) -> double { return originX + static_cast<double>(gx) * gridMm; };
+    auto worldY = [&](int gy) -> double { return originY + static_cast<double>(gy) * gridMm; };
+    auto clampCell = [](double v, int maxIdx) -> int {
+        if (!(v > 0.0)) return 0;
+        if (v >= static_cast<double>(maxIdx)) return maxIdx;
+        return static_cast<int>(v);
+    };
+    auto cellX = [&](double x) -> int { return clampCell(std::round((x - originX) / gridMm), gxMax - 1); };
+    auto cellY = [&](double y) -> int { return clampCell(std::round((y - originY) / gridMm), gyMax - 1); };
+
+    // ---- 5. Static rasterization (int32 net ownership with conflict marking) --------------
+    // cellOwner: 0 = free, > 0 = only that net's copper/halo covers the cell,
+    // kCellBlockAll = obstacle/keepout or halos of two different nets overlap.
+    std::vector<int32_t> cellOwner(totalCells, 0);
+    std::vector<int32_t> viaOwner(planeCells, 0); // all-layer via annular-ring guard (2D)
+    auto markOwner = [](int32_t& slot, int32_t id) {
+        if (slot == 0) {
+            slot = id;
+        } else if (slot != id) {
+            slot = kCellBlockAll;
+        }
+    };
+    auto forEachCellNear = [&](double xMin, double xMax, double yMin, double yMax, double r,
+                               auto&& distFn, auto&& onCell) {
+        int x0 = clampCell(std::floor((xMin - r - originX) / gridMm), gxMax - 1);
+        int x1 = clampCell(std::ceil((xMax + r - originX) / gridMm), gxMax - 1);
+        int y0 = clampCell(std::floor((yMin - r - originY) / gridMm), gyMax - 1);
+        int y1 = clampCell(std::ceil((yMax + r - originY) / gridMm), gyMax - 1);
+        for (int gy = y0; gy <= y1; ++gy) {
+            double wy = worldY(gy);
+            for (int gx = x0; gx <= x1; ++gx) {
+                if (distFn(worldX(gx), wy) <= r + 1e-9) onCell(gx, gy);
+            }
+        }
+    };
+    // Grid discretization slack. A route is a polyline between cell centres whose segments are at
+    // most 2h long (h = half cell diagonal). If every centre of one polyline is >= R from a shape,
+    // every segment point is >= sqrt(R^2 - h^2). Inflating R = sqrt(r^2 + h^2) therefore guarantees
+    // clearance r against exact geometry (one discretized side), and R = sqrt(r^2 + 2h^2) between
+    // two discretized polylines. Via centres sit exactly on cell centres and need no slack.
+    const double gridHalfDiag = gridMm * 0.70710678118654752;
+    auto slack1 = [gridHalfDiag](double r) { return std::sqrt(r * r + gridHalfDiag * gridHalfDiag); };
+    auto slack2 = [gridHalfDiag](double r) { return std::sqrt(r * r + 2.0 * gridHalfDiag * gridHalfDiag); };
+    auto stampOwner = [&](int layer, int32_t id, double xMin, double xMax, double yMin, double yMax,
+                          double r, auto&& distFn) {
+        forEachCellNear(xMin, xMax, yMin, yMax, slack1(r), distFn, [&](int gx, int gy) {
+            for (int ly = 0; ly < numLayers; ++ly) {
+                if (layer != -1 && ly != layer) continue;
+                markOwner(cellOwner[nodeIdx(ly, gx, gy)], id);
+            }
+        });
+    };
+    auto stampVia = [&](int32_t id, double xMin, double xMax, double yMin, double yMax,
+                        double r, auto&& distFn) {
+        forEachCellNear(xMin, xMax, yMin, yMax, r, distFn, [&](int gx, int gy) {
+            markOwner(viaOwner[planeIdx(gx, gy)], id);
+        });
+    };
+
+    for (const auto& r : rects) {
+        auto dist = [&r](double wx, double wy) {
+            return pointRectDistanceLocal(wx - r.cx, wy - r.cy, r.hw, r.hh);
+        };
+        stampOwner(r.layer, r.ownerId, r.cx - r.hw, r.cx + r.hw, r.cy - r.hh, r.cy + r.hh, r.margin, dist);
+        if (r.viaMargin >= 0.0) {
+            stampVia(r.ownerId, r.cx - r.hw, r.cx + r.hw, r.cy - r.hh, r.cy + r.hh, r.viaMargin, dist);
+        }
+    }
+    // Exact Euclidean point-to-segment rasterization of existing tracks
+    for (const auto& t : tracksIn) {
+        auto dist = [&t](double wx, double wy) {
+            return pointSegmentDistance(wx, wy, t.x1, t.y1, t.x2, t.y2);
+        };
+        double xMin = std::min(t.x1, t.x2), xMax = std::max(t.x1, t.x2);
+        double yMin = std::min(t.y1, t.y2), yMax = std::max(t.y1, t.y2);
+        stampOwner(t.layer, t.netId, xMin, xMax, yMin, yMax, 0.5 * (t.w + trackWidthMm) + clearanceMm, dist);
+        stampVia(t.netId, xMin, xMax, yMin, yMax, 0.5 * (t.w + viaSizeMm) + clearanceMm, dist);
+    }
+    for (const auto& v : viasIn) {
+        auto dist = [&v](double wx, double wy) { return std::hypot(wx - v.x, wy - v.y); };
+        stampOwner(-1, v.netId, v.x, v.x, v.y, v.y, 0.5 * (v.d + trackWidthMm) + clearanceMm, dist);
+        stampVia(v.netId, v.x, v.x, v.y, v.y, 0.5 * (v.d + viaSizeMm) + clearanceMm, dist);
+    }
+    // Rotated rectangular pads with rounded (Euclidean) clearance halos
+    for (const auto& p : staticPads) {
+        auto dist = [&p](double wx, double wy) {
+            double dx = wx - p.x;
+            double dy = wy - p.y;
+            return pointRectDistanceLocal(dx * p.cosR + dy * p.sinR, -dx * p.sinR + dy * p.cosR, p.hw, p.hh);
+        };
+        double ax = std::fabs(p.hw * p.cosR) + std::fabs(p.hh * p.sinR);
+        double ay = std::fabs(p.hw * p.sinR) + std::fabs(p.hh * p.cosR);
+        stampOwner(p.layer, p.netId, p.x - ax, p.x + ax, p.y - ay, p.y + ay,
+                   clearanceMm + 0.5 * trackWidthMm, dist);
+        stampVia(p.netId, p.x - ax, p.x + ax, p.y - ay, p.y + ay, clearanceMm + 0.5 * viaSizeMm, dist);
+    }
+    // Every routed net's own pad centre cells are owned by that net so pin entry/exit is legal
     for (const auto& ns : nets) {
         for (const auto& pc : ns.pads) {
-            if (pc.l == -1) {
-                for (int ly = 0; ly < numLayers; ++ly) {
-                    size_t cid = nodeIdx(ly, pc.x, pc.y);
-                    existingNetOwner[cid] = ns.name;
-                }
-            } else {
-                size_t cid = nodeIdx(pc.l, pc.x, pc.y);
-                existingNetOwner[cid] = ns.name;
+            int gx = cellX(pc.x);
+            int gy = cellY(pc.y);
+            for (int ly = 0; ly < numLayers; ++ly) {
+                if (pc.layer != -1 && ly != pc.layer) continue;
+                cellOwner[nodeIdx(ly, gx, gy)] = ns.id;
             }
         }
     }
 
-    std::vector<int> occupancy(totalCells, 0);
-    std::vector<double> historyCost(totalCells, 1.0);
-    int ripupPassesUsed = 0;
-    int reroutedNetsCount = 0;
+    // ---- 6. Copper islands per net (union-find over pads, existing tracks and vias) -------
+    std::map<int32_t, std::vector<size_t>> tracksByNet;
+    std::map<int32_t, std::vector<size_t>> viasByNet;
+    for (size_t i = 0; i < tracksIn.size(); ++i) tracksByNet[tracksIn[i].netId].push_back(i);
+    for (size_t i = 0; i < viasIn.size(); ++i) viasByNet[viasIn[i].netId].push_back(i);
+    constexpr double kTouchEps = 1e-3;
 
-    // 8 octilinear 2D directions (dx, dy)
-    const int dx[8] = {1, -1, 0, 0, 1, 1, -1, -1};
-    const int dy[8] = {0, 0, 1, -1, 1, -1, 1, -1};
-    const double stepCost[8] = {1.0, 1.0, 1.0, 1.0, 1.4142, 1.4142, 1.4142, 1.4142};
+    for (auto& ns : nets) {
+        struct Elem {
+            int kind; // 0 = pad, 1 = track, 2 = via
+            size_t idx;
+        };
+        std::vector<Elem> elems;
+        for (size_t i = 0; i < ns.pads.size(); ++i) elems.push_back({0, i});
+        for (size_t ti : tracksByNet[ns.id]) elems.push_back({1, ti});
+        for (size_t vi : viasByNet[ns.id]) elems.push_back({2, vi});
+
+        auto padLocal = [](const PadGeom& p, double x, double y, double& lx, double& ly) {
+            double dx = x - p.x;
+            double dy = y - p.y;
+            lx = dx * p.cosR + dy * p.sinR;
+            ly = -dx * p.sinR + dy * p.cosR;
+        };
+        auto layersOverlap = [](int a, int b) { return a == -1 || b == -1 || a == b; };
+        auto touches = [&](const Elem& a, const Elem& b) -> bool {
+            const Elem& e1 = (a.kind <= b.kind) ? a : b;
+            const Elem& e2 = (a.kind <= b.kind) ? b : a;
+            if (e1.kind == 0 && e2.kind == 0) {
+                const PadGeom& p = ns.pads[e1.idx];
+                const PadGeom& q = ns.pads[e2.idx];
+                if (!layersOverlap(p.layer, q.layer)) return false;
+                double lx = 0.0, ly = 0.0;
+                padLocal(p, q.x, q.y, lx, ly);
+                if (pointRectDistanceLocal(lx, ly, p.hw, p.hh) <= kTouchEps) return true;
+                padLocal(q, p.x, p.y, lx, ly);
+                return pointRectDistanceLocal(lx, ly, q.hw, q.hh) <= kTouchEps;
+            }
+            if (e1.kind == 0 && e2.kind == 1) {
+                const PadGeom& p = ns.pads[e1.idx];
+                const TrackGeom& t = tracksIn[e2.idx];
+                if (!layersOverlap(p.layer, t.layer)) return false;
+                double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0;
+                padLocal(p, t.x1, t.y1, ax, ay);
+                padLocal(p, t.x2, t.y2, bx, by);
+                return segmentRectDistanceLocal(ax, ay, bx, by, p.hw, p.hh) <= 0.5 * t.w + kTouchEps;
+            }
+            if (e1.kind == 0 && e2.kind == 2) {
+                const PadGeom& p = ns.pads[e1.idx];
+                const ViaGeom& v = viasIn[e2.idx];
+                double lx = 0.0, ly = 0.0;
+                padLocal(p, v.x, v.y, lx, ly);
+                return pointRectDistanceLocal(lx, ly, p.hw, p.hh) <= 0.5 * v.d + kTouchEps;
+            }
+            if (e1.kind == 1 && e2.kind == 1) {
+                const TrackGeom& t = tracksIn[e1.idx];
+                const TrackGeom& u = tracksIn[e2.idx];
+                if (t.layer != u.layer) return false;
+                return segmentSegmentDistance(t.x1, t.y1, t.x2, t.y2, u.x1, u.y1, u.x2, u.y2) <=
+                       0.5 * (t.w + u.w) + kTouchEps;
+            }
+            if (e1.kind == 1 && e2.kind == 2) {
+                const TrackGeom& t = tracksIn[e1.idx];
+                const ViaGeom& v = viasIn[e2.idx];
+                return pointSegmentDistance(v.x, v.y, t.x1, t.y1, t.x2, t.y2) <= 0.5 * (t.w + v.d) + kTouchEps;
+            }
+            const ViaGeom& v = viasIn[e1.idx];
+            const ViaGeom& u = viasIn[e2.idx];
+            return std::hypot(v.x - u.x, v.y - u.y) <= 0.5 * (v.d + u.d) + kTouchEps;
+        };
+
+        DisjointSet ds(elems.size());
+        for (size_t i = 0; i < elems.size(); ++i) {
+            for (size_t j = i + 1; j < elems.size(); ++j) {
+                if (touches(elems[i], elems[j])) ds.unite(static_cast<int>(i), static_cast<int>(j));
+            }
+        }
+
+        // Rasterize seed/goal cells with exact world coordinates. Two elements landing on the
+        // same grid cell are merged: at grid resolution they cannot be bridged separately.
+        struct RawCell {
+            size_t cid;
+            int elem;
+            double ex;
+            double ey;
+        };
+        std::vector<RawCell> raw;
+        std::unordered_map<size_t, int> cellElem;
+        auto addCell = [&](size_t cid, int e, double ex, double ey) {
+            auto it = cellElem.find(cid);
+            if (it == cellElem.end()) {
+                cellElem.emplace(cid, e);
+                raw.push_back({cid, e, ex, ey});
+            } else {
+                ds.unite(it->second, e);
+            }
+        };
+        for (size_t ei = 0; ei < elems.size(); ++ei) {
+            const Elem& e = elems[ei];
+            int eIdx = static_cast<int>(ei);
+            if (e.kind == 0) {
+                const PadGeom& p = ns.pads[e.idx];
+                int gx = cellX(p.x);
+                int gy = cellY(p.y);
+                for (int ly = 0; ly < numLayers; ++ly) {
+                    if (p.layer != -1 && ly != p.layer) continue;
+                    addCell(nodeIdx(ly, gx, gy), eIdx, p.x, p.y);
+                }
+            } else if (e.kind == 2) {
+                const ViaGeom& v = viasIn[e.idx];
+                int gx = cellX(v.x);
+                int gy = cellY(v.y);
+                for (int ly = 0; ly < numLayers; ++ly) addCell(nodeIdx(ly, gx, gy), eIdx, v.x, v.y);
+            } else {
+                const TrackGeom& t = tracksIn[e.idx];
+                double len = std::hypot(t.x2 - t.x1, t.y2 - t.y1);
+                int steps = std::max(1, static_cast<int>(std::ceil(len / (0.5 * gridMm))));
+                for (int s = 0; s <= steps; ++s) {
+                    double u = static_cast<double>(s) / static_cast<double>(steps);
+                    int gx = cellX(t.x1 + u * (t.x2 - t.x1));
+                    int gy = cellY(t.y1 + u * (t.y2 - t.y1));
+                    double ex = 0.0, ey = 0.0;
+                    closestPointOnSegment(worldX(gx), worldY(gy), t.x1, t.y1, t.x2, t.y2, ex, ey);
+                    addCell(nodeIdx(t.layer, gx, gy), eIdx, ex, ey);
+                }
+            }
+        }
+
+        std::map<int, int> rootToIsland;
+        for (size_t ei = 0; ei < elems.size(); ++ei) {
+            int root = ds.find(static_cast<int>(ei));
+            if (rootToIsland.find(root) == rootToIsland.end()) {
+                int next = static_cast<int>(rootToIsland.size());
+                rootToIsland.emplace(root, next);
+            }
+        }
+        ns.islandCount = static_cast<int>(rootToIsland.size());
+        std::vector<char> hasPad(static_cast<size_t>(ns.islandCount), 0);
+        for (size_t ei = 0; ei < elems.size(); ++ei) {
+            if (elems[ei].kind == 0) hasPad[rootToIsland[ds.find(static_cast<int>(ei))]] = 1;
+        }
+        ns.requiredIslands = 0;
+        ns.padlessIslands = 0;
+        for (char hp : hasPad) {
+            if (hp) {
+                ++ns.requiredIslands;
+            } else {
+                ++ns.padlessIslands;
+            }
+        }
+        ns.startIsland = rootToIsland[ds.find(0)];
+        for (const auto& rc : raw) {
+            int isl = rootToIsland[ds.find(rc.elem)];
+            if (hasPad[isl]) ns.copper.push_back({rc.cid, isl, rc.ex, rc.ey});
+        }
+    }
+
+    // ---- 7. Negotiated-congestion (PathFinder) island-to-island multi-source A* -----------
+    std::vector<uint16_t> haloCount(totalCells, 0);       // nets whose new-track halo covers cell
+    std::vector<uint16_t> viaHaloCount2D(planeCells, 0);  // nets whose new copper is too close for a via
+    std::vector<uint16_t> newViaCount2D(planeCells, 0);   // nets whose new vias are within via pitch
+    std::vector<float> historyCost(totalCells, 1.0f);
+    std::vector<float> bestG(totalCells, 0.0f);
+    std::vector<uint32_t> visitGen(totalCells, 0);
+    std::vector<uint8_t> parentCode(totalCells, 0);
+    std::vector<uint32_t> markGen(totalCells, 0);
+    std::vector<int32_t> markRef(totalCells, 0);
+    std::vector<uint32_t> haloStamp(totalCells, 0);
+    std::vector<uint32_t> via2DStamp(planeCells, 0);
+    std::vector<uint32_t> newVia2DStamp(planeCells, 0);
+    uint32_t searchGen = 0;
+    uint32_t commitGen = 0;
+    std::vector<std::pair<double, double>> seedExact;
+
+    const int kDx[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+    const int kDy[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+    const float kStep[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f};
+    constexpr uint8_t kParentSeed = 255;
+    // Via cost expressed in grid steps: 1.25 mm of track equivalent (5 steps at the legacy 0.25 mm grid)
+    const float viaCostSteps = static_cast<float>(std::max(2.0, 1.25 / gridMm));
+
+    auto discOffsets = [&](double r) {
+        std::vector<std::pair<int, int>> offs;
+        int rc = static_cast<int>(std::ceil(r / gridMm));
+        for (int oy = -rc; oy <= rc; ++oy) {
+            for (int ox = -rc; ox <= rc; ++ox) {
+                if (std::hypot(static_cast<double>(ox), static_cast<double>(oy)) * gridMm <= r + 1e-9) {
+                    offs.emplace_back(ox, oy);
+                }
+            }
+        }
+        return offs;
+    };
+    const auto viaLayerHaloOffs = discOffsets(slack1(0.5 * (viaSizeMm + trackWidthMm) + clearanceMm));
+    const auto viaViaOffs = discOffsets(viaSizeMm + clearanceMm);
+
+    auto blockedFor = [&](size_t cid, int32_t id) -> bool {
+        int32_t o = cellOwner[cid];
+        return o != 0 && o != id;
+    };
+
+    struct ANode {
+        float f;
+        float g;
+        uint32_t id;
+        bool operator>(const ANode& o) const { return f > o.f; }
+    };
+
+    auto routeNet = [&](NetSpec& net, float presentFactor) -> bool {
+        net.bridges.clear();
+        if (net.requiredIslands <= 1) return true;
+        std::vector<char> inS(static_cast<size_t>(net.islandCount), 0);
+        inS[static_cast<size_t>(net.startIsland)] = 1;
+        int remaining = net.requiredIslands - 1;
+        std::vector<size_t> grownCells;
+
+        while (remaining > 0) {
+            ++searchGen;
+            if (searchGen == 0) {
+                std::fill(visitGen.begin(), visitGen.end(), 0u);
+                std::fill(markGen.begin(), markGen.end(), 0u);
+                searchGen = 1;
+            }
+            const uint32_t gen = searchGen;
+            seedExact.clear();
+
+            // Goals: every copper cell of every island not yet connected
+            int bx0 = std::numeric_limits<int>::max(), bx1 = -1;
+            int by0 = std::numeric_limits<int>::max(), by1 = -1;
+            for (size_t i = 0; i < net.copper.size(); ++i) {
+                const auto& cc = net.copper[i];
+                if (inS[static_cast<size_t>(cc.island)]) continue;
+                markGen[cc.cid] = gen;
+                markRef[cc.cid] = static_cast<int32_t>(i);
+                int l = 0, x = 0, y = 0;
+                decodeCell(cc.cid, l, x, y);
+                bx0 = std::min(bx0, x);
+                bx1 = std::max(bx1, x);
+                by0 = std::min(by0, y);
+                by1 = std::max(by1, y);
+            }
+            if (bx1 < 0) return false;
+            auto heuristic = [&](int x, int y) -> float {
+                int ddx = std::max({0, bx0 - x, x - bx1});
+                int ddy = std::max({0, by0 - y, y - by1});
+                float a = static_cast<float>(std::max(ddx, ddy));
+                float b = static_cast<float>(std::min(ddx, ddy));
+                return a + 0.41421356f * b;
+            };
+
+            std::priority_queue<ANode, std::vector<ANode>, std::greater<ANode>> pq;
+            auto addSeed = [&](size_t cid, double ex, double ey) {
+                if (markGen[cid] == gen) return;
+                markGen[cid] = gen;
+                markRef[cid] = -1 - static_cast<int32_t>(seedExact.size());
+                seedExact.emplace_back(ex, ey);
+                visitGen[cid] = gen;
+                bestG[cid] = 0.0f;
+                parentCode[cid] = kParentSeed;
+                int l = 0, x = 0, y = 0;
+                decodeCell(cid, l, x, y);
+                pq.push({heuristic(x, y), 0.0f, static_cast<uint32_t>(cid)});
+            };
+            // Seeds: all copper of the connected island set plus previously added bridges (g = 0)
+            for (const auto& cc : net.copper) {
+                if (inS[static_cast<size_t>(cc.island)]) addSeed(cc.cid, cc.ex, cc.ey);
+            }
+            for (size_t cid : grownCells) {
+                int l = 0, x = 0, y = 0;
+                decodeCell(cid, l, x, y);
+                addSeed(cid, worldX(x), worldY(y));
+            }
+
+            auto isGoal = [&](size_t cid) { return markGen[cid] == gen && markRef[cid] >= 0; };
+            auto relax = [&](size_t nid, float ng, uint8_t code, int nx, int ny) {
+                if (visitGen[nid] != gen || ng < bestG[nid]) {
+                    visitGen[nid] = gen;
+                    bestG[nid] = ng;
+                    parentCode[nid] = code;
+                    pq.push({ng + heuristic(nx, ny), ng, static_cast<uint32_t>(nid)});
+                }
+            };
+
+            size_t reached = std::numeric_limits<size_t>::max();
+            while (!pq.empty()) {
+                ANode cur = pq.top();
+                pq.pop();
+                if (cur.g > bestG[cur.id]) continue;
+                if (isGoal(cur.id)) {
+                    reached = cur.id;
+                    break;
+                }
+                int cl = 0, cx = 0, cy = 0;
+                decodeCell(cur.id, cl, cx, cy);
+
+                // Planar 8-way moves
+                for (int d = 0; d < 8; ++d) {
+                    int nx = cx + kDx[d];
+                    int ny = cy + kDy[d];
+                    if (nx < 0 || nx >= gxMax || ny < 0 || ny >= gyMax) continue;
+                    size_t nid = nodeIdx(cl, nx, ny);
+                    if (!isGoal(nid) && blockedFor(nid, net.id)) continue;
+                    float cong = 1.0f + static_cast<float>(haloCount[nid]) * presentFactor;
+                    if (d >= 4) {
+                        // Prevent diagonal corner cutting through obstacles or across another net
+                        size_t c1 = nodeIdx(cl, cx, ny);
+                        size_t c2 = nodeIdx(cl, nx, cy);
+                        if (blockedFor(c1, net.id) || blockedFor(c2, net.id)) continue;
+                        cong += 0.5f * static_cast<float>(haloCount[c1] + haloCount[c2]) * presentFactor;
+                    }
+                    relax(nid, cur.g + kStep[d] * historyCost[nid] * cong, static_cast<uint8_t>(d), nx, ny);
+                }
+
+                // Layer transition (through via): must clear foreign copper on ALL layers and
+                // every newly placed via of another net by via_size + clearance.
+                size_t pid = planeIdx(cx, cy);
+                if (viaOwner[pid] != 0 && viaOwner[pid] != net.id) continue;
+                if (newViaCount2D[pid] > 0) continue;
+                for (int nl = 0; nl < numLayers; ++nl) {
+                    if (nl == cl) continue;
+                    size_t nid = nodeIdx(nl, cx, cy);
+                    if (!isGoal(nid) && blockedFor(nid, net.id)) continue;
+                    float cong = 1.0f + static_cast<float>(haloCount[nid] + viaHaloCount2D[pid]) * presentFactor;
+                    relax(nid, cur.g + viaCostSteps * historyCost[nid] * cong,
+                          static_cast<uint8_t>(8 + cl), cx, cy);
+                }
+            }
+
+            if (reached == std::numeric_limits<size_t>::max()) {
+                net.bridges.clear();
+                return false;
+            }
+
+            Bridge br;
+            size_t c = reached;
+            for (size_t guard = 0; guard <= totalCells; ++guard) {
+                br.cells.push_back(c);
+                uint8_t code = parentCode[c];
+                if (code == kParentSeed) break;
+                int l = 0, x = 0, y = 0;
+                decodeCell(c, l, x, y);
+                if (code < 8) {
+                    c = nodeIdx(l, x - kDx[code], y - kDy[code]);
+                } else {
+                    c = nodeIdx(static_cast<int>(code) - 8, x, y);
+                }
+            }
+            std::reverse(br.cells.begin(), br.cells.end());
+            int32_t seedRef = markRef[br.cells.front()];
+            if (seedRef >= 0 || static_cast<size_t>(-1 - seedRef) >= seedExact.size()) {
+                net.bridges.clear();
+                return false;
+            }
+            br.sx = seedExact[static_cast<size_t>(-1 - seedRef)].first;
+            br.sy = seedExact[static_cast<size_t>(-1 - seedRef)].second;
+            const CopperCell& goalCell = net.copper[static_cast<size_t>(markRef[reached])];
+            br.ex = goalCell.ex;
+            br.ey = goalCell.ey;
+            inS[static_cast<size_t>(goalCell.island)] = 1;
+            --remaining;
+            grownCells.insert(grownCells.end(), br.cells.begin(), br.cells.end());
+            net.bridges.push_back(std::move(br));
+        }
+        return true;
+    };
+
+    auto commitNet = [&](NetSpec& net) {
+        ++commitGen;
+        if (commitGen == 0) {
+            std::fill(haloStamp.begin(), haloStamp.end(), 0u);
+            std::fill(via2DStamp.begin(), via2DStamp.end(), 0u);
+            std::fill(newVia2DStamp.begin(), newVia2DStamp.end(), 0u);
+            commitGen = 1;
+        }
+        const uint32_t gen = commitGen;
+        const auto trackHaloOffs = discOffsets(slack2(0.5 * (net.widthMm + trackWidthMm) + clearanceMm));
+        const auto trackViaOffs = discOffsets(slack1(0.5 * (net.widthMm + viaSizeMm) + clearanceMm));
+        auto addHalo = [&](int l, int x, int y, const std::vector<std::pair<int, int>>& offs) {
+            for (const auto& o : offs) {
+                int nx = x + o.first;
+                int ny = y + o.second;
+                if (nx < 0 || nx >= gxMax || ny < 0 || ny >= gyMax) continue;
+                size_t cid = nodeIdx(l, nx, ny);
+                if (haloStamp[cid] == gen) continue;
+                haloStamp[cid] = gen;
+                ++haloCount[cid];
+                net.haloCells.push_back(cid);
+            }
+        };
+        auto add2D = [&](int x, int y, const std::vector<std::pair<int, int>>& offs,
+                         std::vector<uint32_t>& stamp, std::vector<uint16_t>& count,
+                         std::vector<size_t>& record) {
+            for (const auto& o : offs) {
+                int nx = x + o.first;
+                int ny = y + o.second;
+                if (nx < 0 || nx >= gxMax || ny < 0 || ny >= gyMax) continue;
+                size_t pid = planeIdx(nx, ny);
+                if (stamp[pid] == gen) continue;
+                stamp[pid] = gen;
+                ++count[pid];
+                record.push_back(pid);
+            }
+        };
+        for (const auto& br : net.bridges) {
+            int pl = -1, px = -1, py = -1;
+            for (size_t k = 0; k < br.cells.size(); ++k) {
+                int l = 0, x = 0, y = 0;
+                decodeCell(br.cells[k], l, x, y);
+                net.centerCells.push_back(br.cells[k]);
+                addHalo(l, x, y, trackHaloOffs);
+                add2D(x, y, trackViaOffs, via2DStamp, viaHaloCount2D, net.viaHalo2D);
+                if (k > 0 && l != pl && x == px && y == py) {
+                    for (int ly = 0; ly < numLayers; ++ly) addHalo(ly, x, y, viaLayerHaloOffs);
+                    add2D(x, y, viaViaOffs, via2DStamp, viaHaloCount2D, net.viaHalo2D);
+                    add2D(x, y, viaViaOffs, newVia2DStamp, newViaCount2D, net.newVia2D);
+                    net.viaSites2D.push_back(planeIdx(x, y));
+                }
+                pl = l;
+                px = x;
+                py = y;
+            }
+        }
+        std::sort(net.centerCells.begin(), net.centerCells.end());
+        net.centerCells.erase(std::unique(net.centerCells.begin(), net.centerCells.end()), net.centerCells.end());
+        std::sort(net.viaSites2D.begin(), net.viaSites2D.end());
+        net.viaSites2D.erase(std::unique(net.viaSites2D.begin(), net.viaSites2D.end()), net.viaSites2D.end());
+        net.routed = true;
+    };
+
+    auto ripUpNet = [&](NetSpec& net) {
+        for (size_t cid : net.haloCells) {
+            if (haloCount[cid] > 0) --haloCount[cid];
+        }
+        for (size_t pid : net.viaHalo2D) {
+            if (viaHaloCount2D[pid] > 0) --viaHaloCount2D[pid];
+        }
+        for (size_t pid : net.newVia2D) {
+            if (newViaCount2D[pid] > 0) --newViaCount2D[pid];
+        }
+        net.haloCells.clear();
+        net.viaHalo2D.clear();
+        net.newVia2D.clear();
+        net.centerCells.clear();
+        net.viaSites2D.clear();
+        net.bridges.clear();
+        net.routed = false;
+    };
+
+    // A net's own halo always covers its own centreline, so any count > 1 is another net
+    auto netViolations = [&](const NetSpec& net) -> int {
+        int v = 0;
+        for (size_t cid : net.centerCells) {
+            if (haloCount[cid] > 1) ++v;
+        }
+        for (size_t pid : net.viaSites2D) {
+            if (viaHaloCount2D[pid] > 1) ++v;
+        }
+        return v;
+    };
 
     std::vector<size_t> netOrder(nets.size());
     for (size_t i = 0; i < nets.size(); ++i) netOrder[i] = i;
+    int ripupPassesUsed = 0;
+    int reroutedNetsCount = 0;
 
     for (int pass = 0; pass < maxPasses; ++pass) {
-        double presentFactor = 1.0 + pass * 2.5;
+        float presentFactor = 1.0f + static_cast<float>(pass) * 2.5f;
         bool anyCongestion = false;
-        for (size_t c = 0; c < totalCells; ++c) {
-            if (occupancy[c] > 1) {
-                anyCongestion = true;
-                historyCost[c] += (occupancy[c] - 1) * 1.5;
-            }
-        }
         bool allRouted = true;
         for (const auto& n : nets) {
-            if (!n.routed) allRouted = false;
+            if (!n.routed) {
+                allRouted = false;
+                continue;
+            }
+            for (size_t cid : n.centerCells) {
+                if (haloCount[cid] > 1) {
+                    anyCongestion = true;
+                    historyCost[cid] += 1.5f * static_cast<float>(haloCount[cid] - 1);
+                }
+            }
+            for (size_t pid : n.viaSites2D) {
+                if (viaHaloCount2D[pid] > 1) {
+                    anyCongestion = true;
+                    int vx = static_cast<int>(pid % static_cast<size_t>(gxMax));
+                    int vy = static_cast<int>(pid / static_cast<size_t>(gxMax));
+                    for (int ly = 0; ly < numLayers; ++ly) {
+                        historyCost[nodeIdx(ly, vx, vy)] += 1.5f * static_cast<float>(viaHaloCount2D[pid] - 1);
+                    }
+                }
+            }
         }
         if (pass > 0 && !anyCongestion && allRouted) {
             break;
         }
 
-        // Identify all nets participating in congestion or unrouted before ripping up
-        std::vector<size_t> netsToReroute;
+        // Rip up every net that is unrouted or violates clearance against another net
         if (pass > 0) {
+            std::vector<size_t> netsToReroute;
             for (size_t idx : netOrder) {
-                auto& net = nets[idx];
-                bool sharesOveruse = !net.routed;
-                for (size_t c : net.routedCells) {
-                    if (occupancy[c] > 1) {
-                        sharesOveruse = true;
-                        break;
-                    }
-                }
-                if (sharesOveruse) {
-                    netsToReroute.push_back(idx);
-                }
+                if (!nets[idx].routed || netViolations(nets[idx]) > 0) netsToReroute.push_back(idx);
             }
             if (!netsToReroute.empty()) {
                 ++ripupPassesUsed;
-                // Rip up all conflicting nets simultaneously and reorder shorter/previously-later nets first
-                for (size_t idx : netsToReroute) {
-                    auto& net = nets[idx];
-                    for (size_t c : net.routedCells) {
-                        occupancy[c] = std::max(0, occupancy[c] - 1);
-                    }
-                    net.routedCells.clear();
-                    net.pairPaths.clear();
-                    net.routed = false;
-                }
+                for (size_t idx : netsToReroute) ripUpNet(nets[idx]);
                 std::reverse(netOrder.begin(), netOrder.end());
             }
         }
 
         for (size_t idx : netOrder) {
             auto& net = nets[idx];
-            if (pass > 0 && net.routed) {
-                continue;
-            }
-            if (pass > 0) {
-                ++reroutedNetsCount;
-            }
-
-            std::set<size_t> netCells;
-            std::vector<std::vector<size_t>> pairPaths;
-            bool okNet = true;
-            for (size_t pIdx = 0; pIdx + 1 < net.pads.size(); ++pIdx) {
-                PadCell src = net.pads[pIdx];
-                PadCell dst = net.pads[pIdx + 1];
-
-                struct ANode {
-                    double f;
-                    double g;
-                    size_t id;
-                    bool operator>(const ANode& o) const { return f > o.f; }
-                };
-                std::priority_queue<ANode, std::vector<ANode>, std::greater<ANode>> pq;
-                std::vector<double> bestG(totalCells, std::numeric_limits<double>::infinity());
-                std::vector<size_t> parent(totalCells, std::numeric_limits<size_t>::max());
-
-                auto heuristic = [&](int l, int x, int y) {
-                    double ddx = std::abs(x - dst.x);
-                    double ddy = std::abs(y - dst.y);
-                    double oct = (ddx + ddy) + (1.4142 - 2.0) * std::min(ddx, ddy);
-                    double layerPen = (dst.l != -1 && l != dst.l) ? 4.0 : 0.0;
-                    return oct + layerPen;
-                };
-
-                auto isGoalCell = [&](int l, int x, int y) -> bool {
-                    if (x != dst.x || y != dst.y) return false;
-                    return (dst.l == -1 || l == dst.l);
-                };
-
-                auto isCellBlockedForNet = [&](size_t cid) -> bool {
-                    if (!obstacleMask[cid]) return false;
-                    if (!existingNetOwner[cid].empty() && existingNetOwner[cid] == net.name) {
-                        return false;
-                    }
-                    return true;
-                };
-
-                if (src.l == -1) {
-                    for (int ly = 0; ly < numLayers; ++ly) {
-                        size_t sid = nodeIdx(ly, src.x, src.y);
-                        bestG[sid] = 0.0;
-                        pq.push({heuristic(ly, src.x, src.y), 0.0, sid});
-                    }
-                } else {
-                    size_t sid = nodeIdx(src.l, src.x, src.y);
-                    bestG[sid] = 0.0;
-                    pq.push({heuristic(src.l, src.x, src.y), 0.0, sid});
-                }
-
-                bool segFound = false;
-                size_t reachedGoalId = std::numeric_limits<size_t>::max();
-
-                while (!pq.empty()) {
-                    ANode cur = pq.top();
-                    pq.pop();
-
-                    int rem = static_cast<int>(cur.id);
-                    int cx = rem % gxMax;
-                    rem /= gxMax;
-                    int cy = rem % gyMax;
-                    int cl = rem / gyMax;
-
-                    if (isGoalCell(cl, cx, cy)) {
-                        segFound = true;
-                        reachedGoalId = cur.id;
-                        break;
-                    }
-                    if (cur.g > bestG[cur.id]) continue;
-
-                    // Planar 8-way moves
-                    for (int d = 0; d < 8; ++d) {
-                        int nx = cx + dx[d];
-                        int ny = cy + dy[d];
-                        if (nx < 0 || nx >= gxMax || ny < 0 || ny >= gyMax) continue;
-                        size_t nid = nodeIdx(cl, nx, ny);
-                        if (!isGoalCell(cl, nx, ny) && isCellBlockedForNet(nid)) continue;
-                        if (d >= 4) {
-                            // Prevent diagonal corner cutting through obstacles or across another net
-                            size_t c1 = nodeIdx(cl, cx, ny);
-                            size_t c2 = nodeIdx(cl, nx, cy);
-                            if (isCellBlockedForNet(c1) || isCellBlockedForNet(c2)) continue;
-                        }
-                        double cong = 1.0 + occupancy[nid] * presentFactor;
-                        if (d >= 4) {
-                            cong += 0.5 * (occupancy[nodeIdx(cl, cx, ny)] + occupancy[nodeIdx(cl, nx, cy)]) * presentFactor;
-                        }
-                        double stepMult = (!existingNetOwner[nid].empty() && existingNetOwner[nid] == net.name)
-                                              ? 0.1
-                                              : stepCost[d];
-                        double ng = cur.g + stepMult * historyCost[nid] * cong;
-                        if (ng < bestG[nid]) {
-                            bestG[nid] = ng;
-                            parent[nid] = cur.id;
-                            pq.push({ng + heuristic(cl, nx, ny), ng, nid});
-                        }
-                    }
-
-                    // Layer transition (via)
-                    for (int nl = 0; nl < numLayers; ++nl) {
-                        if (nl == cl) continue;
-                        size_t nid = nodeIdx(nl, cx, cy);
-                        if (!isGoalCell(nl, cx, cy) && isCellBlockedForNet(nid)) continue;
-                        double cong = 1.0 + occupancy[nid] * presentFactor;
-                        double ng = cur.g + 5.0 * historyCost[nid] * cong;
-                        if (ng < bestG[nid]) {
-                            bestG[nid] = ng;
-                            parent[nid] = cur.id;
-                            pq.push({ng + heuristic(nl, cx, cy), ng, nid});
-                        }
-                    }
-                }
-
-                if (!segFound) {
-                    okNet = false;
-                    break;
-                }
-                std::vector<size_t> ordered;
-                size_t cur = reachedGoalId;
-                while (cur != std::numeric_limits<size_t>::max()) {
-                    netCells.insert(cur);
-                    ordered.push_back(cur);
-                    size_t par = parent[cur];
-                    if (par != std::numeric_limits<size_t>::max()) {
-                        int r1 = static_cast<int>(cur);
-                        int x1 = r1 % gxMax; r1 /= gxMax;
-                        int y1 = r1 % gyMax; int l1 = r1 / gyMax;
-                        int r2 = static_cast<int>(par);
-                        int x2 = r2 % gxMax; r2 /= gxMax;
-                        int y2 = r2 % gyMax; int l2 = r2 / gyMax;
-                        if (l1 == l2 && x1 != x2 && y1 != y2) {
-                            netCells.insert(nodeIdx(l1, x1, y2));
-                        }
-                    }
-                    cur = par;
-                }
-                std::reverse(ordered.begin(), ordered.end());
-                pairPaths.push_back(std::move(ordered));
-            }
-
-            if (okNet) {
-                net.routed = true;
-                net.routedCells.assign(netCells.begin(), netCells.end());
-                net.pairPaths = std::move(pairPaths);
-                for (size_t c : net.routedCells) {
-                    occupancy[c] += 1;
-                }
+            if (pass > 0 && net.routed) continue;
+            if (pass > 0) ++reroutedNetsCount;
+            if (routeNet(net, presentFactor)) {
+                commitNet(net);
+            } else {
+                net.routed = false;
             }
         }
     }
 
     int drcViolations = 0;
-    for (size_t c = 0; c < totalCells; ++c) {
-        if (occupancy[c] > 1) ++drcViolations;
+    for (const auto& net : nets) {
+        if (net.routed) drcViolations += netViolations(net);
     }
 
+    // ---- 8. Emit tracks/vias in mm and mil with exact endpoint snapping -------------------
+    auto r4 = [](double v) { return std::round(v * 1e4) / 1e4; };
+    auto toMil = [](double mm) { return std::round(mm / kMmPerMil * 1e3) / 1e3; };
     nlohmann::json tracksJson = nlohmann::json::array();
     nlohmann::json viasJson = nlohmann::json::array();
+    nlohmann::json unroutedNames = nlohmann::json::array();
     int routedCount = 0;
     int unroutedCount = 0;
+    int alreadyConnected = 0;
+    int bridgesCount = 0;
+    int padlessIslandsIgnored = 0;
 
-    auto decodeCell = [&](size_t cid, int& outL, int& outX, int& outY) {
-        int rem = static_cast<int>(cid);
-        outX = rem % gxMax;
-        rem /= gxMax;
-        outY = rem % gyMax;
-        outL = rem / gyMax;
+    auto emitTrack = [&](const NetSpec& net, int layer, double x1, double y1, double x2, double y2) {
+        if (std::hypot(x2 - x1, y2 - y1) < 1e-6) return;
+        tracksJson.push_back({
+            {"net", net.name},
+            {"layer", layerIdxToName(layer)},
+            {"x1_mm", r4(x1)},
+            {"y1_mm", r4(y1)},
+            {"x2_mm", r4(x2)},
+            {"y2_mm", r4(y2)},
+            {"width_mm", r4(net.widthMm)},
+            {"x1", toMil(x1)},
+            {"y1", toMil(y1)},
+            {"x2", toMil(x2)},
+            {"y2", toMil(y2)},
+            {"width", toMil(net.widthMm)}
+        });
     };
 
     for (const auto& net : nets) {
-        if (!net.routed || net.routedCells.empty()) {
+        padlessIslandsIgnored += net.padlessIslands;
+        if (!net.routed) {
             ++unroutedCount;
+            unroutedNames.push_back(net.name);
             continue;
         }
         ++routedCount;
-
-        for (const auto& path : net.pairPaths) {
-            if (path.size() < 2) continue;
+        if (net.bridges.empty()) {
+            ++alreadyConnected;
+            continue;
+        }
+        std::set<size_t> emittedVias;
+        for (const auto& br : net.bridges) {
+            if (br.cells.empty()) continue;
+            ++bridgesCount;
             int curL = 0, startX = 0, startY = 0;
-            decodeCell(path[0], curL, startX, startY);
+            decodeCell(br.cells.front(), curL, startX, startY);
+            // Stub from the exact seed copper point (pad centre / via / track point) to the grid
+            emitTrack(net, curL, br.sx, br.sy, worldX(startX), worldY(startY));
             int prevX = startX, prevY = startY;
             int dirX = 0, dirY = 0;
             bool hasDir = false;
-
-            for (size_t k = 1; k < path.size(); ++k) {
+            for (size_t k = 1; k < br.cells.size(); ++k) {
                 int nl = 0, nx = 0, ny = 0;
-                decodeCell(path[k], nl, nx, ny);
+                decodeCell(br.cells[k], nl, nx, ny);
                 if (nl != curL) {
                     if (prevX != startX || prevY != startY) {
-                        tracksJson.push_back({
+                        emitTrack(net, curL, worldX(startX), worldY(startY), worldX(prevX), worldY(prevY));
+                    }
+                    size_t pid = planeIdx(nx, ny);
+                    if (emittedVias.insert(pid).second) {
+                        double vx = worldX(nx);
+                        double vy = worldY(ny);
+                        viasJson.push_back({
                             {"net", net.name},
-                            {"layer", layerIdxToName(curL)},
-                            {"x1_mm", fromGridCoord(startX, gridMm)},
-                            {"y1_mm", fromGridCoord(startY, gridMm)},
-                            {"x2_mm", fromGridCoord(prevX, gridMm)},
-                            {"y2_mm", fromGridCoord(prevY, gridMm)},
-                            {"width_mm", net.widthMm}
+                            {"x_mm", r4(vx)},
+                            {"y_mm", r4(vy)},
+                            {"size_mm", r4(viaSizeMm)},
+                            {"drill_mm", r4(viaDrillMm)},
+                            {"x", toMil(vx)},
+                            {"y", toMil(vy)},
+                            {"diameter", toMil(viaSizeMm)},
+                            {"drill", toMil(viaDrillMm)}
                         });
                     }
-                    viasJson.push_back({
-                        {"net", net.name},
-                        {"x_mm", fromGridCoord(nx, gridMm)},
-                        {"y_mm", fromGridCoord(ny, gridMm)},
-                        {"size_mm", viaSizeMm},
-                        {"drill_mm", viaDrillMm}
-                    });
                     curL = nl;
                     startX = nx;
                     startY = ny;
@@ -1438,15 +2094,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                         dirY = sdy;
                         hasDir = true;
                     } else if (sdx != dirX || sdy != dirY) {
-                        tracksJson.push_back({
-                            {"net", net.name},
-                            {"layer", layerIdxToName(curL)},
-                            {"x1_mm", fromGridCoord(startX, gridMm)},
-                            {"y1_mm", fromGridCoord(startY, gridMm)},
-                            {"x2_mm", fromGridCoord(prevX, gridMm)},
-                            {"y2_mm", fromGridCoord(prevY, gridMm)},
-                            {"width_mm", net.widthMm}
-                        });
+                        emitTrack(net, curL, worldX(startX), worldY(startY), worldX(prevX), worldY(prevY));
                         startX = prevX;
                         startY = prevY;
                         dirX = sdx;
@@ -1457,31 +2105,46 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                 }
             }
             if (prevX != startX || prevY != startY) {
-                tracksJson.push_back({
-                    {"net", net.name},
-                    {"layer", layerIdxToName(curL)},
-                    {"x1_mm", fromGridCoord(startX, gridMm)},
-                    {"y1_mm", fromGridCoord(startY, gridMm)},
-                    {"x2_mm", fromGridCoord(prevX, gridMm)},
-                    {"y2_mm", fromGridCoord(prevY, gridMm)},
-                    {"width_mm", net.widthMm}
-                });
+                emitTrack(net, curL, worldX(startX), worldY(startY), worldX(prevX), worldY(prevY));
             }
+            // Stub from the grid to the exact target copper point (T-junction / pad / via)
+            emitTrack(net, curL, worldX(prevX), worldY(prevY), br.ex, br.ey);
         }
     }
 
+    std::string layerStyle = useEasyEdaNumeric ? "easyeda_numeric" : (useEasyEdaNames ? "easyeda" : "kicad");
+    nlohmann::json warningsJson = nlohmann::json::array();
+    for (const auto& w : warnings) warningsJson.push_back(w);
+
     outSuccess = (unroutedCount == 0 && drcViolations == 0);
-    outSummary = "Routed " + std::to_string(routedCount) + "/" + std::to_string(nets.size()) +
-                 " nets • " + std::to_string(drcViolations) + " DRC • " +
-                 std::to_string(ripupPassesUsed) + " rip-up passes";
+    std::ostringstream summary;
+    summary << "Routed " << routedCount << "/" << nets.size() << " nets • " << drcViolations
+            << " DRC • " << ripupPassesUsed << " rip-up passes • " << bridgesCount
+            << " island bridges • grid " << r4(gridMm) << " mm";
+    outSummary = summary.str();
     return {
         {"ok", outSuccess},
         {"total_nets", static_cast<int>(nets.size())},
         {"routed_nets", routedCount},
         {"unrouted_nets", unroutedCount},
+        {"unrouted_net_names", unroutedNames},
+        {"already_connected_nets", alreadyConnected},
+        {"islands_bridged", bridgesCount},
+        {"padless_islands_ignored", padlessIslandsIgnored},
         {"drc_violations", drcViolations},
         {"ripup_passes_used", ripupPassesUsed},
         {"rerouted_nets_count", reroutedNetsCount},
+        {"units", units},
+        {"bare_coordinate_units", "mil"},
+        {"layers", numLayers},
+        {"layer_style", layerStyle},
+        {"grid_mm", r4(gridMm)},
+        {"requested_grid_mm", r4(requestedGridMm)},
+        {"grid_coarsened", gridCoarsened},
+        {"grid_cells", {{"x", gxMax}, {"y", gyMax}, {"per_layer", static_cast<int64_t>(planeCells)}}},
+        {"canvas", {{"mode", canvasMode}, {"origin_x_mm", r4(originX)}, {"origin_y_mm", r4(originY)},
+                    {"width_mm", r4(spanX)}, {"height_mm", r4(spanY)}}},
+        {"warnings", warningsJson},
         {"tracks", tracksJson},
         {"vias", viasJson},
         {"summary", outSummary}
