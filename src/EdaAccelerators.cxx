@@ -3920,11 +3920,33 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
     }
 
     // 10. Semantic Layer 4: Decoupling capacitor validation on active ICs (U* / IC*)
+    auto isSupplyPinName = [&](const std::string& pName) -> bool {
+        std::string u = toUpperAscii(pName);
+        if (u.empty()) return false;
+        if (u == "VCC" || u == "VDD" || u == "AVCC" || u == "DVCC" ||
+            u == "AVDD" || u == "DVDD" || u == "VDDIO" || u == "VDDA" ||
+            u == "VDDD" || u == "VBAT" || u == "VS" || u == "V+" ||
+            u == "VIN" || u == "VPWR" || u == "PWR") {
+            return true;
+        }
+        if (u.rfind("VCC", 0) == 0 || u.rfind("VDD", 0) == 0 ||
+            u.rfind("AVCC", 0) == 0 || u.rfind("DVCC", 0) == 0 ||
+            u.rfind("AVDD", 0) == 0 || u.rfind("DVDD", 0) == 0) {
+            return true;
+        }
+        bool isGnd = false;
+        bool isPos = false;
+        double v = -1.0;
+        classifySupplyRail(u, isGnd, isPos, v);
+        return isPos;
+    };
+
     nlohmann::json decouplingIssuesJson = nlohmann::json::array();
     if (!isPartialCompSubset) {
         for (const auto& pc : partComps) {
             if (!hasRefPrefix(pc.ref, "U") && !hasRefPrefix(pc.ref, "IC")) continue;
-            std::set<std::string> icSupplyNets;
+            std::set<std::string> allPosSupplyNets;
+            std::set<std::string> namedSupplyPinNets;
             std::string icGndNet;
             for (size_t pIdx : pc.pinIndices) {
                 if (pins[pIdx].noConnected) continue;
@@ -3933,9 +3955,14 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
                 if (isGroundNet(n)) {
                     icGndNet = n;
                 } else if (isPositiveSupplyNet(n)) {
-                    icSupplyNets.insert(n);
+                    allPosSupplyNets.insert(n);
+                    if (isSupplyPinName(pins[pIdx].name)) {
+                        namedSupplyPinNets.insert(n);
+                    }
                 }
             }
+            const std::set<std::string>& icSupplyNets =
+                !namedSupplyPinNets.empty() ? namedSupplyPinNets : allPosSupplyNets;
             if (!icGndNet.empty() && !icSupplyNets.empty()) {
                 for (const auto& supNet : icSupplyNets) {
                     if (decoupledSupplyNets.count(supNet) == 0) {

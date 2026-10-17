@@ -390,10 +390,10 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    // Initial synchronous poll
-    pollOnce();
-
     if (command == "mcp") {
+        // Initial synchronous poll for stdio MCP mode
+        pollOnce();
+
         // Start background polling thread
         std::thread pollerThread([&]() {
             while (!g_shutdown) {
@@ -439,7 +439,8 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Web or Daemon mode
+    // Web or Daemon mode: bind TCP Gateway and WebServer before initial pollOnce()
+    // so reconnecting SSE MCP clients never experience connection refused during startup.
     DynamicToolRegistry dynamicRegistry;
     TcpGateway tcpGateway(dynamicRegistry);
     edaBridge.attachTcpGateway(&tcpGateway);
@@ -481,6 +482,9 @@ int main(int argc, char* argv[]) {
         tcpGateway.stop();
         return 1;
     }
+
+    // Initial synchronous poll now that listening sockets are bound
+    pollOnce();
 
     std::cout << "[aimon] Running in " << command << " mode (PID: " << getpid() << ")" << std::endl;
 

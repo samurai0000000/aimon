@@ -499,7 +499,7 @@ TEST(EdaBridge_PluginRelay, WebSocketMultiFrameContinuationAndPluginChunkReassem
             {"jsonrpc", "2.0"},
             {"id", "frag-reg-1"},
             {"method", "plugin/register"},
-            {"params", {{"app", "easyeda"}, {"version", "1.1.6"}, {"active_document", "servosense.epro"}}}
+            {"params", {{"app", "easyeda"}, {"version", "1.1.7"}, {"active_document", "servosense.epro"}}}
         };
         auto regFrame = EdaRpcServer::encodeWebSocketFrame(reg.dump(), 0x1, true);
         ::send(sock, regFrame.data(), regFrame.size(), 0);
@@ -1502,14 +1502,25 @@ TEST(EdaBridge_LoopbackRpc, FilteredInspectionSchematicErcPcbAuditAndDeclarative
     CHECK_FALSE(pcbSummary.contains("tracks"));
     CHECK_FALSE(pcbSummary.contains("vias"));
 
-    // (e) easyeda_edit_pcb defaults units to "mil" and supports delete_primitives, modify_pads, place_components
+    nlohmann::json pcbRefOnly = bridge.callTool("easyeda_inspect_pcb", {
+        {"references", nlohmann::json::array({"C35"})},
+        {"include_pours", false}
+    });
+    CHECK_TRUE(pcbRefOnly.value("ok", false));
+    CHECK_EQUAL(1, static_cast<int>(pcbRefOnly["components"].size()));
+    CHECK_EQUAL(2, static_cast<int>(pcbRefOnly["pads"].size()));
+    CHECK_EQUAL(2, static_cast<int>(pcbRefOnly["tracks"].size()));
+    CHECK_FALSE(pcbRefOnly.contains("pours"));
+
+    // (e) easyeda_edit_pcb defaults units to "mil" and supports delete_primitives, modify_pads (by id or reference+pad), place_components
     nlohmann::json editPcbRes = bridge.callTool("easyeda_edit_pcb", {
         {"delete_primitives", nlohmann::json::array({
             {{"id", "e1640e5"}, {"type", "line"}},
             "trk_gnd_stub"
         })},
         {"modify_pads", nlohmann::json::array({
-            {{"id", "pad_c35_2"}, {"net", "GND"}}
+            {{"id", "pad_c35_2"}, {"net", "GND"}},
+            {{"reference", "R16"}, {"pad", "1"}, {"net", "SDA"}}
         })},
         {"place_components", nlohmann::json::array({
             {{"reference", "U2"}, {"lcsc", "C25804"}, {"x", 850.0}, {"y", 600.0}, {"layer", "TopLayer"}, {"rotation", 90.0}}
@@ -1527,7 +1538,7 @@ TEST(EdaBridge_LoopbackRpc, FilteredInspectionSchematicErcPcbAuditAndDeclarative
     CHECK_TRUE(editPcbRes.value("ok", false));
     CHECK_EQUAL("mil", lastEditPcbArgs.value("units", ""));
     CHECK_EQUAL(2, editPcbRes.value("deleted_primitives", 0));
-    CHECK_EQUAL(1, editPcbRes.value("modified_pads", 0));
+    CHECK_EQUAL(2, editPcbRes.value("modified_pads", 0));
     CHECK_EQUAL(1, editPcbRes.value("placed_components", 0));
     CHECK_TRUE(editPcbRes.value("updated_placements", 0) >= 1);
     CHECK_EQUAL(1, editPcbRes.value("added_tracks", 0));
@@ -1663,7 +1674,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     EdaBridgeAppSettings loaded;
     CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgFile, loaded, err));
     CHECK_TRUE(err.empty());
-    STRCMP_EQUAL("1.1.6", loaded.version.c_str());
+    STRCMP_EQUAL("1.1.7", loaded.version.c_str());
     CHECK_EQUAL(orig.enableEasyEda, loaded.enableEasyEda);
     CHECK_EQUAL(orig.enableKiCad, loaded.enableKiCad);
     CHECK_EQUAL(orig.enableFreeCad, loaded.enableFreeCad);
@@ -1728,7 +1739,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeployment) {
-    CHECK_EQUAL("1.1.6", EdaBridgeAppSettings().version);
+    CHECK_EQUAL("1.1.7", EdaBridgeAppSettings().version);
 
     std::vector<uint8_t> zipBytes = EdaBridgeAppConfig::buildEasyEdaEextZipBytes();
     CHECK_TRUE(zipBytes.size() > 512);
@@ -1745,7 +1756,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(zipView.find("edaEsbuildExportName") != std::string::npos);
     CHECK_TRUE(zipView.find("eda.sys_WebSocket") != std::string::npos);
     CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
-    CHECK_TRUE(zipView.find("1.1.6") != std::string::npos);
+    CHECK_TRUE(zipView.find("1.1.7") != std::string::npos);
     CHECK_TRUE(zipView.find("8d4c91f2a70e4c6b9b24e31f6a821100") != std::string::npos);
     CHECK_TRUE(zipView.find("check(false, false, true)") != std::string::npos);
     CHECK_TRUE(zipView.find("getAllPinsByPrimitiveId") != std::string::npos);
@@ -1795,7 +1806,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream kcIfs(kcDir + "/KiCadAimonBridge.py");
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(kcContent.find("1.1.6") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.7") != std::string::npos);
         CHECK_TRUE(kcContent.find("*.Cu") != std::string::npos);
         CHECK_TRUE(kcContent.find("GetAttribute") != std::string::npos);
     }
@@ -1810,7 +1821,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream fcIfs(fcDir + "/AimonFreeCadBridge.py");
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(fcContent.find("1.1.6") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.7") != std::string::npos);
     }
 
     // 3a. Re-run when destination files are identical -> do NOT overwrite (alreadyDeployed == true)
@@ -1838,7 +1849,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(kcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(kcContent.find("1.1.6") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.7") != std::string::npos);
     }
 
     CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir2, err, "", false, &fcAlready));
@@ -1848,7 +1859,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(fcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(fcContent.find("1.1.6") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.7") != std::string::npos);
     }
 
     // 4. Test customTargetDir (simulating QFileDialog user selection)

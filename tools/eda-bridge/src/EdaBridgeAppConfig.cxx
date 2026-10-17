@@ -226,7 +226,7 @@ static const char* kEmbeddedEasyEdaIndexJs = R"JS(/*
 var edaEsbuildExportName = (function () {
     "use strict";
 
-    const BRIDGE_VERSION = "1.1.6";
+    const BRIDGE_VERSION = "1.1.7";
     const DEFAULT_WS_URL = "ws://127.0.0.1:3893";
     const HEARTBEAT_INTERVAL_MS = 10000;
     const ALLOWED_PREFIXES = [
@@ -540,7 +540,10 @@ var edaEsbuildExportName = (function () {
                         const cuid = String(callGetter(compObj, "getState_UniqueId", "uniqueId", "unique_id", ""));
                         const cid = String(callGetter(compObj, "getState_PrimitiveId", "primitiveId", "id", ""));
                         const cref = String(callGetter(compObj, "getState_Designator", "designator", "reference", ""));
-                        return cuid ? ("uid:" + cuid) : ("id:" + cid + ":" + cref);
+                        const cnet = String(callGetter(compObj, "getState_Net", "net", ""));
+                        const cx = String(callGetter(compObj, "getState_X", "x", "0"));
+                        const cy = String(callGetter(compObj, "getState_Y", "y", "0"));
+                        return cuid ? ("uid:" + cuid) : ("id:" + cid + ":" + cref + ":" + cnet + ":" + cx + ":" + cy);
                     };
                     if (Array.isArray(activeComps)) {
                         for (const ac of activeComps) {
@@ -590,6 +593,8 @@ var edaEsbuildExportName = (function () {
                             const compType = String(callGetter(c, "getState_ComponentType", "componentType", "", ""));
                             const ref = String(callGetter(c, "getState_Designator", "designator", "reference", ""));
                             const onActiveSheet = hasActiveSet ? Boolean(activeSheetIds[compKeyOf(c)]) : (documentInfo.documentType === 1);
+                            const isPart = (compType === "part" || (!compType && ref.indexOf("#") !== 0 && ref.indexOf("FRAME") !== 0));
+                            if (!isPart && !onActiveSheet) continue;
 
                             if (!fullForBridge) {
                                 if (refFilter.length > 0 && refFilter.indexOf(ref) < 0) continue;
@@ -601,7 +606,6 @@ var edaEsbuildExportName = (function () {
                                 ? String(fpRaw.name || fpRaw.title || fpRaw.uuid || "")
                                 : String(fpRaw || "");
 
-                            const isPart = (compType === "part" || (!compType && ref.indexOf("#") !== 0 && ref.indexOf("FRAME") !== 0));
                             const matchesRefFilter = (refFilter.length === 0 || refFilter.indexOf(ref) >= 0);
                             const matchesTypeFilter = (typeFilter.length === 0 || typeFilter.indexOf(compType) >= 0);
                             const needPinsForThisComp = isPart && onActiveSheet &&
@@ -656,11 +660,15 @@ var edaEsbuildExportName = (function () {
                 }
             }
             if (args && args.include_netlist === true) {
-                try {
-                    if (eda.sch_Netlist && eda.sch_Netlist.getNetlist) {
-                        netlist = (await eda.sch_Netlist.getNetlist("JLCEDA")) || {};
+                if (eda.sch_Netlist && eda.sch_Netlist.getNetlist) {
+                    try {
+                        netlist = (await eda.sch_Netlist.getNetlist("JLCEDA_PRO")) || {};
+                    } catch (err1) {
+                        try {
+                            netlist = (await eda.sch_Netlist.getNetlist("JLCEDA")) || {};
+                        } catch (err2) {
+                        }
                     }
-                } catch (err) {
                 }
             }
         }
@@ -949,11 +957,13 @@ var edaEsbuildExportName = (function () {
                 if (!mc || typeof mc !== "object") continue;
                 const ref = String(mc.reference || mc.designator || "");
                 const existing = compByRef[ref];
-                const targetId = String(mc.id || mc.primitive_id || (existing ? callGetter(existing, "getState_PrimitiveId", "primitiveId", "id", "") : ref));
-                const preserveConn = preserveConnGlobal || Boolean(mc.preserve_connections === true);
+                let targetId = String(mc.id || mc.primitive_id || (existing ? callGetter(existing, "getState_PrimitiveId", "primitiveId", "id", "") : ref));
+                const wantsRot = (mc.rotation !== undefined || mc.rotation_deg !== undefined);
+                const wantsFp = (mc.footprint !== undefined && String(mc.footprint) !== "");
+                const preserveConn = preserveConnGlobal || Boolean(mc.preserve_connections === true) || wantsRot || wantsFp;
                 const hasMove = (mc.x !== undefined || mc.y !== undefined || mc.x_mm !== undefined || mc.y_mm !== undefined);
                 let oldPins = [];
-                if (preserveConn && targetId && hasMove) {
+                if (preserveConn && targetId && (hasMove || wantsRot || wantsFp)) {
                     oldPins = await extractComponentPins(targetId);
                 }
                 const modProps = {};
@@ -970,12 +980,55 @@ var edaEsbuildExportName = (function () {
                 if (mc.lcsc !== undefined) modProps.supplierId = String(mc.lcsc);
                 if (mc.x !== undefined || mc.x_mm !== undefined) modProps.x = coordToMil(mc, "x", "x_mm", units, 0);
                 if (mc.y !== undefined || mc.y_mm !== undefined) modProps.y = coordToMil(mc, "y", "y_mm", units, 0);
-                if (mc.rotation !== undefined || mc.rotation_deg !== undefined) {
+                if (wantsRot) {
                     modProps.rotation = Number(mc.rotation !== undefined ? mc.rotation : mc.rotation_deg);
                 }
                 if (targetId && typeof eda.sch_PrimitiveComponent.modify === "function") {
                     try {
                         await eda.sch_PrimitiveComponent.modify(targetId, modProps);
+                    } catch (err) {
+                    }
+                }
+                if (existing && (wantsRot || wantsFp) && typeof eda.sch_PrimitiveComponent.create === "function") {
+                    try {
+                        const curFpRaw = callGetter(existing, "getState_Footprint", "footprintName", "footprint", "");
+                        const curFpStr = (curFpRaw && typeof curFpRaw === "object")
+                            ? String(curFpRaw.name || curFpRaw.title || curFpRaw.uuid || "")
+                            : String(curFpRaw || "");
+                        const curRot = Number(callGetter(existing, "getState_Rotation", "rotation", "", 0) || 0);
+                        const reqFpStr = (mc.footprint && typeof mc.footprint === "object")
+                            ? String(mc.footprint.name || mc.footprint.uuid || "")
+                            : String(mc.footprint || "");
+                        const needRecreate = (wantsRot && modProps.rotation !== curRot) ||
+                                             (wantsFp && reqFpStr && reqFpStr !== curFpStr);
+                        if (needRecreate) {
+                            const exUid = String(modProps.uniqueId || callGetter(existing, "getState_UniqueId", "uniqueId", "", ""));
+                            const exVal = String(modProps.name !== undefined ? modProps.name : callGetter(existing, "getState_Name", "value", "name", ""));
+                            const exLcsc = String(mc.lcsc || callGetter(existing, "getState_SupplierId", "supplierPart", "supplierId", ""));
+                            const exX = (modProps.x !== undefined) ? modProps.x : Number(callGetter(existing, "getState_X", "x", "", 0) || 0);
+                            const exY = (modProps.y !== undefined) ? modProps.y : Math.abs(Number(callGetter(existing, "getState_Y", "y", "", 0) || 0));
+                            const exRot = wantsRot ? modProps.rotation : curRot;
+                            const token = await resolveSchComponentToken({
+                                device_uuid: mc.device_uuid,
+                                lcsc: exLcsc,
+                                footprint: reqFpStr || curFpStr,
+                                value: exVal,
+                                reference: ref
+                            });
+                            if (token) {
+                                if (targetId && typeof eda.sch_PrimitiveComponent.delete === "function") {
+                                    try { await eda.sch_PrimitiveComponent.delete([targetId]); } catch (e) {}
+                                }
+                                const created = await eda.sch_PrimitiveComponent.create(token, exX, exY, undefined, exRot, false, true, true);
+                                if (created) {
+                                    targetId = String(callGetter(created, "getState_PrimitiveId", "primitiveId", "id", targetId));
+                                    const reProps = { designator: modProps.designator || ref };
+                                    if (exVal) reProps.name = exVal;
+                                    if (exUid) reProps.uniqueId = exUid;
+                                    try { await eda.sch_PrimitiveComponent.modify(targetId, reProps); } catch (e) {}
+                                }
+                            }
+                        }
                     } catch (err) {
                     }
                 }
@@ -1063,10 +1116,22 @@ var edaEsbuildExportName = (function () {
                     : ((mp.noConnected !== undefined) ? Boolean(mp.noConnected) : true);
                 if (pinId) {
                     try {
+                        const modObj = { noConnected: noConn };
+                        if (mp.y !== undefined && mp.y !== null) {
+                            modObj.y = Math.abs(Number(mp.y));
+                        } else if (eda.sch_PrimitivePin && typeof eda.sch_PrimitivePin.getByPrimitiveId === "function") {
+                            const curPin = await eda.sch_PrimitivePin.getByPrimitiveId(pinId);
+                            if (curPin) {
+                                const curY = Number(callGetter(curPin, "getState_Y", "y", "", NaN));
+                                if (!isNaN(curY)) {
+                                    modObj.y = Math.abs(curY);
+                                }
+                            }
+                        }
                         if (eda.sch_PrimitivePin && typeof eda.sch_PrimitivePin.modify === "function") {
-                            await eda.sch_PrimitivePin.modify(pinId, { noConnected: noConn });
+                            await eda.sch_PrimitivePin.modify(pinId, modObj);
                         } else if (eda.sch_PrimitiveComponent && typeof eda.sch_PrimitiveComponent.modifyPin === "function") {
-                            await eda.sch_PrimitiveComponent.modifyPin(pinId, { noConnected: noConn });
+                            await eda.sch_PrimitiveComponent.modifyPin(pinId, modObj);
                         }
                     } catch (err) {
                     }
@@ -3658,7 +3723,7 @@ class AimonFreeCadBridgeClient:
                     return f"{v[0]}.{v[1]}.{v[2]}"
             except Exception:
                 pass
-        return "1.1.6"
+        return "1.1.7"
 
     def _active_doc_name(self):
         if HAS_FREECAD and getattr(FreeCAD, "ActiveDocument", None) is not None:

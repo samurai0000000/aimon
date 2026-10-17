@@ -1500,7 +1500,13 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 : remoteArgs["pcb_state"].value("active_document", "PCB1")}
         };
     } else {
-        dispatchedOk = dispatchRemoteRpc(toolName, remoteArgs, rpcResult, rpcError, rpcErrorCode);
+        nlohmann::json pluginArgs = remoteArgs;
+        if (toolName == "easyeda_edit_pcb" && !inMemoryPcbEdit && pluginArgs.is_object()) {
+            pluginArgs.erase("place_components");
+            pluginArgs.erase("modify_pads");
+            pluginArgs.erase("pad_nets");
+        }
+        dispatchedOk = dispatchRemoteRpc(toolName, pluginArgs, rpcResult, rpcError, rpcErrorCode);
         if (!dispatchedOk && (inMemorySchEdit || inMemoryPcbEdit)) {
             dispatchedOk = true;
             rpcResult = {
@@ -1611,6 +1617,7 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 }
             }
         }
+        std::map<std::string, std::string> compRefById;
         for (const char* arrKey : {"components", "schematic_components", "footprints", "pcb_components"}) {
             if (!payload.contains(arrKey) || !payload[arrKey].is_array()) continue;
             for (auto& compObj : payload[arrKey]) {
@@ -1629,6 +1636,35 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 }
                 if (compObj.contains("component_type")) {
                     compObj["component_type"] = safeJsonStr(compObj, "component_type", "type", nullptr, "part");
+                }
+                std::string cid = safeJsonStr(compObj, "id", "primitiveId");
+                std::string cref = safeJsonStr(compObj, "reference", "ref", "designator");
+                if (!cid.empty() && !cref.empty()) {
+                    compRefById[cid] = cref;
+                }
+            }
+        }
+        if (payload.contains("pads") && payload["pads"].is_array() && !compRefById.empty()) {
+            for (auto& padObj : payload["pads"]) {
+                if (!padObj.is_object()) continue;
+                std::string pRef = safeJsonStr(padObj, "ref", "reference");
+                if (!pRef.empty()) continue;
+                std::string pid = safeJsonStr(padObj, "id", "primitiveId");
+                size_t lastE = pid.rfind('e');
+                if (lastE != std::string::npos && lastE > 0 && lastE + 1 < pid.size()) {
+                    bool allDigits = true;
+                    for (size_t i = lastE + 1; i < pid.size(); ++i) {
+                        if (!std::isdigit(static_cast<unsigned char>(pid[i]))) {
+                            allDigits = false;
+                            break;
+                        }
+                    }
+                    if (allDigits) {
+                        auto it = compRefById.find(pid.substr(0, lastE));
+                        if (it != compRefById.end()) {
+                            padObj["ref"] = it->second;
+                        }
+                    }
                 }
             }
         }
@@ -2065,6 +2101,7 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
             rpcResult["erc_audit"] = ercAudit;
 
             nlohmann::json violationsArr = nlohmann::json::array();
+            nlohmann::json nativeSummaryArr = nlohmann::json::array();
             if (rpcResult.contains("violations") && rpcResult["violations"].is_array()) {
                 for (const auto& existingV : rpcResult["violations"]) {
                     if (existingV.is_object()) {
@@ -2076,9 +2113,21 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                             vt == "voltage_domain_issue") {
                             continue;
                         }
+                        if (existingV.contains("count") &&
+                            !existingV.contains("id") &&
+                            !existingV.contains("reference") &&
+                            !existingV.contains("issue") &&
+                            !existingV.contains("rule") &&
+                            !existingV.contains("message")) {
+                            nativeSummaryArr.push_back(existingV);
+                            continue;
+                        }
                     }
                     violationsArr.push_back(existingV);
                 }
+            }
+            if (!nativeSummaryArr.empty()) {
+                rpcResult["native_drc_summary"] = std::move(nativeSummaryArr);
             }
             auto appendAuditViolations = [&](const char* arrKey, const char* vType) {
                 if (ercAudit.contains(arrKey) && ercAudit[arrKey].is_array()) {
@@ -2102,9 +2151,19 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
 
             rpcResult["violations"] = std::move(violationsArr);
             rpcResult["violation_count"] = static_cast<int>(rpcResult["violations"].size());
-            if (!ercAudit.value("passed", true)) {
-                rpcResult["passed"] = false;
+            rpcResult["passed"] = (rpcResult["violations"].empty() && ercAudit.value("passed", true));
+            if (rpcResult.contains("erc_audit") && rpcResult["erc_audit"].is_object()) {
+                rpcResult["erc_audit"].erase("inferred_nets");
             }
+            rpcResult.erase("components");
+            rpcResult.erase("wires");
+            rpcResult.erase("netlist");
+        } else {
+            rpcResult.erase("components");
+            rpcResult.erase("pads");
+            rpcResult.erase("tracks");
+            rpcResult.erase("vias");
+            rpcResult.erase("pours");
         }
     } else if (toolName == "easyeda_edit_schematic" && rpcResult.is_object()) {
         std::string unitsStr = remoteArgs.value("units", "mil");
@@ -3030,10 +3089,14 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
         rpcResult["connectivity_audit"] = accCopy.calcPcbConnectivityAudit(rpcResult, auditOk, auditSummary);
 
         std::set<std::string> refSet;
-        if (arguments.is_object() && arguments.contains("references") && arguments["references"].is_array()) {
-            for (const auto& r : arguments["references"]) {
-                if (r.is_string() && !r.get<std::string>().empty()) {
-                    refSet.insert(r.get<std::string>());
+        if (arguments.is_object()) {
+            for (const char* refKey : {"references", "component_refs"}) {
+                if (arguments.contains(refKey) && arguments[refKey].is_array()) {
+                    for (const auto& r : arguments[refKey]) {
+                        if (r.is_string() && !r.get<std::string>().empty()) {
+                            refSet.insert(r.get<std::string>());
+                        }
+                    }
                 }
             }
         }
@@ -3051,13 +3114,22 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
         if (hasFilter) {
             std::set<std::string> effectiveNetSet = netSet;
             std::set<std::string> effectiveRefSet = refSet;
+            struct PadCoord {
+                double x;
+                double y;
+                bool isMm;
+            };
+            std::vector<PadCoord> matchedPadCoords;
             if (rpcResult.contains("pads") && rpcResult["pads"].is_array()) {
                 for (const auto& p : rpcResult["pads"]) {
                     if (!p.is_object()) continue;
                     std::string pr = p.value("ref", p.value("reference", ""));
                     std::string pn = p.value("net", "");
-                    if (!refSet.empty() && refSet.count(pr) > 0 && netSet.empty() && !pn.empty()) {
-                        effectiveNetSet.insert(pn);
+                    if (!refSet.empty() && refSet.count(pr) > 0) {
+                        bool isMm = p.contains("x_mm");
+                        double px = isMm ? p.value("x_mm", 0.0) : p.value("x", 0.0);
+                        double py = isMm ? p.value("y_mm", 0.0) : p.value("y", 0.0);
+                        matchedPadCoords.push_back({px, py, isMm});
                     }
                     if (!netSet.empty() && netSet.count(pn) > 0 && refSet.empty() && !pr.empty()) {
                         effectiveRefSet.insert(pr);
@@ -3098,7 +3170,26 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 nlohmann::json fTracks = nlohmann::json::array();
                 for (const auto& t : rpcResult["tracks"]) {
                     if (!t.is_object()) continue;
-                    if (effectiveNetSet.count(t.value("net", "")) > 0) {
+                    bool matchTrack = false;
+                    if (!effectiveNetSet.empty() && effectiveNetSet.count(t.value("net", "")) > 0) {
+                        matchTrack = true;
+                    } else if (!matchedPadCoords.empty() && netSet.empty()) {
+                        bool isMm = t.contains("x1_mm");
+                        double x1 = isMm ? t.value("x1_mm", 0.0) : t.value("x1", 0.0);
+                        double y1 = isMm ? t.value("y1_mm", 0.0) : t.value("y1", 0.0);
+                        double x2 = isMm ? t.value("x2_mm", 0.0) : t.value("x2", 0.0);
+                        double y2 = isMm ? t.value("y2_mm", 0.0) : t.value("y2", 0.0);
+                        const double tol = isMm ? 0.65 : 25.0;
+                        for (const auto& pc : matchedPadCoords) {
+                            if (pc.isMm != isMm) continue;
+                            if (std::hypot(x1 - pc.x, y1 - pc.y) <= tol ||
+                                std::hypot(x2 - pc.x, y2 - pc.y) <= tol) {
+                                matchTrack = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (matchTrack) {
                         fTracks.push_back(t);
                     }
                 }
@@ -3110,7 +3201,23 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 nlohmann::json fVias = nlohmann::json::array();
                 for (const auto& v : rpcResult["vias"]) {
                     if (!v.is_object()) continue;
-                    if (effectiveNetSet.count(v.value("net", "")) > 0) {
+                    bool matchVia = false;
+                    if (!effectiveNetSet.empty() && effectiveNetSet.count(v.value("net", "")) > 0) {
+                        matchVia = true;
+                    } else if (!matchedPadCoords.empty() && netSet.empty()) {
+                        bool isMm = v.contains("x_mm");
+                        double vx = isMm ? v.value("x_mm", 0.0) : v.value("x", 0.0);
+                        double vy = isMm ? v.value("y_mm", 0.0) : v.value("y", 0.0);
+                        const double tol = isMm ? 1.27 : 50.0;
+                        for (const auto& pc : matchedPadCoords) {
+                            if (pc.isMm != isMm) continue;
+                            if (std::hypot(vx - pc.x, vy - pc.y) <= tol) {
+                                matchVia = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (matchVia) {
                         fVias.push_back(v);
                     }
                 }
@@ -3122,7 +3229,7 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 nlohmann::json fPours = nlohmann::json::array();
                 for (const auto& pr : rpcResult["pours"]) {
                     if (!pr.is_object()) continue;
-                    if (effectiveNetSet.count(pr.value("net", "")) > 0) {
+                    if (!effectiveNetSet.empty() && effectiveNetSet.count(pr.value("net", "")) > 0) {
                         fPours.push_back(pr);
                     }
                 }
@@ -3149,6 +3256,15 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
             rpcResult.erase("vias");
             rpcResult.erase("pours");
             rpcResult.erase("schematic_components");
+        }
+
+        if (arguments.is_object()) {
+            if (!arguments.value("include_components", true)) rpcResult.erase("components");
+            if (!arguments.value("include_pads", true)) rpcResult.erase("pads");
+            if (!arguments.value("include_tracks", true)) rpcResult.erase("tracks");
+            if (!arguments.value("include_vias", true)) rpcResult.erase("vias");
+            if (!arguments.value("include_pours", true)) rpcResult.erase("pours");
+            if (!arguments.value("include_audit", true)) rpcResult.erase("connectivity_audit");
         }
     } else if (toolName == "easyeda_edit_pcb" && rpcResult.is_object()) {
         std::string unitsStr = remoteArgs.value("units", "mil");
@@ -3200,13 +3316,56 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
             rpcResult["deleted_primitives"] = delCount;
         }
 
-        // 2. modify_pads
-        if (remoteArgs.contains("modify_pads") && remoteArgs["modify_pads"].is_array() &&
-            !rpcResult.contains("modified_pads")) {
+        // 2. modify_pads / pad_nets
+        const nlohmann::json* modPadsArr = nullptr;
+        if (remoteArgs.contains("modify_pads") && remoteArgs["modify_pads"].is_array()) {
+            modPadsArr = &remoteArgs["modify_pads"];
+        } else if (remoteArgs.contains("pad_nets") && remoteArgs["pad_nets"].is_array()) {
+            modPadsArr = &remoteArgs["pad_nets"];
+        }
+        if (modPadsArr != nullptr && !rpcResult.contains("modified_pads")) {
+            std::map<std::pair<std::string, std::string>, std::string> padIdByRefNum;
+            bool needRefPadLookup = false;
+            for (const auto& mp : *modPadsArr) {
+                if (!mp.is_object()) continue;
+                if (mp.value("id", mp.value("pad_id", "")).empty() &&
+                    !mp.value("reference", mp.value("ref", mp.value("designator", ""))).empty()) {
+                    needRefPadLookup = true;
+                    break;
+                }
+            }
+            if (needRefPadLookup && !inMemoryPcbEdit) {
+                nlohmann::json pcbSnap;
+                std::string snapErr;
+                int snapCode = 0;
+                if (dispatchRemoteRpc("easyeda_inspect_pcb", {{"include_raw_primitives", true}},
+                                      pcbSnap, snapErr, snapCode) && pcbSnap.is_object()) {
+                    sanitizeEasyEdaProject(pcbSnap);
+                    if (pcbSnap.contains("pads") && pcbSnap["pads"].is_array()) {
+                        for (const auto& p : pcbSnap["pads"]) {
+                            if (!p.is_object()) continue;
+                            std::string pId = p.value("id", "");
+                            std::string pRef = p.value("ref", p.value("reference", ""));
+                            std::string pNum = p.value("pad", p.value("number", ""));
+                            if (!pId.empty() && !pRef.empty() && !pNum.empty()) {
+                                padIdByRefNum[{pRef, pNum}] = pId;
+                            }
+                        }
+                    }
+                }
+            }
             int modPadsCount = 0;
-            for (const auto& mp : remoteArgs["modify_pads"]) {
+            for (const auto& mp : *modPadsArr) {
                 if (!mp.is_object()) continue;
                 std::string padId = mp.value("id", mp.value("pad_id", ""));
+                if (padId.empty()) {
+                    std::string pRef = mp.value("reference", mp.value("ref", mp.value("designator", "")));
+                    std::string pNum = mp.value("pad", mp.value("pad_number", mp.value("number", "")));
+                    auto it = padIdByRefNum.find({pRef, pNum});
+                    if (it != padIdByRefNum.end()) {
+                        padId = it->second;
+                    }
+                }
                 if (padId.empty()) continue;
                 nlohmann::json modProps = nlohmann::json::object();
                 if (mp.contains("net")) modProps["net"] = mp.value("net", "");
@@ -3228,9 +3387,10 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
         if (remoteArgs.contains("place_components") && remoteArgs["place_components"].is_array() &&
             !rpcResult.contains("placed_components")) {
             int placedCompCount = 0;
+            nlohmann::json placedDetails = nlohmann::json::array();
             for (const auto& pc : remoteArgs["place_components"]) {
                 if (!pc.is_object()) continue;
-                std::string compUuid = pc.value("uuid", pc.value("footprint_uuid", ""));
+                std::string compUuid = pc.value("uuid", pc.value("device_uuid", pc.value("footprint_uuid", "")));
                 std::string libUuid = pc.value("library_uuid", pc.value("libraryUuid", ""));
                 std::string searchKey = pc.value("lcsc", pc.value("query", ""));
                 if ((compUuid.empty() || libUuid.empty()) && !searchKey.empty()) {
@@ -3242,7 +3402,7 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                         !searchRes["result"].empty() && searchRes["result"][0].is_object()) {
                         const auto& hit = searchRes["result"][0];
                         if (compUuid.empty()) {
-                            compUuid = hit.value("footprintUuid", hit.value("uuid", ""));
+                            compUuid = hit.value("uuid", hit.value("footprintUuid", ""));
                         }
                         if (libUuid.empty()) {
                             libUuid = hit.value("libraryUuid", hit.value("library_uuid", ""));
@@ -3262,25 +3422,83 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                                      nlohmann::json::array({devObj, layerId, xVal, yVal, rotVal, false}),
                                      createRes)) {
                     std::string createdId;
+                    nlohmann::json rawPads = nlohmann::json::array();
                     if (createRes.contains("result")) {
                         if (createRes["result"].is_string()) {
                             createdId = createRes["result"].get<std::string>();
                         } else if (createRes["result"].is_object()) {
                             createdId = createRes["result"].value(
                                 "primitiveId", createRes["result"].value("id", ""));
+                            if (createRes["result"].contains("pads") &&
+                                createRes["result"]["pads"].is_array()) {
+                                rawPads = createRes["result"]["pads"];
+                            }
                         }
                     }
-                    std::string ref = pc.value("reference", pc.value("ref", ""));
-                    if (!createdId.empty() && !ref.empty()) {
+                    std::string ref = pc.value("reference", pc.value("ref", pc.value("designator", "")));
+                    std::string uniqueId = pc.value("unique_id", pc.value("uniqueId", ""));
+                    std::string valStr = pc.value("value", pc.value("name", ""));
+                    if (!createdId.empty() && (!ref.empty() || !uniqueId.empty() || !valStr.empty())) {
+                        nlohmann::json modProps = nlohmann::json::object();
+                        if (!ref.empty()) modProps["designator"] = ref;
+                        if (!uniqueId.empty()) modProps["uniqueId"] = uniqueId;
+                        if (!valStr.empty()) modProps["name"] = valStr;
                         nlohmann::json modRes;
                         invokeEasyEdaApi("eda.pcb_PrimitiveComponent.modify",
-                                         nlohmann::json::array({createdId, {{"designator", ref}}}),
+                                         nlohmann::json::array({createdId, modProps}),
                                          modRes);
                     }
+                    nlohmann::json padDetails = nlohmann::json::array();
+                    if (!createdId.empty() && !rawPads.empty()) {
+                        const nlohmann::json padNetsObj =
+                            (pc.contains("pad_nets") && pc["pad_nets"].is_object())
+                                ? pc["pad_nets"]
+                                : nlohmann::json::object();
+                        for (const auto& rp : rawPads) {
+                            if (!rp.is_object()) continue;
+                            std::string pNum = rp.value("padNumber", rp.value("number", ""));
+                            std::string pSubId = rp.value("primitiveId", rp.value("id", ""));
+                            if (pSubId.empty()) continue;
+                            std::string fullPadId = (pSubId.rfind(createdId, 0) == 0)
+                                ? pSubId
+                                : (createdId + pSubId);
+                            std::string netToSet = padNetsObj.contains(pNum) && padNetsObj[pNum].is_string()
+                                ? padNetsObj[pNum].get<std::string>()
+                                : rp.value("net", "");
+                            nlohmann::json padEntry = {
+                                {"id", fullPadId},
+                                {"pad", pNum},
+                                {"net", netToSet}
+                            };
+                            if (padNetsObj.contains(pNum) && padNetsObj[pNum].is_string()) {
+                                nlohmann::json padModRes;
+                                if (invokeEasyEdaApi("eda.pcb_PrimitivePad.modify",
+                                                     nlohmann::json::array({fullPadId, {{"net", netToSet}}}),
+                                                     padModRes) &&
+                                    padModRes.contains("result") && padModRes["result"].is_object()) {
+                                    padEntry["x"] = padModRes["result"].value("x", 0.0);
+                                    padEntry["y"] = padModRes["result"].value("y", 0.0);
+                                }
+                            }
+                            padDetails.push_back(std::move(padEntry));
+                        }
+                    }
+                    placedDetails.push_back({
+                        {"id", createdId},
+                        {"reference", ref},
+                        {"unique_id", uniqueId},
+                        {"x", xVal},
+                        {"y", yVal},
+                        {"rotation", rotVal},
+                        {"pads", std::move(padDetails)}
+                    });
                     ++placedCompCount;
                 }
             }
             rpcResult["placed_components"] = placedCompCount;
+            if (!placedDetails.empty()) {
+                rpcResult["placed_component_details"] = std::move(placedDetails);
+            }
         }
 
         // 4. move_components (including preserve_connections track rubber-banding)
@@ -3448,8 +3666,10 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 rpcResult["pcb_state"] = pcbState;
             }
         }
-    } else if (toolName == "easyeda_sync_sch_to_pcb" && remoteArgs.value("dry_run", false)) {
+    } else if (toolName == "easyeda_sync_sch_to_pcb" &&
+               (remoteArgs.value("dry_run", false) || !rpcResult.value("synced", false))) {
         if (!rpcResult.contains("components_to_add")) {
+            bool isDryRun = remoteArgs.value("dry_run", false);
             nlohmann::json schState = (remoteArgs.contains("schematic_state") && remoteArgs["schematic_state"].is_object())
                 ? remoteArgs["schematic_state"]
                 : nlohmann::json::object();
@@ -3457,29 +3677,143 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 ? remoteArgs["pcb_state"]
                 : nlohmann::json::object();
 
+            EdaAccelerators accCopy;
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                accCopy = _accelerators;
+            }
+
+            std::map<std::pair<std::string, std::string>, std::string> inferredPinNets;
+            std::map<std::string, std::vector<std::pair<std::string, std::string>>> inferredNetMembers;
+            std::set<std::string> namedSchNets;
+            std::set<std::string> validSchNets;
+            auto collectSheetNamedNets = [&](const nlohmann::json& sheetState) {
+                if (sheetState.contains("wires") && sheetState["wires"].is_array()) {
+                    for (const auto& w : sheetState["wires"]) {
+                        if (w.is_object() && !w.value("net", "").empty()) {
+                            namedSchNets.insert(w.value("net", ""));
+                            validSchNets.insert(w.value("net", ""));
+                        }
+                    }
+                }
+                if (sheetState.contains("nets") && sheetState["nets"].is_array()) {
+                    for (const auto& n : sheetState["nets"]) {
+                        if (n.is_object() && !n.value("name", "").empty()) {
+                            namedSchNets.insert(n.value("name", ""));
+                            validSchNets.insert(n.value("name", ""));
+                        }
+                    }
+                }
+            };
+            auto extractInferredNets = [&](const nlohmann::json& sheetState, const std::string& sheetKey) {
+                collectSheetNamedNets(sheetState);
+                bool ercOk = false;
+                std::string ercSummary;
+                nlohmann::json erc = accCopy.calcSchematicErcAudit(sheetState, ercOk, ercSummary);
+                if (!erc.is_object() || !erc.contains("inferred_nets")) return;
+                auto recordNetPins = [&](std::string netName, const nlohmann::json& pinsArr) {
+                    if (netName.empty() || !pinsArr.is_array()) return;
+                    if (netName.rfind("$NET_", 0) == 0) {
+                        if (!sheetKey.empty()) {
+                            netName = "$NET_" + sheetKey + "_" + netName.substr(5);
+                        }
+                    } else {
+                        namedSchNets.insert(netName);
+                        validSchNets.insert(netName);
+                    }
+                    for (const auto& pinStrJ : pinsArr) {
+                        if (!pinStrJ.is_string()) continue;
+                        std::string pinStr = pinStrJ.get<std::string>();
+                        auto dotPos = pinStr.find('.');
+                        if (dotPos == std::string::npos) continue;
+                        std::string cRef = pinStr.substr(0, dotPos);
+                        std::string pNum = pinStr.substr(dotPos + 1);
+                        inferredPinNets[{cRef, pNum}] = netName;
+                        inferredNetMembers[netName].push_back({cRef, pNum});
+                    }
+                };
+                if (erc["inferred_nets"].is_array()) {
+                    for (const auto& entry : erc["inferred_nets"]) {
+                        if (!entry.is_object()) continue;
+                        recordNetPins(entry.value("name", ""),
+                                      entry.contains("pins") ? entry["pins"] : nlohmann::json::array());
+                    }
+                } else if (erc["inferred_nets"].is_object()) {
+                    for (auto it = erc["inferred_nets"].begin(); it != erc["inferred_nets"].end(); ++it) {
+                        recordNetPins(it.key(), it.value());
+                    }
+                }
+            };
+
             if (schState.empty() && (_connected || gw != nullptr)) {
                 std::string subErr;
                 int subCode = 0;
-                dispatchRemoteRpc("easyeda_inspect_schematic", {{"include_pins", false}}, schState, subErr, subCode);
-                if (schState.is_object() && schState.contains("document") &&
-                    schState["document"].is_object() && schState["document"].value("documentType", 0) != 1 &&
-                    schState.contains("project") && schState["project"].is_object() &&
+                dispatchRemoteRpc("easyeda_inspect_schematic", nlohmann::json::object(), schState, subErr, subCode);
+                std::vector<std::string> pageUuids;
+                if (schState.is_object() && schState.contains("project") && schState["project"].is_object() &&
                     schState["project"].contains("data") && schState["project"]["data"].is_array() &&
                     !schState["project"]["data"].empty() &&
                     schState["project"]["data"][0].contains("schematic") &&
                     schState["project"]["data"][0]["schematic"].contains("page") &&
-                    schState["project"]["data"][0]["schematic"]["page"].is_array() &&
-                    !schState["project"]["data"][0]["schematic"]["page"].empty()) {
-                    std::string schUuid = schState["project"]["data"][0]["schematic"]["page"][0].value("uuid", "");
-                    if (!schUuid.empty()) {
-                        nlohmann::json openRes;
-                        invokeEasyEdaApi("eda.dmt_EditorControl.openDocument",
-                                         nlohmann::json::array({schUuid}), openRes);
-                        dispatchRemoteRpc("easyeda_inspect_schematic", {{"include_pins", false}}, schState, subErr, subCode);
+                    schState["project"]["data"][0]["schematic"]["page"].is_array()) {
+                    for (const auto& pg : schState["project"]["data"][0]["schematic"]["page"]) {
+                        if (pg.is_object() && !pg.value("uuid", "").empty()) {
+                            pageUuids.push_back(pg.value("uuid", ""));
+                        }
                     }
                 }
-                mergeCachedPinStatesAndCacheSheet(schState);
+                if (!pageUuids.empty()) {
+                    nlohmann::json mergedComponents = nlohmann::json::array();
+                    std::map<std::string, size_t> refToMergedIdx;
+                    for (const auto& pgUuid : pageUuids) {
+                        nlohmann::json openRes;
+                        invokeEasyEdaApi("eda.dmt_EditorControl.openDocument",
+                                         nlohmann::json::array({pgUuid}), openRes);
+                        nlohmann::json pageState;
+                        if (dispatchRemoteRpc("easyeda_inspect_schematic", nlohmann::json::object(),
+                                              pageState, subErr, subCode) && pageState.is_object()) {
+                            mergeCachedPinStatesAndCacheSheet(pageState);
+                            extractInferredNets(pageState, pgUuid);
+                            if (pageState.contains("components") && pageState["components"].is_array()) {
+                                for (const auto& sc : pageState["components"]) {
+                                    if (!sc.is_object()) continue;
+                                    if (sc.contains("on_active_sheet") && sc["on_active_sheet"].is_boolean() &&
+                                        !sc["on_active_sheet"].get<bool>()) {
+                                        continue;
+                                    }
+                                    std::string r = sc.value("reference", sc.value("ref", sc.value("designator", "")));
+                                    std::string ct = sc.value("component_type", sc.value("type", ""));
+                                    if (!r.empty() && ct == "part") {
+                                        auto exIt = refToMergedIdx.find(r);
+                                        if (exIt != refToMergedIdx.end()) {
+                                            bool existingEmptyPins = !mergedComponents[exIt->second].contains("pins") ||
+                                                !mergedComponents[exIt->second]["pins"].is_array() ||
+                                                mergedComponents[exIt->second]["pins"].empty();
+                                            bool newHasPins = sc.contains("pins") && sc["pins"].is_array() && !sc["pins"].empty();
+                                            if (existingEmptyPins && newHasPins) {
+                                                mergedComponents[exIt->second] = sc;
+                                            }
+                                            continue;
+                                        }
+                                        refToMergedIdx[r] = mergedComponents.size();
+                                    }
+                                    mergedComponents.push_back(sc);
+                                }
+                            }
+                            if (schState.empty() || !schState.contains("project")) {
+                                schState = pageState;
+                            }
+                        }
+                    }
+                    schState["components"] = std::move(mergedComponents);
+                } else {
+                    mergeCachedPinStatesAndCacheSheet(schState);
+                    extractInferredNets(schState, "sheet0");
+                }
+            } else if (!schState.empty()) {
+                extractInferredNets(schState, "sheet0");
             }
+
             if (pcbState.empty() && (_connected || gw != nullptr)) {
                 std::string subErr;
                 int subCode = 0;
@@ -3508,9 +3842,14 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
             nlohmann::json orphanedTracks = nlohmann::json::array();
 
             struct PcbCompEntry {
+                std::string id;
+                std::string uniqueId;
                 std::string value;
                 std::string footprint;
                 std::map<std::string, std::string> padNets;
+                std::map<std::string, std::string> padIds;
+                std::map<std::string, std::pair<double, double>> padCoords;
+                std::map<std::string, bool> padIsMm;
             };
             std::map<std::string, PcbCompEntry> pcbComps;
             for (const char* arrKey : {"components", "footprints", "pcb_components"}) {
@@ -3520,6 +3859,8 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                     std::string ref = pc.value("reference", pc.value("ref", pc.value("designator", "")));
                     if (ref.empty()) continue;
                     PcbCompEntry& entry = pcbComps[ref];
+                    entry.id = pc.value("id", entry.id);
+                    entry.uniqueId = pc.value("unique_id", pc.value("uniqueId", entry.uniqueId));
                     entry.value = pc.value("value", entry.value);
                     entry.footprint = pc.value("footprint", entry.footprint);
                     if (pc.contains("pads") && pc["pads"].is_array()) {
@@ -3528,6 +3869,17 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                             std::string pNum = pad.value("number", pad.value("pad", ""));
                             if (!pNum.empty()) {
                                 entry.padNets[pNum] = pad.value("net", "");
+                                if (!pad.value("id", "").empty()) {
+                                    entry.padIds[pNum] = pad.value("id", "");
+                                }
+                                if (pad.contains("x") || pad.contains("x_mm")) {
+                                    bool isMm = pad.contains("x_mm");
+                                    entry.padCoords[pNum] = {
+                                        isMm ? pad.value("x_mm", 0.0) : pad.value("x", 0.0),
+                                        isMm ? pad.value("y_mm", 0.0) : pad.value("y", 0.0)
+                                    };
+                                    entry.padIsMm[pNum] = isMm;
+                                }
                             }
                         }
                     }
@@ -3540,41 +3892,162 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                     std::string pNum = pad.value("pad", pad.value("number", ""));
                     if (!ref.empty() && !pNum.empty()) {
                         pcbComps[ref].padNets[pNum] = pad.value("net", "");
+                        if (!pad.value("id", "").empty()) {
+                            pcbComps[ref].padIds[pNum] = pad.value("id", "");
+                        }
+                        if (pad.contains("x") || pad.contains("x_mm")) {
+                            bool isMm = pad.contains("x_mm");
+                            pcbComps[ref].padCoords[pNum] = {
+                                isMm ? pad.value("x_mm", 0.0) : pad.value("x", 0.0),
+                                isMm ? pad.value("y_mm", 0.0) : pad.value("y", 0.0)
+                            };
+                            pcbComps[ref].padIsMm[pNum] = isMm;
+                        }
                     }
                 }
             }
+
+            auto toUpperAscii = [](std::string s) {
+                for (char& ch : s) {
+                    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                }
+                return s;
+            };
+            std::map<std::string, std::string> pcbNetByUpper;
+            std::set<std::string> routedPcbNets;
+            if (pcbState.contains("tracks") && pcbState["tracks"].is_array()) {
+                for (const auto& trk : pcbState["tracks"]) {
+                    if (!trk.is_object()) continue;
+                    std::string tNet = trk.value("net", "");
+                    if (!tNet.empty()) {
+                        routedPcbNets.insert(tNet);
+                        pcbNetByUpper[toUpperAscii(tNet)] = tNet;
+                    }
+                }
+            }
+            if (pcbState.contains("vias") && pcbState["vias"].is_array()) {
+                for (const auto& via : pcbState["vias"]) {
+                    if (!via.is_object()) continue;
+                    std::string vNet = via.value("net", "");
+                    if (!vNet.empty()) {
+                        routedPcbNets.insert(vNet);
+                        pcbNetByUpper[toUpperAscii(vNet)] = vNet;
+                    }
+                }
+            }
+            for (const auto& kv : pcbComps) {
+                for (const auto& pkv : kv.second.padNets) {
+                    if (!pkv.second.empty() &&
+                        pcbNetByUpper.find(toUpperAscii(pkv.second)) == pcbNetByUpper.end()) {
+                        pcbNetByUpper[toUpperAscii(pkv.second)] = pkv.second;
+                    }
+                }
+            }
+            auto normalizeToPcbNetCase = [&](const std::string& net) -> std::string {
+                if (net.empty()) return net;
+                auto it = pcbNetByUpper.find(toUpperAscii(net));
+                if (it != pcbNetByUpper.end()) {
+                    return it->second;
+                }
+                return net;
+            };
+
+            collectSheetNamedNets(schState);
+            {
+                std::set<std::string> normNamed;
+                for (const auto& n : namedSchNets) normNamed.insert(normalizeToPcbNetCase(n));
+                namedSchNets = std::move(normNamed);
+                std::set<std::string> normValid;
+                for (const auto& n : validSchNets) normValid.insert(normalizeToPcbNetCase(n));
+                validSchNets = std::move(normValid);
+            }
+
+            // Resolve synthetic "$NET_*" names from calcSchematicErcAudit against existing PCB pad/track nets
+            auto resolveSchNet = [&](const std::string& rawNet) -> std::string {
+                if (rawNet.empty()) return "";
+                if (rawNet.rfind("$NET_", 0) != 0) {
+                    return normalizeToPcbNetCase(rawNet);
+                }
+                auto memIt = inferredNetMembers.find(rawNet);
+                if (memIt != inferredNetMembers.end()) {
+                    if (memIt->second.size() <= 1) {
+                        return "";
+                    }
+                    for (const auto& rp : memIt->second) {
+                        auto cIt = pcbComps.find(rp.first);
+                        if (cIt != pcbComps.end()) {
+                            auto pIt = cIt->second.padNets.find(rp.second);
+                            if (pIt != cIt->second.padNets.end() && !pIt->second.empty() &&
+                                namedSchNets.find(pIt->second) == namedSchNets.end()) {
+                                return pIt->second;
+                            }
+                        }
+                    }
+                    if (pcbState.contains("tracks") && pcbState["tracks"].is_array()) {
+                        for (const auto& rp : memIt->second) {
+                            auto cIt = pcbComps.find(rp.first);
+                            if (cIt == pcbComps.end()) continue;
+                            auto coordIt = cIt->second.padCoords.find(rp.second);
+                            if (coordIt == cIt->second.padCoords.end()) continue;
+                            bool padMm = cIt->second.padIsMm[rp.second];
+                            double px = coordIt->second.first;
+                            double py = coordIt->second.second;
+                            const double tol = padMm ? 0.15 : 5.0;
+                            for (const auto& trk : pcbState["tracks"]) {
+                                if (!trk.is_object()) continue;
+                                std::string tNet = trk.value("net", "");
+                                if (tNet.empty() || namedSchNets.find(tNet) != namedSchNets.end()) continue;
+                                bool trkMm = trk.contains("x1_mm");
+                                if (trkMm != padMm) continue;
+                                double x1 = trkMm ? trk.value("x1_mm", 0.0) : trk.value("x1", 0.0);
+                                double y1 = trkMm ? trk.value("y1_mm", 0.0) : trk.value("y1", 0.0);
+                                double x2 = trkMm ? trk.value("x2_mm", 0.0) : trk.value("x2", 0.0);
+                                double y2 = trkMm ? trk.value("y2_mm", 0.0) : trk.value("y2", 0.0);
+                                if (std::hypot(x1 - px, y1 - py) <= tol ||
+                                    std::hypot(x2 - px, y2 - py) <= tol) {
+                                    return tNet;
+                                }
+                            }
+                        }
+                    }
+                    return memIt->second.front().first + "_" + memIt->second.front().second;
+                }
+                return "";
+            };
 
             std::set<std::string> schRefsSet;
-            std::set<std::string> validSchNets;
-            if (schState.contains("wires") && schState["wires"].is_array()) {
-                for (const auto& w : schState["wires"]) {
-                    if (w.is_object() && !w.value("net", "").empty()) {
-                        validSchNets.insert(w.value("net", ""));
-                    }
-                }
-            }
-            if (schState.contains("nets") && schState["nets"].is_array()) {
-                for (const auto& n : schState["nets"]) {
-                    if (n.is_object() && !n.value("name", "").empty()) {
-                        validSchNets.insert(n.value("name", ""));
-                    }
+            for (const auto& kv : inferredNetMembers) {
+                std::string resolved = resolveSchNet(kv.first);
+                if (!resolved.empty()) {
+                    validSchNets.insert(resolved);
                 }
             }
 
+            bool forceOverwriteRouted = remoteArgs.value("force_overwrite_routed_pads", false);
+            std::map<std::pair<std::string, std::string>, std::string> targetPadNets;
+            int updatedCompMetadata = 0;
             if (schState.contains("components") && schState["components"].is_array()) {
                 for (const auto& sc : schState["components"]) {
                     if (!sc.is_object()) continue;
                     std::string ref = sc.value("reference", sc.value("ref", sc.value("designator", "")));
                     std::string compType = sc.value("component_type", sc.value("type", ""));
+                    std::string fp = sc.value("footprint", "");
                     if (ref.empty() || compType == "netport" || compType == "frame" ||
-                        compType == "power" || compType == "netflag" ||
+                        compType == "power" || compType == "netflag" || compType == "sheet" ||
+                        compType == "drawing" ||
                         ref.rfind("FRAME", 0) == 0 || ref.rfind("#", 0) == 0 ||
-                        ref == "GND" || ref == "VCC") {
+                        ref == "GND" || ref == "VCC" || ref == "A") {
                         continue;
                     }
-                    schRefsSet.insert(ref);
+                    if (fp.empty() && !compType.empty() && compType != "part") {
+                        continue;
+                    }
+                    if (!schRefsSet.insert(ref).second) {
+                        continue;
+                    }
                     std::string val = sc.value("value", "");
-                    std::string fp = sc.value("footprint", "");
+                    std::string lcsc = sc.value("lcsc", "");
+                    std::string uniqueId = sc.value("unique_id", sc.value("uniqueId", ""));
                     if (ref.find('?') != std::string::npos) {
                         unannotatedReferences.push_back(ref);
                     }
@@ -3587,9 +4060,17 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                         for (const auto& p : sc["pins"]) {
                             if (!p.is_object()) continue;
                             std::string pNum = p.value("number", "");
-                            std::string pNet = p.value("net", "");
+                            bool isNoConn = p.value("no_connected", false);
+                            std::string pNet = isNoConn ? "" : normalizeToPcbNetCase(p.value("net", ""));
+                            if (!isNoConn && pNet.empty() && !pNum.empty()) {
+                                auto infIt = inferredPinNets.find({ref, pNum});
+                                if (infIt != inferredPinNets.end()) {
+                                    pNet = resolveSchNet(infIt->second);
+                                }
+                            }
                             if (!pNum.empty()) {
                                 schPinNets[pNum] = pNet;
+                                targetPadNets[{ref, pNum}] = pNet;
                             }
                             if (!pNet.empty()) {
                                 validSchNets.insert(pNet);
@@ -3600,11 +4081,21 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                     auto pcbIt = pcbComps.find(ref);
                     if (pcbIt == pcbComps.end()) {
                         if (ref.find('?') == std::string::npos && !fp.empty()) {
-                            componentsToAdd.push_back({
+                            nlohmann::json padNetsJson = nlohmann::json::object();
+                            for (const auto& kv : schPinNets) {
+                                if (!kv.second.empty()) {
+                                    padNetsJson[kv.first] = kv.second;
+                                }
+                            }
+                            nlohmann::json addEntry = {
                                 {"reference", ref},
                                 {"value", val},
                                 {"footprint", fp}
-                            });
+                            };
+                            if (!lcsc.empty()) addEntry["lcsc"] = lcsc;
+                            if (!uniqueId.empty()) addEntry["unique_id"] = uniqueId;
+                            if (!padNetsJson.empty()) addEntry["pad_nets"] = std::move(padNetsJson);
+                            componentsToAdd.push_back(std::move(addEntry));
                         }
                     } else {
                         if (!fp.empty() && !pcbIt->second.footprint.empty() && fp != pcbIt->second.footprint) {
@@ -3614,17 +4105,44 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                                 {"pcb_footprint", pcbIt->second.footprint}
                             });
                         }
+                        if (!isDryRun && (_connected || gw != nullptr) && !pcbIt->second.id.empty()) {
+                            nlohmann::json compModProps = nlohmann::json::object();
+                            if (!uniqueId.empty() && pcbIt->second.uniqueId != uniqueId) {
+                                compModProps["uniqueId"] = uniqueId;
+                            }
+                            if (!val.empty() && pcbIt->second.value != val) {
+                                compModProps["name"] = val;
+                            }
+                            if (!compModProps.empty()) {
+                                nlohmann::json modRes;
+                                if (invokeEasyEdaApi("eda.pcb_PrimitiveComponent.modify",
+                                                     nlohmann::json::array({pcbIt->second.id, compModProps}),
+                                                     modRes)) {
+                                    ++updatedCompMetadata;
+                                }
+                            }
+                        }
                         for (const auto& kv : schPinNets) {
                             std::string oldNet = pcbIt->second.padNets.count(kv.first)
                                 ? pcbIt->second.padNets[kv.first]
                                 : "";
+                            if (!forceOverwriteRouted && !oldNet.empty() && oldNet != kv.second &&
+                                validSchNets.find(oldNet) != validSchNets.end() &&
+                                routedPcbNets.find(oldNet) != routedPcbNets.end()) {
+                                continue;
+                            }
                             if (oldNet != kv.second && (!oldNet.empty() || !kv.second.empty())) {
-                                padNetDeltas.push_back({
+                                nlohmann::json deltaObj = {
                                     {"reference", ref},
                                     {"pad", kv.first},
                                     {"old_net", oldNet},
                                     {"new_net", kv.second}
-                                });
+                                };
+                                auto pidIt = pcbIt->second.padIds.find(kv.first);
+                                if (pidIt != pcbIt->second.padIds.end() && !pidIt->second.empty()) {
+                                    deltaObj["pad_id"] = pidIt->second;
+                                }
+                                padNetDeltas.push_back(std::move(deltaObj));
                             }
                         }
                     }
@@ -3660,11 +4178,92 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
             }
 
             bool readyToSync = unannotatedReferences.empty() && missingFootprints.empty();
+            int appliedPadModifications = 0;
+            int updatedOrphanedTracks = 0;
+            bool didSync = false;
+
+            if (!isDryRun && readyToSync && (_connected || gw != nullptr)) {
+                std::map<std::string, std::string> mergedOldToNewNet;
+                for (const auto& delta : padNetDeltas) {
+                    std::string padId = delta.value("pad_id", "");
+                    std::string oldNet = delta.value("old_net", "");
+                    std::string newNet = delta.value("new_net", "");
+                    if (!oldNet.empty() && !newNet.empty() &&
+                        validSchNets.find(oldNet) == validSchNets.end()) {
+                        mergedOldToNewNet[oldNet] = newNet;
+                    }
+                    if (!padId.empty()) {
+                        nlohmann::json modRes;
+                        if (invokeEasyEdaApi("eda.pcb_PrimitivePad.modify",
+                                             nlohmann::json::array({padId, {{"net", newNet}}}),
+                                             modRes)) {
+                            ++appliedPadModifications;
+                        }
+                    }
+                }
+                if (pcbState.contains("tracks") && pcbState["tracks"].is_array()) {
+                    for (const auto& trk : pcbState["tracks"]) {
+                        if (!trk.is_object()) continue;
+                        std::string tNet = trk.value("net", "");
+                        if (tNet.empty() || validSchNets.find(tNet) != validSchNets.end() ||
+                            mergedOldToNewNet.find(tNet) != mergedOldToNewNet.end()) {
+                            continue;
+                        }
+                        bool trkMm = trk.contains("x1_mm");
+                        double x1 = trkMm ? trk.value("x1_mm", 0.0) : trk.value("x1", 0.0);
+                        double y1 = trkMm ? trk.value("y1_mm", 0.0) : trk.value("y1", 0.0);
+                        double x2 = trkMm ? trk.value("x2_mm", 0.0) : trk.value("x2", 0.0);
+                        double y2 = trkMm ? trk.value("y2_mm", 0.0) : trk.value("y2", 0.0);
+                        for (const auto& ckv : pcbComps) {
+                            for (const auto& coordKv : ckv.second.padCoords) {
+                                bool padMm = ckv.second.padIsMm.at(coordKv.first);
+                                if (padMm != trkMm) continue;
+                                const double tol = padMm ? 0.15 : 5.0;
+                                double px = coordKv.second.first;
+                                double py = coordKv.second.second;
+                                if (std::hypot(x1 - px, y1 - py) <= tol ||
+                                    std::hypot(x2 - px, y2 - py) <= tol) {
+                                    auto tIt = targetPadNets.find({ckv.first, coordKv.first});
+                                    if (tIt != targetPadNets.end() && !tIt->second.empty() &&
+                                        validSchNets.find(tIt->second) != validSchNets.end()) {
+                                        mergedOldToNewNet[tNet] = tIt->second;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (mergedOldToNewNet.find(tNet) != mergedOldToNewNet.end()) {
+                                break;
+                            }
+                        }
+                    }
+                    for (const auto& trk : pcbState["tracks"]) {
+                        if (!trk.is_object()) continue;
+                        std::string trkId = trk.value("id", "");
+                        std::string tNet = trk.value("net", "");
+                        // Never touch child sub-primitives inside a footprint (<compId>e<subId>)
+                        if (trkId.empty() || trkId.find('e', 1) != std::string::npos) continue;
+                        auto mIt = mergedOldToNewNet.find(tNet);
+                        if (mIt != mergedOldToNewNet.end()) {
+                            nlohmann::json modRes;
+                            if (invokeEasyEdaApi("eda.pcb_PrimitiveLine.modify",
+                                                 nlohmann::json::array({trkId, {{"net", mIt->second}}}),
+                                                 modRes)) {
+                                ++updatedOrphanedTracks;
+                            }
+                        }
+                    }
+                }
+                didSync = true;
+            }
+
             rpcResult = {
                 {"ok", true},
-                {"dry_run", true},
-                {"synced", false},
+                {"dry_run", isDryRun},
+                {"synced", didSync},
                 {"ready_to_sync", readyToSync},
+                {"applied_pad_net_deltas", appliedPadModifications},
+                {"updated_component_metadata", updatedCompMetadata},
+                {"updated_orphaned_tracks", updatedOrphanedTracks},
                 {"components_to_add", componentsToAdd},
                 {"components_to_remove", componentsToRemove},
                 {"footprint_mismatches", footprintMismatches},
