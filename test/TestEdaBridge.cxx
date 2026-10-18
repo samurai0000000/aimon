@@ -2402,6 +2402,203 @@ TEST(EdaAccelerators_Unit, EdaBridgeLiveAutorouteRulePrecedenceAndOutlineWarning
     STRCMP_EQUAL("board_design_rules", expRes["rules"]["sources"].value("via_size_mm", "").c_str());
 }
 
+TEST(EdaAccelerators_Unit, Envelope2ConnectivityAuditCopperPoursAndUnassignedPads) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // Board with:
+    // - Pad 1: SMD pad on TopLayer, net GND at (500, 500)
+    // - Pad 2: SMD pad on TopLayer, net GND at (1500, 1500)
+    // - Via 1: stitching via, net GND at (1000, 1000)
+    // - Pour 1: TopLayer copper pour for net GND, defined via flat command array polygon
+    // - Pour 2: InnerLayer2 copper pour for net VCC, defined via bbox
+    // - Pad 3: Unassigned NC pad at (200, 200) with net "" (ref U1, pad NC)
+    nlohmann::json stateConnected = {
+        {"units", "mil"},
+        {"pads", nlohmann::json::array({
+            {{"id", "p1"}, {"ref", "U1"}, {"number", "1"}, {"net", "GND"},
+             {"x", 500.0}, {"y", 500.0}, {"size_x", 30.0}, {"size_y", 30.0}, {"layer", "1"}},
+            {{"id", "p2"}, {"ref", "U2"}, {"number", "1"}, {"net", "GND"},
+             {"x", 1500.0}, {"y", 1500.0}, {"size_x", 30.0}, {"size_y", 30.0}, {"layer", "1"}},
+            {{"id", "p_nc"}, {"ref", "U1"}, {"number", "NC"}, {"net", ""},
+             {"x", 200.0}, {"y", 200.0}, {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}}
+        })},
+        {"vias", nlohmann::json::array({
+            {{"id", "via_gnd"}, {"net", "GND"}, {"x", 1000.0}, {"y", 1000.0}, {"diameter", 24.0}, {"drill", 12.0}}
+        })},
+        {"copper_pours", nlohmann::json::array({
+            {
+                {"id", "pour_gnd_top"},
+                {"net", "GND"},
+                {"layer", "1"},
+                {"polygon", nlohmann::json::array({
+                    0.0, 0.0, "L",
+                    2000.0, 0.0, "L",
+                    2000.0, 2000.0, "L",
+                    0.0, 2000.0, "L"
+                })}
+            },
+            {
+                {"id", "pour_vcc_in2"},
+                {"net", "VCC"},
+                {"layer", "16"},
+                {"min_x", 100.0}, {"min_y", 100.0}, {"max_x", 1900.0}, {"max_y", 1900.0}
+            }
+        })}
+    };
+
+    nlohmann::json resConn = acc.calcPcbConnectivityAudit(stateConnected, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE_TEXT(resConn.value("all_connected", false), resConn.dump().c_str());
+    CHECK_EQUAL(0, resConn.value("unrouted_nets_count", -1));
+    CHECK_EQUAL(0, resConn.value("dangling_tracks_count", -1));
+    CHECK_EQUAL(1, resConn.value("unassigned_pads_count", -1));
+    CHECK_EQUAL(2, resConn.value("pours_count", -1));
+
+    // Move Pad 2 outside the pour polygon -> unrouted_nets_count becomes 1 and all_connected becomes false!
+    nlohmann::json stateDisconnected = stateConnected;
+    stateDisconnected["pads"][1]["x"] = 3500.0;
+    stateDisconnected["pads"][1]["y"] = 3500.0;
+
+    nlohmann::json resDisc = acc.calcPcbConnectivityAudit(stateDisconnected, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_FALSE(resDisc.value("all_connected", true));
+    CHECK_EQUAL(1, resDisc.value("unrouted_nets_count", 0));
+
+    // Board with zero assigned nets and only unassigned NC pads should be all_connected == true
+    nlohmann::json stateOnlyNc = {
+        {"units", "mil"},
+        {"pads", nlohmann::json::array({
+            {{"id", "p_nc1"}, {"ref", "U1"}, {"number", "NC"}, {"net", ""},
+             {"x", 200.0}, {"y", 200.0}, {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}}
+        })}
+    };
+    nlohmann::json resOnlyNc = acc.calcPcbConnectivityAudit(stateOnlyNc, ok, summary);
+    CHECK_TRUE(ok);
+    CHECK_TRUE_TEXT(resOnlyNc.value("all_connected", false), resOnlyNc.dump().c_str());
+    CHECK_EQUAL(1, resOnlyNc.value("unassigned_pads_count", -1));
+    CHECK_EQUAL(0, resOnlyNc.value("unrouted_nets_count", -1));
+}
+
+TEST(EdaAccelerators_Unit, Envelope2AutorouteStitchingViasAndPours) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // 1. Standalone stitching via routing:
+    // A net "GND" with 2 pads (at (5.0, 10.0) and (25.0, 10.0)) and a standalone stitching via
+    // at (15.0, 10.0) in existing_vias.
+    // The stitching via must be recognized as a valid routable island (hasPad[isl] = 1),
+    // padless_islands_ignored must be 0, and the router must route between all islands.
+    nlohmann::json viaArgs = {
+        {"board", {{"width_mm", 30.0}, {"height_mm", 20.0}, {"layers", 2}}},
+        {"rules", {{"track_width_mm", 0.25}, {"clearance_mm", 0.2}, {"via_size_mm", 0.6}, {"via_drill_mm", 0.3}}},
+        {"nets", nlohmann::json::array({
+            {{"name", "GND"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 5.0}, {"y_mm", 10.0}, {"layer", "F.Cu"}},
+                {{"x_mm", 25.0}, {"y_mm", 10.0}, {"layer", "F.Cu"}}
+            })}}
+        })},
+        {"existing_vias", nlohmann::json::array({
+            {{"x_mm", 15.0}, {"y_mm", 10.0}, {"net", "GND"}, {"diameter_mm", 0.6}}
+        })}
+    };
+
+    nlohmann::json viaRes = acc.calcPcbAutoroute(viaArgs, ok, summary);
+    CHECK_TRUE_TEXT(ok, viaRes.dump().c_str());
+    CHECK_TRUE(viaRes.value("ok", false));
+    CHECK_EQUAL(1, viaRes.value("routed_nets", 0));
+    CHECK_EQUAL(0, viaRes.value("unrouted_nets", -1));
+    CHECK_EQUAL(0, viaRes.value("padless_islands_ignored", -1));
+    CHECK_TRUE(!viaRes["tracks"].empty());
+
+    // 2. Copper pour union in autoroute island detection:
+    // If a copper pour for net "GND" already covers both pads at (5.0, 10.0) and (15.0, 10.0),
+    // they belong to the same pour island, so no new tracks are needed (unrouted_nets == 0).
+    nlohmann::json pourArgs = {
+        {"board", {{"width_mm", 30.0}, {"height_mm", 20.0}, {"layers", 2}}},
+        {"rules", {{"track_width_mm", 0.25}, {"clearance_mm", 0.2}, {"via_size_mm", 0.6}, {"via_drill_mm", 0.3}}},
+        {"nets", nlohmann::json::array({
+            {{"name", "GND"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 5.0}, {"y_mm", 10.0}, {"layer", "F.Cu"}},
+                {{"x_mm", 15.0}, {"y_mm", 10.0}, {"layer", "F.Cu"}}
+            })}}
+        })},
+        {"pours", nlohmann::json::array({
+            {
+                {"id", "pour_gnd"},
+                {"net", "GND"},
+                {"layer", "F.Cu"},
+                {"points", nlohmann::json::array({
+                    nlohmann::json::array({2.0, 5.0}),
+                    nlohmann::json::array({20.0, 5.0}),
+                    nlohmann::json::array({20.0, 15.0}),
+                    nlohmann::json::array({2.0, 15.0})
+                })}
+            }
+        })}
+    };
+
+    nlohmann::json pourRes = acc.calcPcbAutoroute(pourArgs, ok, summary);
+    CHECK_TRUE_TEXT(ok, pourRes.dump().c_str());
+    CHECK_TRUE(pourRes.value("ok", false));
+    CHECK_EQUAL(0, pourRes.value("unrouted_nets", -1));
+    // Since pads are already united by the copper pour, zero new tracks are required!
+    CHECK_EQUAL(0, static_cast<int>(pourRes["tracks"].size()));
+}
+
+TEST(EdaAccelerators_Unit, Envelope2LiveAutorouteSafeCommittedIdsAndDrcShifts) {
+    EdaBridgeConfig cfg;
+    cfg.enabled = false;
+    cfg.accelerators.enabled = true;
+    EdaBridge bridge(cfg);
+
+    // Live autoroute with pcb_state containing copper pours and pre-existing tracks.
+    // Verify that:
+    // 1. Pours are passed into calcPcbAutoroute and reflected in the post-route connectivity audit.
+    // 2. committed_ids in commit_result only targets newly generated tracks.
+    nlohmann::json state = {
+        {"units", "mil"},
+        {"pads", nlohmann::json::array({
+            {{"id", "p_sig1"}, {"ref", "U1"}, {"pad", "1"}, {"net", "SIG"}, {"x", 1000.0}, {"y", 1000.0},
+             {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+            {{"id", "p_sig2"}, {"ref", "U2"}, {"pad", "1"}, {"net", "SIG"}, {"x", 1600.0}, {"y", 1000.0},
+             {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+            {{"id", "p_gnd1"}, {"ref", "U1"}, {"pad", "2"}, {"net", "GND"}, {"x", 1000.0}, {"y", 1200.0},
+             {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+            {{"id", "p_gnd2"}, {"ref", "U2"}, {"pad", "2"}, {"net", "GND"}, {"x", 1600.0}, {"y", 1200.0},
+             {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"id", "trk_pre_existing"}, {"net", "GND"}, {"layer", "1"},
+             {"x1", 1000.0}, {"y1", 1200.0}, {"x2", 1600.0}, {"y2", 1200.0}, {"width", 10.0}}
+        })},
+        {"vias", nlohmann::json::array()},
+        {"zones", nlohmann::json::array({
+            {
+                {"id", "pour_gnd"},
+                {"net", "GND"},
+                {"layer", "1"},
+                {"min_x", 800.0}, {"min_y", 1100.0}, {"max_x", 1800.0}, {"max_y", 1300.0}
+            }
+        })}
+    };
+
+    nlohmann::json res = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", state}, {"apply_to_pcb", true}, {"grid_step_mm", 0.1}
+    });
+
+    CHECK_TRUE_TEXT(res.value("ok", false), res.dump().c_str());
+    CHECK_TRUE(res.value("committed", false));
+    CHECK_EQUAL(1, static_cast<int>(res["routed_nets"].size()));
+    STRCMP_EQUAL("SIG", res["routed_nets"][0].get<std::string>().c_str());
+    CHECK_TRUE(res.contains("post_route_audit"));
+    CHECK_TRUE(res["post_route_audit"].value("all_connected", false));
+    CHECK_EQUAL(0, res["post_route_audit"].value("unrouted_nets_count", -1));
+    CHECK_EQUAL(1, res["post_route_audit"].value("pours_count", -1));
+}
+
 
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {

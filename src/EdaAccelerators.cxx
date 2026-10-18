@@ -1187,6 +1187,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         int island = 0;
         double ex = 0.0;
         double ey = 0.0;
+        bool isInterior = false;
     };
     struct Bridge {
         std::vector<size_t> cells;
@@ -1240,8 +1241,11 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             staticPads.push_back(parsePad(p, netIdFor(netNameOf(p, ""))));
         }
     }
-    if (args.contains("existing_tracks") && args["existing_tracks"].is_array()) {
-        for (const auto& et : args["existing_tracks"]) {
+    const nlohmann::json* tracksArr = args.contains("existing_tracks") && args["existing_tracks"].is_array()
+        ? &args["existing_tracks"]
+        : (args.contains("tracks") && args["tracks"].is_array() ? &args["tracks"] : nullptr);
+    if (tracksArr) {
+        for (const auto& et : *tracksArr) {
             if (!et.is_object()) continue;
             TrackGeom t;
             t.x1 = readLen(et, {"x1_mm"}, {"x1"}, 0.0);
@@ -1254,8 +1258,11 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             tracksIn.push_back(t);
         }
     }
-    if (args.contains("existing_vias") && args["existing_vias"].is_array()) {
-        for (const auto& ev : args["existing_vias"]) {
+    const nlohmann::json* viasArr = args.contains("existing_vias") && args["existing_vias"].is_array()
+        ? &args["existing_vias"]
+        : (args.contains("vias") && args["vias"].is_array() ? &args["vias"] : nullptr);
+    if (viasArr) {
+        for (const auto& ev : *viasArr) {
             if (!ev.is_object()) continue;
             ViaGeom v;
             v.x = readLen(ev, {"x_mm"}, {"x"}, 0.0);
@@ -1322,42 +1329,202 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             rects.push_back(r);
         }
     }
-    // pours[] / zones[] are net-owned copper areas on their layer. They do not block vias:
-    // EasyEDA / KiCad pours re-flood around vias, so treating planes as via obstacles would
-    // make every inner-plane 4-layer board unroutable.
-    for (const char* pourKey : {"pours", "zones"}) {
+    // pours[] / zones[] / copper_pours[] are net-owned copper areas on their layer.
+    struct RoutePour {
+        std::string id;
+        std::string net;
+        int layer = 0;
+        std::vector<std::pair<double, double>> poly;
+        bool hasBbox = false;
+        double xMin = 0.0;
+        double yMin = 0.0;
+        double xMax = 0.0;
+        double yMax = 0.0;
+    };
+    std::vector<RoutePour> allRoutePours;
+
+    for (const char* pourKey : {"pours", "zones", "copper_pours"}) {
         if (!args.contains(pourKey) || !args[pourKey].is_array()) continue;
         for (const auto& z : args[pourKey]) {
             if (!z.is_object()) continue;
-            double xMin = 0.0, xMax = -1.0, yMin = 0.0, yMax = -1.0;
-            if (z.contains("x_min") && z.contains("x_max")) {
-                xMin = readLen(z, {}, {"x_min"}, 0.0);
-                xMax = readLen(z, {}, {"x_max"}, 0.0);
-                yMin = readLen(z, {}, {"y_min"}, 0.0);
-                yMax = readLen(z, {}, {"y_max"}, 0.0);
-            } else if (z.contains("w_mm") || z.contains("width_mm")) {
+            RoutePour rp;
+            rp.id = z.value("id", "pour_" + std::to_string(allRoutePours.size() + 1));
+            rp.net = netNameOf(z, "");
+            rp.layer = layerNameToIdx(extractLayerStr(z, "TopLayer"));
+
+            const nlohmann::json* polyArr = nullptr;
+            for (const char* polyKey : {"polygon", "points", "outline", "source", "Source"}) {
+                if (z.contains(polyKey)) {
+                    if (z[polyKey].is_array()) {
+                        polyArr = &z[polyKey];
+                        break;
+                    } else if (z[polyKey].is_object()) {
+                        const auto& inner = z[polyKey];
+                        for (const char* innerKey : {"polygon", "points", "outline", "source", "Source"}) {
+                            if (inner.contains(innerKey) && inner[innerKey].is_array()) {
+                                polyArr = &inner[innerKey];
+                                break;
+                            }
+                        }
+                        if (polyArr != nullptr) break;
+                    }
+                }
+            }
+
+            if (polyArr != nullptr) {
+                for (size_t i = 0; i < polyArr->size(); ++i) {
+                    const auto& tok = (*polyArr)[i];
+                    if (tok.is_string()) {
+                        std::string s = tok.get<std::string>();
+                        for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        if (s == "ARC" && i + 1 < polyArr->size() && (*polyArr)[i + 1].is_number()) {
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (tok.is_object()) {
+                        if (tok.contains("x_mm") && tok.contains("y_mm") &&
+                            tok["x_mm"].is_number() && tok["y_mm"].is_number()) {
+                            rp.poly.emplace_back(tok["x_mm"].get<double>(), tok["y_mm"].get<double>());
+                        } else if (tok.contains("x") && tok.contains("y") &&
+                                   tok["x"].is_number() && tok["y"].is_number()) {
+                            rp.poly.emplace_back(tok["x"].get<double>() * unitScale, tok["y"].get<double>() * unitScale);
+                        }
+                    } else if (tok.is_array() && tok.size() >= 2 &&
+                               tok[0].is_number() && tok[1].is_number()) {
+                        rp.poly.emplace_back(tok[0].get<double>() * unitScale, tok[1].get<double>() * unitScale);
+                    } else if (tok.is_number() && i + 1 < polyArr->size() &&
+                               (*polyArr)[i + 1].is_number()) {
+                        rp.poly.emplace_back(tok.get<double>() * unitScale, (*polyArr)[i + 1].get<double>() * unitScale);
+                        ++i;
+                    }
+                }
+            }
+
+            if (z.contains("x_min_mm") && z.contains("y_min_mm") && z.contains("x_max_mm") && z.contains("y_max_mm") &&
+                z["x_min_mm"].is_number() && z["y_min_mm"].is_number() &&
+                z["x_max_mm"].is_number() && z["y_max_mm"].is_number()) {
+                rp.hasBbox = true;
+                rp.xMin = z["x_min_mm"].get<double>();
+                rp.yMin = z["y_min_mm"].get<double>();
+                rp.xMax = z["x_max_mm"].get<double>();
+                rp.yMax = z["y_max_mm"].get<double>();
+            } else if (z.contains("x_min") && z.contains("y_min") && z.contains("x_max") && z.contains("y_max") &&
+                       z["x_min"].is_number() && z["y_min"].is_number() &&
+                       z["x_max"].is_number() && z["y_max"].is_number()) {
+                rp.hasBbox = true;
+                rp.xMin = z["x_min"].get<double>() * unitScale;
+                rp.yMin = z["y_min"].get<double>() * unitScale;
+                rp.xMax = z["x_max"].get<double>() * unitScale;
+                rp.yMax = z["y_max"].get<double>() * unitScale;
+            } else if (z.contains("min_x") && z.contains("min_y") && z.contains("max_x") && z.contains("max_y") &&
+                       z["min_x"].is_number() && z["min_y"].is_number() &&
+                       z["max_x"].is_number() && z["max_y"].is_number()) {
+                rp.hasBbox = true;
+                rp.xMin = z["min_x"].get<double>() * unitScale;
+                rp.yMin = z["min_y"].get<double>() * unitScale;
+                rp.xMax = z["max_x"].get<double>() * unitScale;
+                rp.yMax = z["max_y"].get<double>() * unitScale;
+            } else if (z.contains("bbox") && z["bbox"].is_object()) {
+                const auto& bb = z["bbox"];
+                if (bb.contains("x_min") && bb.contains("y_min") && bb.contains("x_max") && bb.contains("y_max")) {
+                    rp.hasBbox = true;
+                    rp.xMin = readLen(bb, {"x_min_mm"}, {"x_min"}, 0.0);
+                    rp.yMin = readLen(bb, {"y_min_mm"}, {"y_min"}, 0.0);
+                    rp.xMax = readLen(bb, {"x_max_mm"}, {"x_max"}, 0.0);
+                    rp.yMax = readLen(bb, {"y_max_mm"}, {"y_max"}, 0.0);
+                } else if (bb.contains("min_x") && bb.contains("min_y") && bb.contains("max_x") && bb.contains("max_y")) {
+                    rp.hasBbox = true;
+                    rp.xMin = readLen(bb, {"min_x_mm"}, {"min_x"}, 0.0);
+                    rp.yMin = readLen(bb, {"min_y_mm"}, {"min_y"}, 0.0);
+                    rp.xMax = readLen(bb, {"max_x_mm"}, {"max_x"}, 0.0);
+                    rp.yMax = readLen(bb, {"max_y_mm"}, {"max_y"}, 0.0);
+                }
+            } else if (z.contains("w_mm") || z.contains("width_mm") ||
+                       (z.contains("x") && z.contains("y") && (z.contains("width") || z.contains("w")))) {
                 double zx = readLen(z, {"x_mm"}, {"x"}, 0.0);
                 double zy = readLen(z, {"y_mm"}, {"y"}, 0.0);
-                double zw = readLen(z, {"w_mm", "width_mm"}, {}, 0.0);
-                double zh = readLen(z, {"h_mm", "height_mm"}, {}, 0.0);
-                xMin = zx;
-                xMax = zx + zw;
-                yMin = zy;
-                yMax = zy + zh;
+                double zw = readLen(z, {"w_mm", "width_mm"}, {"width", "w"}, 0.0);
+                double zh = readLen(z, {"h_mm", "height_mm"}, {"height", "h"}, 0.0);
+                if (zw > 0.0 && zh > 0.0) {
+                    rp.hasBbox = true;
+                    rp.xMin = zx;
+                    rp.yMin = zy;
+                    rp.xMax = zx + zw;
+                    rp.yMax = zy + zh;
+                }
             }
-            if (xMax < xMin || yMax < yMin) continue;
-            RectGeom r;
-            r.cx = 0.5 * (xMin + xMax);
-            r.cy = 0.5 * (yMin + yMax);
-            r.hw = 0.5 * (xMax - xMin);
-            r.hh = 0.5 * (yMax - yMin);
-            r.layer = layerNameToIdx(extractLayerStr(z, "F.Cu"));
-            r.ownerId = netIdFor(netNameOf(z, ""));
-            r.margin = clearanceMm;
-            r.viaMargin = -1.0;
-            rects.push_back(r);
+
+            if (rp.hasBbox) {
+                if (rp.xMin > rp.xMax) std::swap(rp.xMin, rp.xMax);
+                if (rp.yMin > rp.yMax) std::swap(rp.yMin, rp.yMax);
+                if (rp.poly.empty()) {
+                    rp.poly = {
+                        {rp.xMin, rp.yMin},
+                        {rp.xMax, rp.yMin},
+                        {rp.xMax, rp.yMax},
+                        {rp.xMin, rp.yMax}
+                    };
+                }
+            } else if (!rp.poly.empty()) {
+                rp.hasBbox = true;
+                rp.xMin = rp.poly[0].first;
+                rp.xMax = rp.poly[0].first;
+                rp.yMin = rp.poly[0].second;
+                rp.yMax = rp.poly[0].second;
+                for (const auto& pt : rp.poly) {
+                    rp.xMin = std::min(rp.xMin, pt.first);
+                    rp.xMax = std::max(rp.xMax, pt.first);
+                    rp.yMin = std::min(rp.yMin, pt.second);
+                    rp.yMax = std::max(rp.yMax, pt.second);
+                }
+            }
+
+            if (rp.hasBbox && rp.xMax >= rp.xMin && rp.yMax >= rp.yMin) {
+                RectGeom r;
+                r.cx = 0.5 * (rp.xMin + rp.xMax);
+                r.cy = 0.5 * (rp.yMin + rp.yMax);
+                r.hw = 0.5 * (rp.xMax - rp.xMin);
+                r.hh = 0.5 * (rp.yMax - rp.yMin);
+                r.layer = rp.layer;
+                r.ownerId = netIdFor(rp.net);
+                r.margin = clearanceMm;
+                r.viaMargin = -1.0;
+                rects.push_back(r);
+            }
+
+            if (!rp.net.empty() && (rp.poly.size() >= 3 || rp.hasBbox)) {
+                allRoutePours.push_back(rp);
+            }
         }
     }
+
+    auto pointInOrNearRoutePour = [](const RoutePour& pour, double px, double py, double radius) -> bool {
+        if (pour.hasBbox) {
+            if (px < pour.xMin - radius || px > pour.xMax + radius ||
+                py < pour.yMin - radius || py > pour.yMax + radius) {
+                return false;
+            }
+        }
+        if (pour.poly.size() >= 3) {
+            bool inside = false;
+            size_t n = pour.poly.size();
+            for (size_t i = 0, j = n - 1; i < n; j = i++) {
+                double xi = pour.poly[i].first;
+                double yi = pour.poly[i].second;
+                double xj = pour.poly[j].first;
+                double yj = pour.poly[j].second;
+                bool intersect = ((yi > py) != (yj > py)) &&
+                                 (px < (xj - xi) * (py - yi) / ((yj - yi) + ((yj >= yi) ? 1e-15 : -1e-15)) + xi);
+                if (intersect) inside = !inside;
+                if (pointSegmentDistance(px, py, xj, yj, xi, yi) <= radius) {
+                    return true;
+                }
+            }
+            return inside;
+        }
+        return pour.hasBbox;
+    };
 
     // ---- 4. Signed canvas origin and fine grid --------------------------------------------
     // If every copper reference point lies inside [0, W] x [0, H] the legacy board box is kept.
@@ -1630,6 +1797,41 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             }
         }
 
+        // Pour-based same-net unions
+        for (const auto& pour : allRoutePours) {
+            if (pour.net != ns.name) continue;
+            int firstInPour = -1;
+            for (size_t ei = 0; ei < elems.size(); ++ei) {
+                const auto& el = elems[ei];
+                bool inPour = false;
+                if (el.kind == 0) {
+                    const PadGeom& p = ns.pads[el.idx];
+                    if (layersOverlap(p.layer, pour.layer)) {
+                        double r = std::max(p.hw, p.hh) + kTouchEps;
+                        inPour = pointInOrNearRoutePour(pour, p.x, p.y, r);
+                    }
+                } else if (el.kind == 1) {
+                    const TrackGeom& t = tracksIn[el.idx];
+                    if (layersOverlap(t.layer, pour.layer)) {
+                        double r = 0.5 * t.w + kTouchEps;
+                        inPour = pointInOrNearRoutePour(pour, t.x1, t.y1, r) ||
+                                 pointInOrNearRoutePour(pour, t.x2, t.y2, r);
+                    }
+                } else if (el.kind == 2) {
+                    const ViaGeom& v = viasIn[el.idx];
+                    double r = 0.5 * v.d + kTouchEps;
+                    inPour = pointInOrNearRoutePour(pour, v.x, v.y, r);
+                }
+                if (inPour) {
+                    if (firstInPour < 0) {
+                        firstInPour = static_cast<int>(ei);
+                    } else {
+                        ds.unite(firstInPour, static_cast<int>(ei));
+                    }
+                }
+            }
+        }
+
         // Rasterize seed/goal cells with exact world coordinates. Two elements landing on the
         // same grid cell are merged: at grid resolution they cannot be bridged separately.
         struct RawCell {
@@ -1637,16 +1839,22 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             int elem;
             double ex;
             double ey;
+            bool isInterior = false;
         };
         std::vector<RawCell> raw;
-        std::unordered_map<size_t, int> cellElem;
-        auto addCell = [&](size_t cid, int e, double ex, double ey) {
-            auto it = cellElem.find(cid);
-            if (it == cellElem.end()) {
-                cellElem.emplace(cid, e);
-                raw.push_back({cid, e, ex, ey});
+        std::unordered_map<size_t, size_t> cellRawIdx;
+        auto addCell = [&](size_t cid, int e, double ex, double ey, bool isInterior = false) {
+            auto it = cellRawIdx.find(cid);
+            if (it == cellRawIdx.end()) {
+                cellRawIdx.emplace(cid, raw.size());
+                raw.push_back({cid, e, ex, ey, isInterior});
             } else {
-                ds.unite(it->second, e);
+                ds.unite(raw[it->second].elem, e);
+                if (!isInterior) {
+                    raw[it->second].isInterior = false;
+                    raw[it->second].ex = ex;
+                    raw[it->second].ey = ey;
+                }
             }
         };
         for (size_t ei = 0; ei < elems.size(); ++ei) {
@@ -1658,13 +1866,13 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                 int gy = cellY(p.y);
                 for (int ly = 0; ly < numLayers; ++ly) {
                     if (p.layer != -1 && ly != p.layer) continue;
-                    addCell(nodeIdx(ly, gx, gy), eIdx, p.x, p.y);
+                    addCell(nodeIdx(ly, gx, gy), eIdx, p.x, p.y, false);
                 }
             } else if (e.kind == 2) {
                 const ViaGeom& v = viasIn[e.idx];
                 int gx = cellX(v.x);
                 int gy = cellY(v.y);
-                for (int ly = 0; ly < numLayers; ++ly) addCell(nodeIdx(ly, gx, gy), eIdx, v.x, v.y);
+                for (int ly = 0; ly < numLayers; ++ly) addCell(nodeIdx(ly, gx, gy), eIdx, v.x, v.y, false);
             } else {
                 const TrackGeom& t = tracksIn[e.idx];
                 double len = std::hypot(t.x2 - t.x1, t.y2 - t.y1);
@@ -1675,7 +1883,8 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                     int gy = cellY(t.y1 + u * (t.y2 - t.y1));
                     double ex = 0.0, ey = 0.0;
                     closestPointOnSegment(worldX(gx), worldY(gy), t.x1, t.y1, t.x2, t.y2, ex, ey);
-                    addCell(nodeIdx(t.layer, gx, gy), eIdx, ex, ey);
+                    bool interior = (s > 0 && s < steps);
+                    addCell(nodeIdx(t.layer, gx, gy), eIdx, ex, ey, interior);
                 }
             }
         }
@@ -1691,7 +1900,9 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         ns.islandCount = static_cast<int>(rootToIsland.size());
         std::vector<char> hasPad(static_cast<size_t>(ns.islandCount), 0);
         for (size_t ei = 0; ei < elems.size(); ++ei) {
-            if (elems[ei].kind == 0) hasPad[rootToIsland[ds.find(static_cast<int>(ei))]] = 1;
+            if (elems[ei].kind == 0 || elems[ei].kind == 2) {
+                hasPad[rootToIsland[ds.find(static_cast<int>(ei))]] = 1;
+            }
         }
         ns.requiredIslands = 0;
         ns.padlessIslands = 0;
@@ -1702,10 +1913,19 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                 ++ns.padlessIslands;
             }
         }
-        ns.startIsland = rootToIsland[ds.find(0)];
+        ns.startIsland = 0;
+        if (!elems.empty()) {
+            for (size_t ei = 0; ei < elems.size(); ++ei) {
+                int isl = rootToIsland[ds.find(static_cast<int>(ei))];
+                if (hasPad[isl]) {
+                    ns.startIsland = isl;
+                    break;
+                }
+            }
+        }
         for (const auto& rc : raw) {
             int isl = rootToIsland[ds.find(rc.elem)];
-            if (hasPad[isl]) ns.copper.push_back({rc.cid, isl, rc.ex, rc.ey});
+            if (hasPad[isl]) ns.copper.push_back({rc.cid, isl, rc.ex, rc.ey, rc.isInterior});
         }
     }
 
@@ -1803,26 +2023,26 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             };
 
             std::priority_queue<ANode, std::vector<ANode>, std::greater<ANode>> pq;
-            auto addSeed = [&](size_t cid, double ex, double ey) {
+            auto addSeed = [&](size_t cid, double ex, double ey, float initG = 0.0f) {
                 if (markGen[cid] == gen) return;
                 markGen[cid] = gen;
                 markRef[cid] = -1 - static_cast<int32_t>(seedExact.size());
                 seedExact.emplace_back(ex, ey);
                 visitGen[cid] = gen;
-                bestG[cid] = 0.0f;
+                bestG[cid] = initG;
                 parentCode[cid] = kParentSeed;
                 int l = 0, x = 0, y = 0;
                 decodeCell(cid, l, x, y);
-                pq.push({heuristic(x, y), 0.0f, static_cast<uint32_t>(cid)});
+                pq.push({initG + heuristic(x, y), initG, static_cast<uint32_t>(cid)});
             };
             // Seeds: all copper of the connected island set plus previously added bridges (g = 0)
             for (const auto& cc : net.copper) {
-                if (inS[static_cast<size_t>(cc.island)]) addSeed(cc.cid, cc.ex, cc.ey);
+                if (inS[static_cast<size_t>(cc.island)]) addSeed(cc.cid, cc.ex, cc.ey, cc.isInterior ? 0.75f : 0.0f);
             }
             for (size_t cid : grownCells) {
                 int l = 0, x = 0, y = 0;
                 decodeCell(cid, l, x, y);
-                addSeed(cid, worldX(x), worldY(y));
+                addSeed(cid, worldX(x), worldY(y), 0.0f);
             }
 
             auto isGoal = [&](size_t cid) { return markGen[cid] == gen && markRef[cid] >= 0; };
@@ -3201,7 +3421,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
     }
 
     std::vector<AuditPour> allPours;
-    for (const char* pourKey : {"pours", "zones"}) {
+    for (const char* pourKey : {"pours", "zones", "copper_pours"}) {
         if (!args.contains(pourKey) || !args[pourKey].is_array()) continue;
         for (const auto& z : args[pourKey]) {
             if (!z.is_object()) continue;
@@ -3210,17 +3430,54 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             ap.net = z.value("net", "");
             ap.layer = canonicalLayer(z, "TopLayer");
 
-            for (const char* polyKey : {"polygon", "points", "outline"}) {
-                if (z.contains(polyKey) && z[polyKey].is_array()) {
-                    for (const auto& pt : z[polyKey]) {
-                        if (pt.is_array() && pt.size() >= 2 && pt[0].is_number() && pt[1].is_number()) {
-                            ap.poly.push_back({pt[0].get<double>(), pt[1].get<double>()});
-                        } else if (pt.is_object() && pt.contains("x") && pt.contains("y") &&
-                                   pt["x"].is_number() && pt["y"].is_number()) {
-                            ap.poly.push_back({pt["x"].get<double>(), pt["y"].get<double>()});
+            const nlohmann::json* polyArr = nullptr;
+            for (const char* polyKey : {"polygon", "points", "outline", "source", "Source"}) {
+                if (z.contains(polyKey)) {
+                    if (z[polyKey].is_array()) {
+                        polyArr = &z[polyKey];
+                        break;
+                    } else if (z[polyKey].is_object()) {
+                        const auto& inner = z[polyKey];
+                        for (const char* innerKey : {"polygon", "points", "outline", "source", "Source"}) {
+                            if (inner.contains(innerKey) && inner[innerKey].is_array()) {
+                                polyArr = &inner[innerKey];
+                                break;
+                            }
                         }
+                        if (polyArr != nullptr) break;
                     }
-                    if (!ap.poly.empty()) break;
+                }
+            }
+
+            if (polyArr != nullptr) {
+                for (size_t i = 0; i < polyArr->size(); ++i) {
+                    const auto& tok = (*polyArr)[i];
+                    if (tok.is_string()) {
+                        std::string s = tok.get<std::string>();
+                        for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        if (s == "ARC" && i + 1 < polyArr->size() && (*polyArr)[i + 1].is_number()) {
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (tok.is_object()) {
+                        if (tok.contains("x") && tok.contains("y") &&
+                            tok["x"].is_number() && tok["y"].is_number()) {
+                            ap.poly.emplace_back(tok["x"].get<double>(), tok["y"].get<double>());
+                        } else if (tok.contains("x_mm") && tok.contains("y_mm") &&
+                                   tok["x_mm"].is_number() && tok["y_mm"].is_number()) {
+                            double px = isMilUnits ? (tok["x_mm"].get<double>() * mmToCoord) : tok["x_mm"].get<double>();
+                            double py = isMilUnits ? (tok["y_mm"].get<double>() * mmToCoord) : tok["y_mm"].get<double>();
+                            ap.poly.emplace_back(px, py);
+                        }
+                    } else if (tok.is_array() && tok.size() >= 2 &&
+                               tok[0].is_number() && tok[1].is_number()) {
+                        ap.poly.emplace_back(tok[0].get<double>(), tok[1].get<double>());
+                    } else if (tok.is_number() && i + 1 < polyArr->size() &&
+                               (*polyArr)[i + 1].is_number()) {
+                        ap.poly.emplace_back(tok.get<double>(), (*polyArr)[i + 1].get<double>());
+                        ++i;
+                    }
                 }
             }
 
@@ -3232,6 +3489,14 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                 ap.yMin = z["y_min"].get<double>();
                 ap.xMax = z["x_max"].get<double>();
                 ap.yMax = z["y_max"].get<double>();
+            } else if (z.contains("min_x") && z.contains("min_y") && z.contains("max_x") && z.contains("max_y") &&
+                       z["min_x"].is_number() && z["min_y"].is_number() &&
+                       z["max_x"].is_number() && z["max_y"].is_number()) {
+                ap.hasBbox = true;
+                ap.xMin = z["min_x"].get<double>();
+                ap.yMin = z["min_y"].get<double>();
+                ap.xMax = z["max_x"].get<double>();
+                ap.yMax = z["max_y"].get<double>();
             } else if (z.contains("bbox") && z["bbox"].is_object()) {
                 const auto& bb = z["bbox"];
                 if (bb.contains("x_min") && bb.contains("y_min") && bb.contains("x_max") && bb.contains("y_max")) {
@@ -3240,6 +3505,41 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                     ap.yMin = bb.value("y_min", 0.0);
                     ap.xMax = bb.value("x_max", 0.0);
                     ap.yMax = bb.value("y_max", 0.0);
+                } else if (bb.contains("min_x") && bb.contains("min_y") && bb.contains("max_x") && bb.contains("max_y")) {
+                    ap.hasBbox = true;
+                    ap.xMin = bb.value("min_x", 0.0);
+                    ap.yMin = bb.value("min_y", 0.0);
+                    ap.xMax = bb.value("max_x", 0.0);
+                    ap.yMax = bb.value("max_y", 0.0);
+                }
+            } else if (z.contains("x") && z.contains("y") &&
+                       (z.contains("width") || z.contains("w")) &&
+                       (z.contains("height") || z.contains("h"))) {
+                double zx = z["x"].is_number() ? z["x"].get<double>() : 0.0;
+                double zy = z["y"].is_number() ? z["y"].get<double>() : 0.0;
+                double zw = z.contains("width") ? (z["width"].is_number() ? z["width"].get<double>() : 0.0)
+                                                : (z["w"].is_number() ? z["w"].get<double>() : 0.0);
+                double zh = z.contains("height") ? (z["height"].is_number() ? z["height"].get<double>() : 0.0)
+                                                 : (z["h"].is_number() ? z["h"].get<double>() : 0.0);
+                if (zw > 0.0 && zh > 0.0) {
+                    ap.hasBbox = true;
+                    ap.xMin = zx;
+                    ap.yMin = zy;
+                    ap.xMax = zx + zw;
+                    ap.yMax = zy + zh;
+                }
+            }
+
+            if (ap.hasBbox) {
+                if (ap.xMin > ap.xMax) std::swap(ap.xMin, ap.xMax);
+                if (ap.yMin > ap.yMax) std::swap(ap.yMin, ap.yMax);
+                if (ap.poly.empty()) {
+                    ap.poly = {
+                        {ap.xMin, ap.yMin},
+                        {ap.xMax, ap.yMin},
+                        {ap.xMax, ap.yMax},
+                        {ap.xMin, ap.yMax}
+                    };
                 }
             } else if (!ap.poly.empty()) {
                 ap.hasBbox = true;
@@ -3707,7 +4007,8 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
     int unassignedCount = static_cast<int>(unassignedPadsJson.size());
     int unsyncedCount = static_cast<int>(unsyncedJson.size());
     int decouplingWarnCount = static_cast<int>(decouplingWarningsJson.size());
-    bool allConnected = (unroutedCount == 0 && danglingCount == 0 && unassignedCount == 0);
+    int poursCount = static_cast<int>(allPours.size());
+    bool allConnected = (totalNets == 0) ? (danglingCount == 0) : (unroutedCount == 0 && danglingCount == 0);
     bool schPcbSynced = (unsyncedCount == 0);
 
     outSuccess = true;
@@ -3727,6 +4028,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         {"unrouted_nets", unroutedNetsJson},
         {"dangling_tracks_count", danglingCount},
         {"dangling_tracks", danglingTracksJson},
+        {"pours_count", poursCount},
         {"unassigned_pads_count", unassignedCount},
         {"unassigned_pads", unassignedPadsJson},
         {"unsynced_schematic_components_count", unsyncedCount},

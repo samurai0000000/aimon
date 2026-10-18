@@ -1265,7 +1265,7 @@ nlohmann::json compactConnectivityAudit(const nlohmann::json& audit) {
     nlohmann::json out = nlohmann::json::object();
     if (!audit.is_object()) return out;
     for (const char* k : {"all_connected", "total_nets", "fully_routed_nets", "unrouted_nets_count",
-                          "dangling_tracks_count", "unassigned_pads_count", "summary"}) {
+                          "dangling_tracks_count", "unassigned_pads_count", "pours_count", "summary"}) {
         if (audit.contains(k)) out[k] = audit[k];
     }
     nlohmann::json unrouted = nlohmann::json::array();
@@ -1729,6 +1729,11 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
                           "obstacles"}) {
         if (arguments.contains(k)) req[k] = arguments[k];
     }
+    for (const char* pourKey : {"pours", "zones", "copper_pours"}) {
+        if (state.contains(pourKey) && state[pourKey].is_array()) {
+            req[pourKey] = state[pourKey];
+        }
+    }
     if (argRules.contains("grid_step_mm")) req["grid_step_mm"] = argRules["grid_step_mm"];
     if (argRules.contains("max_ripup_passes")) req["max_ripup_passes"] = argRules["max_ripup_passes"];
 
@@ -1840,16 +1845,53 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
             }
         }
 
+        auto countGeometricDrcViolations = [](const nlohmann::json& drcRes) -> int {
+            if (!drcRes.is_object()) return 0;
+            int geomCount = 0;
+            if (drcRes.contains("violations") && drcRes["violations"].is_array() && !drcRes["violations"].empty()) {
+                for (const auto& v : drcRes["violations"]) {
+                    if (!v.is_object()) continue;
+                    std::string errType = v.value("errorType", v.value("type", ""));
+                    std::string ruleName = v.value("ruleName", "");
+                    if (errType == "Connection Error" || errType == "Netlist Error" ||
+                        ruleName == "Connection Error" || ruleName == "Netlist Error") {
+                        continue;
+                    }
+                    ++geomCount;
+                }
+                return geomCount;
+            }
+            if (drcRes.contains("violation_summary") && drcRes["violation_summary"].is_object()) {
+                const auto& vs = drcRes["violation_summary"];
+                if (vs.contains("by_error_type") && vs["by_error_type"].is_object()) {
+                    for (auto it = vs["by_error_type"].begin(); it != vs["by_error_type"].end(); ++it) {
+                        if (it.key() == "Connection Error" || it.key() == "Netlist Error") continue;
+                        if (it.value().is_number_integer()) {
+                            geomCount += it.value().get<int>();
+                        }
+                    }
+                    return geomCount;
+                }
+            }
+            return jsonInt(drcRes, "violation_count", 0);
+        };
+
         int preDrcViolations = 0;
+        int preGeomViolations = 0;
         bool preDrcAvailable = false;
         nlohmann::json preDrcRes = callTool("easyeda_run_drc", withPcbUuid({{"target", "pcb"}}));
         if (preDrcRes.is_object() && jsonFlag(preDrcRes, "ok", false)) {
             preDrcAvailable = true;
             preDrcViolations = jsonInt(preDrcRes, "violation_count", 0);
+            preGeomViolations = countGeometricDrcViolations(preDrcRes);
             result["pre_route_drc"] = {
                 {"passed", jsonFlag(preDrcRes, "passed", preDrcViolations == 0)},
-                {"violation_count", preDrcViolations}
+                {"violation_count", preDrcViolations},
+                {"geometric_violation_count", preGeomViolations}
             };
+            if (preDrcRes.contains("violation_summary")) {
+                result["pre_drc_summary"] = preDrcRes["violation_summary"];
+            }
         }
 
         // Router output always carries *_mm keys plus mil bare keys; commit in mil canvas units.
@@ -1896,12 +1938,14 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
         nlohmann::json post;
         std::string postErr;
         if (fetchLiveState({{"include_raw_primitives", true}}, post, postErr)) {
-            for (const char* arrKey : {"tracks", "vias"}) {
-                if (post.contains(arrKey) && post[arrKey].is_array()) {
-                    for (const auto& item : post[arrKey]) {
-                        if (item.is_object() && item.contains("id") && item["id"].is_string()) {
-                            const std::string id = item["id"].get<std::string>();
-                            if (prePrimitiveIds.count(id) == 0) recordId(id);
+            if (committedIds.empty()) {
+                for (const char* arrKey : {"tracks", "vias"}) {
+                    if (post.contains(arrKey) && post[arrKey].is_array()) {
+                        for (const auto& item : post[arrKey]) {
+                            if (item.is_object() && item.contains("id") && item["id"].is_string()) {
+                                const std::string id = item["id"].get<std::string>();
+                                if (prePrimitiveIds.count(id) == 0) recordId(id);
+                            }
                         }
                     }
                 }
@@ -1950,18 +1994,35 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
         }
 
         int postDrcViolations = 0;
+        int postGeomViolations = 0;
         bool postDrcAvailable = false;
         nlohmann::json postDrcRes = callTool("easyeda_run_drc", withPcbUuid({{"target", "pcb"}}));
         if (postDrcRes.is_object() && jsonFlag(postDrcRes, "ok", false)) {
             postDrcAvailable = true;
             postDrcViolations = jsonInt(postDrcRes, "violation_count", 0);
+            postGeomViolations = countGeometricDrcViolations(postDrcRes);
             result["post_route_drc"] = {
                 {"passed", jsonFlag(postDrcRes, "passed", postDrcViolations == 0)},
                 {"violation_count", postDrcViolations},
+                {"geometric_violation_count", postGeomViolations},
                 {"violations", postDrcRes.value("violations", nlohmann::json::array())}
             };
+            if (postDrcRes.contains("violation_summary")) {
+                result["post_drc_summary"] = postDrcRes["violation_summary"];
+            }
         }
-        if (postDrcAvailable && postDrcViolations > (preDrcAvailable ? preDrcViolations : 0) && !allowDrcViolations) {
+        int preUnroutedCount = jsonInt(preAudit, "unrouted_nets_count", 0);
+        int postUnroutedCount = jsonInt(postAudit, "unrouted_nets_count", preUnroutedCount);
+        bool shouldRollback = false;
+        if (postDrcAvailable && !allowDrcViolations) {
+            if (postGeomViolations > (preDrcAvailable ? preGeomViolations : 0)) {
+                shouldRollback = true;
+            } else if (postDrcViolations > (preDrcAvailable ? preDrcViolations : 0) &&
+                       postUnroutedCount >= preUnroutedCount) {
+                shouldRollback = true;
+            }
+        }
+        if (shouldRollback) {
             int rbCount = rollbackCommitted();
             result["committed"] = false;
             result["rolled_back"] = true;
@@ -1969,8 +2030,9 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
             result["post_route_audit"] = compactConnectivityAudit(postAudit);
             return finish(false, arSummary,
                           "Post-commit EasyEDA Pro DRC reported " + std::to_string(postDrcViolations) +
-                          " violations (pre-route baseline: " + std::to_string(preDrcAvailable ? preDrcViolations : 0) +
-                          "); rolled back " + std::to_string(rbCount) +
+                          " violations (" + std::to_string(postGeomViolations) + " geometric vs pre-route baseline " +
+                          std::to_string(preDrcAvailable ? preGeomViolations : 0) + "); rolled back " +
+                          std::to_string(rbCount) +
                           " committed primitives (pass allow_drc_violations: true to override)");
         }
         result["committed"] = true;
@@ -2204,7 +2266,8 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
 
     bool callerRequestedRawPrimitives = false;
     if (toolName == "easyeda_inspect_pcb") {
-        callerRequestedRawPrimitives = remoteArgs.value("include_raw_primitives", false);
+        callerRequestedRawPrimitives = remoteArgs.value("include_raw_primitives",
+                                           remoteArgs.value("include_primitives", false));
         remoteArgs["include_raw_primitives"] = true;
         remoteArgs["_full_for_bridge"] = true;
         remoteArgs.erase("summary_only");
@@ -2986,6 +3049,102 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
             rpcResult.erase("tracks");
             rpcResult.erase("vias");
             rpcResult.erase("pours");
+            rpcResult.erase("schematic_components");
+
+            bool includeVerbose = remoteArgs.value("include_verbose_error", false);
+            bool summaryOnly = remoteArgs.value("summary_only", false);
+            int maxViolations = remoteArgs.value("max_violations", 0);
+
+            std::set<std::string> netFilter;
+            for (const char* k : {"nets", "net_filter", "net"}) {
+                if (remoteArgs.contains(k)) {
+                    if (remoteArgs[k].is_array()) {
+                        for (const auto& n : remoteArgs[k]) {
+                            if (n.is_string() && !n.get<std::string>().empty()) netFilter.insert(n.get<std::string>());
+                        }
+                    } else if (remoteArgs[k].is_string() && !remoteArgs[k].get<std::string>().empty()) {
+                        netFilter.insert(remoteArgs[k].get<std::string>());
+                    }
+                }
+            }
+            std::set<std::string> errTypeFilter;
+            for (const char* k : {"error_types", "error_type"}) {
+                if (remoteArgs.contains(k)) {
+                    if (remoteArgs[k].is_array()) {
+                        for (const auto& et : remoteArgs[k]) {
+                            if (et.is_string() && !et.get<std::string>().empty()) errTypeFilter.insert(et.get<std::string>());
+                        }
+                    } else if (remoteArgs[k].is_string() && !remoteArgs[k].get<std::string>().empty()) {
+                        errTypeFilter.insert(remoteArgs[k].get<std::string>());
+                    }
+                }
+            }
+
+            if (rpcResult.contains("violations") && rpcResult["violations"].is_array()) {
+                nlohmann::json compactedViolations = nlohmann::json::array();
+                std::map<std::string, int> byErrType;
+                std::map<std::string, int> byRule;
+                std::map<std::string, int> byNet;
+
+                for (auto& item : rpcResult["violations"]) {
+                    if (!item.is_object()) continue;
+                    std::string eType = item.value("errorType", item.value("type", ""));
+                    std::string rName = item.value("ruleName", "");
+                    std::string nName = item.value("net", "");
+
+                    if (!includeVerbose && item.contains("explanation")) {
+                        if (item["explanation"].is_object()) {
+                            std::string msg = item["explanation"].value("msg",
+                                              item["explanation"].value("brief", ""));
+                            item["explanation"].erase("errData");
+                            if (!msg.empty()) {
+                                item["explanation"] = msg;
+                                if (!item.contains("msg")) {
+                                    item["msg"] = msg;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!eType.empty()) byErrType[eType]++;
+                    if (!rName.empty()) byRule[rName]++;
+                    if (!nName.empty()) byNet[nName]++;
+
+                    if (!errTypeFilter.empty() && errTypeFilter.count(eType) == 0 && errTypeFilter.count(rName) == 0) {
+                        continue;
+                    }
+                    if (!netFilter.empty() && (nName.empty() || netFilter.count(nName) == 0)) {
+                        continue;
+                    }
+
+                    compactedViolations.push_back(item);
+                }
+
+                if (!rpcResult.contains("violation_summary") || !rpcResult["violation_summary"].is_object()) {
+                    rpcResult["violation_summary"] = {
+                        {"by_error_type", byErrType},
+                        {"by_rule_name", byRule},
+                        {"by_net", byNet}
+                    };
+                }
+
+                if (maxViolations > 0 && static_cast<int>(compactedViolations.size()) > maxViolations) {
+                    rpcResult["total_matching_violations"] = static_cast<int>(compactedViolations.size());
+                    nlohmann::json truncated = nlohmann::json::array();
+                    for (int i = 0; i < maxViolations; ++i) {
+                        truncated.push_back(compactedViolations[i]);
+                    }
+                    rpcResult["violations"] = std::move(truncated);
+                    rpcResult["truncated"] = true;
+                } else {
+                    rpcResult["violations"] = std::move(compactedViolations);
+                }
+
+                rpcResult["violation_count"] = static_cast<int>(rpcResult["violations"].size());
+                if (summaryOnly) {
+                    rpcResult.erase("violations");
+                }
+            }
         }
     } else if (toolName == "easyeda_edit_schematic" && rpcResult.is_object()) {
         std::string unitsStr = remoteArgs.value("units", "mil");
@@ -4009,26 +4168,123 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
 
         std::set<std::string> refSet;
         if (arguments.is_object()) {
-            for (const char* refKey : {"references", "component_refs"}) {
-                if (arguments.contains(refKey) && arguments[refKey].is_array()) {
-                    for (const auto& r : arguments[refKey]) {
-                        if (r.is_string() && !r.get<std::string>().empty()) {
-                            refSet.insert(r.get<std::string>());
+            for (const char* refKey : {"references", "component_refs", "refs", "reference", "ref_filter"}) {
+                if (arguments.contains(refKey)) {
+                    if (arguments[refKey].is_array()) {
+                        for (const auto& r : arguments[refKey]) {
+                            if (r.is_string() && !r.get<std::string>().empty()) {
+                                refSet.insert(r.get<std::string>());
+                            }
                         }
+                    } else if (arguments[refKey].is_string() && !arguments[refKey].get<std::string>().empty()) {
+                        refSet.insert(arguments[refKey].get<std::string>());
                     }
                 }
             }
         }
+
         std::set<std::string> netSet;
-        if (arguments.is_object() && arguments.contains("nets") && arguments["nets"].is_array()) {
-            for (const auto& n : arguments["nets"]) {
-                if (n.is_string() && !n.get<std::string>().empty()) {
-                    netSet.insert(n.get<std::string>());
+        if (arguments.is_object()) {
+            for (const char* netKey : {"nets", "net_filter", "net"}) {
+                if (arguments.contains(netKey)) {
+                    if (arguments[netKey].is_array()) {
+                        for (const auto& n : arguments[netKey]) {
+                            if (n.is_string() && !n.get<std::string>().empty()) {
+                                netSet.insert(n.get<std::string>());
+                            }
+                        }
+                    } else if (arguments[netKey].is_string() && !arguments[netKey].get<std::string>().empty()) {
+                        netSet.insert(arguments[netKey].get<std::string>());
+                    }
                 }
             }
         }
+
+        auto normalizeLayer = [](const std::string& l) -> std::string {
+            std::string s = toUpperAscii(l);
+            if (s == "TOPLAYER" || s == "F.CU" || s == "1" || s == "TOP") return "1";
+            if (s == "BOTTOMLAYER" || s == "B.CU" || s == "2" || s == "BOTTOM") return "2";
+            if (s == "INNERLAYER1" || s == "IN1.CU" || s == "15") return "15";
+            if (s == "INNERLAYER2" || s == "IN2.CU" || s == "16") return "16";
+            if (s == "INNERLAYER3" || s == "IN3.CU" || s == "17") return "17";
+            if (s == "INNERLAYER4" || s == "IN4.CU" || s == "18") return "18";
+            if (s == "MULTILAYER" || s == "*.CU" || s == "12" || s == "PTH" || s == "MULTI-LAYER") return "12";
+            return s;
+        };
+
+        std::set<std::string> layerSet;
+        if (arguments.is_object()) {
+            for (const char* layerKey : {"layers", "layer"}) {
+                if (arguments.contains(layerKey)) {
+                    if (arguments[layerKey].is_array()) {
+                        for (const auto& l : arguments[layerKey]) {
+                            if (l.is_string() && !l.get<std::string>().empty()) {
+                                layerSet.insert(normalizeLayer(l.get<std::string>()));
+                            } else if (l.is_number_integer()) {
+                                layerSet.insert(normalizeLayer(std::to_string(l.get<int>())));
+                            }
+                        }
+                    } else if (arguments[layerKey].is_string() && !arguments[layerKey].get<std::string>().empty()) {
+                        layerSet.insert(normalizeLayer(arguments[layerKey].get<std::string>()));
+                    } else if (arguments[layerKey].is_number_integer()) {
+                        layerSet.insert(normalizeLayer(std::to_string(arguments[layerKey].get<int>())));
+                    }
+                }
+            }
+        }
+
+        bool hasBbox = false;
+        double bbMinX = 0.0, bbMinY = 0.0, bbMaxX = 0.0, bbMaxY = 0.0;
+        if (arguments.is_object() && arguments.contains("bbox") && arguments["bbox"].is_object()) {
+            const auto& bb = arguments["bbox"];
+            std::string cUnits = rpcResult.value("units", "mil");
+            bool canvasMil = (cUnits == "mil");
+            if (bb.contains("min_x_mm") && bb.contains("min_y_mm") && bb.contains("max_x_mm") && bb.contains("max_y_mm")) {
+                hasBbox = true;
+                double s = canvasMil ? 39.37007874 : 1.0;
+                bbMinX = bb["min_x_mm"].get<double>() * s;
+                bbMinY = bb["min_y_mm"].get<double>() * s;
+                bbMaxX = bb["max_x_mm"].get<double>() * s;
+                bbMaxY = bb["max_y_mm"].get<double>() * s;
+            } else if (bb.contains("min_x") && bb.contains("min_y") && bb.contains("max_x") && bb.contains("max_y")) {
+                hasBbox = true;
+                bbMinX = bb["min_x"].get<double>();
+                bbMinY = bb["min_y"].get<double>();
+                bbMaxX = bb["max_x"].get<double>();
+                bbMaxY = bb["max_y"].get<double>();
+            } else if (bb.contains("x_min") && bb.contains("y_min") && bb.contains("x_max") && bb.contains("y_max")) {
+                hasBbox = true;
+                bbMinX = bb["x_min"].get<double>();
+                bbMinY = bb["y_min"].get<double>();
+                bbMaxX = bb["x_max"].get<double>();
+                bbMaxY = bb["y_max"].get<double>();
+            }
+            if (hasBbox) {
+                if (bbMinX > bbMaxX) std::swap(bbMinX, bbMaxX);
+                if (bbMinY > bbMaxY) std::swap(bbMinY, bbMaxY);
+            }
+        }
+
+        auto layerMatches = [&](const nlohmann::json& item) -> bool {
+            if (layerSet.empty()) return true;
+            std::string lStr;
+            if (item.contains("layer")) {
+                if (item["layer"].is_string()) lStr = item["layer"].get<std::string>();
+                else if (item["layer"].is_number_integer()) lStr = std::to_string(item["layer"].get<int>());
+            }
+            std::string norm = normalizeLayer(lStr);
+            if (norm == "12") return true; // MultiLayer matches any layer
+            return layerSet.count(norm) > 0;
+        };
+
+        auto ptInBbox = [&](double px, double py) -> bool {
+            if (!hasBbox) return true;
+            return (px >= bbMinX - 1e-3 && px <= bbMaxX + 1e-3 &&
+                    py >= bbMinY - 1e-3 && py <= bbMaxY + 1e-3);
+        };
+
         bool summaryOnly = arguments.is_object() ? arguments.value("summary_only", false) : false;
-        bool hasFilter = (!refSet.empty() || !netSet.empty());
+        bool hasFilter = (!refSet.empty() || !netSet.empty() || !layerSet.empty() || hasBbox);
 
         if (hasFilter) {
             std::set<std::string> effectiveNetSet = netSet;
@@ -4061,9 +4317,12 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 for (const auto& c : rpcResult["components"]) {
                     if (!c.is_object()) continue;
                     std::string cr = c.value("reference", c.value("ref", ""));
-                    if (effectiveRefSet.count(cr) > 0) {
-                        fComps.push_back(c);
-                    }
+                    if (!effectiveRefSet.empty() && effectiveRefSet.count(cr) == 0) continue;
+                    if (!layerMatches(c)) continue;
+                    double cx = c.value("x", c.value("x_mm", 0.0));
+                    double cy = c.value("y", c.value("y_mm", 0.0));
+                    if (!ptInBbox(cx, cy)) continue;
+                    fComps.push_back(c);
                 }
                 rpcResult["components"] = std::move(fComps);
                 rpcResult["components_count"] = static_cast<int>(rpcResult["components"].size());
@@ -4077,9 +4336,14 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                     std::string pn = p.value("net", "");
                     bool matchRef = !refSet.empty() && refSet.count(pr) > 0;
                     bool matchNet = !netSet.empty() && netSet.count(pn) > 0;
-                    if (matchRef || matchNet) {
-                        fPads.push_back(p);
+                    if (!refSet.empty() || !netSet.empty()) {
+                        if (!matchRef && !matchNet) continue;
                     }
+                    if (!layerMatches(p)) continue;
+                    double px = p.value("x", p.value("x_mm", 0.0));
+                    double py = p.value("y", p.value("y_mm", 0.0));
+                    if (!ptInBbox(px, py)) continue;
+                    fPads.push_back(p);
                 }
                 rpcResult["pads"] = std::move(fPads);
                 rpcResult["pads_count"] = static_cast<int>(rpcResult["pads"].size());
@@ -4107,10 +4371,17 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                                 break;
                             }
                         }
+                    } else if (effectiveNetSet.empty() && refSet.empty()) {
+                        matchTrack = true;
                     }
-                    if (matchTrack) {
-                        fTracks.push_back(t);
-                    }
+                    if (!matchTrack) continue;
+                    if (!layerMatches(t)) continue;
+                    double x1 = t.value("x1", t.value("x1_mm", 0.0));
+                    double y1 = t.value("y1", t.value("y1_mm", 0.0));
+                    double x2 = t.value("x2", t.value("x2_mm", 0.0));
+                    double y2 = t.value("y2", t.value("y2_mm", 0.0));
+                    if (hasBbox && !ptInBbox(x1, y1) && !ptInBbox(x2, y2)) continue;
+                    fTracks.push_back(t);
                 }
                 rpcResult["tracks"] = std::move(fTracks);
                 rpcResult["tracks_count"] = static_cast<int>(rpcResult["tracks"].size());
@@ -4135,10 +4406,14 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                                 break;
                             }
                         }
+                    } else if (effectiveNetSet.empty() && refSet.empty()) {
+                        matchVia = true;
                     }
-                    if (matchVia) {
-                        fVias.push_back(v);
-                    }
+                    if (!matchVia) continue;
+                    double vx = v.value("x", v.value("x_mm", 0.0));
+                    double vy = v.value("y", v.value("y_mm", 0.0));
+                    if (!ptInBbox(vx, vy)) continue;
+                    fVias.push_back(v);
                 }
                 rpcResult["vias"] = std::move(fVias);
                 rpcResult["vias_count"] = static_cast<int>(rpcResult["vias"].size());
@@ -4148,9 +4423,9 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                 nlohmann::json fPours = nlohmann::json::array();
                 for (const auto& pr : rpcResult["pours"]) {
                     if (!pr.is_object()) continue;
-                    if (!effectiveNetSet.empty() && effectiveNetSet.count(pr.value("net", "")) > 0) {
-                        fPours.push_back(pr);
-                    }
+                    if (!effectiveNetSet.empty() && effectiveNetSet.count(pr.value("net", "")) == 0) continue;
+                    if (!layerMatches(pr)) continue;
+                    fPours.push_back(pr);
                 }
                 rpcResult["pours"] = std::move(fPours);
                 rpcResult["pours_count"] = static_cast<int>(rpcResult["pours"].size());

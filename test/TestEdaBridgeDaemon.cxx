@@ -587,7 +587,7 @@ TEST(EdaBridge_PluginRelay, WebSocketMultiFrameContinuationAndPluginChunkReassem
             {"jsonrpc", "2.0"},
             {"id", "frag-reg-1"},
             {"method", "plugin/register"},
-            {"params", {{"app", "easyeda"}, {"version", "1.1.8"}, {"active_document", "servosense.epro"}}}
+            {"params", {{"app", "easyeda"}, {"version", "1.1.9"}, {"active_document", "servosense.epro"}}}
         };
         auto regFrame = EdaRpcServer::encodeWebSocketFrame(reg.dump(), 0x1, true);
         ::send(sock, regFrame.data(), regFrame.size(), 0);
@@ -1346,9 +1346,16 @@ TEST(EdaBridge_LoopbackRpc, FilteredInspectionSchematicErcPcbAuditAndDeclarative
                             {{"type", "fatalError"}, {"count", 3}}
                         });
                     } else {
-                        res["passed"] = true;
-                        res["violation_count"] = 0;
-                        res["violations"] = nlohmann::json::array();
+                        res["passed"] = false;
+                        res["violation_count"] = 3;
+                        res["violations"] = nlohmann::json::array({
+                            {{"type", "Clearance Error"}, {"ruleName", "Track to Track"}, {"net", "GND"},
+                             {"explanation", {{"brief", "Clearance violation: 0.1mm < 0.2mm"}, {"errData", {{"huge", "blob"}}}}}},
+                            {{"type", "Connection Error"}, {"ruleName", "No Connection"}, {"net", "VCC"},
+                             {"explanation", {{"brief", "Unrouted net VCC"}}}},
+                            {{"type", "Clearance Error"}, {"ruleName", "Track to SMD Pad"}, {"net", "GND"},
+                             {"explanation", {{"brief", "Clearance violation: 0.12mm < 0.2mm"}}}}
+                        });
                     }
                 } else if (tName == "easyeda_inspect_pcb") {
                     res["units"] = "mil";
@@ -1600,6 +1607,64 @@ TEST(EdaBridge_LoopbackRpc, FilteredInspectionSchematicErcPcbAuditAndDeclarative
     CHECK_EQUAL(2, static_cast<int>(pcbRefOnly["tracks"].size()));
     CHECK_FALSE(pcbRefOnly.contains("pours"));
 
+    // (b2) Ergonomic easyeda_inspect_pcb filters (net_filter, layers, bbox) without explicit include_primitives: true
+    nlohmann::json pcbNetFilter = bridge.callTool("easyeda_inspect_pcb", {
+        {"net_filter", "GND"}
+    });
+    CHECK_TRUE(pcbNetFilter.value("ok", false));
+    CHECK_TRUE(pcbNetFilter.contains("pads"));
+    CHECK_EQUAL(2, static_cast<int>(pcbNetFilter["pads"].size()));
+    CHECK_EQUAL("GND", pcbNetFilter["pads"][0].value("net", ""));
+    CHECK_EQUAL("GND", pcbNetFilter["pads"][1].value("net", ""));
+    CHECK_TRUE(pcbNetFilter.contains("tracks"));
+    CHECK_EQUAL(1, static_cast<int>(pcbNetFilter["tracks"].size()));
+    CHECK_EQUAL("GND", pcbNetFilter["tracks"][0].value("net", ""));
+    CHECK_TRUE(pcbNetFilter.contains("vias"));
+    CHECK_EQUAL(1, static_cast<int>(pcbNetFilter["vias"].size()));
+    CHECK_TRUE(pcbNetFilter.contains("pours"));
+    CHECK_EQUAL(1, static_cast<int>(pcbNetFilter["pours"].size()));
+
+    nlohmann::json pcbBboxFilter = bridge.callTool("easyeda_inspect_pcb", {
+        {"bbox", {{"min_x", 650.0}, {"min_y", 450.0}, {"max_x", 750.0}, {"max_y", 550.0}}}
+    });
+    CHECK_TRUE(pcbBboxFilter.value("ok", false));
+    CHECK_TRUE(pcbBboxFilter.contains("components"));
+    CHECK_EQUAL(1, static_cast<int>(pcbBboxFilter["components"].size()));
+    CHECK_EQUAL("R16", pcbBboxFilter["components"][0].value("reference", ""));
+
+    // (b3) Compact and filtered easyeda_run_drc with violation_summary and inline payload
+    nlohmann::json drcPcb = bridge.callTool("easyeda_run_drc", {
+        {"target", "pcb"}
+    });
+    CHECK_TRUE(drcPcb.value("ok", false));
+    CHECK_FALSE(drcPcb.value("passed", true));
+    CHECK_TRUE(drcPcb.contains("violation_summary"));
+    CHECK_EQUAL(2, drcPcb["violation_summary"]["by_error_type"].value("Clearance Error", 0));
+    CHECK_EQUAL(1, drcPcb["violation_summary"]["by_error_type"].value("Connection Error", 0));
+    CHECK_EQUAL(2, drcPcb["violation_summary"]["by_net"].value("GND", 0));
+    CHECK_EQUAL(1, drcPcb["violation_summary"]["by_net"].value("VCC", 0));
+    // Explanation is compacted to brief string and errData is stripped
+    CHECK_TRUE(drcPcb["violations"][0]["explanation"].is_string());
+    STRCMP_EQUAL("Clearance violation: 0.1mm < 0.2mm", drcPcb["violations"][0]["explanation"].get<std::string>().c_str());
+
+    // Filter by net
+    nlohmann::json drcNetFiltered = bridge.callTool("easyeda_run_drc", {
+        {"target", "pcb"},
+        {"net_filter", "VCC"}
+    });
+    CHECK_TRUE(drcNetFiltered.value("ok", false));
+    CHECK_EQUAL(1, static_cast<int>(drcNetFiltered["violations"].size()));
+    CHECK_EQUAL("VCC", drcNetFiltered["violations"][0].value("net", ""));
+
+    // summary_only removes violations array but keeps violation_summary
+    nlohmann::json drcSummaryOnly = bridge.callTool("easyeda_run_drc", {
+        {"target", "pcb"},
+        {"summary_only", true}
+    });
+    CHECK_TRUE(drcSummaryOnly.value("ok", false));
+    CHECK_FALSE(drcSummaryOnly.contains("violations"));
+    CHECK_TRUE(drcSummaryOnly.contains("violation_summary"));
+
     // (e) easyeda_edit_pcb defaults units to "mil" and supports delete_primitives, modify_pads (by id or reference+pad), place_components
     nlohmann::json editPcbRes = bridge.callTool("easyeda_edit_pcb", {
         {"delete_primitives", nlohmann::json::array({
@@ -1762,7 +1827,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     EdaBridgeAppSettings loaded;
     CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgFile, loaded, err));
     CHECK_TRUE(err.empty());
-    STRCMP_EQUAL("1.1.8", loaded.version.c_str());
+    STRCMP_EQUAL("1.1.9", loaded.version.c_str());
     CHECK_EQUAL(orig.enableEasyEda, loaded.enableEasyEda);
     CHECK_EQUAL(orig.enableKiCad, loaded.enableKiCad);
     CHECK_EQUAL(orig.enableFreeCad, loaded.enableFreeCad);
@@ -1827,7 +1892,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeployment) {
-    CHECK_EQUAL("1.1.8", EdaBridgeAppSettings().version);
+    CHECK_EQUAL("1.1.9", EdaBridgeAppSettings().version);
 
     std::vector<uint8_t> zipBytes = EdaBridgeAppConfig::buildEasyEdaEextZipBytes();
     CHECK_TRUE(zipBytes.size() > 512);
@@ -1844,7 +1909,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(zipView.find("edaEsbuildExportName") != std::string::npos);
     CHECK_TRUE(zipView.find("eda.sys_WebSocket") != std::string::npos);
     CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
-    CHECK_TRUE(zipView.find("1.1.8") != std::string::npos);
+    CHECK_TRUE(zipView.find("1.1.9") != std::string::npos);
     CHECK_TRUE(zipView.find("8d4c91f2a70e4c6b9b24e31f6a821100") != std::string::npos);
     CHECK_TRUE(zipView.find("check(false, false, true)") != std::string::npos);
     CHECK_TRUE(zipView.find("getAllPinsByPrimitiveId") != std::string::npos);
@@ -1894,7 +1959,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream kcIfs(kcDir + "/KiCadAimonBridge.py");
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(kcContent.find("1.1.8") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.9") != std::string::npos);
         CHECK_TRUE(kcContent.find("*.Cu") != std::string::npos);
         CHECK_TRUE(kcContent.find("GetAttribute") != std::string::npos);
     }
@@ -1909,7 +1974,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream fcIfs(fcDir + "/AimonFreeCadBridge.py");
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(fcContent.find("1.1.8") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.9") != std::string::npos);
     }
 
     // 3a. Re-run when destination files are identical -> do NOT overwrite (alreadyDeployed == true)
@@ -1937,7 +2002,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(kcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(kcContent.find("1.1.8") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.9") != std::string::npos);
     }
 
     CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir2, err, "", false, &fcAlready));
@@ -1947,7 +2012,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(fcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(fcContent.find("1.1.8") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.9") != std::string::npos);
     }
 
     // 4. Test customTargetDir (simulating QFileDialog user selection)

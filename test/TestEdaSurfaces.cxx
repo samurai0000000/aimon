@@ -371,7 +371,8 @@ TEST(McpServer_EdaProfile, WorkspaceAutoDetectsEdaProfileAndPreservesExistingPro
     CHECK_EQUAL("embedded", McpServer::detectProfileFromWorkspace("/workspace/embdevenv"));
     CHECK_EQUAL("network", McpServer::detectProfileFromWorkspace("/workspace/netmon"));
     CHECK_EQUAL("mesh", McpServer::detectProfileFromWorkspace("/workspace/meshmon"));
-    CHECK_EQUAL("core", McpServer::detectProfileFromWorkspace("/workspace/aimon"));
+    CHECK_EQUAL("all", McpServer::detectProfileFromWorkspace("/workspace/aimon"));
+    CHECK_EQUAL("core", McpServer::detectProfileFromWorkspace("/workspace/intelligence"));
 }
 
 TEST(McpServer_EdaProfile, ProfileScopingAndPerComponentTogglesFilterToolsListAndCall) {

@@ -7,7 +7,7 @@
 var edaEsbuildExportName = (function () {
     "use strict";
 
-    const BRIDGE_VERSION = "1.1.8";
+    const BRIDGE_VERSION = "1.1.9";
     const DEFAULT_WS_URL = "ws://127.0.0.1:3893";
     const HEARTBEAT_INTERVAL_MS = 10000;
     const ALLOWED_PREFIXES = [
@@ -531,6 +531,13 @@ var edaEsbuildExportName = (function () {
             }
         }
         return out;
+    }
+
+    function normalizeStringArray(raw) {
+        if (!raw) return [];
+        if (Array.isArray(raw)) return raw.map(String).filter(Boolean);
+        if (typeof raw === "string") return raw.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+        return [String(raw)];
     }
 
     function normalizePcbLayer(layerName) {
@@ -1276,8 +1283,46 @@ var edaEsbuildExportName = (function () {
         const includeOtherProp = Boolean(args && args.include_other_property === true);
         const summaryOnly = Boolean(args && args.summary_only === true);
         const fullForBridge = Boolean(args && (args._full_for_bridge === true || args.include_raw_primitives === true));
-        const refFilter = (args && Array.isArray(args.references)) ? args.references.map(String) : [];
-        const netFilter = (args && Array.isArray(args.nets)) ? args.nets.map(String) : [];
+        const refFilter = normalizeStringArray(args && (args.references || args.reference || args.ref_filter));
+        const netFilter = normalizeStringArray(args && (args.nets || args.net_filter || args.net));
+        const layerFilter = normalizeStringArray(args && (args.layers || args.layer)).map(normalizePcbLayer);
+        let bbox = null;
+        if (args && args.bbox && typeof args.bbox === "object") {
+            const b = args.bbox;
+            const isMm = (args.units === "mm") || (b.min_x_mm !== undefined || b.x_mm !== undefined || b.width_mm !== undefined);
+            const scale = isMm ? 39.37007874 : 1.0;
+            let bx1 = -Infinity, by1 = -Infinity, bx2 = Infinity, by2 = Infinity;
+            if (b.min_x !== undefined || b.min_x_mm !== undefined) {
+                bx1 = Number(b.min_x !== undefined ? b.min_x : b.min_x_mm) * (b.min_x_mm !== undefined ? 39.37007874 : scale);
+            } else if (b.x !== undefined || b.x_mm !== undefined) {
+                bx1 = Number(b.x !== undefined ? b.x : b.x_mm) * (b.x_mm !== undefined ? 39.37007874 : scale);
+            }
+            if (b.min_y !== undefined || b.min_y_mm !== undefined) {
+                by1 = Number(b.min_y !== undefined ? b.min_y : b.min_y_mm) * (b.min_y_mm !== undefined ? 39.37007874 : scale);
+            } else if (b.y !== undefined || b.y_mm !== undefined) {
+                by1 = Number(b.y !== undefined ? b.y : b.y_mm) * (b.y_mm !== undefined ? 39.37007874 : scale);
+            }
+            if (b.max_x !== undefined || b.max_x_mm !== undefined) {
+                bx2 = Number(b.max_x !== undefined ? b.max_x : b.max_x_mm) * (b.max_x_mm !== undefined ? 39.37007874 : scale);
+            } else if (b.width !== undefined || b.width_mm !== undefined) {
+                const w = Number(b.width !== undefined ? b.width : b.width_mm) * (b.width_mm !== undefined ? 39.37007874 : scale);
+                bx2 = bx1 + w;
+            }
+            if (b.max_y !== undefined || b.max_y_mm !== undefined) {
+                by2 = Number(b.max_y !== undefined ? b.max_y : b.max_y_mm) * (b.max_y_mm !== undefined ? 39.37007874 : scale);
+            } else if (b.height !== undefined || b.height_mm !== undefined) {
+                const h = Number(b.height !== undefined ? b.height : b.height_mm) * (b.height_mm !== undefined ? 39.37007874 : scale);
+                by2 = by1 + h;
+            }
+            if (bx1 !== -Infinity && bx2 !== Infinity && by1 !== -Infinity && by2 !== Infinity) {
+                bbox = {
+                    minX: Math.min(bx1, bx2),
+                    minY: Math.min(by1, by2),
+                    maxX: Math.max(bx1, bx2),
+                    maxY: Math.max(by1, by2)
+                };
+            }
+        }
 
         if (typeof eda !== "undefined") {
             const pcbErr = await requirePcbDocument(args);
@@ -1732,23 +1777,56 @@ var edaEsbuildExportName = (function () {
 
         const filteredComponents = fullForBridge ? components : components.filter(function (c) {
             if (refFilter.length > 0 && refFilter.indexOf(c.reference) < 0) return false;
+            if (layerFilter.length > 0 && layerFilter.indexOf(normalizePcbLayer(c.layer)) < 0) return false;
+            if (bbox) {
+                if (c.x < bbox.minX || c.x > bbox.maxX || c.y < bbox.minY || c.y > bbox.maxY) return false;
+            }
             return true;
         });
         const filteredPads = fullForBridge ? pads : pads.filter(function (p) {
             if (refFilter.length > 0 && refFilter.indexOf(p.ref) < 0) return false;
             if (netFilter.length > 0 && netFilter.indexOf(p.net) < 0) return false;
+            if (layerFilter.length > 0) {
+                const pLayer = normalizePcbLayer(p.layer);
+                if (pLayer !== "MultiLayer" && p.layer !== "12" && layerFilter.indexOf(pLayer) < 0) return false;
+            }
+            if (bbox) {
+                const hw = (p.size_x || 0) / 2;
+                const hh = (p.size_y || 0) / 2;
+                if (p.x + hw < bbox.minX || p.x - hw > bbox.maxX || p.y + hh < bbox.minY || p.y - hh > bbox.maxY) return false;
+            }
             return true;
         });
         const filteredTracks = fullForBridge ? tracks : tracks.filter(function (t) {
             if (netFilter.length > 0 && netFilter.indexOf(t.net) < 0) return false;
+            if (layerFilter.length > 0 && layerFilter.indexOf(normalizePcbLayer(t.layer)) < 0) return false;
+            if (bbox) {
+                const minTx = Math.min(t.x1, t.x2);
+                const maxTx = Math.max(t.x1, t.x2);
+                const minTy = Math.min(t.y1, t.y2);
+                const maxTy = Math.max(t.y1, t.y2);
+                if (maxTx < bbox.minX || minTx > bbox.maxX || maxTy < bbox.minY || minTy > bbox.maxY) return false;
+            }
             return true;
         });
         const filteredVias = fullForBridge ? vias : vias.filter(function (v) {
             if (netFilter.length > 0 && netFilter.indexOf(v.net) < 0) return false;
+            if (layerFilter.length > 0 && v.layer && normalizePcbLayer(v.layer) !== "MultiLayer" && layerFilter.indexOf(normalizePcbLayer(v.layer)) < 0) return false;
+            if (bbox) {
+                if (v.x < bbox.minX || v.x > bbox.maxX || v.y < bbox.minY || v.y > bbox.maxY) return false;
+            }
             return true;
         });
         const filteredPours = fullForBridge ? pours : pours.filter(function (pr) {
             if (netFilter.length > 0 && netFilter.indexOf(pr.net) < 0) return false;
+            if (layerFilter.length > 0 && layerFilter.indexOf(normalizePcbLayer(pr.layer)) < 0) return false;
+            if (bbox) {
+                const minPx = pr.x;
+                const maxPx = pr.x + (pr.width || 0);
+                const minPy = pr.y;
+                const maxPy = pr.y + (pr.height || 0);
+                if (maxPx < bbox.minX || minPx > bbox.maxX || maxPy < bbox.minY || minPy > bbox.maxY) return false;
+            }
             return true;
         });
 
@@ -2157,32 +2235,243 @@ var edaEsbuildExportName = (function () {
             }
         }
 
-        const zones = args.zones || args.copper_pours || [];
-        if (Array.isArray(zones) && typeof eda !== "undefined" && eda.pcb_PrimitivePour) {
-            for (const z of zones) {
-                const scaledPts = Array.isArray(z.points)
-                    ? z.points.map(function (pt) {
+        async function getBoardOutlineBboxMil() {
+            let bMinX = Infinity, bMinY = Infinity, bMaxX = -Infinity, bMaxY = -Infinity;
+            if (typeof eda === "undefined") return null;
+            function updateBbox(x, y) {
+                if (typeof x === "number" && !isNaN(x) && typeof y === "number" && !isNaN(y)) {
+                    if (x < bMinX) bMinX = x;
+                    if (x > bMaxX) bMaxX = x;
+                    if (y < bMinY) bMinY = y;
+                    if (y > bMaxY) bMaxY = y;
+                }
+            }
+            if (eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.getAll === "function") {
+                try {
+                    const lines = await eda.pcb_PrimitiveLine.getAll();
+                    if (Array.isArray(lines)) {
+                        for (const ln of lines) {
+                            const lid = callGetter(ln, "getState_Layer", "layer", "", "");
+                            if (isBoardOutlineLayer(lid)) {
+                                updateBbox(Number(callGetter(ln, "getState_StartX", "startX", "x1", 0) || 0),
+                                           Number(callGetter(ln, "getState_StartY", "startY", "y1", 0) || 0));
+                                updateBbox(Number(callGetter(ln, "getState_EndX", "endX", "x2", 0) || 0),
+                                           Number(callGetter(ln, "getState_EndY", "endY", "y2", 0) || 0));
+                            }
+                        }
+                    }
+                } catch (e) {}
+            }
+            if (eda.pcb_PrimitivePolyline && typeof eda.pcb_PrimitivePolyline.getAll === "function") {
+                try {
+                    const polys = await eda.pcb_PrimitivePolyline.getAll();
+                    if (Array.isArray(polys)) {
+                        for (const pl of polys) {
+                            const lid = callGetter(pl, "getState_Layer", "layer", "", "");
+                            if (isBoardOutlineLayer(lid)) {
+                                const rawPoly = callGetter(pl, "getState_Polygon", "polygon", "points", []);
+                                const polyArr = Array.isArray(rawPoly) ? rawPoly : (rawPoly && (rawPoly.polygon || rawPoly.points || []));
+                                if (Array.isArray(polyArr)) {
+                                    for (let i = 0; i < polyArr.length; ++i) {
+                                        const it = polyArr[i];
+                                        if (it && typeof it === "object" && it.x !== undefined && it.y !== undefined) {
+                                            updateBbox(Number(it.x), Number(it.y));
+                                        } else if (Array.isArray(it) && it.length >= 2) {
+                                            updateBbox(Number(it[0]), Number(it[1]));
+                                        } else if (typeof it === "number" && i + 1 < polyArr.length && typeof polyArr[i + 1] === "number") {
+                                            updateBbox(Number(it), Number(polyArr[i + 1]));
+                                            i += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {}
+            }
+            if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.getAll === "function") {
+                try {
+                    const trks = await eda.pcb_PrimitiveTrack.getAll();
+                    if (Array.isArray(trks)) {
+                        for (const trk of trks) {
+                            const lid = callGetter(trk, "getState_Layer", "layer", "", "");
+                            if (isBoardOutlineLayer(lid)) {
+                                updateBbox(Number(callGetter(trk, "getState_StartX", "startX", "x1", 0) || 0),
+                                           Number(callGetter(trk, "getState_StartY", "startY", "y1", 0) || 0));
+                                updateBbox(Number(callGetter(trk, "getState_EndX", "endX", "x2", 0) || 0),
+                                           Number(callGetter(trk, "getState_EndY", "endY", "y2", 0) || 0));
+                            }
+                        }
+                    }
+                } catch (e) {}
+            }
+            if (bMinX !== Infinity && bMaxX !== -Infinity && bMinY !== Infinity && bMaxY !== -Infinity) {
+                return { minX: bMinX, minY: bMinY, maxX: bMaxX, maxY: bMaxY };
+            }
+            return null;
+        }
+
+        const zonesList = [].concat(
+            (args && Array.isArray(args.zones)) ? args.zones : [],
+            (args && Array.isArray(args.pours)) ? args.pours : [],
+            (args && Array.isArray(args.copper_pours)) ? args.copper_pours : []
+        );
+        const createdPourIds = [];
+        if (zonesList.length > 0 && typeof eda !== "undefined" && eda.pcb_PrimitivePour) {
+            let cachedBoardBbox = null;
+            for (const z of zonesList) {
+                let scaledPts = [];
+                const rawPts = z.points || z.polygon;
+                const hasExplicitBox = (z.x !== undefined || z.x_mm !== undefined ||
+                                        z.min_x !== undefined || z.min_x_mm !== undefined ||
+                                        z.width !== undefined || z.width_mm !== undefined);
+                const wantsBoardOutline = Boolean(z.outline_from_board === true ||
+                                                  (!Array.isArray(rawPts) && !hasExplicitBox));
+                if (wantsBoardOutline) {
+                    if (!cachedBoardBbox) {
+                        cachedBoardBbox = await getBoardOutlineBboxMil();
+                    }
+                    const bBox = cachedBoardBbox || { minX: 0, minY: 0, maxX: 3937, maxY: 3937 };
+                    const inset = (z.margin_mm !== undefined)
+                        ? (Number(z.margin_mm) * 39.37007874)
+                        : ((z.inset_mm !== undefined)
+                            ? (Number(z.inset_mm) * 39.37007874)
+                            : ((z.margin !== undefined)
+                                ? toCanvasUnits(z.margin, units)
+                                : 15.748)); // default 0.4mm = 15.748 mil
+                    const minX = bBox.minX + inset;
+                    const minY = bBox.minY + inset;
+                    const maxX = bBox.maxX - inset;
+                    const maxY = bBox.maxY - inset;
+                    scaledPts = [
+                        { x: minX, y: minY },
+                        { x: maxX, y: minY },
+                        { x: maxX, y: maxY },
+                        { x: minX, y: maxY }
+                    ];
+                } else if (Array.isArray(rawPts) && rawPts.length >= 3) {
+                    scaledPts = rawPts.map(function (pt) {
                         if (pt && typeof pt === "object") {
                             return {
                                 x: coordToMil(pt, "x", "x_mm", units, 0),
                                 y: coordToMil(pt, "y", "y_mm", units, 0)
                             };
+                        } else if (Array.isArray(pt) && pt.length >= 2) {
+                            return {
+                                x: toCanvasUnits(pt[0], units),
+                                y: toCanvasUnits(pt[1], units)
+                            };
                         }
-                        return toCanvasUnits(pt, units);
-                    })
-                    : [];
-                if (eda.pcb_PrimitivePour.create) {
-                    await eda.pcb_PrimitivePour.create(
-                        z.net || "GND",
-                        normalizePcbLayer(z.layer || "TopLayer"),
-                        scaledPts
-                    );
+                        return { x: 0, y: 0 };
+                    });
+                } else if (hasExplicitBox) {
+                    let minX = 0, minY = 0, maxX = 0, maxY = 0;
+                    if (z.min_x !== undefined || z.min_x_mm !== undefined) {
+                        minX = coordToMil(z, "min_x", "min_x_mm", units, 0);
+                        minY = coordToMil(z, "min_y", "min_y_mm", units, 0);
+                        maxX = coordToMil(z, "max_x", "max_x_mm", units, 0);
+                        maxY = coordToMil(z, "max_y", "max_y_mm", units, 0);
+                    } else {
+                        minX = coordToMil(z, "x", "x_mm", units, 0);
+                        minY = coordToMil(z, "y", "y_mm", units, 0);
+                        maxX = minX + coordToMil(z, "width", "width_mm", units, 0);
+                        maxY = minY + coordToMil(z, "height", "height_mm", units, 0);
+                    }
+                    scaledPts = [
+                        { x: minX, y: minY },
+                        { x: maxX, y: minY },
+                        { x: maxX, y: maxY },
+                        { x: minX, y: maxY }
+                    ];
                 }
-                addedZones += 1;
+
+                // Ensure at least 3 points, and do not duplicate closing vertex if last point equals first point
+                if (scaledPts.length >= 3) {
+                    const first = scaledPts[0];
+                    const last = scaledPts[scaledPts.length - 1];
+                    if (Math.hypot(last.x - first.x, last.y - first.y) < 1e-3) {
+                        scaledPts.pop();
+                    }
+                }
+                if (scaledPts.length < 3) continue;
+
+                // Build flatPolyCmds: [x1, y1, "L", x2, y2, "L", ..., xn, yn]
+                const flatPolyCmds = [scaledPts[0].x, scaledPts[0].y];
+                for (let i = 1; i < scaledPts.length; ++i) {
+                    flatPolyCmds.push("L");
+                    flatPolyCmds.push(scaledPts[i].x);
+                    flatPolyCmds.push(scaledPts[i].y);
+                }
+
+                let polyArg = flatPolyCmds;
+                if (eda.pcb_MathPolygon && typeof eda.pcb_MathPolygon.createPolygon === "function") {
+                    try {
+                        let mp = eda.pcb_MathPolygon.createPolygon(flatPolyCmds);
+                        if (mp && typeof mp.then === "function") mp = await mp;
+                        if (mp) polyArg = mp;
+                    } catch (mpErr) {
+                    }
+                }
+
+                const layerId = resolveEasyEdaCopperLayerId(z.layer || "TopLayer");
+                const netName = String(z.net || "GND");
+                const pourFillMethod = z.fill_method !== undefined ? z.fill_method : (z.pourFillMethod !== undefined ? z.pourFillMethod : undefined);
+                const preserveSmdPad = z.preserve_smd_pad !== undefined ? Boolean(z.preserve_smd_pad) : (z.preserveSmdPad !== undefined ? Boolean(z.preserveSmdPad) : undefined);
+                const lineWidth = (z.line_width !== undefined || z.line_width_mm !== undefined) ? coordToMil(z, "line_width", "line_width_mm", units, 10.0) : undefined;
+                const clearance = (z.clearance !== undefined || z.clearance_mm !== undefined) ? coordToMil(z, "clearance", "clearance_mm", units, 10.0) : undefined;
+                const pourName = String(z.name || z.pourName || "");
+
+                let createdPour = null;
+                if (typeof eda.pcb_PrimitivePour.create === "function") {
+                    try {
+                        if (clearance !== undefined || lineWidth !== undefined || pourFillMethod !== undefined || preserveSmdPad !== undefined) {
+                            createdPour = await eda.pcb_PrimitivePour.create(
+                                netName, layerId, polyArg, pourFillMethod, preserveSmdPad, lineWidth, clearance, pourName
+                            );
+                        } else {
+                            createdPour = await eda.pcb_PrimitivePour.create(netName, layerId, polyArg);
+                        }
+                    } catch (createErr) {
+                        // Fallback for mock environments expecting (net, layerName, scaledPts)
+                        try {
+                            createdPour = await eda.pcb_PrimitivePour.create(
+                                netName, normalizePcbLayer(z.layer || "TopLayer"), scaledPts
+                            );
+                        } catch (fallbackErr) {}
+                    }
+                    if (!createdPour) {
+                        try {
+                            createdPour = await eda.pcb_PrimitivePour.create(
+                                netName, normalizePcbLayer(z.layer || "TopLayer"), scaledPts
+                            );
+                        } catch (e2) {}
+                    }
+                    const pid = extractCreatedPrimitiveId(createdPour);
+                    if (pid && createdPourIds.indexOf(pid) < 0) {
+                        createdPourIds.push(pid);
+                    }
+                    addedZones += 1;
+                }
+            }
+
+            // Pour rebuild / repour
+            if (args.rebuild_pours === true || addedZones > 0) {
+                const rebuildMethods = ["rebuildAll", "repourAll", "rebuild", "repour", "fillAll"];
+                for (const m of rebuildMethods) {
+                    if (typeof eda.pcb_PrimitivePour[m] === "function") {
+                        try { await eda.pcb_PrimitivePour[m](); break; } catch (e) {}
+                    }
+                }
+                if (eda.pcb_Drc && typeof eda.pcb_Drc.rebuildPours === "function") {
+                    try { await eda.pcb_Drc.rebuildPours(); } catch (e) {}
+                }
             }
         }
 
         const createdTrackIds = [];
+        const directTrackIds = {};
+        const splitExistingTrackIds = [];
+        const requestedTrackSegments = [];
         const createdViaIds = [];
         function extractCreatedPrimitiveId(createdObj) {
             if (!createdObj) return "";
@@ -2224,6 +2513,17 @@ var edaEsbuildExportName = (function () {
                 const tX2 = coordToMil(t, "x2", "x2_mm", units, 0);
                 const tY2 = coordToMil(t, "y2", "y2_mm", units, 0);
                 const tW = coordToMil(t, "width", "width_mm", units, 10.0);
+                const layerId = resolveEasyEdaCopperLayerId(t.layer || "TopLayer");
+                requestedTrackSegments.push({
+                    net: tNet,
+                    layerId: layerId,
+                    layer: normalizePcbLayer(t.layer || "TopLayer"),
+                    x1: tX1,
+                    y1: tY1,
+                    x2: tX2,
+                    y2: tY2,
+                    width: tW
+                });
                 if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.create === "function") {
                     const createdTrk = await eda.pcb_PrimitiveTrack.create(
                         tNet,
@@ -2235,10 +2535,12 @@ var edaEsbuildExportName = (function () {
                         tW
                     );
                     const newTid = extractCreatedPrimitiveId(createdTrk);
-                    if (newTid && createdTrackIds.indexOf(newTid) < 0) createdTrackIds.push(newTid);
+                    if (newTid) {
+                        directTrackIds[newTid] = true;
+                        if (createdTrackIds.indexOf(newTid) < 0) createdTrackIds.push(newTid);
+                    }
                     addedTracks += 1;
                 } else if (eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.create === "function") {
-                    const layerId = resolveEasyEdaCopperLayerId(t.layer || "TopLayer");
                     const createdLn = await eda.pcb_PrimitiveLine.create(
                         tNet,
                         layerId,
@@ -2250,9 +2552,24 @@ var edaEsbuildExportName = (function () {
                         false
                     );
                     const newLid = extractCreatedPrimitiveId(createdLn);
-                    if (newLid && createdTrackIds.indexOf(newLid) < 0) createdTrackIds.push(newLid);
+                    if (newLid) {
+                        directTrackIds[newLid] = true;
+                        if (createdTrackIds.indexOf(newLid) < 0) createdTrackIds.push(newLid);
+                    }
                     addedTracks += 1;
                 }
+            }
+            function matchesAnyRequested(sx, sy, ex, ey) {
+                for (let r = 0; r < requestedTrackSegments.length; ++r) {
+                    const req = requestedTrackSegments[r];
+                    const dFwd1 = Math.hypot(sx - req.x1, sy - req.y1);
+                    const dFwd2 = Math.hypot(ex - req.x2, ey - req.y2);
+                    if (dFwd1 <= 0.2 && dFwd2 <= 0.2) return true;
+                    const dRev1 = Math.hypot(sx - req.x2, sy - req.y2);
+                    const dRev2 = Math.hypot(ex - req.x1, ey - req.y1);
+                    if (dRev1 <= 0.2 && dRev2 <= 0.2) return true;
+                }
+                return false;
             }
             try {
                 if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.getAll === "function") {
@@ -2260,8 +2577,16 @@ var edaEsbuildExportName = (function () {
                     if (Array.isArray(postT)) {
                         for (const pt of postT) {
                             const tid = String(callGetter(pt, "getState_PrimitiveId", "primitiveId", "id", ""));
-                            if (tid && !preTrackIds[tid] && createdTrackIds.indexOf(tid) < 0) {
-                                createdTrackIds.push(tid);
+                            if (tid && !preTrackIds[tid] && !directTrackIds[tid]) {
+                                const sx = Number(callGetter(pt, "getState_StartX", "startX", "x1", 0) || 0);
+                                const sy = Number(callGetter(pt, "getState_StartY", "startY", "y1", 0) || 0);
+                                const ex = Number(callGetter(pt, "getState_EndX", "endX", "x2", 0) || 0);
+                                const ey = Number(callGetter(pt, "getState_EndY", "endY", "y2", 0) || 0);
+                                if (matchesAnyRequested(sx, sy, ex, ey)) {
+                                    if (createdTrackIds.indexOf(tid) < 0) createdTrackIds.push(tid);
+                                } else {
+                                    if (splitExistingTrackIds.indexOf(tid) < 0) splitExistingTrackIds.push(tid);
+                                }
                             }
                         }
                     }
@@ -2271,8 +2596,16 @@ var edaEsbuildExportName = (function () {
                     if (Array.isArray(postL)) {
                         for (const pl of postL) {
                             const lid = String(callGetter(pl, "getState_PrimitiveId", "primitiveId", "id", ""));
-                            if (lid && !preTrackIds[lid] && createdTrackIds.indexOf(lid) < 0) {
-                                createdTrackIds.push(lid);
+                            if (lid && !preTrackIds[lid] && !directTrackIds[lid]) {
+                                const sx = Number(callGetter(pl, "getState_StartX", "startX", "x1", 0) || 0);
+                                const sy = Number(callGetter(pl, "getState_StartY", "startY", "y1", 0) || 0);
+                                const ex = Number(callGetter(pl, "getState_EndX", "endX", "x2", 0) || 0);
+                                const ey = Number(callGetter(pl, "getState_EndY", "endY", "y2", 0) || 0);
+                                if (matchesAnyRequested(sx, sy, ex, ey)) {
+                                    if (createdTrackIds.indexOf(lid) < 0) createdTrackIds.push(lid);
+                                } else {
+                                    if (splitExistingTrackIds.indexOf(lid) < 0) splitExistingTrackIds.push(lid);
+                                }
                             }
                         }
                     }
@@ -2337,7 +2670,7 @@ var edaEsbuildExportName = (function () {
         } catch (err) {
         }
 
-        const committedIds = createdTrackIds.concat(createdViaIds);
+        const committedIds = createdTrackIds.concat(createdViaIds, createdPourIds);
         return {
             ok: true,
             active_document: await resolveActiveDocumentTitle(),
@@ -2352,8 +2685,10 @@ var edaEsbuildExportName = (function () {
             added_zones: addedZones,
             added_tracks: addedTracks,
             added_vias: addedVias,
+            created_pour_ids: createdPourIds,
             created_track_ids: createdTrackIds,
             created_via_ids: createdViaIds,
+            split_existing_track_ids: splitExistingTrackIds,
             committed_ids: committedIds,
             rubber_banded_tracks: rubberBandedTracks,
             rubber_banded_tracks_count: rubberBandedTracks.length
@@ -2457,8 +2792,27 @@ var edaEsbuildExportName = (function () {
         if (typeof eda === "undefined") {
             return { ok: false, triggered: false, error: "EasyEDA Pro eda API is unavailable" };
         }
+        const edaRouteApis = {};
+        try {
+            const probeNames = [
+                "pcb_Route", "pcb_AutoRoute", "pcb_Router", "sys_Menu", "sys_ShortcutKey",
+                "pcb_Action", "sys_Action", "dmt_Pcb", "dmt_EditorControl"
+            ];
+            for (const pName of probeNames) {
+                if (eda[pName]) {
+                    const keys = [];
+                    try {
+                        for (const k in eda[pName]) {
+                            keys.push(k);
+                        }
+                    } catch (e) {}
+                    edaRouteApis[pName] = keys;
+                }
+            }
+        } catch (probeErr) {}
+
         const pcbErr = await requirePcbDocument(args);
-        if (pcbErr) return Object.assign({ triggered: false }, pcbErr);
+        if (pcbErr) return Object.assign({ triggered: false, eda_route_apis: edaRouteApis }, pcbErr);
         const beforeTracks = await countCopperTracks();
         const docs = collectAccessibleDocuments();
         const attempts = [];
@@ -2499,6 +2853,7 @@ var edaEsbuildExportName = (function () {
                 needs_win32_ui_automation: true,
                 before_tracks: beforeTracks,
                 accessible_documents: docs.map(function (d) { return d.label; }),
+                eda_route_apis: edaRouteApis,
                 attempts: attempts
             };
         }
@@ -2528,6 +2883,7 @@ var edaEsbuildExportName = (function () {
             after_tracks: last,
             added_tracks: last - beforeTracks,
             settled: changed && stableTicks >= 3,
+            eda_route_apis: edaRouteApis,
             attempts: attempts
         };
     }
@@ -2581,15 +2937,109 @@ var edaEsbuildExportName = (function () {
             }
         }
 
+        const normalizedViolations = [];
+        for (const v of violations) {
+            if (!v || typeof v !== "object") continue;
+            const norm = {
+                code: v.code || v.errCode || v.errorCode || "",
+                errorType: v.errorType || v.type || v.category || "",
+                ruleName: v.ruleName || v.rule || "",
+                net1: v.net1 || v.net || "",
+                net2: v.net2 || "",
+                layer: v.layer !== undefined ? String(v.layer) : "",
+                x: v.x !== undefined ? Number(v.x) : (v.point ? Number(v.point.x || 0) : undefined),
+                y: v.y !== undefined ? Number(v.y) : (v.point ? Number(v.point.y || 0) : undefined),
+                obj1Type: v.obj1Type || v.item1Type || "",
+                obj2Type: v.obj2Type || v.item2Type || "",
+                primitiveId1: v.primitiveId1 || v.id1 || v.errorObjId1 || "",
+                primitiveId2: v.primitiveId2 || v.id2 || v.errorObjId2 || "",
+                errorObjId1: v.errorObjId1 || v.primitiveId1 || "",
+                errorObjId2: v.errorObjId2 || v.primitiveId2 || "",
+                msg: (v.explanation && v.explanation.msg) ? String(v.explanation.msg) : String(v.msg || v.message || "")
+            };
+            if (args && args.include_verbose_error === true) {
+                norm.explanation = v.explanation;
+                norm.raw = v;
+            } else if (v.explanation && v.explanation.msg) {
+                norm.explanation = { msg: v.explanation.msg };
+            }
+            normalizedViolations.push(norm);
+        }
+
+        const summaryByErrorType = {};
+        const summaryByRuleName = {};
+        const summaryByNet = {};
+        for (const nv of normalizedViolations) {
+            const et = nv.errorType || "Unknown";
+            summaryByErrorType[et] = (summaryByErrorType[et] || 0) + 1;
+            const rn = nv.ruleName || "Unknown";
+            summaryByRuleName[rn] = (summaryByRuleName[rn] || 0) + 1;
+            if (nv.net1) {
+                summaryByNet[nv.net1] = (summaryByNet[nv.net1] || 0) + 1;
+            }
+            if (nv.net2 && nv.net2 !== nv.net1) {
+                summaryByNet[nv.net2] = (summaryByNet[nv.net2] || 0) + 1;
+            }
+        }
+        const violationSummary = {
+            by_error_type: summaryByErrorType,
+            by_rule_name: summaryByRuleName,
+            by_net: summaryByNet
+        };
+
+        const targetNets = normalizeStringArray(args && (args.nets || args.net_filter || args.net));
+        const targetTypes = normalizeStringArray(args && (args.error_types || args.error_type)).map(function (s) { return s.toLowerCase(); });
+
+        let filteredViolations = normalizedViolations;
+        if (targetNets.length > 0) {
+            filteredViolations = filteredViolations.filter(function (nv) {
+                return targetNets.indexOf(nv.net1) >= 0 || targetNets.indexOf(nv.net2) >= 0;
+            });
+        }
+        if (targetTypes.length > 0) {
+            filteredViolations = filteredViolations.filter(function (nv) {
+                const etLower = (nv.errorType || "").toLowerCase();
+                const rnLower = (nv.ruleName || "").toLowerCase();
+                for (const tt of targetTypes) {
+                    if (etLower === tt || rnLower === tt || etLower.indexOf(tt) >= 0 || rnLower.indexOf(tt) >= 0) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        }
+
+        const summaryOnly = Boolean(args && args.summary_only === true);
+        const maxViolations = (args && typeof args.max_violations === "number" && args.max_violations > 0)
+            ? args.max_violations
+            : (args && args.include_verbose_error === true ? 1000 : 200);
+
+        let resultViolations = filteredViolations;
+        let truncated = false;
+        if (summaryOnly) {
+            resultViolations = [];
+        } else if (resultViolations.length > maxViolations) {
+            resultViolations = resultViolations.slice(0, maxViolations);
+            truncated = true;
+        }
+
         const out = {
             ok: true,
             target: target,
-            passed: passed,
-            native_passed: passed,
+            passed: (violations.length === 0),
+            native_passed: (violations.length === 0),
             raw_categories: rawCategoriesCount,
             violation_count: violations.length,
-            violations: violations
+            filtered_violation_count: filteredViolations.length,
+            violation_summary: violationSummary,
+            violations: resultViolations
         };
+        if (summaryOnly) {
+            out.violations_omitted = true;
+        }
+        if (truncated) {
+            out.violations_truncated = true;
+        }
 
         if (target === "pcb") {
             const pcbSnap = await handleInspectPcb({ _full_for_bridge: true });

@@ -198,6 +198,89 @@ IUIAutomationElement* pollUiaElementByName(IUIAutomation* uia, IUIAutomationElem
     }
 }
 
+// Scans descendants of root using TrueCondition, performing case-insensitive substring matching on CurrentName
+// against substrings. If controlType != 0, requires matching CurrentControlType. If controlType == 0, accepts
+// common clickable control types (MenuItem, Text, Button, Custom). Optionally collects visible names into outCandidates.
+IUIAutomationElement* findUiaElementBySubstring(IUIAutomation* uia, IUIAutomationElement* root,
+                                               const std::vector<std::wstring>& substrings,
+                                               int controlType,
+                                               std::vector<std::string>* outCandidates = nullptr) {
+    if (uia == nullptr || root == nullptr) return nullptr;
+    ComRelease<IUIAutomationCondition> trueCond;
+    if (FAILED(uia->CreateTrueCondition(&trueCond.p)) || trueCond.p == nullptr) {
+        return nullptr;
+    }
+    ComRelease<IUIAutomationElementArray> arr;
+    if (FAILED(root->FindAll(TreeScope_Descendants, trueCond.p, &arr.p)) || arr.p == nullptr) {
+        return nullptr;
+    }
+    int len = 0;
+    arr.p->get_Length(&len);
+
+    std::vector<std::wstring> lowerSubs;
+    lowerSubs.reserve(substrings.size());
+    for (const auto& s : substrings) {
+        std::wstring ls;
+        ls.reserve(s.size());
+        for (wchar_t wc : s) ls += static_cast<wchar_t>(std::towlower(wc));
+        lowerSubs.push_back(std::move(ls));
+    }
+
+    for (int i = 0; i < len; ++i) {
+        ComRelease<IUIAutomationElement> el;
+        if (FAILED(arr.p->GetElement(i, &el.p)) || el.p == nullptr) continue;
+
+        CONTROLTYPEID ct = 0;
+        el.p->get_CurrentControlType(&ct);
+        if (controlType != 0) {
+            if (ct != static_cast<CONTROLTYPEID>(controlType)) continue;
+        } else {
+            if (ct != UIA_MenuItemControlTypeId && ct != UIA_TextControlTypeId &&
+                ct != UIA_ButtonControlTypeId && ct != UIA_CustomControlTypeId) {
+                continue;
+            }
+        }
+
+        BSTR nameBstr = nullptr;
+        el.p->get_CurrentName(&nameBstr);
+        if (nameBstr == nullptr) continue;
+        std::wstring name(nameBstr, ::SysStringLen(nameBstr));
+        ::SysFreeString(nameBstr);
+        if (name.empty()) continue;
+
+        if (outCandidates != nullptr && outCandidates->size() < 25) {
+            std::string utf8Name;
+            int sizeNeeded = ::WideCharToMultiByte(CP_UTF8, 0, name.c_str(), static_cast<int>(name.size()),
+                                                   nullptr, 0, nullptr, nullptr);
+            if (sizeNeeded > 0) {
+                utf8Name.resize(sizeNeeded);
+                ::WideCharToMultiByte(CP_UTF8, 0, name.c_str(), static_cast<int>(name.size()),
+                                      &utf8Name[0], sizeNeeded, nullptr, nullptr);
+            }
+            if (!utf8Name.empty()) {
+                bool foundCand = false;
+                for (const auto& c : *outCandidates) {
+                    if (c == utf8Name) { foundCand = true; break; }
+                }
+                if (!foundCand) outCandidates->push_back(utf8Name);
+            }
+        }
+
+        std::wstring lowerName;
+        lowerName.reserve(name.size());
+        for (wchar_t wc : name) lowerName += static_cast<wchar_t>(std::towlower(wc));
+
+        for (const auto& ls : lowerSubs) {
+            if (lowerName.find(ls) != std::wstring::npos) {
+                IUIAutomationElement* ret = el.p;
+                ret->AddRef();
+                return ret;
+            }
+        }
+    }
+    return nullptr;
+}
+
 void sendMouseClickAt(int x, int y) {
     ::SetCursorPos(x, y);
     INPUT inputs[2] = {};
@@ -271,16 +354,26 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
     }
 
     const std::vector<std::wstring> routeNames = {L"Route", L"\u5e03\u7ebf"};
+    const std::vector<std::wstring> routeSubstrings = {L"route", L"\u5e03\u7ebf"};
     const std::vector<std::wstring> autoItemNames = {
         L"Auto Route...", L"Auto Route\u2026", L"Auto Route", L"Auto Router...", L"Auto Router",
         L"\u81ea\u52a8\u5e03\u7ebf...", L"\u81ea\u52a8\u5e03\u7ebf\u2026", L"\u81ea\u52a8\u5e03\u7ebf"
     };
+    const std::vector<std::wstring> autoSubstrings = {
+        L"auto route", L"autoroute", L"auto router", L"\u81ea\u52a8\u5e03\u7ebf"
+    };
     const std::vector<std::wstring> runNames = {
         L"Run", L"Run Auto Route", L"Auto Route", L"\u6267\u884c", L"\u5f00\u59cb\u5e03\u7ebf", L"\u8fd0\u884c"
+    };
+    const std::vector<std::wstring> runSubstrings = {
+        L"run", L"\u6267\u884c", L"\u5f00\u59cb", L"\u8fd0\u884c"
     };
 
     ComRelease<IUIAutomationElement> routeMenu;
     routeMenu.p = pollUiaElementByName(uia.p, root.p, routeNames, 0, 3000);
+    if (routeMenu.p == nullptr) {
+        routeMenu.p = findUiaElementBySubstring(uia.p, root.p, routeSubstrings, 0);
+    }
     if (routeMenu.p == nullptr) {
         outDiag["stage"] = "route_menu_not_found";
         outDiag["error"] = "UI Automation could not find the Route menu in the EasyEDA Pro window";
@@ -289,35 +382,74 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
     outDiag["route_menu_method"] = activateUiaElement(routeMenu.p);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
+    std::vector<std::string> visibleCandidates;
     ComRelease<IUIAutomationElement> autoItem;
-    autoItem.p = pollUiaElementByName(uia.p, root.p, autoItemNames, 0, 2000);
+    autoItem.p = pollUiaElementByName(uia.p, root.p, autoItemNames, 0, 1000);
     if (autoItem.p == nullptr) {
-        // Native popup menus are separate top-level windows: search the desktop once.
-        ComRelease<IUIAutomationElement> desktop;
-        if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
-            autoItem.p = findUiaElementByName(uia.p, desktop.p, autoItemNames, UIA_MenuItemControlTypeId);
+        autoItem.p = findUiaElementBySubstring(uia.p, root.p, autoSubstrings, 0, &visibleCandidates);
+    }
+    if (autoItem.p == nullptr) {
+        // Explicitly click center of routeMenu's bounding rectangle if not found within 1000 ms
+        RECT rcMenu = {};
+        if (SUCCEEDED(routeMenu.p->get_CurrentBoundingRectangle(&rcMenu)) &&
+            rcMenu.right > rcMenu.left && rcMenu.bottom > rcMenu.top) {
+            sendMouseClickAt((rcMenu.left + rcMenu.right) / 2, (rcMenu.top + rcMenu.bottom) / 2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            autoItem.p = pollUiaElementByName(uia.p, root.p, autoItemNames, 0, 1000);
+            if (autoItem.p == nullptr) {
+                autoItem.p = findUiaElementBySubstring(uia.p, root.p, autoSubstrings, 0, &visibleCandidates);
+            }
         }
     }
     if (autoItem.p == nullptr) {
-        outDiag["stage"] = "auto_route_item_not_found";
-        outDiag["error"] = "UI Automation could not find the Auto Route menu item";
-        sendVirtualKey(VK_ESCAPE);
-        return false;
+        // Native popup menus are separate top-level windows: search desktop
+        ComRelease<IUIAutomationElement> desktop;
+        if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
+            autoItem.p = findUiaElementByName(uia.p, desktop.p, autoItemNames, UIA_MenuItemControlTypeId);
+            if (autoItem.p == nullptr) {
+                autoItem.p = findUiaElementBySubstring(uia.p, desktop.p, autoSubstrings, 0, &visibleCandidates);
+            }
+        }
     }
-    outDiag["auto_route_item_method"] = activateUiaElement(autoItem.p);
+
+    if (autoItem.p != nullptr) {
+        outDiag["auto_route_item_method"] = activateUiaElement(autoItem.p);
+    } else {
+        if (!visibleCandidates.empty()) {
+            outDiag["visible_menu_candidates"] = visibleCandidates;
+        }
+        sendVirtualKey(VK_DOWN);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        sendVirtualKey(VK_RETURN);
+        outDiag["auto_route_item_method"] = "keyboard_down_enter";
+    }
 
     ComRelease<IUIAutomationElement> runBtn;
     runBtn.p = pollUiaElementByName(uia.p, root.p, runNames, UIA_ButtonControlTypeId, dialogTimeoutMs);
+    if (runBtn.p == nullptr) {
+        runBtn.p = findUiaElementBySubstring(uia.p, root.p, runSubstrings, UIA_ButtonControlTypeId);
+    }
+    if (runBtn.p == nullptr) {
+        ComRelease<IUIAutomationElement> desktop;
+        if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
+            runBtn.p = findUiaElementByName(uia.p, desktop.p, runNames, UIA_ButtonControlTypeId);
+            if (runBtn.p == nullptr) {
+                runBtn.p = findUiaElementBySubstring(uia.p, desktop.p, runSubstrings, UIA_ButtonControlTypeId);
+            }
+        }
+    }
+
     if (runBtn.p != nullptr) {
         outDiag["run_method"] = activateUiaElement(runBtn.p);
-    } else if (::GetForegroundWindow() == hwnd) {
-        // Assumes Run is the Auto Route dialog's default button; unverified until qualified on
-        // Windows, and the caller judges success by the settled track count, not by this path.
+    } else if (autoItem.p != nullptr && ::GetForegroundWindow() == hwnd) {
         sendVirtualKey(VK_RETURN);
         outDiag["run_method"] = "enter_key";
     } else {
-        outDiag["stage"] = "run_button_not_found";
-        outDiag["error"] = "Auto Route dialog Run button not found and EasyEDA Pro is not the foreground window";
+        outDiag["stage"] = (autoItem.p == nullptr) ? "auto_route_item_not_found" : "run_button_not_found";
+        outDiag["error"] = (autoItem.p == nullptr)
+            ? "UI Automation could not find the Auto Route menu item and keyboard fallback did not open dialog"
+            : "Auto Route dialog Run button not found and EasyEDA Pro is not the foreground window";
+        sendVirtualKey(VK_ESCAPE);
         return false;
     }
     outDiag["stage"] = "triggered";
@@ -704,14 +836,32 @@ nlohmann::json introspectEasyEdaApiCatalog(const nlohmann::json& args) {
             "eda.pcb_PrimitivePour.create",
             "pcb_PrimitivePour",
             "create",
-            "create(net: string, layer: TPCB_LayersOfPour, polygon: IPCB_Polygon, pourName?: string, clearance?: number): Promise<IPCB_PrimitivePour | undefined>",
+            "create(net: string, layer: EPCB_LayerId, polygon: IPCB_Polygon, pourFillMethod?: EPCB_PrimitivePourFillMethod, preserveSmdPad?: boolean, lineWidth?: number, clearance?: number, pourName?: string, hatchedWidth?: number, hatchedSpacing?: number, locked?: boolean): Promise<IPCB_PrimitivePour | undefined>",
             "Promise<IPCB_PrimitivePour | undefined>",
-            "Create a copper pour zone attached to a net on TopLayer/BottomLayer/inner plane.",
+            "Create a copper pour zone attached to a net on TopLayer(1)/BottomLayer(2)/InnerLayer1(15)/InnerLayer2(16). Note: layer must be numeric EPCB_LayerId and polygon must be created via eda.pcb_MathPolygon.createPolygon([x1, y1, 'L', x2, y2, ...]).",
             nlohmann::json::array({
                 {{"name", "net"}, {"type", "string"}, {"optional", false}},
-                {{"name", "layer"}, {"type", "TPCB_LayersOfPour"}, {"optional", false}},
+                {{"name", "layer"}, {"type", "EPCB_LayerId (number: 1=Top, 2=Bottom, 15=Inner1, 16=Inner2)"}, {"optional", false}},
                 {{"name", "polygon"}, {"type", "IPCB_Polygon"}, {"optional", false}},
-                {{"name", "clearance"}, {"type", "number (mil)"}, {"optional", true}}
+                {{"name", "pourFillMethod"}, {"type", "EPCB_PrimitivePourFillMethod"}, {"optional", true}},
+                {{"name", "preserveSmdPad"}, {"type", "boolean"}, {"optional", true}},
+                {{"name", "lineWidth"}, {"type", "number (mil)"}, {"optional", true}},
+                {{"name", "clearance"}, {"type", "number (mil)"}, {"optional", true}},
+                {{"name", "pourName"}, {"type", "string"}, {"optional", true}},
+                {{"name", "hatchedWidth"}, {"type", "number (mil)"}, {"optional", true}},
+                {{"name", "hatchedSpacing"}, {"type", "number (mil)"}, {"optional", true}},
+                {{"name", "locked"}, {"type", "boolean"}, {"optional", true}}
+            })
+        },
+        {
+            "eda.pcb_MathPolygon.createPolygon",
+            "pcb_MathPolygon",
+            "createPolygon",
+            "createPolygon(flatCommands: (number | string)[]): IPCB_Polygon",
+            "IPCB_Polygon",
+            "Create an EasyEDA Pro MathPolygon object from canvas mil coordinates [x1, y1, 'L', x2, y2, 'L', ...].",
+            nlohmann::json::array({
+                {{"name", "flatCommands"}, {"type", "(number | string)[]"}, {"optional", false}}
             })
         },
         {
@@ -3463,10 +3613,17 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
             std::string auditSummary;
             plugRes["connectivity_audit"] = acc.calcPcbConnectivityAudit(plugRes, auditOk, auditSummary);
         }
-        bool includeRawPrimitives = args.value("include_raw_primitives", false);
+        bool includeRawPrimitives = args.value("include_raw_primitives", args.value("include_primitives", false));
         bool summaryOnly = args.value("summary_only", false);
-        bool hasFilter = (args.contains("references") && args["references"].is_array() && !args["references"].empty()) ||
-                         (args.contains("nets") && args["nets"].is_array() && !args["nets"].empty());
+        bool hasFilter = (args.contains("references") && !args["references"].empty()) ||
+                         (args.contains("reference") && !args["reference"].empty()) ||
+                         (args.contains("ref_filter") && !args["ref_filter"].empty()) ||
+                         (args.contains("nets") && !args["nets"].empty()) ||
+                         (args.contains("net") && !args["net"].empty()) ||
+                         (args.contains("net_filter") && !args["net_filter"].empty()) ||
+                         (args.contains("layers") && !args["layers"].empty()) ||
+                         (args.contains("layer") && !args["layer"].empty()) ||
+                         (args.contains("bbox") && args["bbox"].is_object() && !args["bbox"].empty());
         if (summaryOnly && toolName == "easyeda_inspect_pcb") {
             plugRes.erase("components");
             plugRes.erase("tracks");

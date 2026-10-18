@@ -636,8 +636,11 @@ std::string McpServer::detectProfileFromWorkspace(const std::string& ws) {
         return "network";
     }
 
-    if (lower.find("intelligence") != std::string::npos ||
-        lower.find("aimon") != std::string::npos) {
+    if (lower.find("aimon") != std::string::npos) {
+        return "all";
+    }
+
+    if (lower.find("intelligence") != std::string::npos) {
         return "core";
     }
 
