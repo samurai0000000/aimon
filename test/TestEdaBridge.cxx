@@ -2599,6 +2599,155 @@ TEST(EdaAccelerators_Unit, Envelope2LiveAutorouteSafeCommittedIdsAndDrcShifts) {
     CHECK_EQUAL(1, res["post_route_audit"].value("pours_count", -1));
 }
 
+TEST_GROUP(EdaBridge) {
+};
+
+TEST(EdaBridge, PowerIntegrityAndBridgeV1_1_10Upgrades) {
+    // 1. 2-part module introspection paths allowed, foreign paths rejected
+    std::string reason;
+    CHECK_TRUE(EdaBridge::guardEasyEdaApiCall("eda.pcb_Drc", reason));
+    CHECK_TRUE(EdaBridge::guardEasyEdaApiCall("eda.pcb_PrimitivePour", reason));
+    CHECK_FALSE(EdaBridge::guardEasyEdaApiCall("window.eval", reason));
+    CHECK_FALSE(reason.empty());
+
+    EdaBridgeConfig cfg;
+    cfg.enabled = true;
+    cfg.mode = "gateway";
+    cfg.easyeda.enabled = true;
+    cfg.accelerators.enabled = true;
+    EdaBridge bridge(cfg);
+
+    nlohmann::json testPcbState = {
+        {"units", "mm"},
+        {"board_outline", nlohmann::json::array({
+            {{"x1", 0.0}, {"y1", 0.0}, {"x2", 50.0}, {"y2", 0.0}},
+            {{"x1", 50.0}, {"y1", 0.0}, {"x2", 50.0}, {"y2", 50.0}},
+            {{"x1", 50.0}, {"y1", 50.0}, {"x2", 0.0}, {"y2", 50.0}},
+            {{"x1", 0.0}, {"y1", 50.0}, {"x2", 0.0}, {"y2", 0.0}}
+        })},
+        {"components", nlohmann::json::array({
+            {
+                {"id", "comp_c35"},
+                {"reference", "C35"},
+                {"value", "={Value}"},
+                {"name", "={Value}"},
+                {"otherProperty", {{"Value", "1000uF"}}},
+                {"x", 10.0}, {"y", 10.0}
+            },
+            {
+                {"id", "comp_u1"},
+                {"reference", "U1"},
+                {"value", "ESP32"},
+                {"x", 30.0}, {"y", 30.0}
+            }
+        })},
+        {"pads", nlohmann::json::array({
+            {{"id", "p_unassigned"}, {"ref", "TP1"}, {"pad", "1"}, {"net", ""}, {"x", 5.0}, {"y", 5.0}, {"layer", "1"}},
+            {{"id", "p_vcc_u1"}, {"ref", "U1"}, {"pad", "1"}, {"net", "VCC"}, {"x", 30.0}, {"y", 30.0}, {"layer", "1"}},
+            {{"id", "p_gnd_u1"}, {"ref", "U1"}, {"pad", "2"}, {"net", "GND"}, {"x", 30.0}, {"y", 32.0}, {"layer", "1"}},
+            {{"id", "p_vcc_c35"}, {"ref", "C35"}, {"pad", "1"}, {"net", "VCC"}, {"x", 10.0}, {"y", 10.0}, {"layer", "1"}},
+            {{"id", "p_gnd_c35"}, {"ref", "C35"}, {"pad", "2"}, {"net", "GND"}, {"x", 10.0}, {"y", 12.0}, {"layer", "1"}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"id", "trk_vcc_1"}, {"net", "VCC"}, {"layer", "1"}, {"x1", 10.0}, {"y1", 10.0}, {"x2", 30.0}, {"y2", 30.0}, {"width_mm", 0.254}},
+            {{"id", "trk_gnd_1"}, {"net", "GND"}, {"layer", "1"}, {"x1", 10.0}, {"y1", 12.0}, {"x2", 30.0}, {"y2", 32.0}, {"width_mm", 0.254}}
+        })},
+        {"vias", nlohmann::json::array()}
+    };
+
+    // 2. easyeda_inspect_pcb with summary_only: true trims audit arrays (payload < 2048 bytes)
+    nlohmann::json inspSummary = bridge.callTool("easyeda_inspect_pcb", {
+        {"pcb_state", testPcbState},
+        {"summary_only", true}
+    });
+    CHECK_TRUE_TEXT(inspSummary.value("ok", false), inspSummary.dump().c_str());
+    CHECK_FALSE(inspSummary.contains("components"));
+    CHECK_FALSE(inspSummary.contains("tracks"));
+    CHECK_FALSE(inspSummary.contains("pads"));
+    CHECK_TRUE(inspSummary.contains("connectivity_audit"));
+    const auto& auditSummary = inspSummary["connectivity_audit"];
+    CHECK_TRUE(auditSummary.value("audit_details_omitted", false));
+    CHECK_FALSE(auditSummary.contains("unassigned_pads"));
+    CHECK_FALSE(auditSummary.contains("decoupling_distance_warnings"));
+    CHECK_TRUE(auditSummary.value("unassigned_pads_count", 0) >= 1);
+    CHECK_TRUE(auditSummary.value("decoupling_distance_warnings_count", 0) >= 1);
+    std::string dumpSummary = inspSummary.dump();
+    CHECK_TRUE_TEXT(dumpSummary.size() < 2048, ("Payload size too large: " + std::to_string(dumpSummary.size())).c_str());
+
+    // With include_audit_details: true, unassigned_pads and decoupling_distance_warnings are retained
+    nlohmann::json inspFullAudit = bridge.callTool("easyeda_inspect_pcb", {
+        {"pcb_state", testPcbState},
+        {"summary_only", true},
+        {"include_audit_details", true}
+    });
+    CHECK_TRUE(inspFullAudit.value("ok", false));
+    const auto& auditFull = inspFullAudit["connectivity_audit"];
+    CHECK_FALSE(auditFull.value("audit_details_omitted", false));
+    CHECK_TRUE(auditFull.contains("unassigned_pads"));
+    CHECK_TRUE(auditFull.contains("decoupling_distance_warnings"));
+
+    // 3. easyeda_edit_pcb with modify_tracks and resolve_value_templates: true
+    nlohmann::json editRes = bridge.callTool("easyeda_edit_pcb", {
+        {"pcb_state", testPcbState},
+        {"units", "mm"},
+        {"modify_tracks", nlohmann::json::array({
+            {{"net", "VCC"}, {"width_mm", 0.8}}
+        })},
+        {"resolve_value_templates", true}
+    });
+    CHECK_TRUE(editRes.value("ok", false));
+    CHECK_EQUAL(1, editRes.value("modified_tracks", 0));
+    CHECK_EQUAL(1, editRes.value("modified_components", 0));
+    CHECK_TRUE(editRes.contains("pcb_state"));
+    const auto& updatedState = editRes["pcb_state"];
+    CHECK_TRUE(updatedState.contains("tracks"));
+    bool foundVcc = false;
+    for (const auto& trk : updatedState["tracks"]) {
+        if (trk.value("net", "") == "VCC") {
+            foundVcc = true;
+            DOUBLES_EQUAL(0.8, trk.value("width_mm", 0.0), 1e-3);
+        }
+    }
+    CHECK_TRUE(foundVcc);
+
+    bool foundC35 = false;
+    for (const auto& comp : updatedState["components"]) {
+        if (comp.value("reference", "") == "C35") {
+            foundC35 = true;
+            STRCMP_EQUAL("1000uF", comp.value("value", "").c_str());
+        }
+    }
+    CHECK_TRUE(foundC35);
+
+    // Also test modify_components explicitly
+    nlohmann::json editModCompRes = bridge.callTool("easyeda_edit_pcb", {
+        {"pcb_state", updatedState},
+        {"modify_components", nlohmann::json::array({
+            {{"reference", "U1"}, {"value", "ESP32-S3-WROOM-1"}}
+        })}
+    });
+    CHECK_TRUE(editModCompRes.value("ok", false));
+    CHECK_EQUAL(1, editModCompRes.value("modified_components", 0));
+    const auto& compState = editModCompRes["pcb_state"];
+    bool foundU1 = false;
+    for (const auto& comp : compState["components"]) {
+        if (comp.value("reference", "") == "U1") {
+            foundU1 = true;
+            STRCMP_EQUAL("ESP32-S3-WROOM-1", comp.value("value", "").c_str());
+        }
+    }
+    CHECK_TRUE(foundU1);
+
+    // 4. easyeda_sync_sch_to_pcb with trigger_native_import: true surfaces native_import_changes
+    nlohmann::json syncRes = bridge.callTool("easyeda_sync_sch_to_pcb", {
+        {"trigger_native_import", true},
+        {"dry_run", false}
+    });
+    CHECK_TRUE(syncRes.value("ok", false));
+    CHECK_TRUE(syncRes.contains("native_import_changes"));
+    CHECK_TRUE(syncRes["native_import_changes"].is_object());
+}
+
 
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {

@@ -1607,39 +1607,11 @@ void EdaTrayWindow::populateQuotasUi(const AimonQuotaSnapshot& snap) {
         _agModelsContainer->setVisible(_agModelsExpanded && !snap.agModels.empty());
 
         if (_actSummaryAg) {
-            double minPct = 100.0;
-            std::string minLabel;
-            bool foundBucket = false;
-            for (const auto& g : snap.agQuotaGroups) {
-                for (const auto& b : g.buckets) {
-                    if (!foundBucket || b.remainingPct < minPct) {
-                        minPct = b.remainingPct;
-                        minLabel = g.displayName + " - " + b.displayName;
-                        foundBucket = true;
-                    }
-                }
-            }
-            if (!foundBucket) {
-                for (const auto& m : snap.agModels) {
-                    if (!foundBucket || m.remainingPct < minPct) {
-                        minPct = m.remainingPct;
-                        minLabel = m.name;
-                        foundBucket = true;
-                    }
-                }
-            }
-            if (foundBucket) {
-                _actSummaryAg->setText(
-                    QString("Antigravity (%1): %2% min (%3)")
-                        .arg(QString::fromStdString(snap.agPlanTier))
-                        .arg(static_cast<int>(std::round(minPct)))
-                        .arg(QString::fromStdString(minLabel))
-                );
-            } else {
-                _actSummaryAg->setText(
-                    QString("Antigravity (%1): Online").arg(QString::fromStdString(snap.agPlanTier))
-                );
-            }
+            AimonQuotaSnapshot agOnly = snap;
+            agOnly.reachable = true;
+            agOnly.cursorAuthenticated = false;
+            agOnly.claudeEnabled = false;
+            _actSummaryAg->setText(QString::fromStdString(EdaBridgeAppConfig::formatTrayTooltipSummary(agOnly)));
         }
     } else {
         _agStatusDot->setStyleSheet("color: #ef4444; font-size: 13px;");
@@ -1730,13 +1702,11 @@ void EdaTrayWindow::populateQuotasUi(const AimonQuotaSnapshot& snap) {
             QString::fromStdString(formatHumanDate(snap.cursorCycleResetIso))
         );
         if (_actSummaryCursor) {
-            _actSummaryCursor->setText(
-                QString("Cursor (%1): $%2 | %3/%4 req")
-                    .arg(QString::fromStdString(snap.cursorPlanTier))
-                    .arg(snap.cursorTotalSpendUsd, 0, 'f', 2)
-                    .arg(QString::fromStdString(formatNumberWithCommas(snap.cursorRequestsUsed)))
-                    .arg(QString::fromStdString(formatNumberWithCommas(snap.cursorRequestsLimit)))
-            );
+            AimonQuotaSnapshot curOnly = snap;
+            curOnly.reachable = true;
+            curOnly.agRunning = false;
+            curOnly.claudeEnabled = false;
+            _actSummaryCursor->setText(QString::fromStdString(EdaBridgeAppConfig::formatTrayTooltipSummary(curOnly)));
         }
     } else {
         _cursorHeaderLabel->setText(
@@ -1879,23 +1849,12 @@ void EdaTrayWindow::populateQuotasUi(const AimonQuotaSnapshot& snap) {
             _claudeAccountsLayout->addWidget(card);
         }
 
-        const auto& first = snap.claudeAccounts.front();
         if (_actSummaryClaude) {
-            if (first.cycleConfigured && first.spendLimitUsd > 0.0) {
-                _actSummaryClaude->setText(
-                    QString("Claude (%1): $%2 / $%3")
-                        .arg(QString::fromStdString(first.name))
-                        .arg(first.costCycleUsd, 0, 'f', 2)
-                        .arg(first.spendLimitUsd, 0, 'f', 0)
-                );
-            } else {
-                _actSummaryClaude->setText(
-                    QString("Claude (%1): 5h $%2 | 7d $%3")
-                        .arg(QString::fromStdString(first.name))
-                        .arg(first.cost5hUsd, 0, 'f', 2)
-                        .arg(first.cost7dUsd, 0, 'f', 2)
-                );
-            }
+            AimonQuotaSnapshot claudeOnly = snap;
+            claudeOnly.reachable = true;
+            claudeOnly.agRunning = false;
+            claudeOnly.cursorAuthenticated = false;
+            _actSummaryClaude->setText(QString::fromStdString(EdaBridgeAppConfig::formatTrayTooltipSummary(claudeOnly)));
         }
     } else {
         _claudeHeaderLabel->setText("○ NO CLAUDE CODE ACCOUNTS");

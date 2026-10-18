@@ -150,9 +150,9 @@ public:
                                    AimonQuotaSnapshot& outSnap,
                                    int timeoutMs = 3000);
     static std::string formatTrayTooltipSummary(const AimonQuotaSnapshot& snap,
-                                                bool eeConn,
-                                                bool kcConn,
-                                                bool fcConn);
+                                                bool eeConn = false,
+                                                bool kcConn = false,
+                                                bool fcConn = false);
 };
 
 } // namespace aimon

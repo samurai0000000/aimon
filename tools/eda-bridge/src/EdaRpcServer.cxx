@@ -356,11 +356,12 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
     const std::vector<std::wstring> routeNames = {L"Route", L"\u5e03\u7ebf"};
     const std::vector<std::wstring> routeSubstrings = {L"route", L"\u5e03\u7ebf"};
     const std::vector<std::wstring> autoItemNames = {
+        L"Auto Routing...", L"Auto Routing\u2026", L"Auto Routing",
         L"Auto Route...", L"Auto Route\u2026", L"Auto Route", L"Auto Router...", L"Auto Router",
         L"\u81ea\u52a8\u5e03\u7ebf...", L"\u81ea\u52a8\u5e03\u7ebf\u2026", L"\u81ea\u52a8\u5e03\u7ebf"
     };
     const std::vector<std::wstring> autoSubstrings = {
-        L"auto route", L"autoroute", L"auto router", L"\u81ea\u52a8\u5e03\u7ebf"
+        L"auto routing", L"auto route", L"autoroute", L"auto router", L"\u81ea\u52a8\u5e03\u7ebf"
     };
     const std::vector<std::wstring> runNames = {
         L"Run", L"Run Auto Route", L"Auto Route", L"\u6267\u884c", L"\u5f00\u59cb\u5e03\u7ebf", L"\u8fd0\u884c"
@@ -455,9 +456,157 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
     outDiag["stage"] = "triggered";
     return true;
 }
+
+bool triggerEasyEdaImportChangesWin32(int dialogTimeoutMs, nlohmann::json& outDiag) {
+    ComApartmentScope com;
+    if (!com.usable()) {
+        outDiag["error"] = "CoInitializeEx failed";
+        return false;
+    }
+    HWND hwnd = findEasyEdaProWindow();
+    if (hwnd == nullptr) {
+        outDiag["error"] = "EasyEDA Pro window not found (no visible easyeda-pro.exe / EasyEDA top-level window)";
+        return false;
+    }
+    if (::IsIconic(hwnd)) ::ShowWindow(hwnd, SW_RESTORE);
+    ::SetForegroundWindow(hwnd);
+
+    ComRelease<IUIAutomation> uia;
+    HRESULT hr = ::CoCreateInstance(kClsidCUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                                    __uuidof(IUIAutomation), reinterpret_cast<void**>(&uia.p));
+    if (FAILED(hr) || uia.p == nullptr) {
+        outDiag["error"] = "CoCreateInstance(CUIAutomation) failed";
+        return false;
+    }
+    ComRelease<IUIAutomationElement> root;
+    if (FAILED(uia.p->ElementFromHandle(hwnd, &root.p)) || root.p == nullptr) {
+        outDiag["error"] = "IUIAutomation::ElementFromHandle failed for the EasyEDA Pro window";
+        return false;
+    }
+
+    const std::vector<std::wstring> designNames = {L"Design", L"\u8bbe\u8ba1"};
+    const std::vector<std::wstring> designSubstrings = {L"design", L"\u8bbe\u8ba1"};
+    const std::vector<std::wstring> importItemNames = {
+        L"Import Changes...", L"Import Changes\u2026", L"Import Changes",
+        L"Update PCB...", L"Update PCB\u2026", L"Update PCB",
+        L"\u5bfc\u5165\u53d8\u66f4...", L"\u5bfc\u5165\u53d8\u66f4\u2026", L"\u5bfc\u5165\u53d8\u66f4",
+        L"\u66f4\u65b0PCB"
+    };
+    const std::vector<std::wstring> importSubstrings = {
+        L"import changes", L"update pcb", L"\u5bfc\u5165\u53d8\u66f4", L"\u66f4\u65b0pcb"
+    };
+    const std::vector<std::wstring> applyNames = {
+        L"Apply Changes", L"Apply", L"Confirm", L"OK", L"Yes",
+        L"\u5e94\u7528\u4fee\u6539", L"\u5e94\u7528", L"\u786e\u8ba4", L"\u786e\u5b9a"
+    };
+    const std::vector<std::wstring> applySubstrings = {
+        L"apply changes", L"apply", L"confirm", L"\u5e94\u7528\u4fee\u6539", L"\u5e94\u7528", L"\u786e\u8ba4", L"\u786e\u5b9a"
+    };
+    const std::vector<std::wstring> closeNames = {
+        L"Close", L"\u5173\u95ed"
+    };
+
+    ComRelease<IUIAutomationElement> designMenu;
+    designMenu.p = pollUiaElementByName(uia.p, root.p, designNames, 0, 3000);
+    if (designMenu.p == nullptr) {
+        designMenu.p = findUiaElementBySubstring(uia.p, root.p, designSubstrings, 0);
+    }
+    if (designMenu.p == nullptr) {
+        outDiag["stage"] = "design_menu_not_found";
+        outDiag["error"] = "UI Automation could not find the Design menu in the EasyEDA Pro window";
+        return false;
+    }
+    outDiag["design_menu_method"] = activateUiaElement(designMenu.p);
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+    std::vector<std::string> visibleCandidates;
+    ComRelease<IUIAutomationElement> importItem;
+    importItem.p = pollUiaElementByName(uia.p, root.p, importItemNames, 0, 1000);
+    if (importItem.p == nullptr) {
+        importItem.p = findUiaElementBySubstring(uia.p, root.p, importSubstrings, 0, &visibleCandidates);
+    }
+    if (importItem.p == nullptr) {
+        RECT rcMenu = {};
+        if (SUCCEEDED(designMenu.p->get_CurrentBoundingRectangle(&rcMenu)) &&
+            rcMenu.right > rcMenu.left && rcMenu.bottom > rcMenu.top) {
+            sendMouseClickAt((rcMenu.left + rcMenu.right) / 2, (rcMenu.top + rcMenu.bottom) / 2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            importItem.p = pollUiaElementByName(uia.p, root.p, importItemNames, 0, 1000);
+            if (importItem.p == nullptr) {
+                importItem.p = findUiaElementBySubstring(uia.p, root.p, importSubstrings, 0, &visibleCandidates);
+            }
+        }
+    }
+    if (importItem.p == nullptr) {
+        ComRelease<IUIAutomationElement> desktop;
+        if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
+            importItem.p = findUiaElementByName(uia.p, desktop.p, importItemNames, UIA_MenuItemControlTypeId);
+            if (importItem.p == nullptr) {
+                importItem.p = findUiaElementBySubstring(uia.p, desktop.p, importSubstrings, 0, &visibleCandidates);
+            }
+        }
+    }
+
+    if (importItem.p != nullptr) {
+        outDiag["import_item_method"] = activateUiaElement(importItem.p);
+    } else {
+        if (!visibleCandidates.empty()) {
+            outDiag["visible_menu_candidates"] = visibleCandidates;
+        }
+        outDiag["stage"] = "import_item_not_found";
+        outDiag["error"] = "UI Automation could not find Import Changes menu item";
+        sendVirtualKey(VK_ESCAPE);
+        return false;
+    }
+
+    // Poll for the confirmation dialog button (Apply Changes, Confirm, etc.)
+    ComRelease<IUIAutomationElement> applyBtn;
+    applyBtn.p = pollUiaElementByName(uia.p, root.p, applyNames, UIA_ButtonControlTypeId, dialogTimeoutMs);
+    if (applyBtn.p == nullptr) {
+        applyBtn.p = findUiaElementBySubstring(uia.p, root.p, applySubstrings, UIA_ButtonControlTypeId);
+    }
+    if (applyBtn.p == nullptr) {
+        ComRelease<IUIAutomationElement> desktop;
+        if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
+            applyBtn.p = findUiaElementByName(uia.p, desktop.p, applyNames, UIA_ButtonControlTypeId);
+            if (applyBtn.p == nullptr) {
+                applyBtn.p = findUiaElementBySubstring(uia.p, desktop.p, applySubstrings, UIA_ButtonControlTypeId);
+            }
+        }
+    }
+
+    if (applyBtn.p != nullptr) {
+        outDiag["apply_method"] = activateUiaElement(applyBtn.p);
+    } else {
+        outDiag["apply_dialog"] = "none_or_auto_applied";
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+    // Check if a Close button is visible on a modal dialog
+    ComRelease<IUIAutomationElement> closeBtn;
+    closeBtn.p = findUiaElementByName(uia.p, root.p, closeNames, UIA_ButtonControlTypeId);
+    if (closeBtn.p == nullptr) {
+        ComRelease<IUIAutomationElement> desktop;
+        if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
+            closeBtn.p = findUiaElementByName(uia.p, desktop.p, closeNames, UIA_ButtonControlTypeId);
+        }
+    }
+    if (closeBtn.p != nullptr) {
+        outDiag["close_method"] = activateUiaElement(closeBtn.p);
+    }
+
+    outDiag["stage"] = "triggered";
+    return true;
+}
 #else
 bool triggerEasyEdaNativeAutoRouteWin32(int /*dialogTimeoutMs*/, nlohmann::json& outDiag) {
     outDiag["error"] = "Win32 UI Automation is only available when aimon-eda-bridge runs on Windows";
+    return false;
+}
+
+bool triggerEasyEdaImportChangesWin32(int /*dialogTimeoutMs*/, nlohmann::json& outDiag) {
+    outDiag["error"] = "Win32 UI Automation not available on this platform";
     return false;
 }
 #endif
@@ -695,8 +844,7 @@ bool checkEasyEdaApiSafety(const std::string& apiPath, std::string& outReason) {
     };
     for (const char* prefix : kAllowedPrefixes) {
         size_t pLen = std::char_traits<char>::length(prefix);
-        if (apiPath.rfind(prefix, 0) == 0 && apiPath.size() > pLen &&
-            apiPath.find('.', pLen) != std::string::npos) {
+        if (apiPath.rfind(prefix, 0) == 0 && apiPath.size() > pLen) {
             return true;
         }
     }
@@ -838,7 +986,7 @@ nlohmann::json introspectEasyEdaApiCatalog(const nlohmann::json& args) {
             "create",
             "create(net: string, layer: EPCB_LayerId, polygon: IPCB_Polygon, pourFillMethod?: EPCB_PrimitivePourFillMethod, preserveSmdPad?: boolean, lineWidth?: number, clearance?: number, pourName?: string, hatchedWidth?: number, hatchedSpacing?: number, locked?: boolean): Promise<IPCB_PrimitivePour | undefined>",
             "Promise<IPCB_PrimitivePour | undefined>",
-            "Create a copper pour zone attached to a net on TopLayer(1)/BottomLayer(2)/InnerLayer1(15)/InnerLayer2(16). Note: layer must be numeric EPCB_LayerId and polygon must be created via eda.pcb_MathPolygon.createPolygon([x1, y1, 'L', x2, y2, ...]).",
+            "Create a copper pour zone attached to a net on TopLayer(1)/BottomLayer(2)/InnerLayer1(15)/InnerLayer2(16). Note: layer must be numeric EPCB_LayerId and polygon must be created via eda.pcb_MathPolygon.createPolygon in closed single-'L' format [x0, y0, 'L', x1, y1, x2, y2, ..., x0, y0].",
             nlohmann::json::array({
                 {{"name", "net"}, {"type", "string"}, {"optional", false}},
                 {{"name", "layer"}, {"type", "EPCB_LayerId (number: 1=Top, 2=Bottom, 15=Inner1, 16=Inner2)"}, {"optional", false}},
@@ -859,7 +1007,7 @@ nlohmann::json introspectEasyEdaApiCatalog(const nlohmann::json& args) {
             "createPolygon",
             "createPolygon(flatCommands: (number | string)[]): IPCB_Polygon",
             "IPCB_Polygon",
-            "Create an EasyEDA Pro MathPolygon object from canvas mil coordinates [x1, y1, 'L', x2, y2, 'L', ...].",
+            "Create an EasyEDA Pro MathPolygon object from canvas mil coordinates in closed single-'L' format [x0, y0, 'L', x1, y1, x2, y2, ..., x0, y0].",
             nlohmann::json::array({
                 {{"name", "flatCommands"}, {"type", "(number | string)[]"}, {"optional", false}}
             })
@@ -3546,6 +3694,16 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
         }
     }
 
+    if (toolName == "easyeda_sync_sch_to_pcb" && plugRes.is_object() &&
+        !args.value("dry_run", false) && args.value("trigger_native_import", false)) {
+        nlohmann::json uiaDiag = nlohmann::json::object();
+        bool uiaOk = triggerEasyEdaImportChangesWin32(args.value("dialog_timeout_ms", 3000), uiaDiag);
+        plugRes["native_import_changes"] = {{"triggered", uiaOk}, {"diagnostics", uiaDiag}};
+        if (uiaOk) {
+            plugRes["synced"] = true;
+        }
+    }
+
     if (toolName == "easyeda_inspect_schematic" && plugRes.is_object() &&
         plugRes.value("ok", true)) {
         if (!plugRes.contains("erc_audit")) {
@@ -3636,6 +3794,21 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
             plugRes.erase("pads");
             plugRes.erase("vias");
             plugRes.erase("schematic_components");
+        }
+        if (summaryOnly && !args.value("include_audit_details", false) &&
+            plugRes.contains("connectivity_audit") && plugRes["connectivity_audit"].is_object()) {
+            auto& ca = plugRes["connectivity_audit"];
+            if (!ca.contains("decoupling_distance_warnings_count") &&
+                ca.contains("decoupling_distance_warnings") && ca["decoupling_distance_warnings"].is_array()) {
+                ca["decoupling_distance_warnings_count"] = static_cast<int>(ca["decoupling_distance_warnings"].size());
+            }
+            if (!ca.contains("unassigned_pads_count") &&
+                ca.contains("unassigned_pads") && ca["unassigned_pads"].is_array()) {
+                ca["unassigned_pads_count"] = static_cast<int>(ca["unassigned_pads"].size());
+            }
+            ca.erase("unassigned_pads");
+            ca.erase("decoupling_distance_warnings");
+            ca["audit_details_omitted"] = true;
         }
     }
 

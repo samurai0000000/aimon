@@ -1827,7 +1827,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     EdaBridgeAppSettings loaded;
     CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgFile, loaded, err));
     CHECK_TRUE(err.empty());
-    STRCMP_EQUAL("1.1.9", loaded.version.c_str());
+    STRCMP_EQUAL("1.1.10", loaded.version.c_str());
     CHECK_EQUAL(orig.enableEasyEda, loaded.enableEasyEda);
     CHECK_EQUAL(orig.enableKiCad, loaded.enableKiCad);
     CHECK_EQUAL(orig.enableFreeCad, loaded.enableFreeCad);
@@ -1892,7 +1892,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
 }
 
 TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeployment) {
-    CHECK_EQUAL("1.1.9", EdaBridgeAppSettings().version);
+    CHECK_EQUAL("1.1.10", EdaBridgeAppSettings().version);
 
     std::vector<uint8_t> zipBytes = EdaBridgeAppConfig::buildEasyEdaEextZipBytes();
     CHECK_TRUE(zipBytes.size() > 512);
@@ -1909,7 +1909,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
     CHECK_TRUE(zipView.find("edaEsbuildExportName") != std::string::npos);
     CHECK_TRUE(zipView.find("eda.sys_WebSocket") != std::string::npos);
     CHECK_TRUE(zipView.find("aimon-easyeda-pro-bridge") != std::string::npos);
-    CHECK_TRUE(zipView.find("1.1.9") != std::string::npos);
+    CHECK_TRUE(zipView.find("1.1.10") != std::string::npos);
     CHECK_TRUE(zipView.find("8d4c91f2a70e4c6b9b24e31f6a821100") != std::string::npos);
     CHECK_TRUE(zipView.find("check(false, false, true)") != std::string::npos);
     CHECK_TRUE(zipView.find("getAllPinsByPrimitiveId") != std::string::npos);
@@ -1959,7 +1959,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream kcIfs(kcDir + "/KiCadAimonBridge.py");
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(kcContent.find("1.1.9") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.10") != std::string::npos);
         CHECK_TRUE(kcContent.find("*.Cu") != std::string::npos);
         CHECK_TRUE(kcContent.find("GetAttribute") != std::string::npos);
     }
@@ -1974,7 +1974,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::ifstream fcIfs(fcDir + "/AimonFreeCadBridge.py");
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
-        CHECK_TRUE(fcContent.find("1.1.9") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.10") != std::string::npos);
     }
 
     // 3a. Re-run when destination files are identical -> do NOT overwrite (alreadyDeployed == true)
@@ -2002,7 +2002,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string kcContent((std::istreambuf_iterator<char>(kcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(kcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(kcContent.find("1.1.9") != std::string::npos);
+        CHECK_TRUE(kcContent.find("1.1.10") != std::string::npos);
     }
 
     CHECK_TRUE(EdaBridgeAppConfig::deployFreeCadPlugin(appData, fcDir2, err, "", false, &fcAlready));
@@ -2012,7 +2012,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, EmbeddedEextZipAndDesktopPluginDeploy
         std::string fcContent((std::istreambuf_iterator<char>(fcIfs)),
                               std::istreambuf_iterator<char>());
         CHECK_TRUE(fcContent.find("OUTDATED_VERSION_1_1_0") == std::string::npos);
-        CHECK_TRUE(fcContent.find("1.1.9") != std::string::npos);
+        CHECK_TRUE(fcContent.find("1.1.10") != std::string::npos);
     }
 
     // 4. Test customTargetDir (simulating QFileDialog user selection)
@@ -2315,15 +2315,122 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, LiveHttpQuotaClientAndTrayTooltipForm
     CHECK_EQUAL(1, postRefreshCount.load());
 
     std::string tooltip = EdaBridgeAppConfig::formatTrayTooltipSummary(snap, true, false, true);
-    CHECK_TRUE(tooltip.rfind("aimon", 0) == 0);
-    CHECK_TRUE(tooltip.find("72%") != std::string::npos);
-    CHECK_TRUE(tooltip.find("$18.50") != std::string::npos);
+    const std::string expectedFallback =
+        "Antigravity: Claude 72%\n"
+        "Cursor: $18.50 (25%)\n"
+        "Claude Code: $24.00/$100.00 (24%)";
+    STRCMP_EQUAL(expectedFallback.c_str(), tooltip.c_str());
+    CHECK_TRUE(tooltip.find("aimon —") == std::string::npos);
+    CHECK_TRUE(tooltip.find("EDA:") == std::string::npos);
+    CHECK_TRUE(tooltip.size() <= 127);
+
+    // Nominal full 3-platform snapshot with multi-window quota groups
+    AimonQuotaSnapshot fullSnap;
+    fullSnap.reachable = true;
+    fullSnap.agRunning = true;
+
+    AimonQuotaGroupItem g1;
+    g1.displayName = "Gemini Models";
+    AimonQuotaBucketItem b1_1;
+    b1_1.displayName = "Weekly Limit Remaining";
+    b1_1.window = "weekly";
+    b1_1.remainingPct = 76.0;
+    b1_1.resetSeconds = 3600;
+    AimonQuotaBucketItem b1_2;
+    b1_2.displayName = "Five Hour Limit Remaining";
+    b1_2.window = "5h";
+    b1_2.remainingPct = 84.0;
+    b1_2.resetSeconds = 1800;
+    g1.buckets.push_back(b1_1);
+    g1.buckets.push_back(b1_2);
+    fullSnap.agQuotaGroups.push_back(g1);
+
+    AimonQuotaGroupItem g2;
+    g2.displayName = "Claude and GPT models";
+    AimonQuotaBucketItem b2_1;
+    b2_1.displayName = "Weekly Limit Remaining";
+    b2_1.window = "weekly";
+    b2_1.remainingPct = 28.0;
+    b2_1.resetSeconds = 3600;
+    AimonQuotaBucketItem b2_2;
+    b2_2.displayName = "Five Hour Limit Remaining";
+    b2_2.window = "5h";
+    b2_2.remainingPct = 100.0;
+    b2_2.resetSeconds = 1800;
+    g2.buckets.push_back(b2_1);
+    g2.buckets.push_back(b2_2);
+    fullSnap.agQuotaGroups.push_back(g2);
+
+    fullSnap.cursorAuthenticated = true;
+    fullSnap.cursorTotalSpendUsd = 848.14;
+    fullSnap.cursorRequestsUsed = 84778;
+    fullSnap.cursorRequestsLimit = 120000;
+
+    fullSnap.claudeEnabled = true;
+    AimonClaudeAccountSummary claudeAcc;
+    claudeAcc.name = "personal";
+    claudeAcc.tier = "pro";
+    claudeAcc.cost7dUsd = 14.80;
+    claudeAcc.cycleConfigured = true;
+    claudeAcc.costCycleUsd = 710.56;
+    claudeAcc.spendLimitUsd = 1000.00;
+    claudeAcc.estPctOfLimit = 71.1;
+    fullSnap.claudeAccounts.push_back(claudeAcc);
+
+    const std::string expectedFull =
+        "Antigravity: Gemini 76%(wk)/84%(5h) Claude 28%(wk)/100%(5h)\n"
+        "Cursor: $848.14 (71%)\n"
+        "Claude Code: $710.56/$1000.00 (71%)";
+    STRCMP_EQUAL(expectedFull.c_str(), EdaBridgeAppConfig::formatTrayTooltipSummary(fullSnap).c_str());
+    CHECK_EQUAL(117, static_cast<int>(expectedFull.size()));
+    CHECK_TRUE(expectedFull.size() <= 127);
+
+    // Boundary: Partial platform applicability omission (Cursor omitted)
+    AimonQuotaSnapshot partialSnap = fullSnap;
+    partialSnap.cursorAuthenticated = false;
+    const std::string expectedPartial =
+        "Antigravity: Gemini 76%(wk)/84%(5h) Claude 28%(wk)/100%(5h)\n"
+        "Claude Code: $710.56/$1000.00 (71%)";
+    STRCMP_EQUAL(expectedPartial.c_str(), EdaBridgeAppConfig::formatTrayTooltipSummary(partialSnap).c_str());
+
+    // Boundary: Zero active platforms on reachable server
+    AimonQuotaSnapshot idleSnap;
+    idleSnap.reachable = true;
+    idleSnap.agRunning = false;
+    idleSnap.cursorAuthenticated = false;
+    idleSnap.claudeEnabled = false;
+    STRCMP_EQUAL("aimon: No active AI quotas", EdaBridgeAppConfig::formatTrayTooltipSummary(idleSnap).c_str());
+
+    // Boundary: Progressive squeeze under 127 characters on oversized multi-group input
+    AimonQuotaSnapshot oversizedSnap = fullSnap;
+    AimonQuotaGroupItem g3;
+    g3.displayName = "Experimental Ultra";
+    AimonQuotaBucketItem b3_1;
+    b3_1.displayName = "Weekly Limit Remaining";
+    b3_1.window = "weekly";
+    b3_1.remainingPct = 100.0;
+    b3_1.resetSeconds = 3600;
+    AimonQuotaBucketItem b3_2;
+    b3_2.displayName = "Five Hour Limit Remaining";
+    b3_2.window = "5h";
+    b3_2.remainingPct = 100.0;
+    b3_2.resetSeconds = 1800;
+    g3.buckets.push_back(b3_1);
+    g3.buckets.push_back(b3_2);
+    oversizedSnap.agQuotaGroups.push_back(g3);
+
+    std::string oversizedTip = EdaBridgeAppConfig::formatTrayTooltipSummary(oversizedSnap);
+    CHECK_TRUE(oversizedTip.size() <= 127);
+    CHECK_TRUE(!oversizedTip.empty());
 
     // Fault injection: unreachable port and malformed JSON
     AimonQuotaSnapshot unreach;
     CHECK_FALSE(EdaBridgeAppConfig::fetchQuotaSnapshot("127.0.0.1", 1, false, unreach, 300));
     CHECK_FALSE(unreach.reachable);
     CHECK_FALSE(unreach.errorMessage.empty());
+    std::string unreachTip = EdaBridgeAppConfig::formatTrayTooltipSummary(unreach);
+    CHECK_TRUE(unreachTip.rfind("aimon: Offline", 0) == 0);
+    CHECK_TRUE(unreachTip.size() <= 127);
 
     std::string parseErr;
     AimonQuotaSnapshot badSnap;

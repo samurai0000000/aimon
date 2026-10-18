@@ -417,7 +417,9 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
             "easyeda",
             "Synchronize schematic changes, footprints, and netlist into the EasyEDA Pro PCB document (or preview diff with dry_run: true).",
             {
-                {"dry_run", {{"type", "boolean"}, {"default", false}, {"description", "Preview pre-sync netlist/footprint diff without mutating the PCB (default: false)"}}}
+                {"dry_run", {{"type", "boolean"}, {"default", false}, {"description", "Preview pre-sync netlist/footprint diff without mutating the PCB (default: false)"}}},
+                {"trigger_native_import", {{"type", "boolean"}, {"default", false}, {"description", "Trigger native EasyEDA Pro Import Changes via Windows UI Automation on Windows (default: false)"}}},
+                {"resolve_value_templates", {{"type", "boolean"}, {"default", false}, {"description", "Resolve ={Value} and ={Manufacturer Part} parameter templates to real values on the PCB (default: false)"}}}
             },
             {}
         },
@@ -428,8 +430,12 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
             {
                 {"references", {{"type", "array"}, {"description", "Optional list of component designators to filter (e.g. ['C35', 'U1']); aliases: refs, component_refs"}}},
                 {"nets", {{"type", "array"}, {"description", "Optional list of net names to filter pads, tracks, vias, and pours (e.g. ['GND', '+5V'])"}}},
+                {"net_filter", {{"type", "string"}, {"description", "Optional single net name filter (alias for nets: [net])"}}},
+                {"layers", {{"type", "array"}, {"description", "Optional list of layers to filter pads, tracks, and pours (e.g. ['TopLayer', 'BottomLayer', 'InnerLayer1'])"}}},
+                {"bbox", {{"type", "object"}, {"description", "Optional spatial bounding box filter {x1, y1, x2, y2} in canvas units"}}},
                 {"include_raw_primitives", {{"type", "boolean"}, {"default", false}, {"description", "Include full unfiltered pads, tracks, vias, and pours arrays (default: false)"}}},
-                {"summary_only", {{"type", "boolean"}, {"default", false}, {"description", "Return counts and connectivity_audit only without primitive arrays (default: false)"}}}
+                {"summary_only", {{"type", "boolean"}, {"default", false}, {"description", "Return counts and connectivity_audit only without primitive arrays (default: false)"}}},
+                {"include_audit_details", {{"type", "boolean"}, {"default", false}, {"description", "With summary_only: true, retain full unassigned_pads and decoupling_distance_warnings arrays (default: false, payloads < 2KB)"}}}
             },
             {}
         },
@@ -445,6 +451,10 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
                 {"move_components", {{"type", "array"}, {"description", "Move/rotate/flip existing PCB footprints ({id, reference, x, y, rotation, layer, preserve_connections})"}}},
                 {"place_components", {{"type", "array"}, {"description", "Instantiate new PCB footprints ({reference, lcsc, uuid, library_uuid, x, y, rotation, layer})"}}},
                 {"modify_pads", {{"type", "array"}, {"description", "Update pad net assignments ({id, net})"}}},
+                {"modify_tracks", {{"type", "array"}, {"description", "Modify width, layer, or net of existing PCB tracks ({id, track_id, primitive_id, net, layer, width, width_mm, to_width, to_width_mm})"}}},
+                {"modify_components", {{"type", "array"}, {"description", "Update component properties ({id, reference, value, designator, footprint})"}}},
+                {"resolve_value_templates", {{"type", "boolean"}, {"default", false}, {"description", "Resolve ={Value} and ={Manufacturer Part} parameter templates on components to concrete values"}}},
+                {"rebuild_pours", {{"type", "boolean"}, {"default", false}, {"description", "Rebuild/re-pour all copper pours on the active PCB after edits"}}},
                 {"delete_primitives", {{"type", "array"}, {"description", "Delete PCB tracks, copper lines, vias, or components ({id, type} or primitive ID string)"}}},
                 {"tracks", {{"type", "array"}, {"description", "PCB trace segments"}}},
                 {"add_tracks", {{"type", "array"}, {"description", "Declarative PCB trace segments ({net, layer, x1, y1, x2, y2, width})"}}},
@@ -463,7 +473,12 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
             "easyeda",
             "Run live Schematic ERC (with geometric/topological erc_audit) or PCB DRC (with 3D connectivity_audit) inside EasyEDA Pro and return structured violations.",
             {
-                {"target", {{"type", "string"}, {"default", "pcb"}, {"description", "Check target: pcb (default) or schematic"}}}
+                {"target", {{"type", "string"}, {"default", "pcb"}, {"description", "Check target: pcb (default) or schematic"}}},
+                {"summary_only", {{"type", "boolean"}, {"default", false}, {"description", "Return violation summary and counts only without detailed violations array"}}},
+                {"net_filter", {{"type", "string"}, {"description", "Filter violations by net name"}}},
+                {"error_types", {{"type", "array"}, {"description", "Filter violations by error type categories"}}},
+                {"include_verbose_error", {{"type", "boolean"}, {"default", false}, {"description", "Include verbose error diagnostics from EasyEDA Pro DRC"}}},
+                {"include_audit_details", {{"type", "boolean"}, {"default", false}, {"description", "With summary_only: true, retain full unassigned_pads and decoupling_distance_warnings in connectivity_audit"}}}
             },
             {}
         },
@@ -484,7 +499,8 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
                 {"api_path", {{"type", "string"}, {"description", "Whitelisted API path (e.g. eda.sch_PrimitiveComponent.getAll)"}}},
                 {"args", {{"type", "array"}, {"description", "Arguments array"}}},
                 {"describe_api", {{"type", "string"}, {"description", "Offline @jlceda/pro-api-types API signature lookup by path (e.g. 'eda.pcb_PrimitiveVia.create')"}}},
-                {"search_api", {{"type", "string"}, {"description", "Offline @jlceda/pro-api-types API keyword search (e.g. 'PrimitiveLine')"}}}
+                {"search_api", {{"type", "string"}, {"description", "Offline @jlceda/pro-api-types API keyword search (e.g. 'PrimitiveLine')"}}},
+                {"inspect_module", {{"type", "boolean"}, {"default", false}, {"description", "Inspect available methods on a 2-part module path without calling a method (e.g. eda.pcb_PrimitivePour)"}}}
             },
             {}
         },
