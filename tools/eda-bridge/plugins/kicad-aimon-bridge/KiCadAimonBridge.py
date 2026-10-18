@@ -11,7 +11,7 @@ import socket
 import threading
 import time
 
-BRIDGE_VERSION = "1.1.9"
+BRIDGE_VERSION = "__AIMON_VERSION__"
 
 try:
     import pcbnew

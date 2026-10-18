@@ -2748,6 +2748,60 @@ TEST(EdaBridge, PowerIntegrityAndBridgeV1_1_10Upgrades) {
     CHECK_TRUE(syncRes["native_import_changes"].is_object());
 }
 
+TEST(EdaBridge, V1_1_11NetlistGuardAndComplexPolygonPours) {
+    EdaBridgeConfig cfg;
+    cfg.enabled = true;
+    cfg.mode = "gateway";
+    cfg.easyeda.enabled = true;
+    cfg.accelerators.enabled = true;
+    EdaBridge bridge(cfg);
+
+    // 1. Netlist format argument guardrail (normalizes JLCEDA_PRO -> JLCEDA, rejects invalid format)
+    nlohmann::json nlArgs = nlohmann::json::array({"JLCEDA_PRO"});
+    std::string nlErr;
+    CHECK_TRUE(EdaBridge::normalizeEasyEdaNetlistArgs("eda.pcb_Net.getNetlist", nlArgs, nlErr));
+    STRCMP_EQUAL("JLCEDA", nlArgs[0].get<std::string>().c_str());
+
+    nlohmann::json badArgs = nlohmann::json::array({"INVALID_NETLIST_FMT"});
+    CHECK_FALSE(EdaBridge::normalizeEasyEdaNetlistArgs("eda.pcb_Net.getNetlist", badArgs, nlErr));
+    CHECK_TRUE(nlErr.find("Invalid EasyEDA Pro netlist format") != std::string::npos);
+
+    nlohmann::json invBadRes = bridge.callTool("easyeda_invoke_api", {
+        {"api_path", "eda.pcb_Net.getNetlist"},
+        {"args", nlohmann::json::array({"INVALID_NETLIST_FMT"})}
+    });
+    CHECK_FALSE(invBadRes.value("ok", true));
+    CHECK_TRUE(invBadRes.value("error", "").find("Invalid EasyEDA Pro netlist format") != std::string::npos);
+
+    // 2. Copper pour complexPolygon.polygon and fallback board_outline parsing in connectivity_audit
+    nlohmann::json pcbWithComplexPours = {
+        {"units", "mil"},
+        {"pads", nlohmann::json::array({
+            {{"id", "p1"}, {"ref", "C1"}, {"pad", "1"}, {"net", "GND"}, {"layer", "MultiLayer"}, {"x", 4500.0}, {"y", -4500.0}, {"size_x", 40.0}, {"size_y", 40.0}},
+            {{"id", "p2"}, {"ref", "C2"}, {"pad", "1"}, {"net", "GND"}, {"layer", "MultiLayer"}, {"x", 5500.0}, {"y", -5000.0}, {"size_x", 40.0}, {"size_y", 40.0}}
+        })},
+        {"pours", nlohmann::json::array({
+            {
+                {"id", "pour1"},
+                {"net", "GND"},
+                {"layer", "15"},
+                {"points", nlohmann::json::array()},
+                {"complexPolygon", {
+                    {"polygon", nlohmann::json::array({4000.0, -6000.0, "L", 4000.0, -3500.0, 6500.0, -3500.0, 6500.0, -6000.0, 4000.0, -6000.0})}
+                }}
+            }
+        })}
+    };
+    nlohmann::json inspRes = bridge.callTool("easyeda_inspect_pcb", {
+        {"pcb_state", pcbWithComplexPours},
+        {"summary_only", true}
+    });
+    CHECK_TRUE(inspRes.value("ok", false));
+    CHECK_EQUAL(1, inspRes["connectivity_audit"].value("pours_count", 0));
+    CHECK_EQUAL(0, inspRes["connectivity_audit"].value("unrouted_nets_count", -1));
+    CHECK_TRUE(inspRes["connectivity_audit"].value("all_connected", false));
+}
+
 
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {

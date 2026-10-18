@@ -53,6 +53,10 @@ public:
     static bool guardEasyEdaApiCall(const std::string& apiPath,
                                     std::string& outReason);
 
+    static bool normalizeEasyEdaNetlistArgs(const std::string& apiPath,
+                                            nlohmann::json& argsArray,
+                                            std::string& outError);
+
     static std::string componentForTool(const std::string& toolName);
 
     void recordToolCall(const std::string& component,
@@ -84,6 +88,7 @@ private:
                                     const nlohmann::json& arguments);
 
     mutable std::mutex _mutex;
+    mutable std::recursive_mutex _easyedaRpcMutex;
     EdaBridgeConfig _config;
     EdaAccelerators _accelerators;
     TcpGateway* _gateway = nullptr;

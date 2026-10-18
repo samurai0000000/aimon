@@ -1353,7 +1353,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             rp.layer = layerNameToIdx(extractLayerStr(z, "TopLayer"));
 
             const nlohmann::json* polyArr = nullptr;
-            for (const char* polyKey : {"polygon", "points", "outline", "source", "Source"}) {
+            for (const char* polyKey : {"polygon", "points", "complexPolygon", "complex_polygon", "outline", "source", "Source"}) {
                 if (z.contains(polyKey)) {
                     if (z[polyKey].is_array()) {
                         polyArr = &z[polyKey];
@@ -3431,7 +3431,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             ap.layer = canonicalLayer(z, "TopLayer");
 
             const nlohmann::json* polyArr = nullptr;
-            for (const char* polyKey : {"polygon", "points", "outline", "source", "Source"}) {
+            for (const char* polyKey : {"polygon", "points", "complexPolygon", "complex_polygon", "outline", "source", "Source"}) {
                 if (z.contains(polyKey)) {
                     if (z[polyKey].is_array()) {
                         polyArr = &z[polyKey];
@@ -3550,6 +3550,48 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                     ap.xMax = std::max(ap.xMax, pt.first);
                     ap.yMin = std::min(ap.yMin, pt.second);
                     ap.yMax = std::max(ap.yMax, pt.second);
+                }
+            } else if (!ap.net.empty()) {
+                // Fallback when an extension omits complexPolygon points: derive board extent
+                // from board_outline or allPads so full-board pours with a valid net are preserved.
+                double fbMinX = std::numeric_limits<double>::infinity();
+                double fbMinY = std::numeric_limits<double>::infinity();
+                double fbMaxX = -std::numeric_limits<double>::infinity();
+                double fbMaxY = -std::numeric_limits<double>::infinity();
+                if (args.contains("board_outline") && args["board_outline"].is_array()) {
+                    for (const auto& seg : args["board_outline"]) {
+                        if (!seg.is_object()) continue;
+                        if (seg.contains("x1") && seg["x1"].is_number() &&
+                            seg.contains("y1") && seg["y1"].is_number() &&
+                            seg.contains("x2") && seg["x2"].is_number() &&
+                            seg.contains("y2") && seg["y2"].is_number()) {
+                            fbMinX = std::min({fbMinX, seg["x1"].get<double>(), seg["x2"].get<double>()});
+                            fbMinY = std::min({fbMinY, seg["y1"].get<double>(), seg["y2"].get<double>()});
+                            fbMaxX = std::max({fbMaxX, seg["x1"].get<double>(), seg["x2"].get<double>()});
+                            fbMaxY = std::max({fbMaxY, seg["y1"].get<double>(), seg["y2"].get<double>()});
+                        }
+                    }
+                }
+                if (!(fbMaxX >= fbMinX && fbMaxY >= fbMinY) && !allPads.empty()) {
+                    for (const auto& pd : allPads) {
+                        fbMinX = std::min(fbMinX, pd.x - pd.sx);
+                        fbMinY = std::min(fbMinY, pd.y - pd.sy);
+                        fbMaxX = std::max(fbMaxX, pd.x + pd.sx);
+                        fbMaxY = std::max(fbMaxY, pd.y + pd.sy);
+                    }
+                }
+                if (fbMaxX >= fbMinX && fbMaxY >= fbMinY) {
+                    ap.hasBbox = true;
+                    ap.xMin = fbMinX;
+                    ap.yMin = fbMinY;
+                    ap.xMax = fbMaxX;
+                    ap.yMax = fbMaxY;
+                    ap.poly = {
+                        {ap.xMin, ap.yMin},
+                        {ap.xMax, ap.yMin},
+                        {ap.xMax, ap.yMax},
+                        {ap.xMin, ap.yMax}
+                    };
                 }
             }
 

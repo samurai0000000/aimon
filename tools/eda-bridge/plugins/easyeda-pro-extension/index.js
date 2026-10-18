@@ -7,7 +7,7 @@
 var edaEsbuildExportName = (function () {
     "use strict";
 
-    const BRIDGE_VERSION = "1.1.10";
+    const BRIDGE_VERSION = "__AIMON_VERSION__";
     const DEFAULT_WS_URL = "ws://127.0.0.1:3893";
     const HEARTBEAT_INTERVAL_MS = 10000;
     const ALLOWED_PREFIXES = [
@@ -34,6 +34,7 @@ var edaEsbuildExportName = (function () {
     let heartbeatTimer = null;
     let reconnectTimer = null;
     let cachedActiveDocument = "EasyEDA-Pro";
+    let toolDispatchQueue = Promise.resolve();
 
     function logDiag(msg) {
         try {
@@ -1842,15 +1843,73 @@ var edaEsbuildExportName = (function () {
                     const rawPours = await eda.pcb_PrimitivePour.getAll();
                     if (Array.isArray(rawPours)) {
                         for (const pr of rawPours) {
+                            let rawPoly = callGetter(pr, "getState_ComplexPolygon", "complexPolygon", "polygon", null);
+                            if (!rawPoly) {
+                                rawPoly = callGetter(pr, "getState_Polygon", "polygon", "points", []);
+                            }
+                            let srcArr = null;
+                            if (Array.isArray(rawPoly)) {
+                                srcArr = rawPoly;
+                            } else if (rawPoly && typeof rawPoly === "object") {
+                                for (const pk of ["polygon", "points", "source", "Source"]) {
+                                    if (Array.isArray(rawPoly[pk])) {
+                                        srcArr = rawPoly[pk];
+                                        break;
+                                    }
+                                }
+                            }
+                            const pts = [];
+                            if (Array.isArray(srcArr)) {
+                                for (let i = 0; i < srcArr.length; i += 1) {
+                                    const tok = srcArr[i];
+                                    if (typeof tok === "string") {
+                                        if (tok.toUpperCase() === "ARC" && i + 1 < srcArr.length && typeof srcArr[i + 1] === "number") {
+                                            i += 1;
+                                        }
+                                        continue;
+                                    }
+                                    if (Array.isArray(tok) && tok.length >= 2 && typeof tok[0] === "number" && typeof tok[1] === "number") {
+                                        pts.push([Number(tok[0]), Number(tok[1])]);
+                                    } else if (tok && typeof tok === "object" && typeof tok.x === "number" && typeof tok.y === "number") {
+                                        pts.push([Number(tok.x), Number(tok.y)]);
+                                    } else if (typeof tok === "number" && i + 1 < srcArr.length && typeof srcArr[i + 1] === "number") {
+                                        pts.push([Number(tok), Number(srcArr[i + 1])]);
+                                        i += 1;
+                                    }
+                                }
+                            }
+                            let px = Number(callGetter(pr, "getState_X", "x", "", 0) || 0);
+                            let py = Number(callGetter(pr, "getState_Y", "y", "", 0) || 0);
+                            let pw = Number(callGetter(pr, "getState_Width", "width", "", 0) || 0);
+                            let ph = Number(callGetter(pr, "getState_Height", "height", "", 0) || 0);
+                            let minX = px, minY = py, maxX = px + pw, maxY = py + ph;
+                            if (pts.length > 0) {
+                                minX = maxX = pts[0][0];
+                                minY = maxY = pts[0][1];
+                                for (const pt of pts) {
+                                    if (pt[0] < minX) minX = pt[0];
+                                    if (pt[0] > maxX) maxX = pt[0];
+                                    if (pt[1] < minY) minY = pt[1];
+                                    if (pt[1] > maxY) maxY = pt[1];
+                                }
+                                px = minX;
+                                py = minY;
+                                pw = maxX - minX;
+                                ph = maxY - minY;
+                            }
                             pours.push({
                                 id: String(callGetter(pr, "getState_PrimitiveId", "primitiveId", "id", "")),
                                 net: String(callGetter(pr, "getState_Net", "net", "", "")),
                                 layer: String(callGetter(pr, "getState_Layer", "layer", "", "TopLayer")),
-                                x: Number(callGetter(pr, "getState_X", "x", "", 0) || 0),
-                                y: Number(callGetter(pr, "getState_Y", "y", "", 0) || 0),
-                                width: Number(callGetter(pr, "getState_Width", "width", "", 0) || 0),
-                                height: Number(callGetter(pr, "getState_Height", "height", "", 0) || 0),
-                                points: callGetter(pr, "getState_Polygon", "polygon", "points", [])
+                                x: px,
+                                y: py,
+                                min_x: minX,
+                                min_y: minY,
+                                max_x: maxX,
+                                max_y: maxY,
+                                width: pw,
+                                height: ph,
+                                points: pts
                             });
                         }
                     }
@@ -3383,6 +3442,12 @@ var edaEsbuildExportName = (function () {
                             if (Array.isArray(subList)) {
                                 rawCategoriesCount += 1;
                                 flattenDrcItems(subList);
+                            } else if (item.count !== undefined && !item.primitiveId1 && !item.errorObjId1 &&
+                                       !item.code && !item.ruleName) {
+                                rawCategoriesCount += 1;
+                                if (Number(item.count) > 0) {
+                                    violations.push(item);
+                                }
                             } else {
                                 violations.push(item);
                             }
@@ -3405,6 +3470,9 @@ var edaEsbuildExportName = (function () {
         const normalizedViolations = [];
         for (const v of violations) {
             if (!v || typeof v !== "object") continue;
+            const expMsg = (v.explanation && (v.explanation.msg || v.explanation.str || v.explanation.brief))
+                ? String(v.explanation.msg || v.explanation.str || v.explanation.brief)
+                : "";
             const norm = {
                 code: v.code || v.errCode || v.errorCode || "",
                 errorType: v.errorType || v.type || v.category || "",
@@ -3420,13 +3488,13 @@ var edaEsbuildExportName = (function () {
                 primitiveId2: v.primitiveId2 || v.id2 || v.errorObjId2 || "",
                 errorObjId1: v.errorObjId1 || v.primitiveId1 || "",
                 errorObjId2: v.errorObjId2 || v.primitiveId2 || "",
-                msg: (v.explanation && v.explanation.msg) ? String(v.explanation.msg) : String(v.msg || v.message || "")
+                msg: expMsg ? expMsg : String(v.msg || v.message || "")
             };
             if (args && args.include_verbose_error === true) {
                 norm.explanation = v.explanation;
                 norm.raw = v;
-            } else if (v.explanation && v.explanation.msg) {
-                norm.explanation = { msg: v.explanation.msg };
+            } else if (expMsg) {
+                norm.explanation = { msg: expMsg };
             }
             normalizedViolations.push(norm);
         }
@@ -3579,7 +3647,7 @@ var edaEsbuildExportName = (function () {
             rawPath = "eda." + rawPath;
         }
         const apiPath = rawPath;
-        const callArgs = Array.isArray(args.args) ? args.args : [];
+        const callArgs = Array.isArray(args.args) ? args.args.slice() : [];
         const allowed = ALLOWED_PREFIXES.some(function (pfx) {
             return apiPath.indexOf(pfx) === 0;
         });
@@ -3639,6 +3707,50 @@ var edaEsbuildExportName = (function () {
 
         if (parts.length !== 3 || parts[0] !== "eda") {
             throw new Error("Expected eda.<module>.<method> format: " + apiPath);
+        }
+        if (apiPath === "eda.pcb_Net.getNetlist" || apiPath === "eda.pcb_Net.setNetlist" ||
+            apiPath === "eda.sch_Netlist.getNetlist" || apiPath === "eda.sch_Netlist.setNetlist") {
+            if (callArgs.length === 0 || callArgs[0] === undefined || callArgs[0] === null ||
+                callArgs[0] === "" || callArgs[0] === "JLCEDA_PRO" || callArgs[0] === "jlceda_pro" ||
+                callArgs[0] === "jlceda") {
+                callArgs[0] = "JLCEDA";
+            }
+            const validNetlistFmts = ["JLCEDA", "EasyEDA", "PADS", "Protel2", "Allegro", "DISA"];
+            if (validNetlistFmts.indexOf(String(callArgs[0])) < 0) {
+                return {
+                    ok: false,
+                    api_path: apiPath,
+                    error: "Invalid EasyEDA Pro netlist format '" + String(callArgs[0]) +
+                           "' (allowed: JLCEDA, EasyEDA, PADS, Protel2, Allegro, DISA)"
+                };
+            }
+        }
+        if (apiPath.indexOf("eda.sch_Netlist.") === 0 && typeof eda !== "undefined") {
+            try {
+                let onPcbTab = false;
+                if (eda.dmt_SelectControl && typeof eda.dmt_SelectControl.getCurrentDocumentInfo === "function") {
+                    const docInfo = await eda.dmt_SelectControl.getCurrentDocumentInfo();
+                    if (docInfo && Number(docInfo.documentType) === 3) {
+                        onPcbTab = true;
+                    }
+                }
+                if (!onPcbTab && eda.dmt_Pcb && typeof eda.dmt_Pcb.getCurrentPcbInfo === "function" &&
+                    eda.dmt_Schematic && typeof eda.dmt_Schematic.getCurrentSchematicInfo === "function") {
+                    const pcbInfo = await eda.dmt_Pcb.getCurrentPcbInfo();
+                    const schInfo = await eda.dmt_Schematic.getCurrentSchematicInfo();
+                    if (pcbInfo && !schInfo) {
+                        onPcbTab = true;
+                    }
+                }
+                if (onPcbTab) {
+                    return {
+                        ok: false,
+                        api_path: apiPath,
+                        error: "Blocked eda.sch_Netlist call while PCB tab is active to prevent EasyEDA Pro UI freeze; switch to a schematic tab or use eda.pcb_Net.getNetlist('JLCEDA')"
+                    };
+                }
+            } catch (tabErr) {
+            }
         }
         if (typeof eda === "undefined" || !eda[parts[1]] || typeof eda[parts[1]][parts[2]] !== "function") {
             return {
@@ -3787,23 +3899,25 @@ var edaEsbuildExportName = (function () {
         const toolName = msg.params.name || "";
         const toolArgs = msg.params.arguments || {};
 
-        try {
-            const res = await dispatchTool(toolName, toolArgs);
-            sendRawJson({
-                jsonrpc: "2.0",
-                id: reqId,
-                result: res
-            });
-        } catch (err) {
-            sendRawJson({
-                jsonrpc: "2.0",
-                id: reqId,
-                error: {
-                    code: -32000,
-                    message: String(err && err.message ? err.message : err)
-                }
-            });
-        }
+        toolDispatchQueue = toolDispatchQueue.then(async function () {
+            try {
+                const res = await dispatchTool(toolName, toolArgs);
+                sendRawJson({
+                    jsonrpc: "2.0",
+                    id: reqId,
+                    result: res
+                });
+            } catch (err) {
+                sendRawJson({
+                    jsonrpc: "2.0",
+                    id: reqId,
+                    error: {
+                        code: -32000,
+                        message: String(err && err.message ? err.message : err)
+                    }
+                });
+            }
+        });
     }
 
     function startHeartbeatLoop(targetUrl) {

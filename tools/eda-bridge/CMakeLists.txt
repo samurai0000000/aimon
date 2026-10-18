@@ -5,7 +5,17 @@
 ##
 
 cmake_minimum_required(VERSION 3.16)
-project(aimon-eda-bridge VERSION 1.1.9 LANGUAGES CXX)
+set(_ROOT_CMAKE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../CMakeLists.txt")
+if(NOT EXISTS "${_ROOT_CMAKE_FILE}")
+    message(FATAL_ERROR "Root CMakeLists.txt not found at ${_ROOT_CMAKE_FILE}")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_ROOT_CMAKE_FILE}")
+file(READ "${_ROOT_CMAKE_FILE}" _ROOT_CMAKE_CONTENT)
+if(NOT _ROOT_CMAKE_CONTENT MATCHES "project\\(aimon[ \t\r\n]+VERSION[ \t\r\n]+([0-9]+\\.[0-9]+\\.[0-9]+)")
+    message(FATAL_ERROR "Could not extract project(aimon VERSION x.y.z) from ${_ROOT_CMAKE_FILE}")
+endif()
+set(_AIMON_ROOT_VERSION "${CMAKE_MATCH_1}")
+project(aimon-eda-bridge VERSION ${_AIMON_ROOT_VERSION} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

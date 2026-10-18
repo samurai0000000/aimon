@@ -11,6 +11,7 @@
 #include "InsightEngine.hxx"
 #include "EdaBridge.hxx"
 #include "EdaAccelerators.hxx"
+#include "Version.hxx"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -737,7 +738,7 @@ nlohmann::json McpServer::handleInitialize(const nlohmann::json& id, const nlohm
             }},
             {"serverInfo", {
                 {"name", "aimon"},
-                {"version", "1.1.0"}
+                {"version", AIMON_VERSION_STRING}
             }}
         }}
     };

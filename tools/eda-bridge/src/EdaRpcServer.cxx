@@ -3605,6 +3605,9 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
         return EasyEdaConverter::executeTool(args);
     }
 
+    static std::recursive_mutex sEasyEdaToolMutex;
+    std::lock_guard<std::recursive_mutex> easyedaToolLock(sEasyEdaToolMutex);
+
     if (toolName == "easyeda_native_autoroute") {
         return handleEasyEdaNativeAutoRoute(args);
     }
@@ -3632,27 +3635,72 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
         };
     }
 
+    nlohmann::json effectiveArgs = args.is_object() ? args : nlohmann::json::object();
+
     if (toolName == "easyeda_invoke_api") {
-        bool hasDescribe = args.contains("describe_api") && args["describe_api"].is_string() &&
-                           !args["describe_api"].get<std::string>().empty();
-        bool hasSearch = args.contains("search_api") && args["search_api"].is_string() &&
-                         !args["search_api"].get<std::string>().empty();
+        bool hasDescribe = effectiveArgs.contains("describe_api") && effectiveArgs["describe_api"].is_string() &&
+                           !effectiveArgs["describe_api"].get<std::string>().empty();
+        bool hasSearch = effectiveArgs.contains("search_api") && effectiveArgs["search_api"].is_string() &&
+                         !effectiveArgs["search_api"].get<std::string>().empty();
         if (hasDescribe || hasSearch) {
-            return introspectEasyEdaApiCatalog(args);
+            return introspectEasyEdaApiCatalog(effectiveArgs);
         }
 
-        std::string apiPath = args.value("api_path", args.value("api", args.value("method", "")));
+        std::string apiPath = effectiveArgs.value("api_path", effectiveArgs.value("api", effectiveArgs.value("method", "")));
         std::string reason;
         if (!checkEasyEdaApiSafety(apiPath, reason)) {
             return {{"ok", false}, {"error", reason}};
         }
+
+        std::string normPath = apiPath;
+        if (normPath.rfind("eda.", 0) != 0 &&
+            (normPath.rfind("sch_", 0) == 0 || normPath.rfind("pcb_", 0) == 0)) {
+            normPath = "eda." + normPath;
+        }
+        if (normPath == "eda.pcb_Net.getNetlist" || normPath == "eda.pcb_Net.setNetlist" ||
+            normPath == "eda.sch_Netlist.getNetlist" || normPath == "eda.sch_Netlist.setNetlist") {
+            nlohmann::json argsArr = (effectiveArgs.contains("args") && effectiveArgs["args"].is_array())
+                ? effectiveArgs["args"] : nlohmann::json::array();
+            if (argsArr.empty() || argsArr[0].is_null() ||
+                (argsArr[0].is_string() && argsArr[0].get<std::string>().empty())) {
+                if (argsArr.empty()) argsArr.push_back("JLCEDA");
+                else argsArr[0] = "JLCEDA";
+            } else if (!argsArr[0].is_string()) {
+                return {{"ok", false}, {"error", "EasyEDA netlist format argument (args[0]) must be a string"}};
+            } else {
+                std::string fmt = argsArr[0].get<std::string>();
+                if (fmt == "JLCEDA_PRO" || fmt == "jlceda_pro" || fmt == "jlceda") {
+                    fmt = "JLCEDA";
+                    argsArr[0] = fmt;
+                }
+                static constexpr const char* kValidNetlistFormats[] = {
+                    "JLCEDA", "EasyEDA", "PADS", "Protel2", "Allegro", "DISA"
+                };
+                bool validFmt = false;
+                for (const char* vf : kValidNetlistFormats) {
+                    if (fmt == vf) {
+                        validFmt = true;
+                        break;
+                    }
+                }
+                if (!validFmt) {
+                    return {
+                        {"ok", false},
+                        {"error", "Invalid EasyEDA Pro netlist format '" + fmt +
+                                  "' for " + normPath +
+                                  " (allowed: JLCEDA, EasyEDA, PADS, Protel2, Allegro, DISA)"}
+                    };
+                }
+            }
+            effectiveArgs["args"] = argsArr;
+        }
     }
 
     int defaultTimeout = std::max(_options.defaultTimeoutMs, 25000);
-    int timeoutMs = args.value("timeout_ms", defaultTimeout);
+    int timeoutMs = effectiveArgs.value("timeout_ms", defaultTimeout);
     nlohmann::json plugRes;
     std::string plugErr;
-    if (!callPlugin("easyeda", toolName, args, plugRes, plugErr, timeoutMs)) {
+    if (!callPlugin("easyeda", toolName, effectiveArgs, plugRes, plugErr, timeoutMs)) {
         return {
             {"ok", false},
             {"error", plugErr}

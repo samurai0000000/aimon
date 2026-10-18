@@ -32,7 +32,7 @@ def detect_project_version(root_dir: Path) -> str:
         m = re.search(r"project\s*\(\s*aimon\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)", content)
         if m:
             return m.group(1)
-    return "1.1.0"
+    raise RuntimeError(f"Could not extract project(aimon VERSION x.y.z) from {cmake_file}")
 
 
 def build_easyeda_eext(plugin_dir: Path, out_eext: Path, version: str | None = None) -> None:
@@ -45,6 +45,8 @@ def build_easyeda_eext(plugin_dir: Path, out_eext: Path, version: str | None = N
     ext_text = ext_json.read_text(encoding="utf-8")
     index_text = index_js.read_text(encoding="utf-8")
     if version:
+        ext_text = ext_text.replace("__AIMON_VERSION__", version)
+        index_text = index_text.replace("__AIMON_VERSION__", version)
         ext_text = re.sub(
             r'("version"\s*:\s*)"[^"]+"',
             rf'\g<1>"{version}"',
