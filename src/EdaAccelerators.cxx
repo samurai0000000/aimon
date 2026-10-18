@@ -1090,19 +1090,87 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         double viaMargin = -1.0; // < 0: does not block vias
     };
 
+    auto extractPolySpan = [](const nlohmann::json& poly, double scale, double& outW, double& outH) {
+        if (!poly.is_array() || poly.empty()) return;
+        double minX = 1e18, maxX = -1e18, minY = 1e18, maxY = -1e18;
+        int count = 0;
+        if (poly[0].is_number()) {
+            for (size_t i = 0; i + 1 < poly.size(); i += 2) {
+                if (!poly[i].is_number() || !poly[i + 1].is_number()) continue;
+                double px = poly[i].get<double>();
+                double py = poly[i + 1].get<double>();
+                minX = std::min(minX, px);
+                maxX = std::max(maxX, px);
+                minY = std::min(minY, py);
+                maxY = std::max(maxY, py);
+                ++count;
+            }
+        } else {
+            for (const auto& pt : poly) {
+                if (pt.is_array() && pt.size() >= 2 && pt[0].is_number() && pt[1].is_number()) {
+                    double px = pt[0].get<double>();
+                    double py = pt[1].get<double>();
+                    minX = std::min(minX, px);
+                    maxX = std::max(maxX, px);
+                    minY = std::min(minY, py);
+                    maxY = std::max(maxY, py);
+                    ++count;
+                }
+            }
+        }
+        if (count >= 2) {
+            if (outW <= 0.0 && maxX > minX) outW = (maxX - minX) * scale;
+            if (outH <= 0.0 && maxY > minY) outH = (maxY - minY) * scale;
+        }
+    };
+
     auto parsePad = [&](const nlohmann::json& p, int32_t netId) -> PadGeom {
         PadGeom g;
         g.x = readLen(p, {"x_mm"}, {"x"}, 0.0);
         g.y = readLen(p, {"y_mm"}, {"y"}, 0.0);
-        double w = readLen(p, {"w_mm", "width_mm"}, {"size_x", "width"}, trackWidthMm);
-        double h = readLen(p, {"h_mm", "height_mm"}, {"size_y", "height"}, trackWidthMm);
-        g.hw = 0.5 * std::max(0.0, w);
-        g.hh = 0.5 * std::max(0.0, h);
+        double w = readLen(p, {"w_mm", "width_mm"}, {"size_x", "width"}, 0.0);
+        double h = readLen(p, {"h_mm", "height_mm"}, {"size_y", "height"}, 0.0);
+        if ((w <= 0.0 || h <= 0.0) && p.contains("pad") && p["pad"].is_array() && !p["pad"].empty() &&
+            p["pad"][0].is_string()) {
+            std::string shape = p["pad"][0].get<std::string>();
+            for (char& c : shape) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if ((shape == "OVAL" || shape == "RECT" || shape == "ELLIPSE" || shape == "OCTAGON") &&
+                p["pad"].size() >= 3 && p["pad"][1].is_number() && p["pad"][2].is_number()) {
+                if (w <= 0.0) w = p["pad"][1].get<double>() * unitScale;
+                if (h <= 0.0) h = p["pad"][2].get<double>() * unitScale;
+            } else if ((shape == "ROUND" || shape == "CIRCLE") &&
+                       p["pad"].size() >= 2 && p["pad"][1].is_number()) {
+                double d = p["pad"][1].get<double>() * unitScale;
+                if (w <= 0.0) w = d;
+                if (h <= 0.0) h = d;
+            } else if (shape == "POLYGON" && p["pad"].size() >= 2) {
+                extractPolySpan(p["pad"][1], unitScale, w, h);
+            }
+        }
+        if ((w <= 0.0 || h <= 0.0) && p.contains("polygon") && p["polygon"].is_array()) {
+            extractPolySpan(p["polygon"], unitScale, w, h);
+        }
+        double holeMm = readLen(p, {"drill_mm"}, {"drill", "hole_diameter"}, 0.0);
+        if (holeMm <= 0.0 && p.contains("hole") && p["hole"].is_array() &&
+            p["hole"].size() >= 2 && p["hole"][1].is_number()) {
+            holeMm = p["hole"][1].get<double>() * unitScale;
+            if (p["hole"].size() >= 3 && p["hole"][2].is_number()) {
+                holeMm = std::max(holeMm, p["hole"][2].get<double>() * unitScale);
+            }
+        }
+        if (holeMm > 0.0) {
+            w = std::max(w, holeMm);
+            h = std::max(h, holeMm);
+        }
+        if (w <= 0.0) w = trackWidthMm;
+        if (h <= 0.0) h = trackWidthMm;
+        g.hw = 0.5 * w;
+        g.hh = 0.5 * h;
         double rad = readNum(p, {"rotation_deg", "rotation"}, 0.0) * kPi / 180.0;
         g.cosR = std::cos(rad);
         g.sinR = std::sin(rad);
         g.layer = layerNameToIdx(extractLayerStr(p, "F.Cu"));
-        if (readLen(p, {"drill_mm"}, {"drill", "hole_diameter"}, 0.0) > 0.0) {
+        if (holeMm > 0.0) {
             g.layer = -1;
         }
         g.netId = netId;
@@ -1455,6 +1523,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         stampOwner(-1, v.netId, v.x, v.x, v.y, v.y, 0.5 * (v.d + trackWidthMm) + clearanceMm, dist);
         stampVia(v.netId, v.x, v.x, v.y, v.y, 0.5 * (v.d + viaSizeMm) + clearanceMm, dist);
     }
+    const bool allowViaInPad = args.value("allow_via_in_pad", false);
     // Rotated rectangular pads with rounded (Euclidean) clearance halos
     for (const auto& p : staticPads) {
         auto dist = [&p](double wx, double wy) {
@@ -1466,7 +1535,11 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         double ay = std::fabs(p.hw * p.sinR) + std::fabs(p.hh * p.cosR);
         stampOwner(p.layer, p.netId, p.x - ax, p.x + ax, p.y - ay, p.y + ay,
                    clearanceMm + 0.5 * trackWidthMm, dist);
-        stampVia(p.netId, p.x - ax, p.x + ax, p.y - ay, p.y + ay, clearanceMm + 0.5 * viaSizeMm, dist);
+        int32_t viaOwnerId = (!allowViaInPad && p.layer != -1) ? kCellBlockAll : p.netId;
+        stampVia(viaOwnerId, p.x - ax, p.x + ax, p.y - ay, p.y + ay, clearanceMm + 0.5 * viaSizeMm, dist);
+        if (!allowViaInPad && p.layer != -1) {
+            viaOwner[planeIdx(cellX(p.x), cellY(p.y))] = kCellBlockAll;
+        }
     }
     // Every routed net's own pad centre cells are owned by that net so pin entry/exit is legal
     for (const auto& ns : nets) {
@@ -2006,7 +2079,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
 
     // ---- 8. Emit tracks/vias in mm and mil with exact endpoint snapping -------------------
     auto r4 = [](double v) { return std::round(v * 1e4) / 1e4; };
-    auto toMil = [](double mm) { return std::round(mm / kMmPerMil * 1e3) / 1e3; };
+    auto toMil = [](double mm) { return std::round(mm / kMmPerMil * 1e4) / 1e4; };
     nlohmann::json tracksJson = nlohmann::json::array();
     nlohmann::json viasJson = nlohmann::json::array();
     nlohmann::json unroutedNames = nlohmann::json::array();
@@ -2052,6 +2125,10 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             ++bridgesCount;
             int curL = 0, startX = 0, startY = 0;
             decodeCell(br.cells.front(), curL, startX, startY);
+            if (br.cells.size() == 1) {
+                emitTrack(net, curL, br.sx, br.sy, br.ex, br.ey);
+                continue;
+            }
             // Stub from the exact seed copper point (pad centre / via / track point) to the grid
             emitTrack(net, curL, br.sx, br.sy, worldX(startX), worldY(startY));
             int prevX = startX, prevY = startY;
@@ -2076,6 +2153,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
                             {"drill_mm", r4(viaDrillMm)},
                             {"x", toMil(vx)},
                             {"y", toMil(vy)},
+                            {"size", toMil(viaSizeMm)},
                             {"diameter", toMil(viaSizeMm)},
                             {"drill", toMil(viaDrillMm)}
                         });
@@ -2839,7 +2917,42 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         double y = 0.0;
         double sx = 0.6;
         double sy = 0.6;
+        double cosR = 1.0;
+        double sinR = 0.0;
         std::string layer;
+    };
+    auto distPointToPad = [](double wx, double wy, const AuditPad& pad) -> double {
+        double dx = wx - pad.x;
+        double dy = wy - pad.y;
+        double lx = dx * pad.cosR + dy * pad.sinR;
+        double ly = -dx * pad.sinR + dy * pad.cosR;
+        return pointRectDistanceLocal(lx, ly, 0.5 * pad.sx, 0.5 * pad.sy);
+    };
+    auto distSegToPad = [](double x1, double y1, double x2, double y2, const AuditPad& pad) -> double {
+        double dx1 = x1 - pad.x, dy1 = y1 - pad.y;
+        double dx2 = x2 - pad.x, dy2 = y2 - pad.y;
+        double lx1 = dx1 * pad.cosR + dy1 * pad.sinR;
+        double ly1 = -dx1 * pad.sinR + dy1 * pad.cosR;
+        double lx2 = dx2 * pad.cosR + dy2 * pad.sinR;
+        double ly2 = -dx2 * pad.sinR + dy2 * pad.cosR;
+        return segmentRectDistanceLocal(lx1, ly1, lx2, ly2, 0.5 * pad.sx, 0.5 * pad.sy);
+    };
+    auto padsTouch = [&](const AuditPad& a, const AuditPad& b, double tol) -> bool {
+        const double hwa = 0.5 * a.sx, hha = 0.5 * a.sy;
+        const double hwb = 0.5 * b.sx, hhb = 0.5 * b.sy;
+        const double localPtsA[5][2] = {{0.0, 0.0}, {-hwa, -hha}, {hwa, -hha}, {hwa, hha}, {-hwa, hha}};
+        for (const auto& lp : localPtsA) {
+            double wx = a.x + lp[0] * a.cosR - lp[1] * a.sinR;
+            double wy = a.y + lp[0] * a.sinR + lp[1] * a.cosR;
+            if (distPointToPad(wx, wy, b) <= tol) return true;
+        }
+        const double localPtsB[5][2] = {{0.0, 0.0}, {-hwb, -hhb}, {hwb, -hhb}, {hwb, hhb}, {-hwb, hhb}};
+        for (const auto& lp : localPtsB) {
+            double wx = b.x + lp[0] * b.cosR - lp[1] * b.sinR;
+            double wy = b.y + lp[0] * b.sinR + lp[1] * b.cosR;
+            if (distPointToPad(wx, wy, a) <= tol) return true;
+        }
+        return false;
     };
     struct AuditTrack {
         std::string id;
@@ -2913,7 +3026,15 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         AuditPad ap;
         ap.id = p.value("id", "pad_" + std::to_string(allPads.size() + 1));
         ap.ref = p.value("ref", p.value("reference", parentRef));
-        ap.pad = p.value("pad", p.value("number", ""));
+        if (p.contains("number") && p["number"].is_string()) {
+            ap.pad = p["number"].get<std::string>();
+        } else if (p.contains("number") && p["number"].is_number_integer()) {
+            ap.pad = std::to_string(p["number"].get<int64_t>());
+        } else if (p.contains("pad") && p["pad"].is_string()) {
+            ap.pad = p["pad"].get<std::string>();
+        } else if (p.contains("pad") && p["pad"].is_number_integer()) {
+            ap.pad = std::to_string(p["pad"].get<int64_t>());
+        }
         ap.net = p.value("net", "");
         ap.x = p.value("x", p.value("x_mm", 0.0));
         ap.y = p.value("y", p.value("y_mm", 0.0));
@@ -2930,11 +3051,48 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             double hMm = extractPositiveNumber(p, "height_mm");
             if (hMm > 0.0) rawSy = hMm * mmToCoord;
         }
+        if ((rawSx <= 0.0 || rawSy <= 0.0) && p.contains("pad") && p["pad"].is_array() &&
+            !p["pad"].empty() && p["pad"][0].is_string()) {
+            std::string shape = p["pad"][0].get<std::string>();
+            for (char& c : shape) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if ((shape == "OVAL" || shape == "RECT" || shape == "ELLIPSE" || shape == "OCTAGON") &&
+                p["pad"].size() >= 3 && p["pad"][1].is_number() && p["pad"][2].is_number()) {
+                if (rawSx <= 0.0) rawSx = p["pad"][1].get<double>();
+                if (rawSy <= 0.0) rawSy = p["pad"][2].get<double>();
+            } else if ((shape == "ROUND" || shape == "CIRCLE") &&
+                       p["pad"].size() >= 2 && p["pad"][1].is_number()) {
+                double d = p["pad"][1].get<double>();
+                if (rawSx <= 0.0) rawSx = d;
+                if (rawSy <= 0.0) rawSy = d;
+            }
+        }
+        if ((rawSx <= 0.0 || rawSy <= 0.0) && p.contains("polygon") && p["polygon"].is_array() &&
+            p["polygon"].size() >= 4 && p["polygon"][0].is_number()) {
+            double minX = 1e18, maxX = -1e18, minY = 1e18, maxY = -1e18;
+            for (size_t k = 0; k + 1 < p["polygon"].size(); k += 2) {
+                if (!p["polygon"][k].is_number() || !p["polygon"][k + 1].is_number()) continue;
+                double px = p["polygon"][k].get<double>();
+                double py = p["polygon"][k + 1].get<double>();
+                minX = std::min(minX, px);
+                maxX = std::max(maxX, px);
+                minY = std::min(minY, py);
+                maxY = std::max(maxY, py);
+            }
+            if (rawSx <= 0.0 && maxX > minX) rawSx = maxX - minX;
+            if (rawSy <= 0.0 && maxY > minY) rawSy = maxY - minY;
+        }
         double holeDia = extractPositiveNumber(p, "hole_diameter");
         if (holeDia <= 0.0) holeDia = extractPositiveNumber(p, "drill");
         if (holeDia <= 0.0) {
             double dMm = extractPositiveNumber(p, "drill_mm");
             if (dMm > 0.0) holeDia = dMm * mmToCoord;
+        }
+        if (holeDia <= 0.0 && p.contains("hole") && p["hole"].is_array() &&
+            p["hole"].size() >= 2 && p["hole"][1].is_number()) {
+            holeDia = p["hole"][1].get<double>();
+            if (p["hole"].size() >= 3 && p["hole"][2].is_number()) {
+                holeDia = std::max(holeDia, p["hole"][2].get<double>());
+            }
         }
         if (holeDia > 0.0) {
             rawSx = std::max(rawSx, holeDia);
@@ -2942,7 +3100,16 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         }
         ap.sx = std::max(minPadSize, (rawSx > 0.0) ? rawSx : defaultPadSize);
         ap.sy = std::max(minPadSize, (rawSy > 0.0) ? rawSy : defaultPadSize);
-        ap.layer = canonicalLayer(p, "TopLayer");
+        double rotDeg = 0.0;
+        if (p.contains("rotation_deg") && p["rotation_deg"].is_number()) {
+            rotDeg = p["rotation_deg"].get<double>();
+        } else if (p.contains("rotation") && p["rotation"].is_number()) {
+            rotDeg = p["rotation"].get<double>();
+        }
+        double rad = rotDeg * (3.14159265358979323846 / 180.0);
+        ap.cosR = std::cos(rad);
+        ap.sinR = std::sin(rad);
+        ap.layer = (holeDia > 0.0) ? std::string("MultiLayer") : canonicalLayer(p, "TopLayer");
         if (!ap.ref.empty()) pcbRefs.insert(ap.ref);
         allPads.push_back(ap);
     };
@@ -3199,12 +3366,10 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         // Pad-to-Pad
         for (size_t i = 0; i < nP; ++i) {
             const auto& pa = allPads[padIndices[i]];
-            double ra = 0.5 * std::max(pa.sx, pa.sy);
             for (size_t j = i + 1; j < nP; ++j) {
                 const auto& pb = allPads[padIndices[j]];
                 if (!layersMatch(pa.layer, pb.layer)) continue;
-                double rb = 0.5 * std::max(pb.sx, pb.sy);
-                if (std::hypot(pa.x - pb.x, pa.y - pb.y) <= ra + rb + touchTol) {
+                if (padsTouch(pa, pb, touchTol)) {
                     ufUnion(i, j);
                 }
             }
@@ -3213,12 +3378,11 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         // Pad-to-Track
         for (size_t i = 0; i < nP; ++i) {
             const auto& pa = allPads[padIndices[i]];
-            double ra = 0.5 * std::max(pa.sx, pa.sy);
             for (size_t j = 0; j < nT; ++j) {
                 const auto& trk = allTracks[trkIndices[j]];
                 if (!layersMatch(pa.layer, trk.layer)) continue;
-                double d = distPointToSeg(pa.x, pa.y, trk.x1, trk.y1, trk.x2, trk.y2);
-                if (d <= ra + 0.5 * trk.width + touchTol) {
+                double d = distSegToPad(trk.x1, trk.y1, trk.x2, trk.y2, pa);
+                if (d <= 0.5 * trk.width + touchTol) {
                     ufUnion(i, nP + j);
                 }
             }
@@ -3227,10 +3391,9 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         // Pad-to-Via (vias span all layers)
         for (size_t i = 0; i < nP; ++i) {
             const auto& pa = allPads[padIndices[i]];
-            double ra = 0.5 * std::max(pa.sx, pa.sy);
             for (size_t k = 0; k < nV; ++k) {
                 const auto& via = allVias[viaIndices[k]];
-                if (std::hypot(pa.x - via.x, pa.y - via.y) <= ra + 0.5 * via.diameter + touchTol) {
+                if (distPointToPad(via.x, via.y, pa) <= 0.5 * via.diameter + touchTol) {
                     ufUnion(i, nP + nT + k);
                 }
             }
@@ -3362,8 +3525,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             for (const auto& pad : allPads) {
                 if (!trk.net.empty() && !pad.net.empty() && trk.net != pad.net) continue;
                 if (!layersMatch(trk.layer, pad.layer)) continue;
-                double rp = 0.5 * std::max(pad.sx, pad.sy);
-                if (std::hypot(ex - pad.x, ey - pad.y) <= rp + 0.5 * trk.width + touchTol) {
+                if (distPointToPad(ex, ey, pad) <= 0.5 * trk.width + touchTol) {
                     anchored = true;
                     break;
                 }

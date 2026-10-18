@@ -3229,6 +3229,14 @@ nlohmann::json EdaRpcServer::handleEasyEdaNativeAutoRoute(const nlohmann::json& 
     }
 
     nlohmann::json out = {{"ok", false}, {"triggered", false}, {"dom_attempt", domRes}};
+    // The plugin answers ok:true/triggered:false when only the DOM path is unavailable; ok:false is a
+    // hard error (e.g. no PCB document open) and must not fall through to clicking EasyEDA menus.
+    if (domRes.is_object() && domRes.contains("ok") && domRes["ok"].is_boolean() && !domRes["ok"].get<bool>()) {
+        out["error"] = (domRes.contains("error") && domRes["error"].is_string())
+            ? domRes["error"].get<std::string>() : std::string("EasyEDA plugin rejected the native autoroute request");
+        if (domRes.contains("active_document")) out["active_document"] = domRes["active_document"];
+        return out;
+    }
     if (!allowWin32) {
         out["error"] = "DOM trigger failed and allow_win32_ui_automation=false";
         return out;
@@ -3388,7 +3396,8 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
         }
     }
 
-    if (toolName == "easyeda_inspect_schematic" && plugRes.is_object()) {
+    if (toolName == "easyeda_inspect_schematic" && plugRes.is_object() &&
+        plugRes.value("ok", true)) {
         if (!plugRes.contains("erc_audit")) {
             EdaAccelerators acc;
             bool ercOk = false;
@@ -3398,6 +3407,7 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
     }
 
     if (toolName == "easyeda_run_drc" && plugRes.is_object() &&
+        plugRes.value("ok", true) &&
         args.value("target", "pcb") == "schematic") {
         plugRes.erase("connectivity_audit");
         if (!plugRes.contains("erc_audit")) {
@@ -3446,7 +3456,7 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
             }
         }
     } else if ((toolName == "easyeda_inspect_pcb" || toolName == "easyeda_run_drc") &&
-               plugRes.is_object()) {
+               plugRes.is_object() && plugRes.value("ok", true)) {
         if (!plugRes.contains("connectivity_audit")) {
             EdaAccelerators acc;
             bool auditOk = false;

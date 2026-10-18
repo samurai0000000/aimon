@@ -72,6 +72,13 @@ private:
     static std::string formatTokensCompact(int64_t tokens);
     static std::string formatHumanDate(const std::string& iso);
     static std::string formatNumberWithCommas(int64_t value);
+    void updateQuotaCountdowns();
+    static std::string formatCountdown(int64_t totalSeconds);
+    static std::string formatBucketTimerText(double remainingPct,
+                                             int64_t remainingSeconds,
+                                             const std::string& description);
+    static std::string formatModelTimerText(double remainingPct,
+                                            int64_t remainingSeconds);
 
     EdaRpcServer& _server;
     EdaBridgeAppSettings _settings;
@@ -82,10 +89,30 @@ private:
 
     QTabWidget* _tabWidget = nullptr;
 
-    // Tab 1: AI Quotas
+    struct LiveCountdownBinding {
+        QLabel* label = nullptr;
+        double remainingPct = 100.0;
+        int64_t initialResetSeconds = 0;
+        std::string description;
+        bool isBucket = true;
+    };
+
+    int64_t _lastQuotaFetchSteadySec = 0;
+    bool _agModelsExpanded = false;
+    std::vector<LiveCountdownBinding> _agCountdownBindings;
+
+    // Tab 1: AI Quotas — Google Antigravity
     QLabel* _quotaConnectionBanner = nullptr;
+    QLabel* _agStatusDot = nullptr;
     QLabel* _agHeaderLabel = nullptr;
-    QLabel* _agCreditsLabel = nullptr;
+    QLabel* _agPlanPill = nullptr;
+    QLabel* _agGoogleOneCreditsVal = nullptr;
+    QLabel* _agCreditMinPill = nullptr;
+    QLabel* _agPromptFlowVal = nullptr;
+    QLabel* _agPromptFlowTierPill = nullptr;
+    QWidget* _agQuotaGroupsContainer = nullptr;
+    QVBoxLayout* _agQuotaGroupsLayout = nullptr;
+    QPushButton* _agModelsToggleBtn = nullptr;
     QWidget* _agModelsContainer = nullptr;
     QVBoxLayout* _agModelsLayout = nullptr;
 

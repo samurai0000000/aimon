@@ -1458,6 +1458,18 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
     if (units != "mm" && units != "mil") units = "mil";
     if (!state.contains("units")) state["units"] = units;
 
+    // An empty board is never "nothing to route": it means no PCB is loaded (e.g. the Start Page).
+    const int statePads = (state.contains("pads") && state["pads"].is_array())
+        ? static_cast<int>(state["pads"].size()) : 0;
+    if (statePads == 0) {
+        const std::string activeDoc = jsonStr(state, "active_document", "");
+        if (!activeDoc.empty()) result["active_document"] = activeDoc;
+        return finish(false, "", hasState
+            ? std::string("pcb_state contains no pads; nothing can be audited or routed")
+            : "The active EasyEDA Pro PCB has no pads (active document: " +
+              (activeDoc.empty() ? std::string("unknown") : activeDoc) + "); is a PCB document open?");
+    }
+
     bool auditOk = false;
     std::string auditSummary;
     nlohmann::json preAudit = accCopy.calcPcbConnectivityAudit(state, auditOk, auditSummary);
@@ -1517,7 +1529,153 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
         return finish(true, "No unrouted nets to route", "");
     }
 
-    // ---- 4. Build the calcPcbAutoroute request from live primitives ----------------------
+    // ---- 4. Resolve design rules (explicit > board_design_rules > existing_copper) -------
+    auto positiveFromObj = [](const nlohmann::json& obj,
+                              std::initializer_list<const char*> keys) -> double {
+        if (!obj.is_object()) return 0.0;
+        for (const char* k : keys) {
+            if (obj.contains(k) && obj[k].is_number()) {
+                double v = obj[k].get<double>();
+                if (v > 0.0) return v;
+            }
+        }
+        return 0.0;
+    };
+    const nlohmann::json argRules =
+        (arguments.contains("rules") && arguments["rules"].is_object())
+            ? arguments["rules"] : nlohmann::json::object();
+    const nlohmann::json boardRules =
+        (state.contains("board_design_rules") && state["board_design_rules"].is_object())
+            ? state["board_design_rules"]
+            : ((state.contains("design_rules") && state["design_rules"].is_object())
+                   ? state["design_rules"] : nlohmann::json::object());
+
+    const double bareScale = (units == "mil") ? 0.0254 : 1.0;
+    double copperMinTrackMm = 0.0;
+    if (state.contains("tracks") && state["tracks"].is_array()) {
+        for (const auto& t : state["tracks"]) {
+            if (!t.is_object()) continue;
+            double wMm = positiveFromObj(t, {"width_mm"});
+            if (wMm <= 0.0) {
+                double wBare = positiveFromObj(t, {"width"});
+                if (wBare > 0.0) wMm = wBare * bareScale;
+            }
+            if (wMm > 0.0 && (copperMinTrackMm <= 0.0 || wMm < copperMinTrackMm)) {
+                copperMinTrackMm = wMm;
+            }
+        }
+    }
+    double copperMinViaSizeMm = 0.0;
+    double copperMinViaDrillMm = 0.0;
+    if (state.contains("vias") && state["vias"].is_array()) {
+        for (const auto& v : state["vias"]) {
+            if (!v.is_object()) continue;
+            double vsMm = positiveFromObj(v, {"size_mm", "diameter_mm"});
+            if (vsMm <= 0.0) {
+                double vsBare = positiveFromObj(v, {"size", "diameter"});
+                if (vsBare > 0.0) vsMm = vsBare * bareScale;
+            }
+            if (vsMm > 0.0 && (copperMinViaSizeMm <= 0.0 || vsMm < copperMinViaSizeMm)) {
+                copperMinViaSizeMm = vsMm;
+            }
+            double vdMm = positiveFromObj(v, {"drill_mm"});
+            if (vdMm <= 0.0) {
+                double vdBare = positiveFromObj(v, {"drill", "hole_diameter"});
+                if (vdBare > 0.0) vdMm = vdBare * bareScale;
+            }
+            if (vdMm > 0.0 && (copperMinViaDrillMm <= 0.0 || vdMm < copperMinViaDrillMm)) {
+                copperMinViaDrillMm = vdMm;
+            }
+        }
+    }
+
+    double expTrackMm = positiveFromObj(arguments, {"track_width_mm"});
+    if (expTrackMm <= 0.0) expTrackMm = positiveFromObj(argRules, {"track_width_mm"});
+    double expClearMm = positiveFromObj(arguments, {"clearance_mm"});
+    if (expClearMm <= 0.0) expClearMm = positiveFromObj(argRules, {"clearance_mm"});
+    double expViaSizeMm = positiveFromObj(arguments, {"via_size_mm", "via_diameter_mm"});
+    if (expViaSizeMm <= 0.0) expViaSizeMm = positiveFromObj(argRules, {"via_size_mm", "via_diameter_mm"});
+    double expViaDrillMm = positiveFromObj(arguments, {"via_drill_mm"});
+    if (expViaDrillMm <= 0.0) expViaDrillMm = positiveFromObj(argRules, {"via_drill_mm"});
+
+    double brdTrackMm = positiveFromObj(boardRules, {"track_width_mm"});
+    double brdClearMm = positiveFromObj(boardRules, {"clearance_mm"});
+    double brdViaSizeMm = positiveFromObj(boardRules, {"via_size_mm", "via_diameter_mm"});
+    double brdViaDrillMm = positiveFromObj(boardRules, {"via_drill_mm"});
+
+    const bool hasExplicitRule =
+        (expTrackMm > 0.0 || expClearMm > 0.0 || expViaSizeMm > 0.0 || expViaDrillMm > 0.0);
+    const bool hasBoardRule =
+        (brdTrackMm > 0.0 || brdClearMm > 0.0 || brdViaSizeMm > 0.0 || brdViaDrillMm > 0.0);
+    const bool hasExistingCopper = (copperMinTrackMm > 0.0 || copperMinViaSizeMm > 0.0);
+
+    if (!hasExplicitRule && !hasBoardRule && !hasExistingCopper) {
+        return finish(false, "",
+                      "Cannot determine PCB design rules: board_design_rules is unavailable, "
+                      "the board has no existing copper (tracks/vias) to infer rules from, and "
+                      "no explicit rules (track_width_mm, clearance_mm, via_size_mm, via_drill_mm) "
+                      "were supplied");
+    }
+
+    auto r4 = [](double v) { return std::round(v * 1e4) / 1e4; };
+    std::string srcTrack = "existing_copper";
+    double resolvedTrackMm = (copperMinTrackMm > 0.0) ? copperMinTrackMm : 0.254;
+    if (expTrackMm > 0.0) {
+        resolvedTrackMm = expTrackMm;
+        srcTrack = "explicit";
+    } else if (brdTrackMm > 0.0) {
+        resolvedTrackMm = brdTrackMm;
+        srcTrack = "board_design_rules";
+    }
+
+    std::string srcClear = "existing_copper";
+    double resolvedClearMm = 0.16;
+    if (expClearMm > 0.0) {
+        resolvedClearMm = expClearMm;
+        srcClear = "explicit";
+    } else if (brdClearMm > 0.0) {
+        resolvedClearMm = brdClearMm;
+        srcClear = "board_design_rules";
+    }
+
+    std::string srcViaSize = "existing_copper";
+    double resolvedViaSizeMm = (copperMinViaSizeMm > 0.0) ? std::max(copperMinViaSizeMm, 0.61) : 0.61;
+    if (expViaSizeMm > 0.0) {
+        resolvedViaSizeMm = expViaSizeMm;
+        srcViaSize = "explicit";
+    } else if (brdViaSizeMm > 0.0) {
+        resolvedViaSizeMm = brdViaSizeMm;
+        srcViaSize = "board_design_rules";
+    }
+
+    std::string srcViaDrill = "existing_copper";
+    double resolvedViaDrillMm = (copperMinViaDrillMm > 0.0) ? std::max(copperMinViaDrillMm, 0.305) : 0.305;
+    if (expViaDrillMm > 0.0) {
+        resolvedViaDrillMm = expViaDrillMm;
+        srcViaDrill = "explicit";
+    } else if (brdViaDrillMm > 0.0) {
+        resolvedViaDrillMm = brdViaDrillMm;
+        srcViaDrill = "board_design_rules";
+    }
+
+    std::string primaryRuleSource = hasExplicitRule
+        ? "explicit"
+        : (hasBoardRule ? "board_design_rules" : "existing_copper");
+    result["rules_source"] = primaryRuleSource;
+    result["rules"] = {
+        {"track_width_mm", r4(resolvedTrackMm)},
+        {"clearance_mm", r4(resolvedClearMm)},
+        {"via_size_mm", r4(resolvedViaSizeMm)},
+        {"via_drill_mm", r4(resolvedViaDrillMm)},
+        {"sources", {
+            {"track_width_mm", srcTrack},
+            {"clearance_mm", srcClear},
+            {"via_size_mm", srcViaSize},
+            {"via_drill_mm", srcViaDrill}
+        }}
+    };
+
+    // ---- 4b. Build the calcPcbAutoroute request from live primitives ---------------------
     std::map<std::string, nlohmann::json> padsByNet;
     std::map<std::string, std::string> netByUpper;
     nlohmann::json allPads = nlohmann::json::array();
@@ -1561,21 +1719,32 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
         {"existing_tracks", (state.contains("tracks") && state["tracks"].is_array())
                                 ? state["tracks"] : nlohmann::json::array()},
         {"existing_vias", (state.contains("vias") && state["vias"].is_array())
-                              ? state["vias"] : nlohmann::json::array()}
+                              ? state["vias"] : nlohmann::json::array()},
+        {"track_width_mm", resolvedTrackMm},
+        {"clearance_mm", resolvedClearMm},
+        {"via_size_mm", resolvedViaSizeMm},
+        {"via_drill_mm", resolvedViaDrillMm}
     };
-    for (const char* k : {"track_width_mm", "clearance_mm", "via_size_mm", "via_diameter_mm",
-                          "via_drill_mm", "grid_step_mm", "max_ripup_passes", "rules", "board",
+    for (const char* k : {"grid_step_mm", "max_ripup_passes", "allow_via_in_pad", "board",
                           "obstacles"}) {
         if (arguments.contains(k)) req[k] = arguments[k];
     }
+    if (argRules.contains("grid_step_mm")) req["grid_step_mm"] = argRules["grid_step_mm"];
+    if (argRules.contains("max_ripup_passes")) req["max_ripup_passes"] = argRules["max_ripup_passes"];
+
+    nlohmann::json warnings = nlohmann::json::array();
     nlohmann::json keepouts = (arguments.contains("keepouts") && arguments["keepouts"].is_array())
         ? arguments["keepouts"] : nlohmann::json::array();
     if (jsonFlag(arguments, "respect_board_outline", true)) {
         nlohmann::json edge = boardOutlineKeepouts(state);
         result["board_outline_keepouts"] = static_cast<int>(edge.size());
+        if (edge.empty()) {
+            warnings.push_back("board_outline is empty; routing is constrained only by the copper bounding box");
+        }
         for (auto& k : edge) keepouts.push_back(std::move(k));
     }
     if (!keepouts.empty()) req["keepouts"] = std::move(keepouts);
+    if (!warnings.empty()) result["warnings"] = warnings;
 
     bool arOk = false;
     std::string arSummary;
@@ -1626,22 +1795,27 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
         return finish(false, arSummary, "No net could be routed; nothing to commit");
     }
 
-    // ---- 5. Commit and re-audit -----------------------------------------------------------
+    // ---- 5. Transactional commit, DRC gate, and re-audit ----------------------------------
     nlohmann::json postAudit;
     if (hasState) {
         nlohmann::json merged = state;
         if (!merged.contains("tracks") || !merged["tracks"].is_array()) merged["tracks"] = nlohmann::json::array();
         if (!merged.contains("vias") || !merged["vias"].is_array()) merged["vias"] = nlohmann::json::array();
+        nlohmann::json committedIds = nlohmann::json::array();
         size_t seq = 0;
         for (const auto& t : tracks) {
             nlohmann::json copy = t;
-            copy["id"] = "autoroute_t" + std::to_string(++seq);
+            std::string id = "autoroute_t" + std::to_string(++seq);
+            copy["id"] = id;
+            committedIds.push_back(id);
             merged["tracks"].push_back(std::move(copy));
         }
         seq = 0;
         for (const auto& v : vias) {
             nlohmann::json copy = v;
-            copy["id"] = "autoroute_v" + std::to_string(++seq);
+            std::string id = "autoroute_v" + std::to_string(++seq);
+            copy["id"] = id;
+            committedIds.push_back(id);
             merged["vias"].push_back(std::move(copy));
         }
         merged["tracks_count"] = static_cast<int>(merged["tracks"].size());
@@ -1652,14 +1826,45 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
         merged["connectivity_audit"] = postAudit;
         result["pcb_state"] = std::move(merged);
         result["committed"] = true;
+        result["committed_ids"] = std::move(committedIds);
         result["commit_target"] = "pcb_state";
     } else {
+        std::set<std::string> prePrimitiveIds;
+        for (const char* arrKey : {"tracks", "vias"}) {
+            if (state.contains(arrKey) && state[arrKey].is_array()) {
+                for (const auto& item : state[arrKey]) {
+                    if (item.is_object() && item.contains("id") && item["id"].is_string()) {
+                        prePrimitiveIds.insert(item["id"].get<std::string>());
+                    }
+                }
+            }
+        }
+
+        int preDrcViolations = 0;
+        bool preDrcAvailable = false;
+        nlohmann::json preDrcRes = callTool("easyeda_run_drc", withPcbUuid({{"target", "pcb"}}));
+        if (preDrcRes.is_object() && jsonFlag(preDrcRes, "ok", false)) {
+            preDrcAvailable = true;
+            preDrcViolations = jsonInt(preDrcRes, "violation_count", 0);
+            result["pre_route_drc"] = {
+                {"passed", jsonFlag(preDrcRes, "passed", preDrcViolations == 0)},
+                {"violation_count", preDrcViolations}
+            };
+        }
+
         // Router output always carries *_mm keys plus mil bare keys; commit in mil canvas units.
         // Chunked so each plugin round-trip stays well inside the bridge RPC timeout.
         constexpr size_t kCommitChunk = 80;
         int committedTracks = 0;
         int committedVias = 0;
         std::string commitErr;
+        std::vector<std::string> committedIds;
+        std::set<std::string> committedIdSet;
+        auto recordId = [&](const std::string& id) {
+            if (!id.empty() && committedIdSet.insert(id).second) {
+                committedIds.push_back(id);
+            }
+        };
         auto commitChunks = [&](const char* key, const nlohmann::json& items, int& counter,
                                 const char* countKey) -> bool {
             for (size_t i = 0; i < items.size(); i += kCommitChunk) {
@@ -1668,6 +1873,15 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
                     chunk.push_back(items[j]);
                 }
                 nlohmann::json er = callTool("easyeda_edit_pcb", withPcbUuid({{"units", "mil"}, {key, chunk}}));
+                if (er.is_object()) {
+                    for (const char* idArrKey : {"committed_ids", "created_track_ids", "created_via_ids"}) {
+                        if (er.contains(idArrKey) && er[idArrKey].is_array()) {
+                            for (const auto& idVal : er[idArrKey]) {
+                                if (idVal.is_string()) recordId(idVal.get<std::string>());
+                            }
+                        }
+                    }
+                }
                 if (!jsonFlag(er, "ok", false)) {
                     commitErr = jsonStr(er, "error", "easyeda_edit_pcb failed");
                     return false;
@@ -1678,24 +1892,89 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
         };
         bool commitOk = commitChunks("tracks", tracks, committedTracks, "added_tracks") &&
                         commitChunks("vias", vias, committedVias, "added_vias");
-        result["committed"] = commitOk;
-        result["commit_target"] = "active_pcb";
-        result["committed_tracks"] = committedTracks;
-        result["committed_vias"] = committedVias;
 
         nlohmann::json post;
         std::string postErr;
-        if (fetchLiveState({{"summary_only", true}}, post, postErr)) {
-            postAudit = (post.contains("connectivity_audit") && post["connectivity_audit"].is_object())
-                ? post["connectivity_audit"] : nlohmann::json::object();
+        if (fetchLiveState({{"include_raw_primitives", true}}, post, postErr)) {
+            for (const char* arrKey : {"tracks", "vias"}) {
+                if (post.contains(arrKey) && post[arrKey].is_array()) {
+                    for (const auto& item : post[arrKey]) {
+                        if (item.is_object() && item.contains("id") && item["id"].is_string()) {
+                            const std::string id = item["id"].get<std::string>();
+                            if (prePrimitiveIds.count(id) == 0) recordId(id);
+                        }
+                    }
+                }
+            }
+            if (jsonInt(post, "pads_count", 0) == 0) {
+                result["post_route_audit_error"] = "post-commit read returned 0 pads (active document: " +
+                                                   jsonStr(post, "active_document", "unknown") + ")";
+            } else {
+                postAudit = (post.contains("connectivity_audit") && post["connectivity_audit"].is_object())
+                    ? post["connectivity_audit"] : nlohmann::json::object();
+            }
         } else {
             result["post_route_audit_error"] = postErr;
         }
+
+        auto rollbackCommitted = [&]() -> int {
+            if (committedIds.empty()) return 0;
+            nlohmann::json delIds = nlohmann::json::array();
+            for (const auto& id : committedIds) delIds.push_back(id);
+            nlohmann::json delRes = callTool("easyeda_edit_pcb",
+                                             withPcbUuid({{"delete_primitives", delIds}}));
+            result["rollback"] = delRes;
+            nlohmann::json rbPost;
+            std::string rbErr;
+            if (fetchLiveState({{"summary_only", true}}, rbPost, rbErr) &&
+                rbPost.contains("connectivity_audit") && rbPost["connectivity_audit"].is_object()) {
+                postAudit = rbPost["connectivity_audit"];
+            }
+            return static_cast<int>(committedIds.size());
+        };
+
+        result["commit_target"] = "active_pcb";
+        result["committed_tracks"] = committedTracks;
+        result["committed_vias"] = committedVias;
+        result["committed_ids"] = committedIds;
+
         if (!commitOk) {
+            int rbCount = rollbackCommitted();
+            result["committed"] = false;
+            result["rolled_back"] = (rbCount > 0);
+            result["rolled_back_count"] = rbCount;
             result["post_route_audit"] = compactConnectivityAudit(postAudit);
             return finish(false, arSummary, "Commit to EasyEDA Pro failed after " + std::to_string(committedTracks) +
-                                            " tracks / " + std::to_string(committedVias) + " vias: " + commitErr);
+                                            " tracks / " + std::to_string(committedVias) + " vias: " + commitErr +
+                                            (rbCount > 0 ? " (rolled back " + std::to_string(rbCount) + " primitives)" : ""));
         }
+
+        int postDrcViolations = 0;
+        bool postDrcAvailable = false;
+        nlohmann::json postDrcRes = callTool("easyeda_run_drc", withPcbUuid({{"target", "pcb"}}));
+        if (postDrcRes.is_object() && jsonFlag(postDrcRes, "ok", false)) {
+            postDrcAvailable = true;
+            postDrcViolations = jsonInt(postDrcRes, "violation_count", 0);
+            result["post_route_drc"] = {
+                {"passed", jsonFlag(postDrcRes, "passed", postDrcViolations == 0)},
+                {"violation_count", postDrcViolations},
+                {"violations", postDrcRes.value("violations", nlohmann::json::array())}
+            };
+        }
+        if (postDrcAvailable && postDrcViolations > (preDrcAvailable ? preDrcViolations : 0) && !allowDrcViolations) {
+            int rbCount = rollbackCommitted();
+            result["committed"] = false;
+            result["rolled_back"] = true;
+            result["rolled_back_count"] = rbCount;
+            result["post_route_audit"] = compactConnectivityAudit(postAudit);
+            return finish(false, arSummary,
+                          "Post-commit EasyEDA Pro DRC reported " + std::to_string(postDrcViolations) +
+                          " violations (pre-route baseline: " + std::to_string(preDrcAvailable ? preDrcViolations : 0) +
+                          "); rolled back " + std::to_string(rbCount) +
+                          " committed primitives (pass allow_drc_violations: true to override)");
+        }
+        result["committed"] = true;
+        result["rolled_back"] = false;
     }
 
     result["post_route_audit"] = compactConnectivityAudit(postAudit);
@@ -3594,7 +3873,7 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
         if (inMemorySchEdit || wantAnnotate || wantConnectToNet || wantAutoPlace) {
             rpcResult["schematic_state"] = schState;
         }
-    } else if (toolName == "easyeda_inspect_pcb" && rpcResult.is_object()) {
+    } else if (toolName == "easyeda_inspect_pcb" && rpcResult.is_object() && jsonFlag(rpcResult, "ok", true)) {
         // Merge cached multi-sheet schematic components into rpcResult["schematic_components"]
         nlohmann::json mergedSchComps = nlohmann::json::array();
         std::set<std::string> seenSchRefs;
@@ -3621,6 +3900,103 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
             }
         }
         rpcResult["schematic_components"] = mergedSchComps;
+
+        if ((!rpcResult.contains("board_outline") || !rpcResult["board_outline"].is_array() ||
+             rpcResult["board_outline"].empty()) &&
+            (_connected || gw != nullptr)) {
+            nlohmann::json outlineSegs = nlohmann::json::array();
+            auto isOutlineLayerVal = [](const nlohmann::json& lv) -> bool {
+                if (lv.is_number_integer()) return lv.get<int>() == 11;
+                if (lv.is_string()) {
+                    std::string s = lv.get<std::string>();
+                    return s == "11" || s == "BoardOutLine" || s == "Edge.Cuts";
+                }
+                return false;
+            };
+            auto appendPolyObjSegments = [&](const nlohmann::json& item, double defaultW) {
+                if (!item.is_object() || !item.contains("layer") || !isOutlineLayerVal(item["layer"])) {
+                    return;
+                }
+                std::string recId = item.value("primitiveId", item.value("id", ""));
+                std::string lidStr = item["layer"].is_string()
+                    ? item["layer"].get<std::string>()
+                    : std::to_string(item["layer"].get<int>());
+                double wVal = item.contains("lineWidth") && item["lineWidth"].is_number()
+                    ? item["lineWidth"].get<double>() : defaultW;
+                if (!item.contains("polygon")) return;
+                const nlohmann::json& rawPoly = item["polygon"];
+                const nlohmann::json* srcArr = nullptr;
+                if (rawPoly.is_array()) {
+                    srcArr = &rawPoly;
+                } else if (rawPoly.is_object()) {
+                    for (const char* k : {"polygon", "Source", "source", "points"}) {
+                        if (rawPoly.contains(k) && rawPoly[k].is_array()) {
+                            srcArr = &rawPoly[k];
+                            break;
+                        }
+                    }
+                }
+                if (srcArr == nullptr) return;
+                std::vector<std::pair<double, double>> pts;
+                for (size_t i = 0; i < srcArr->size(); ++i) {
+                    const auto& tok = (*srcArr)[i];
+                    if (tok.is_string() && toUpperAscii(tok.get<std::string>()) == "ARC") {
+                        if (i + 1 < srcArr->size() && (*srcArr)[i + 1].is_number()) {
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (tok.is_object() && tok.contains("x") && tok.contains("y") &&
+                        tok["x"].is_number() && tok["y"].is_number()) {
+                        pts.emplace_back(tok["x"].get<double>(), tok["y"].get<double>());
+                    } else if (tok.is_array() && tok.size() >= 2 &&
+                               tok[0].is_number() && tok[1].is_number()) {
+                        pts.emplace_back(tok[0].get<double>(), tok[1].get<double>());
+                    } else if (tok.is_number() && i + 1 < srcArr->size() &&
+                               (*srcArr)[i + 1].is_number()) {
+                        pts.emplace_back(tok.get<double>(), (*srcArr)[i + 1].get<double>());
+                        ++i;
+                    }
+                }
+                for (size_t i = 0; i + 1 < pts.size(); ++i) {
+                    outlineSegs.push_back({
+                        {"id", recId},
+                        {"layer", lidStr},
+                        {"width", wVal},
+                        {"x1", pts[i].first},
+                        {"y1", pts[i].second},
+                        {"x2", pts[i + 1].first},
+                        {"y2", pts[i + 1].second}
+                    });
+                }
+                if (pts.size() >= 3 &&
+                    std::hypot(pts.front().first - pts.back().first,
+                               pts.front().second - pts.back().second) > 1e-3) {
+                    outlineSegs.push_back({
+                        {"id", recId},
+                        {"layer", lidStr},
+                        {"width", wVal},
+                        {"x1", pts.back().first},
+                        {"y1", pts.back().second},
+                        {"x2", pts.front().first},
+                        {"y2", pts.front().second}
+                    });
+                }
+            };
+            for (const char* apiPath : {"eda.pcb_PrimitivePolyline.getAll", "eda.pcb_PrimitiveRegion.getAll"}) {
+                nlohmann::json apiRes;
+                if (invokeEasyEdaApi(apiPath, nlohmann::json::array(), apiRes) &&
+                    apiRes.is_object() && apiRes.contains("result") && apiRes["result"].is_array()) {
+                    for (const auto& item : apiRes["result"]) {
+                        appendPolyObjSegments(item, 0.25);
+                    }
+                }
+                if (!outlineSegs.empty()) break;
+            }
+            if (!outlineSegs.empty()) {
+                rpcResult["board_outline"] = std::move(outlineSegs);
+            }
+        }
 
         EdaAccelerators accCopy;
         {

@@ -182,13 +182,88 @@ private:
                     } else if (tName == "easyeda_sync_sch_to_pcb") {
                         res["synced"] = true;
                     } else if (tName == "easyeda_inspect_pcb") {
-                        res["components_count"] = 2;
-                        res["unrouted_nets"] = nlohmann::json::array();
+                        if (simulatePcbNotOpen) {
+                            res = {
+                                {"ok", false},
+                                {"error_code", "ERR_PCB_DOCUMENT_NOT_OPEN"},
+                                {"error", "No PCB document is open"}
+                            };
+                        } else if (simulateAutorouteBoard) {
+                            res["units"] = "mil";
+                            res["pads"] = nlohmann::json::array({
+                                {{"id", "p1"}, {"ref", "U1"}, {"pad", "1"}, {"net", "SIG"},
+                                 {"x", 1000.0}, {"y", 1000.0}, {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+                                {{"id", "p2"}, {"ref", "U1"}, {"pad", "2"}, {"net", "SIG"},
+                                 {"x", 1400.0}, {"y", 1000.0}, {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+                                {{"id", "p3"}, {"ref", "U1"}, {"pad", "3"}, {"net", "DONE"},
+                                 {"x", 1000.0}, {"y", 1200.0}, {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+                                {{"id", "p4"}, {"ref", "U1"}, {"pad", "4"}, {"net", "DONE"},
+                                 {"x", 1400.0}, {"y", 1200.0}, {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}}
+                            });
+                            res["pads_count"] = 4;
+                            res["tracks"] = simTracks;
+                            res["tracks_count"] = static_cast<int>(simTracks.size());
+                            res["vias"] = nlohmann::json::array();
+                            res["vias_count"] = 0;
+                            res["board_outline"] = nlohmann::json::array({
+                                {{"x1", 800.0}, {"y1", 800.0}, {"x2", 1600.0}, {"y2", 800.0}},
+                                {{"x1", 1600.0}, {"y1", 800.0}, {"x2", 1600.0}, {"y2", 1400.0}},
+                                {{"x1", 1600.0}, {"y1", 1400.0}, {"x2", 800.0}, {"y2", 1400.0}},
+                                {{"x1", 800.0}, {"y1", 1400.0}, {"x2", 800.0}, {"y2", 800.0}}
+                            });
+                        } else {
+                            res["components_count"] = 2;
+                            res["unrouted_nets"] = nlohmann::json::array();
+                        }
                     } else if (tName == "easyeda_edit_pcb") {
-                        res["updated_placements"] = 2;
+                        if (simulateAutorouteBoard) {
+                            nlohmann::json createdIds = nlohmann::json::array();
+                            if (tArgs.contains("tracks") && tArgs["tracks"].is_array()) {
+                                for (const auto& t : tArgs["tracks"]) {
+                                    nlohmann::json copy = t;
+                                    std::string tid = "sim_trk_" + std::to_string(++simSeq);
+                                    copy["id"] = tid;
+                                    simTracks.push_back(copy);
+                                    createdIds.push_back(tid);
+                                }
+                                res["added_tracks"] = static_cast<int>(createdIds.size());
+                                res["created_track_ids"] = createdIds;
+                                res["committed_ids"] = createdIds;
+                            }
+                            if (tArgs.contains("delete_primitives") && tArgs["delete_primitives"].is_array()) {
+                                int delCount = 0;
+                                for (const auto& d : tArgs["delete_primitives"]) {
+                                    if (!d.is_string()) continue;
+                                    std::string did = d.get<std::string>();
+                                    deletedIds.push_back(did);
+                                    for (auto it = simTracks.begin(); it != simTracks.end();) {
+                                        if (it->value("id", "") == did) {
+                                            it = simTracks.erase(it);
+                                            ++delCount;
+                                        } else {
+                                            ++it;
+                                        }
+                                    }
+                                }
+                                res["deleted_primitives"] = delCount;
+                            }
+                        } else {
+                            res["updated_placements"] = 2;
+                        }
                     } else if (tName == "easyeda_run_drc") {
-                        res["violation_count"] = 0;
-                        res["violations"] = nlohmann::json::array();
+                        ++drcCallCount;
+                        if (simulateAutorouteBoard && simulatePostDrcViolation && drcCallCount >= 2) {
+                            res["passed"] = false;
+                            res["violation_count"] = 2;
+                            res["violations"] = nlohmann::json::array({
+                                {{"rule", "Track to SMD Pad"}, {"message", "clearance 4.1mil < 6mil"}},
+                                {{"rule", "Track to SMD Pad"}, {"message", "clearance 4.3mil < 6mil"}}
+                            });
+                        } else {
+                            res["passed"] = true;
+                            res["violation_count"] = 0;
+                            res["violations"] = nlohmann::json::array();
+                        }
                     } else if (tName == "easyeda_export_jlcpcb") {
                         res["gerber_data"] = "PK\x03\x04JLCPCB_ARCHIVE";
                         res["bom_csv"] = "Comment,Designator,Footprint,LCSC Part #\n10k,R1,0603,C25804\n";
@@ -211,6 +286,19 @@ private:
         }
     }
 
+public:
+    bool simulatePcbNotOpen = false;
+    bool simulateAutorouteBoard = false;
+    bool simulatePostDrcViolation = false;
+    int drcCallCount = 0;
+    int simSeq = 0;
+    nlohmann::json simTracks = nlohmann::json::array({
+        {{"id", "t_done"}, {"net", "DONE"}, {"layer", "1"},
+         {"x1", 1000.0}, {"y1", 1200.0}, {"x2", 1400.0}, {"y2", 1200.0}, {"width", 10.0}}
+    });
+    std::vector<std::string> deletedIds;
+
+private:
     int _sock = -1;
     std::vector<uint8_t> _initialBuf;
     std::atomic<bool> _running{false};
@@ -2877,6 +2965,47 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, AgentCadSpecValidationVolumetricDiffF
     CHECK_EQUAL("ok", liveSt["recent_calls"][0].value("status", ""));
     CHECK_TRUE(liveSt["recent_calls"][0].contains("duration_ms"));
     CHECK_FALSE(liveSt["recent_calls"][0].value("summary", "").empty());
+
+    // 8. Verify EdaRpcServer passes ok: false plugin error responses through without fake connectivity_audit
+    eePlugin.simulatePcbNotOpen = true;
+    nlohmann::json notOpenRes = bridge.callTool("easyeda_inspect_pcb", nlohmann::json::object());
+    CHECK_FALSE(notOpenRes.value("ok", true));
+    STRCMP_EQUAL("ERR_PCB_DOCUMENT_NOT_OPEN", notOpenRes.value("error_code", "").c_str());
+    CHECK_FALSE(notOpenRes.contains("connectivity_audit"));
+    eePlugin.simulatePcbNotOpen = false;
+
+    // 9. Verify transactional live autoroute rollback when post-commit DRC reports violations > baseline
+    eePlugin.simulateAutorouteBoard = true;
+    eePlugin.simulatePostDrcViolation = true;
+    eePlugin.drcCallCount = 0;
+    eePlugin.deletedIds.clear();
+    nlohmann::json rbRes = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"from_active_pcb", true},
+        {"apply_to_pcb", true},
+        {"grid_step_mm", 0.1}
+    });
+    CHECK_FALSE(rbRes.value("ok", true));
+    CHECK_FALSE(rbRes.value("committed", true));
+    CHECK_TRUE(rbRes.value("rolled_back", false));
+    CHECK_TRUE(rbRes.value("rolled_back_count", 0) >= 1);
+    CHECK_TRUE(!eePlugin.deletedIds.empty());
+    CHECK_EQUAL(1, static_cast<int>(eePlugin.simTracks.size())); // rolled back to original t_done only
+
+    // And when post-commit DRC passes (0 violations), live autoroute commits cleanly without rollback
+    eePlugin.simulatePostDrcViolation = false;
+    eePlugin.drcCallCount = 0;
+    eePlugin.deletedIds.clear();
+    nlohmann::json okRouteRes = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"from_active_pcb", true},
+        {"apply_to_pcb", true},
+        {"grid_step_mm", 0.1}
+    });
+    CHECK_TRUE_TEXT(okRouteRes.value("ok", false), okRouteRes.dump().c_str());
+    CHECK_TRUE(okRouteRes.value("committed", false));
+    CHECK_FALSE(okRouteRes.value("rolled_back", true));
+    CHECK_TRUE(okRouteRes["post_route_drc"].value("passed", false));
+    CHECK_EQUAL(0, okRouteRes["post_route_drc"].value("violation_count", -1));
+    CHECK_TRUE(eePlugin.deletedIds.empty());
 
     eePlugin.stop();
     srv.stop();

@@ -381,8 +381,12 @@ var edaEsbuildExportName = (function () {
     }
 
     function coordToMil(obj, keyCanvas, keyMm, units, defaultVal) {
+        const isMm = String(units || "mil").toLowerCase() === "mm";
+        if (!isMm && obj && keyCanvas && obj[keyCanvas] !== undefined && obj[keyCanvas] !== null) {
+            return Number(obj[keyCanvas]);
+        }
         if (obj && keyMm && obj[keyMm] !== undefined && obj[keyMm] !== null) {
-            return Math.round(Number(obj[keyMm]) * MM_TO_MIL * 1000) / 1000;
+            return Math.round(Number(obj[keyMm]) * MM_TO_MIL * 10000) / 10000;
         }
         if (obj && keyCanvas && obj[keyCanvas] !== undefined && obj[keyCanvas] !== null) {
             return toCanvasUnits(obj[keyCanvas], units);
@@ -468,6 +472,35 @@ var edaEsbuildExportName = (function () {
             }
         }
         return { documentInfo: docInfo, projectInfo: projInfo };
+    }
+
+    // documentType 3 is a PCB document (verified live via eda.dmt_SelectControl.getCurrentDocumentInfo).
+    // Returns null when the requested (or current) PCB is active, else an { ok: false, error } result,
+    // so PCB tools never silently read the Start Page or another document as an empty board.
+    async function requirePcbDocument(args) {
+        const wanted = (args && args.pcb_uuid) ? String(args.pcb_uuid).trim() : "";
+        const ensured = await ensureDocumentOpen("pcb", wanted, null);
+        const info = (ensured && ensured.documentInfo) || {};
+        const activeTitle = await resolveActiveDocumentTitle();
+        if (Number(info.documentType) !== 3) {
+            return {
+                ok: false,
+                error: (wanted ? "PCB document " + wanted + " could not be opened" : "No PCB document is open") +
+                    " (active document: " + activeTitle + ", documentType: " +
+                    String(info.documentType === undefined ? "unknown" : info.documentType) +
+                    "). Open the project and its PCB in EasyEDA Pro.",
+                active_document: activeTitle
+            };
+        }
+        if (wanted && String(info.uuid || "") !== wanted) {
+            return {
+                ok: false,
+                error: "Requested PCB " + wanted + " is not active (active PCB: " + String(info.uuid || "") +
+                    "). It may belong to a project that is not open.",
+                active_document: activeTitle
+            };
+        }
+        return null;
     }
 
     async function handleInspectSchematic(args) {
@@ -1466,7 +1499,8 @@ var edaEsbuildExportName = (function () {
         const netFilter = (args && Array.isArray(args.nets)) ? args.nets.map(String) : [];
 
         if (typeof eda !== "undefined") {
-            await ensureDocumentOpen("pcb", args && args.pcb_uuid, null);
+            const pcbErr = await requirePcbDocument(args);
+            if (pcbErr) return pcbErr;
             const compRefById = {};
             try {
                 if (eda.pcb_PrimitiveComponent && eda.pcb_PrimitiveComponent.getAll) {
@@ -1549,8 +1583,15 @@ var edaEsbuildExportName = (function () {
                         const pid = String(callGetter(p, "getState_PrimitiveId", "primitiveId", "id", ""));
                         if (pid && seenPadIds[pid]) continue;
                         if (pid) seenPadIds[pid] = true;
-                        const padNum = String(callGetter(p, "getState_PadNumber", "padNumber", "number", "") ||
-                                              callGetter(p, "getState_Pad", "pad", "", ""));
+                        const rawPadNum = callGetter(p, "getState_PadNumber", "padNumber", "number", "");
+                        const rawPadField = callGetter(p, "getState_Pad", "pad", "", null);
+                        const padNum = String(
+                            (rawPadNum !== undefined && rawPadNum !== null && rawPadNum !== "")
+                                ? rawPadNum
+                                : ((!Array.isArray(rawPadField) && rawPadField !== null && typeof rawPadField !== "object")
+                                    ? rawPadField
+                                    : "")
+                        );
                         let padRef = String(callGetter(p, "getState_Designator", "designator", "reference", "") ||
                                             callGetter(p, "getState_ComponentDesignator", "componentDesignator", "ref", ""));
                         if (!padRef && pid) {
@@ -1562,7 +1603,72 @@ var edaEsbuildExportName = (function () {
                                 }
                             }
                         }
-                        pads.push({
+                        let sizeX = Number(callGetter(p, "getState_Width", "width", "size_x", 0) || 0);
+                        let sizeY = Number(callGetter(p, "getState_Height", "height", "size_y", 0) || 0);
+                        let padShape = String(callGetter(p, "getState_Shape", "shape", "", "") || "");
+                        let padPolygon = null;
+                        if (Array.isArray(rawPadField) && rawPadField.length >= 2) {
+                            const kind = String(rawPadField[0] || "").toUpperCase();
+                            if (!padShape) padShape = kind;
+                            if ((kind === "OVAL" || kind === "RECT" || kind === "ELLIPSE" || kind === "OCTAGON") &&
+                                rawPadField.length >= 3) {
+                                const wVal = Number(rawPadField[1] || 0);
+                                const hVal = Number(rawPadField[2] || 0);
+                                if (sizeX <= 0 && wVal > 0) sizeX = wVal;
+                                if (sizeY <= 0 && hVal > 0) sizeY = hVal;
+                            } else if ((kind === "ROUND" || kind === "CIRCLE") && rawPadField.length >= 2) {
+                                const dVal = Number(rawPadField[1] || 0);
+                                if (sizeX <= 0 && dVal > 0) sizeX = dVal;
+                                if (sizeY <= 0 && dVal > 0) sizeY = dVal;
+                            } else if (kind === "POLYGON") {
+                                const coords = Array.isArray(rawPadField[1]) ? rawPadField[1] : rawPadField.slice(1);
+                                const numPts = [];
+                                for (let k = 0; k + 1 < coords.length; k += 2) {
+                                    const vx = Number(coords[k]);
+                                    const vy = Number(coords[k + 1]);
+                                    if (!isNaN(vx) && !isNaN(vy)) {
+                                        numPts.push([vx, vy]);
+                                    }
+                                }
+                                if (numPts.length >= 3) {
+                                    padPolygon = numPts;
+                                    let minPx = numPts[0][0], maxPx = numPts[0][0];
+                                    let minPy = numPts[0][1], maxPy = numPts[0][1];
+                                    for (let k = 1; k < numPts.length; ++k) {
+                                        if (numPts[k][0] < minPx) minPx = numPts[k][0];
+                                        if (numPts[k][0] > maxPx) maxPx = numPts[k][0];
+                                        if (numPts[k][1] < minPy) minPy = numPts[k][1];
+                                        if (numPts[k][1] > maxPy) maxPy = numPts[k][1];
+                                    }
+                                    if (sizeX <= 0) sizeX = Math.max(0, maxPx - minPx);
+                                    if (sizeY <= 0) sizeY = Math.max(0, maxPy - minPy);
+                                }
+                            }
+                        }
+                        let holeDiameter = Number(callGetter(p, "getState_HoleDiameter", "holeDiameter", "drill", 0) || 0);
+                        const rawHoleField = callGetter(p, "getState_Hole", "hole", "", null);
+                        if (holeDiameter <= 0 && Array.isArray(rawHoleField) && rawHoleField.length >= 2) {
+                            const hKind = String(rawHoleField[0] || "").toUpperCase();
+                            if (hKind === "ROUND" || hKind === "CIRCLE") {
+                                const hd = Number(rawHoleField[1] || 0);
+                                if (hd > 0) holeDiameter = hd;
+                            } else if (hKind === "SLOT" && rawHoleField.length >= 3) {
+                                const hw = Number(rawHoleField[1] || 0);
+                                const hh = Number(rawHoleField[2] || 0);
+                                const hd = Math.min(hw > 0 ? hw : hh, hh > 0 ? hh : hw);
+                                if (hd > 0) holeDiameter = hd;
+                            } else {
+                                const hd = Number(rawHoleField[1] || 0);
+                                if (hd > 0) holeDiameter = hd;
+                            }
+                        } else if (holeDiameter <= 0 && typeof rawHoleField === "number" && rawHoleField > 0) {
+                            holeDiameter = rawHoleField;
+                        }
+                        let padLayer = String(callGetter(p, "getState_Layer", "layer", "", "1"));
+                        if (holeDiameter > 0 && (padLayer === "1" || padLayer === "2" || padLayer === "TopLayer" || padLayer === "BottomLayer")) {
+                            padLayer = "12";
+                        }
+                        const padRec = {
                             id: pid,
                             ref: padRef,
                             pad: padNum,
@@ -1570,31 +1676,114 @@ var edaEsbuildExportName = (function () {
                             net: String(callGetter(p, "getState_Net", "net", "", "")),
                             x: Number(callGetter(p, "getState_X", "x", "", 0) || 0),
                             y: Number(callGetter(p, "getState_Y", "y", "", 0) || 0),
-                            layer: String(callGetter(p, "getState_Layer", "layer", "", "1")),
+                            layer: padLayer,
                             rotation: Number(callGetter(p, "getState_Rotation", "rotation", "", 0) || 0),
-                            size_x: Number(callGetter(p, "getState_Width", "width", "size_x", 0) || 0),
-                            size_y: Number(callGetter(p, "getState_Height", "height", "size_y", 0) || 0),
-                            hole_diameter: Number(callGetter(p, "getState_HoleDiameter", "holeDiameter", "drill", 0) || 0)
-                        });
+                            size_x: sizeX,
+                            size_y: sizeY,
+                            hole_diameter: holeDiameter
+                        };
+                        if (padShape) padRec.shape = padShape;
+                        if (padPolygon) padRec.polygon = padPolygon;
+                        pads.push(padRec);
                     }
                 }
             } catch (err) {
+            }
+            function appendPolygonOutlineSegments(recId, lid, widthVal, rawPoly) {
+                if (!rawPoly) return;
+                const pts = [];
+                let src = [];
+                if (Array.isArray(rawPoly)) {
+                    src = rawPoly;
+                } else if (typeof rawPoly === "object") {
+                    if (Array.isArray(rawPoly.polygon)) src = rawPoly.polygon;
+                    else if (Array.isArray(rawPoly.Source)) src = rawPoly.Source;
+                    else if (Array.isArray(rawPoly.source)) src = rawPoly.source;
+                    else if (Array.isArray(rawPoly.points)) src = rawPoly.points;
+                }
+                for (let i = 0; i < src.length; ++i) {
+                    const item = src[i];
+                    if (typeof item === "string" && item.toUpperCase() === "ARC") {
+                        if (i + 1 < src.length && typeof src[i + 1] === "number") {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    if (item && typeof item === "object" && !Array.isArray(item) &&
+                        item.x !== undefined && item.y !== undefined) {
+                        const px = Number(item.x);
+                        const py = Number(item.y);
+                        if (!isNaN(px) && !isNaN(py)) pts.push([px, py]);
+                    } else if (Array.isArray(item) && item.length >= 2) {
+                        const px = Number(item[0]);
+                        const py = Number(item[1]);
+                        if (!isNaN(px) && !isNaN(py)) pts.push([px, py]);
+                    } else if (typeof item === "number" && i + 1 < src.length && typeof src[i + 1] === "number") {
+                        pts.push([Number(item), Number(src[i + 1])]);
+                        i += 1;
+                    }
+                }
+                for (let i = 0; i + 1 < pts.length; ++i) {
+                    outline.push({
+                        id: recId,
+                        layer: String(lid),
+                        width: widthVal,
+                        x1: pts[i][0],
+                        y1: pts[i][1],
+                        x2: pts[i + 1][0],
+                        y2: pts[i + 1][1]
+                    });
+                }
+                if (pts.length >= 3) {
+                    const first = pts[0];
+                    const last = pts[pts.length - 1];
+                    if (Math.hypot(first[0] - last[0], first[1] - last[1]) > 1e-3) {
+                        outline.push({
+                            id: recId,
+                            layer: String(lid),
+                            width: widthVal,
+                            x1: last[0],
+                            y1: last[1],
+                            x2: first[0],
+                            y2: first[1]
+                        });
+                    }
+                }
             }
             try {
                 if (eda.pcb_PrimitiveTrack && eda.pcb_PrimitiveTrack.getAll) {
                     const rawTracks = await eda.pcb_PrimitiveTrack.getAll();
                     if (Array.isArray(rawTracks)) {
                         for (const t of rawTracks) {
-                            tracks.push({
-                                id: String(callGetter(t, "getState_PrimitiveId", "primitiveId", "id", "")),
-                                net: String(callGetter(t, "getState_Net", "net", "", "")),
-                                layer: String(callGetter(t, "getState_Layer", "layer", "", "TopLayer")),
-                                width: Number(callGetter(t, "getState_LineWidth", "lineWidth", "width", 0.25) || 0.25),
-                                x1: Number(callGetter(t, "getState_StartX", "startX", "x1", 0) || 0),
-                                y1: Number(callGetter(t, "getState_StartY", "startY", "y1", 0) || 0),
-                                x2: Number(callGetter(t, "getState_EndX", "endX", "x2", 0) || 0),
-                                y2: Number(callGetter(t, "getState_EndY", "endY", "y2", 0) || 0)
-                            });
+                            const lid = callGetter(t, "getState_Layer", "layer", "", "TopLayer");
+                            const recId = String(callGetter(t, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            const w = Number(callGetter(t, "getState_LineWidth", "lineWidth", "width", 0.25) || 0.25);
+                            const x1 = Number(callGetter(t, "getState_StartX", "startX", "x1", 0) || 0);
+                            const y1 = Number(callGetter(t, "getState_StartY", "startY", "y1", 0) || 0);
+                            const x2 = Number(callGetter(t, "getState_EndX", "endX", "x2", 0) || 0);
+                            const y2 = Number(callGetter(t, "getState_EndY", "endY", "y2", 0) || 0);
+                            if (isBoardOutlineLayer(lid)) {
+                                outline.push({
+                                    id: recId,
+                                    layer: String(lid),
+                                    width: w,
+                                    x1: x1,
+                                    y1: y1,
+                                    x2: x2,
+                                    y2: y2
+                                });
+                            } else {
+                                tracks.push({
+                                    id: recId,
+                                    net: String(callGetter(t, "getState_Net", "net", "", "")),
+                                    layer: String(lid),
+                                    width: w,
+                                    x1: x1,
+                                    y1: y1,
+                                    x2: x2,
+                                    y2: y2
+                                });
+                            }
                         }
                     }
                 }
@@ -1640,6 +1829,66 @@ var edaEsbuildExportName = (function () {
             } catch (err) {
             }
             try {
+                if (eda.pcb_PrimitivePolyline && typeof eda.pcb_PrimitivePolyline.getAll === "function") {
+                    const rawPolys = await eda.pcb_PrimitivePolyline.getAll();
+                    if (Array.isArray(rawPolys)) {
+                        for (const pl of rawPolys) {
+                            const lid = callGetter(pl, "getState_Layer", "layer", "", "");
+                            if (!isBoardOutlineLayer(lid)) continue;
+                            const recId = String(callGetter(pl, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            const w = Number(callGetter(pl, "getState_LineWidth", "lineWidth", "width", 0.25) || 0.25);
+                            const poly = callGetter(pl, "getState_Polygon", "polygon", "points", []);
+                            appendPolygonOutlineSegments(recId, lid, w, poly);
+                        }
+                    }
+                }
+            } catch (err) {
+            }
+            try {
+                if (eda.pcb_PrimitiveArc && typeof eda.pcb_PrimitiveArc.getAll === "function") {
+                    const rawArcs = await eda.pcb_PrimitiveArc.getAll();
+                    if (Array.isArray(rawArcs)) {
+                        for (const ar of rawArcs) {
+                            const lid = callGetter(ar, "getState_Layer", "layer", "", "");
+                            if (!isBoardOutlineLayer(lid)) continue;
+                            const recId = String(callGetter(ar, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            const w = Number(callGetter(ar, "getState_LineWidth", "lineWidth", "width", 0.25) || 0.25);
+                            const x1 = Number(callGetter(ar, "getState_StartX", "startX", "x1", 0) || 0);
+                            const y1 = Number(callGetter(ar, "getState_StartY", "startY", "y1", 0) || 0);
+                            const x2 = Number(callGetter(ar, "getState_EndX", "endX", "x2", 0) || 0);
+                            const y2 = Number(callGetter(ar, "getState_EndY", "endY", "y2", 0) || 0);
+                            if (Math.hypot(x2 - x1, y2 - y1) > 1e-3) {
+                                outline.push({
+                                    id: recId,
+                                    layer: String(lid),
+                                    width: w,
+                                    x1: x1,
+                                    y1: y1,
+                                    x2: x2,
+                                    y2: y2
+                                });
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+            }
+            try {
+                if (eda.pcb_PrimitiveRegion && typeof eda.pcb_PrimitiveRegion.getAll === "function") {
+                    const rawRegions = await eda.pcb_PrimitiveRegion.getAll();
+                    if (Array.isArray(rawRegions)) {
+                        for (const rg of rawRegions) {
+                            const lid = callGetter(rg, "getState_Layer", "layer", "", "");
+                            if (!isBoardOutlineLayer(lid)) continue;
+                            const recId = String(callGetter(rg, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            const poly = callGetter(rg, "getState_Polygon", "polygon", "points", []);
+                            appendPolygonOutlineSegments(recId, lid, 0.15, poly);
+                        }
+                    }
+                }
+            } catch (err) {
+            }
+            try {
                 if (eda.pcb_PrimitiveVia && eda.pcb_PrimitiveVia.getAll) {
                     const rawVias = await eda.pcb_PrimitiveVia.getAll();
                     if (Array.isArray(rawVias)) {
@@ -1679,6 +1928,27 @@ var edaEsbuildExportName = (function () {
             }
         }
 
+        let boardDesignRules = null;
+        if (typeof eda !== "undefined") {
+            const ruleNamespaces = [eda.pcb_DesignRule, eda.pcb_Drc, eda.dmt_Pcb];
+            const ruleMethods = ["getDesignRule", "getDesignRules", "getCurrentDesignRule", "getRule", "getRules", "getRuleConfiguration"];
+            for (const ns of ruleNamespaces) {
+                if (!ns || typeof ns !== "object") continue;
+                for (const mName of ruleMethods) {
+                    if (typeof ns[mName] !== "function") continue;
+                    try {
+                        const rawRule = await ns[mName]();
+                        if (rawRule && typeof rawRule === "object") {
+                            boardDesignRules = rawRule;
+                            break;
+                        }
+                    } catch (err) {
+                    }
+                }
+                if (boardDesignRules) break;
+            }
+        }
+
         const filteredComponents = fullForBridge ? components : components.filter(function (c) {
             if (refFilter.length > 0 && refFilter.indexOf(c.reference) < 0) return false;
             return true;
@@ -1712,6 +1982,9 @@ var edaEsbuildExportName = (function () {
             pours_count: filteredPours.length,
             board_outline: outline
         };
+        if (boardDesignRules) {
+            out.board_design_rules = boardDesignRules;
+        }
         if (!summaryOnly || fullForBridge) {
             out.components = filteredComponents;
             out.schematic_components = schematicComponents;
@@ -1735,7 +2008,8 @@ var edaEsbuildExportName = (function () {
         const units = (args && args.units) ? String(args.units) : "mil";
 
         if (typeof eda !== "undefined") {
-            await ensureDocumentOpen("pcb", args && args.pcb_uuid, null);
+            const pcbErr = await requirePcbDocument(args);
+            if (pcbErr) return pcbErr;
         }
 
         if (args.board_outline && typeof eda !== "undefined" && eda.pcb_PrimitiveLine && eda.pcb_PrimitiveLine.create) {
@@ -2127,8 +2401,41 @@ var edaEsbuildExportName = (function () {
             }
         }
 
+        const createdTrackIds = [];
+        const createdViaIds = [];
+        function extractCreatedPrimitiveId(createdObj) {
+            if (!createdObj) return "";
+            if (typeof createdObj === "string") return createdObj;
+            if (typeof createdObj === "object") {
+                return String(callGetter(createdObj, "getState_PrimitiveId", "primitiveId", "id", "") || "");
+            }
+            return "";
+        }
+
         const tracks = args.tracks || args.add_tracks || [];
-        if (Array.isArray(tracks) && typeof eda !== "undefined") {
+        const preTrackIds = {};
+        if (Array.isArray(tracks) && tracks.length > 0 && typeof eda !== "undefined") {
+            try {
+                if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.getAll === "function") {
+                    const existingT = await eda.pcb_PrimitiveTrack.getAll();
+                    if (Array.isArray(existingT)) {
+                        for (const et of existingT) {
+                            const tid = String(callGetter(et, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            if (tid) preTrackIds[tid] = true;
+                        }
+                    }
+                }
+                if (eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.getAll === "function") {
+                    const existingL = await eda.pcb_PrimitiveLine.getAll();
+                    if (Array.isArray(existingL)) {
+                        for (const el of existingL) {
+                            const lid = String(callGetter(el, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            if (lid) preTrackIds[lid] = true;
+                        }
+                    }
+                }
+            } catch (err) {
+            }
             for (const t of tracks) {
                 const tNet = String(t.net || "");
                 const tX1 = coordToMil(t, "x1", "x1_mm", units, 0);
@@ -2137,7 +2444,7 @@ var edaEsbuildExportName = (function () {
                 const tY2 = coordToMil(t, "y2", "y2_mm", units, 0);
                 const tW = coordToMil(t, "width", "width_mm", units, 10.0);
                 if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.create === "function") {
-                    await eda.pcb_PrimitiveTrack.create(
+                    const createdTrk = await eda.pcb_PrimitiveTrack.create(
                         tNet,
                         normalizePcbLayer(t.layer || "TopLayer"),
                         tX1,
@@ -2146,10 +2453,12 @@ var edaEsbuildExportName = (function () {
                         tY2,
                         tW
                     );
+                    const newTid = extractCreatedPrimitiveId(createdTrk);
+                    if (newTid && createdTrackIds.indexOf(newTid) < 0) createdTrackIds.push(newTid);
                     addedTracks += 1;
                 } else if (eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.create === "function") {
                     const layerId = resolveEasyEdaCopperLayerId(t.layer || "TopLayer");
-                    await eda.pcb_PrimitiveLine.create(
+                    const createdLn = await eda.pcb_PrimitiveLine.create(
                         tNet,
                         layerId,
                         tX1,
@@ -2159,24 +2468,84 @@ var edaEsbuildExportName = (function () {
                         tW,
                         false
                     );
+                    const newLid = extractCreatedPrimitiveId(createdLn);
+                    if (newLid && createdTrackIds.indexOf(newLid) < 0) createdTrackIds.push(newLid);
                     addedTracks += 1;
                 }
+            }
+            try {
+                if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.getAll === "function") {
+                    const postT = await eda.pcb_PrimitiveTrack.getAll();
+                    if (Array.isArray(postT)) {
+                        for (const pt of postT) {
+                            const tid = String(callGetter(pt, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            if (tid && !preTrackIds[tid] && createdTrackIds.indexOf(tid) < 0) {
+                                createdTrackIds.push(tid);
+                            }
+                        }
+                    }
+                }
+                if (eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.getAll === "function") {
+                    const postL = await eda.pcb_PrimitiveLine.getAll();
+                    if (Array.isArray(postL)) {
+                        for (const pl of postL) {
+                            const lid = String(callGetter(pl, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            if (lid && !preTrackIds[lid] && createdTrackIds.indexOf(lid) < 0) {
+                                createdTrackIds.push(lid);
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
             }
         }
 
         const vias = args.vias || args.add_vias || [];
-        if (Array.isArray(vias) && typeof eda !== "undefined" && eda.pcb_PrimitiveVia) {
+        const preViaIds = {};
+        if (Array.isArray(vias) && vias.length > 0 && typeof eda !== "undefined" && eda.pcb_PrimitiveVia) {
+            try {
+                if (typeof eda.pcb_PrimitiveVia.getAll === "function") {
+                    const existingV = await eda.pcb_PrimitiveVia.getAll();
+                    if (Array.isArray(existingV)) {
+                        for (const ev of existingV) {
+                            const vid = String(callGetter(ev, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            if (vid) preViaIds[vid] = true;
+                        }
+                    }
+                }
+            } catch (err) {
+            }
             for (const v of vias) {
                 if (eda.pcb_PrimitiveVia.create) {
-                    await eda.pcb_PrimitiveVia.create(
+                    const viaDrill = coordToMil(v, "drill", "drill_mm", units, 12.0);
+                    const viaDia = (v.size !== undefined || v.size_mm !== undefined)
+                        ? coordToMil(v, "size", "size_mm", units, 24.0)
+                        : coordToMil(v, "diameter", "diameter_mm", units, 24.0);
+                    const createdVia = await eda.pcb_PrimitiveVia.create(
                         v.net || "",
                         coordToMil(v, "x", "x_mm", units, 0),
                         coordToMil(v, "y", "y_mm", units, 0),
-                        coordToMil(v, "drill", "drill_mm", units, 12.0),
-                        coordToMil(v, "size", "size_mm", units, 24.0)
+                        viaDrill,
+                        viaDia
                     );
+                    const newVid = extractCreatedPrimitiveId(createdVia);
+                    if (newVid && createdViaIds.indexOf(newVid) < 0) createdViaIds.push(newVid);
                 }
                 addedVias += 1;
+            }
+            try {
+                if (typeof eda.pcb_PrimitiveVia.getAll === "function") {
+                    const postV = await eda.pcb_PrimitiveVia.getAll();
+                    if (Array.isArray(postV)) {
+                        for (const pv of postV) {
+                            const vid = String(callGetter(pv, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            if (vid && !preViaIds[vid] && createdViaIds.indexOf(vid) < 0) {
+                                createdViaIds.push(vid);
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
             }
         }
 
@@ -2187,6 +2556,7 @@ var edaEsbuildExportName = (function () {
         } catch (err) {
         }
 
+        const committedIds = createdTrackIds.concat(createdViaIds);
         return {
             ok: true,
             active_document: await resolveActiveDocumentTitle(),
@@ -2201,6 +2571,9 @@ var edaEsbuildExportName = (function () {
             added_zones: addedZones,
             added_tracks: addedTracks,
             added_vias: addedVias,
+            created_track_ids: createdTrackIds,
+            created_via_ids: createdViaIds,
+            committed_ids: committedIds,
             rubber_banded_tracks: rubberBandedTracks,
             rubber_banded_tracks_count: rubberBandedTracks.length
         };
@@ -2303,7 +2676,8 @@ var edaEsbuildExportName = (function () {
         if (typeof eda === "undefined") {
             return { ok: false, triggered: false, error: "EasyEDA Pro eda API is unavailable" };
         }
-        await ensureDocumentOpen("pcb", args && args.pcb_uuid, null);
+        const pcbErr = await requirePcbDocument(args);
+        if (pcbErr) return Object.assign({ triggered: false }, pcbErr);
         const beforeTracks = await countCopperTracks();
         const docs = collectAccessibleDocuments();
         const attempts = [];
@@ -2387,7 +2761,8 @@ var edaEsbuildExportName = (function () {
             if (target === "schematic") {
                 await ensureDocumentOpen("schematic", args && (args.page_uuid || args.sheet || args.page), null);
             } else {
-                await ensureDocumentOpen("pcb", args && args.pcb_uuid, null);
+                const pcbErr = await requirePcbDocument(args);
+                if (pcbErr) return pcbErr;
             }
             let raw = null;
             if (target === "schematic" && eda.sch_Drc && typeof eda.sch_Drc.check === "function") {
@@ -2399,21 +2774,22 @@ var edaEsbuildExportName = (function () {
                 passed = raw;
                 violations = [];
             } else if (Array.isArray(raw)) {
-                for (const item of raw) {
-                    if (item && typeof item === "object") {
-                        const subList = item.list || item.items || item.errors || item.violations;
-                        if (Array.isArray(subList)) {
-                            rawCategoriesCount += 1;
-                            for (const leaf of subList) {
-                                violations.push(leaf);
+                const flattenDrcItems = function (arr) {
+                    for (const item of arr) {
+                        if (item && typeof item === "object") {
+                            const subList = item.list || item.items || item.errors || item.violations;
+                            if (Array.isArray(subList)) {
+                                rawCategoriesCount += 1;
+                                flattenDrcItems(subList);
+                            } else {
+                                violations.push(item);
                             }
-                        } else {
+                        } else if (item !== undefined && item !== null) {
                             violations.push(item);
                         }
-                    } else if (item !== undefined && item !== null) {
-                        violations.push(item);
                     }
-                }
+                };
+                flattenDrcItems(raw);
                 passed = (violations.length === 0);
             } else if (raw && typeof raw === "object") {
                 const sub = raw.violations || raw.errors || raw.list;
@@ -5490,7 +5866,44 @@ bool EdaBridgeAppConfig::parseQuotaSnapshotJson(const std::string& jsonBody,
         outSnap.agPlanTier = ag.value("plan_tier", "Unknown");
         outSnap.agPromptCredits = ag.value("available_prompt_credits", 0);
         outSnap.agFlowCredits = ag.value("available_flow_credits", 0);
+        outSnap.agMonthlyPromptCredits = ag.value("monthly_prompt_credits", 0);
+        outSnap.agMonthlyFlowCredits = ag.value("monthly_flow_credits", 0);
         outSnap.agError = ag.value("error_message", "");
+
+        if (ag.contains("available_credits") && ag["available_credits"].is_array() &&
+            !ag["available_credits"].empty() && ag["available_credits"][0].is_object()) {
+            const auto& c0 = ag["available_credits"][0];
+            outSnap.agHasGoogleOneCredits = true;
+            outSnap.agGoogleOneCredits = c0.value("credit_amount", 0);
+            outSnap.agMinCreditPerReq = c0.value("minimum_credit_amount_for_usage", 0);
+        }
+
+        if (ag.contains("quota_groups") && ag["quota_groups"].is_array()) {
+            for (const auto& g : ag["quota_groups"]) {
+                if (!g.is_object()) continue;
+                AimonQuotaGroupItem grp;
+                grp.displayName = g.value("display_name", "");
+                grp.description = g.value("description", "");
+                if (g.contains("buckets") && g["buckets"].is_array()) {
+                    for (const auto& b : g["buckets"]) {
+                        if (!b.is_object()) continue;
+                        AimonQuotaBucketItem bkt;
+                        bkt.bucketId = b.value("bucket_id", "");
+                        bkt.displayName = b.value("display_name", "Capacity");
+                        bkt.window = b.value("window", "");
+                        bkt.description = b.value("description", "");
+                        double frac = b.value("remaining_fraction", 1.0);
+                        bkt.remainingPct = std::max(0.0, std::min(100.0, frac * 100.0));
+                        bkt.resetSeconds = b.value("reset_time_remaining_seconds", int64_t(0));
+                        bkt.resetTimeIso = b.value("reset_time_iso", "");
+                        grp.buckets.push_back(bkt);
+                    }
+                }
+                if (!grp.displayName.empty() || !grp.buckets.empty()) {
+                    outSnap.agQuotaGroups.push_back(grp);
+                }
+            }
+        }
 
         if (ag.contains("models") && ag["models"].is_array()) {
             for (const auto& m : ag["models"]) {
@@ -5500,19 +5913,18 @@ bool EdaBridgeAppConfig::parseQuotaSnapshotJson(const std::string& jsonBody,
                 double frac = m.value("remaining_fraction", 1.0);
                 item.remainingPct = std::max(0.0, std::min(100.0, frac * 100.0));
                 item.resetSeconds = m.value("reset_time_remaining_seconds", int64_t(0));
+                item.resetTimeIso = m.value("reset_time_iso", "");
                 outSnap.agModels.push_back(item);
             }
         }
-        if (outSnap.agModels.empty() && ag.contains("quota_groups") && ag["quota_groups"].is_array()) {
-            for (const auto& g : ag["quota_groups"]) {
-                if (!g.is_object() || !g.contains("buckets") || !g["buckets"].is_array()) continue;
-                for (const auto& b : g["buckets"]) {
-                    if (!b.is_object()) continue;
+        if (outSnap.agModels.empty() && !outSnap.agQuotaGroups.empty()) {
+            for (const auto& g : outSnap.agQuotaGroups) {
+                for (const auto& b : g.buckets) {
                     AimonModelQuotaItem item;
-                    item.name = b.value("display_name", g.value("display_name", "Quota"));
-                    double frac = b.value("remaining_fraction", 1.0);
-                    item.remainingPct = std::max(0.0, std::min(100.0, frac * 100.0));
-                    item.resetSeconds = b.value("reset_time_remaining_seconds", int64_t(0));
+                    item.name = b.displayName.empty() ? g.displayName : b.displayName;
+                    item.remainingPct = b.remainingPct;
+                    item.resetSeconds = b.resetSeconds;
+                    item.resetTimeIso = b.resetTimeIso;
                     outSnap.agModels.push_back(item);
                 }
             }
@@ -5781,13 +6193,29 @@ std::string EdaBridgeAppConfig::formatTrayTooltipSummary(const AimonQuotaSnapsho
         }
         oss << "\n";
     } else {
-        if (snap.agRunning && !snap.agModels.empty()) {
+        if (snap.agRunning && (!snap.agQuotaGroups.empty() || !snap.agModels.empty())) {
             double minPct = 100.0;
-            std::string minName = snap.agModels.front().name;
-            for (const auto& m : snap.agModels) {
-                if (m.remainingPct < minPct) {
-                    minPct = m.remainingPct;
-                    minName = m.name;
+            std::string minName;
+            bool foundBucket = false;
+            for (const auto& g : snap.agQuotaGroups) {
+                for (const auto& b : g.buckets) {
+                    std::string label = g.displayName.empty()
+                        ? b.displayName
+                        : (g.displayName + " - " + b.displayName);
+                    if (!foundBucket || b.remainingPct < minPct) {
+                        minPct = b.remainingPct;
+                        minName = label;
+                        foundBucket = true;
+                    }
+                }
+            }
+            if (!foundBucket && !snap.agModels.empty()) {
+                minName = snap.agModels.front().name;
+                for (const auto& m : snap.agModels) {
+                    if (m.remainingPct < minPct) {
+                        minPct = m.remainingPct;
+                        minName = m.name;
+                    }
                 }
             }
             oss << "Antigravity: " << static_cast<int>(std::round(minPct))

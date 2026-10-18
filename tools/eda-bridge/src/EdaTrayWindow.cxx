@@ -7,6 +7,9 @@
 #ifdef AIMON_EDA_BRIDGE_WITH_QT
 
 #include "EdaTrayWindow.hxx"
+#include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -170,6 +173,24 @@ QString colorForRemainingPercent(double remainingPct) {
         return "#fbbf24";
     }
     return "#00f2fe";
+}
+
+QString bucketColorForPercent(double remainingPct) {
+    if (remainingPct <= 20.0) {
+        return "#ef4444";
+    }
+    if (remainingPct <= 50.0) {
+        return "#f59e0b";
+    }
+    return "#10b981";
+}
+
+QString bucketProgressBarStyle(double remainingPct) {
+    return QString(
+        "QProgressBar { border: none; border-radius: 3px; "
+        "background-color: rgba(255, 255, 255, 0.08); min-height: 7px; max-height: 7px; } "
+        "QProgressBar::chunk { background-color: %1; border-radius: 3px; }"
+    ).arg(bucketColorForPercent(remainingPct));
 }
 
 QString spendProgressBarStyle(double usedPct) {
@@ -455,8 +476,11 @@ void EdaTrayWindow::buildUi() {
     agHeaderRow->setContentsMargins(0, 0, 0, 0);
     agHeaderRow->setSpacing(8);
 
-    QLabel* agTitleLbl = new QLabel("✦  Google Antigravity", agCard);
-    agTitleLbl->setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: 800; letter-spacing: 0.3px;");
+    _agStatusDot = new QLabel("●", agCard);
+    _agStatusDot->setStyleSheet("color: #64748b; font-size: 13px;");
+
+    QLabel* agTitleLbl = new QLabel("Google Antigravity", agCard);
+    agTitleLbl->setStyleSheet("color: #f8fafc; font-size: 15px; font-weight: 800; letter-spacing: 0.3px;");
 
     _agHeaderLabel = new QLabel("○ PROBING", agCard);
     _agHeaderLabel->setStyleSheet(
@@ -465,56 +489,137 @@ void EdaTrayWindow::buildUi() {
         "padding: 2px 8px; font-size: 11px; font-weight: 700;"
     );
 
-    QLabel* agPlanPill = new QLabel("Google AI Ultra", agCard);
-    agPlanPill->setObjectName("agPlanPill");
-    agPlanPill->setStyleSheet(
-        "background-color: rgba(56, 189, 248, 0.14); color: #38bdf8; "
-        "border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 6px; "
-        "padding: 2px 8px; font-size: 11px; font-weight: 700;"
+    _agPlanPill = new QLabel("GOOGLE AI ULTRA", agCard);
+    _agPlanPill->setObjectName("agPlanPill");
+    _agPlanPill->setStyleSheet(
+        "background-color: rgba(0, 242, 254, 0.12); color: #00f2fe; "
+        "border: 1px solid rgba(0, 242, 254, 0.30); border-radius: 6px; "
+        "padding: 3px 10px; font-size: 11px; font-weight: 700; letter-spacing: 0.4px;"
     );
+
+    agHeaderRow->addWidget(_agStatusDot);
     agHeaderRow->addWidget(agTitleLbl);
     agHeaderRow->addStretch(1);
     agHeaderRow->addWidget(_agHeaderLabel);
-    agHeaderRow->addWidget(agPlanPill);
+    agHeaderRow->addWidget(_agPlanPill);
     agLayout->addLayout(agHeaderRow);
 
+    // Credits & Allowances Strip (2 Equal Columns)
     QHBoxLayout* agStatsRow = new QHBoxLayout();
     agStatsRow->setSpacing(10);
 
-    QFrame* agPromptBox = new QFrame(agCard);
-    agPromptBox->setStyleSheet(statBoxStyle);
-    QVBoxLayout* agPromptLayout = new QVBoxLayout(agPromptBox);
-    agPromptLayout->setContentsMargins(6, 4, 6, 4);
-    agPromptLayout->setSpacing(2);
-    QLabel* agPromptCap = new QLabel("PROMPT CREDITS", agPromptBox);
-    agPromptCap->setStyleSheet(statCaptionStyle);
-    _agCreditsLabel = new QLabel("--", agPromptBox);
-    _agCreditsLabel->setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: 700; border: none; padding: 0;");
-    agPromptLayout->addWidget(agPromptCap);
-    agPromptLayout->addWidget(_agCreditsLabel);
+    const QString creditCardQss =
+        "#agCreditCard { background-color: rgba(255, 255, 255, 0.03); "
+        "border: 1px solid #1e293b; border-radius: 10px; }";
 
-    QFrame* agFlowBox = new QFrame(agCard);
-    agFlowBox->setStyleSheet(statBoxStyle);
-    QVBoxLayout* agFlowLayout = new QVBoxLayout(agFlowBox);
-    agFlowLayout->setContentsMargins(6, 4, 6, 4);
-    agFlowLayout->setSpacing(2);
-    QLabel* agFlowCap = new QLabel("FLOW CREDITS", agFlowBox);
-    agFlowCap->setStyleSheet(statCaptionStyle);
-    QLabel* agFlowVal = new QLabel("--", agFlowBox);
-    agFlowVal->setObjectName("agFlowCreditsValue");
-    agFlowVal->setStyleSheet("color: #38bdf8; font-size: 14px; font-weight: 700; border: none; padding: 0;");
-    agFlowLayout->addWidget(agFlowCap);
-    agFlowLayout->addWidget(agFlowVal);
+    // Left Card (GOOGLE ONE AI CREDITS)
+    QFrame* agGoogleOneCard = new QFrame(agCard);
+    agGoogleOneCard->setObjectName("agCreditCard");
+    agGoogleOneCard->setStyleSheet(creditCardQss);
+    QVBoxLayout* agGoogleOneLayout = new QVBoxLayout(agGoogleOneCard);
+    agGoogleOneLayout->setContentsMargins(12, 10, 12, 10);
+    agGoogleOneLayout->setSpacing(6);
 
-    agStatsRow->addWidget(agPromptBox, 1);
-    agStatsRow->addWidget(agFlowBox, 1);
+    QHBoxLayout* agGoTopRow = new QHBoxLayout();
+    agGoTopRow->setContentsMargins(0, 0, 0, 0);
+    agGoTopRow->setSpacing(4);
+    QLabel* agGoTitle = new QLabel("GOOGLE ONE AI CREDITS", agGoogleOneCard);
+    agGoTitle->setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: 700; letter-spacing: 0.4px;");
+    _agCreditMinPill = new QLabel("Min 50 / req", agGoogleOneCard);
+    _agCreditMinPill->setStyleSheet(
+        "background-color: rgba(255, 255, 255, 0.05); color: #94a3b8; "
+        "border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600;"
+    );
+    agGoTopRow->addWidget(agGoTitle);
+    agGoTopRow->addStretch(1);
+    agGoTopRow->addWidget(_agCreditMinPill);
+    agGoogleOneLayout->addLayout(agGoTopRow);
+
+    _agGoogleOneCreditsVal = new QLabel("--", agGoogleOneCard);
+    _agGoogleOneCreditsVal->setStyleSheet(
+        "color: #00f2fe; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+        "font-size: 20px; font-weight: 800;"
+    );
+    agGoogleOneLayout->addWidget(_agGoogleOneCreditsVal);
+
+    // Right Card (PROMPT & FLOW BALANCE)
+    QFrame* agPromptFlowCard = new QFrame(agCard);
+    agPromptFlowCard->setObjectName("agCreditCard");
+    agPromptFlowCard->setStyleSheet(creditCardQss);
+    QVBoxLayout* agPromptFlowLayout = new QVBoxLayout(agPromptFlowCard);
+    agPromptFlowLayout->setContentsMargins(12, 10, 12, 10);
+    agPromptFlowLayout->setSpacing(6);
+
+    QHBoxLayout* agPfTopRow = new QHBoxLayout();
+    agPfTopRow->setContentsMargins(0, 0, 0, 0);
+    agPfTopRow->setSpacing(4);
+    QLabel* agPfTitle = new QLabel("PROMPT & FLOW BALANCE", agPromptFlowCard);
+    agPfTitle->setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: 700; letter-spacing: 0.4px;");
+    _agPromptFlowTierPill = new QLabel("Monthly", agPromptFlowCard);
+    _agPromptFlowTierPill->setStyleSheet(
+        "background-color: rgba(255, 255, 255, 0.05); color: #94a3b8; "
+        "border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600;"
+    );
+    agPfTopRow->addWidget(agPfTitle);
+    agPfTopRow->addStretch(1);
+    agPfTopRow->addWidget(_agPromptFlowTierPill);
+    agPromptFlowLayout->addLayout(agPfTopRow);
+
+    _agPromptFlowVal = new QLabel("--", agPromptFlowCard);
+    _agPromptFlowVal->setStyleSheet(
+        "color: #f8fafc; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+        "font-size: 20px; font-weight: 800;"
+    );
+    agPromptFlowLayout->addWidget(_agPromptFlowVal);
+
+    agStatsRow->addWidget(agGoogleOneCard, 1);
+    agStatsRow->addWidget(agPromptFlowCard, 1);
     agLayout->addLayout(agStatsRow);
+
+    // Model Quota Limits Section
+    QLabel* agQuotaSectionTitle = new QLabel("MODEL QUOTA LIMITS", agCard);
+    agQuotaSectionTitle->setStyleSheet(
+        "color: #94a3b8; font-size: 11px; font-weight: 700; "
+        "letter-spacing: 0.5px; margin-top: 2px;"
+    );
+    _agQuotaGroupsContainer = new QWidget(agCard);
+    _agQuotaGroupsLayout = new QVBoxLayout(_agQuotaGroupsContainer);
+    _agQuotaGroupsLayout->setContentsMargins(0, 0, 0, 0);
+    _agQuotaGroupsLayout->setSpacing(10);
+    agLayout->addWidget(agQuotaSectionTitle);
+    agLayout->addWidget(_agQuotaGroupsContainer);
+
+    // Collapsible Individual Model Capacities Section
+    QFrame* agDivider = new QFrame(agCard);
+    agDivider->setFixedHeight(1);
+    agDivider->setStyleSheet("background-color: rgba(255, 255, 255, 0.06); border: none;");
+    agLayout->addWidget(agDivider);
+
+    _agModelsToggleBtn = new QPushButton("Individual Model Capacities (0)  ˅", agCard);
+    _agModelsToggleBtn->setStyleSheet(
+        "QPushButton { background: transparent; border: none; color: #94a3b8; "
+        "font-size: 12px; font-weight: 600; text-align: left; padding: 4px 2px; } "
+        "QPushButton:hover { color: #f8fafc; background: transparent; border: none; }"
+    );
+    agLayout->addWidget(_agModelsToggleBtn);
 
     _agModelsContainer = new QWidget(agCard);
     _agModelsLayout = new QVBoxLayout(_agModelsContainer);
     _agModelsLayout->setContentsMargins(0, 4, 0, 0);
     _agModelsLayout->setSpacing(6);
+    _agModelsContainer->setVisible(false);
     agLayout->addWidget(_agModelsContainer);
+
+    QObject::connect(_agModelsToggleBtn, &QPushButton::clicked, [this]() {
+        _agModelsExpanded = !_agModelsExpanded;
+        _agModelsContainer->setVisible(_agModelsExpanded && !_lastQuotaSnap.agModels.empty());
+        _agModelsToggleBtn->setText(
+            QString("Individual Model Capacities (%1)  %2")
+                .arg(_lastQuotaSnap.agModels.size())
+                .arg(_agModelsExpanded ? "˄" : "˅")
+        );
+    });
+
     scrollVBox->addWidget(agCard);
 
     // 2. Cursor Card
@@ -1177,6 +1282,7 @@ void EdaTrayWindow::refreshLiveStatus() {
                 .arg(!_settings.enableFreeCad ? "Off" : (fcConn ? "Live" : "Ready"))
         );
     }
+    updateQuotaCountdowns();
 }
 
 void EdaTrayWindow::refreshAiQuotas(bool triggerRemoteRefresh) {
@@ -1184,6 +1290,9 @@ void EdaTrayWindow::refreshAiQuotas(bool triggerRemoteRefresh) {
     EdaBridgeAppConfig::fetchQuotaSnapshot(
         _settings.aimonHost, _settings.aimonWebPort, triggerRemoteRefresh, snap, 2500
     );
+    _lastQuotaFetchSteadySec = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
     _lastQuotaSnap = snap;
     populateQuotasUi(snap);
     refreshLiveStatus();
@@ -1231,37 +1340,170 @@ void EdaTrayWindow::populateQuotasUi(const AimonQuotaSnapshot& snap) {
         "padding: 2px 8px; font-size: 11px; font-weight: 700;";
 
     // 1. Google Antigravity
+    _agCountdownBindings.clear();
+    clearLayoutWidgets(_agQuotaGroupsLayout);
     clearLayoutWidgets(_agModelsLayout);
-    QLabel* agPlanPill = findChild<QLabel*>("agPlanPill");
-    QLabel* agFlowVal = findChild<QLabel*>("agFlowCreditsValue");
 
     if (snap.agRunning) {
-        _agHeaderLabel->setText("● ACTIVE");
-        _agHeaderLabel->setStyleSheet(activeStatusPillStyle);
-        if (agPlanPill) {
-            agPlanPill->setText(
-                snap.agPlanTier.empty()
-                    ? QString("Google AI Ultra")
-                    : QString::fromStdString(snap.agPlanTier)
-            );
-            agPlanPill->setVisible(true);
-        }
-        _agCreditsLabel->setText(
-            QString::fromStdString(formatNumberWithCommas(snap.agPromptCredits))
+        _agStatusDot->setStyleSheet("color: #10b981; font-size: 13px;");
+        _agHeaderLabel->setVisible(false);
+        _agPlanPill->setText(
+            QString::fromStdString(snap.agPlanTier.empty() ? "Google AI Ultra" : snap.agPlanTier).toUpper()
         );
-        if (agFlowVal) {
-            agFlowVal->setText(
-                QString::fromStdString(formatNumberWithCommas(snap.agFlowCredits))
+        _agPlanPill->setVisible(true);
+
+        if (snap.agHasGoogleOneCredits) {
+            _agGoogleOneCreditsVal->setText(
+                QString::fromStdString(formatNumberWithCommas(snap.agGoogleOneCredits))
             );
+            _agGoogleOneCreditsVal->setStyleSheet(
+                "color: #00f2fe; font-family: 'Consolas', 'JetBrains Mono', monospace; font-size: 20px; font-weight: 800;"
+            );
+            _agCreditMinPill->setText(
+                QString("Min %1 / req").arg(snap.agMinCreditPerReq > 0 ? snap.agMinCreditPerReq : 50)
+            );
+        } else {
+            _agGoogleOneCreditsVal->setText("0");
+            _agGoogleOneCreditsVal->setStyleSheet(
+                "color: #f8fafc; font-family: 'Consolas', 'JetBrains Mono', monospace; font-size: 20px; font-weight: 800;"
+            );
+            _agCreditMinPill->setText("Min 50 / req");
         }
 
-        double minPct = 100.0;
-        std::string minModel;
-        for (const auto& m : snap.agModels) {
-            if (m.remainingPct < minPct || minModel.empty()) {
-                minPct = m.remainingPct;
-                minModel = m.name;
+        if (snap.agPromptCredits > 0 || snap.agFlowCredits > 0 ||
+            snap.agMonthlyPromptCredits > 0 || snap.agMonthlyFlowCredits > 0) {
+            _agPromptFlowVal->setText(
+                QString("%1 / %2")
+                    .arg(QString::fromStdString(formatNumberWithCommas(snap.agPromptCredits)))
+                    .arg(QString::fromStdString(formatNumberWithCommas(snap.agFlowCredits)))
+            );
+            if (snap.agMonthlyPromptCredits > 0 || snap.agMonthlyFlowCredits > 0) {
+                _agPromptFlowTierPill->setText(
+                    QString("Mo: %1k / %2k")
+                        .arg(snap.agMonthlyPromptCredits / 1000)
+                        .arg(snap.agMonthlyFlowCredits / 1000)
+                );
+            } else {
+                _agPromptFlowTierPill->setText("Monthly");
             }
+        } else {
+            _agPromptFlowVal->setText("--");
+            _agPromptFlowTierPill->setText("Monthly");
+        }
+
+        if (snap.agQuotaGroups.empty()) {
+            QLabel* noGroupsLbl = new QLabel("No quota groups reported", _agQuotaGroupsContainer);
+            noGroupsLbl->setStyleSheet("color: #64748b; font-size: 11px;");
+            _agQuotaGroupsLayout->addWidget(noGroupsLbl);
+        } else {
+            for (const auto& group : snap.agQuotaGroups) {
+                QFrame* groupCard = new QFrame(_agQuotaGroupsContainer);
+                groupCard->setObjectName("agQuotaGroupCard");
+                groupCard->setStyleSheet(
+                    "#agQuotaGroupCard { background-color: rgba(255, 255, 255, 0.025); border: 1px solid #1e293b; border-radius: 12px; }"
+                );
+                QVBoxLayout* grpLayout = new QVBoxLayout(groupCard);
+                grpLayout->setContentsMargins(12, 10, 12, 10);
+                grpLayout->setSpacing(8);
+
+                QLabel* grpTitleLbl = new QLabel(QString::fromStdString(group.displayName), groupCard);
+                grpTitleLbl->setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: 700;");
+                grpLayout->addWidget(grpTitleLbl);
+
+                if (!group.description.empty()) {
+                    QLabel* grpDescLbl = new QLabel(QString::fromStdString(group.description), groupCard);
+                    grpDescLbl->setStyleSheet("color: #94a3b8; font-size: 11px;");
+                    grpDescLbl->setWordWrap(true);
+                    grpLayout->addWidget(grpDescLbl);
+                }
+
+                QGridLayout* bucketsGrid = new QGridLayout();
+                bucketsGrid->setSpacing(10);
+                bucketsGrid->setColumnStretch(0, 1);
+                bucketsGrid->setColumnStretch(1, 1);
+
+                for (size_t bIdx = 0; bIdx < group.buckets.size(); ++bIdx) {
+                    const auto& b = group.buckets[bIdx];
+                    QFrame* bucketCard = new QFrame(groupCard);
+                    bucketCard->setObjectName("agBucketCard");
+                    bucketCard->setStyleSheet(
+                        "#agBucketCard { background-color: rgba(0, 0, 0, 0.22); border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 8px; }"
+                    );
+                    QVBoxLayout* bktLayout = new QVBoxLayout(bucketCard);
+                    bktLayout->setContentsMargins(10, 8, 10, 8);
+                    bktLayout->setSpacing(6);
+
+                    // Top row
+                    QHBoxLayout* bktTopRow = new QHBoxLayout();
+                    bktTopRow->setContentsMargins(0, 0, 0, 0);
+                    bktTopRow->setSpacing(4);
+                    QLabel* bktNameLbl = new QLabel(QString::fromStdString(b.displayName), bucketCard);
+                    bktNameLbl->setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;");
+                    const int roundedPct = static_cast<int>(std::round(b.remainingPct));
+                    QLabel* bktPctLbl = new QLabel(QString("%1%").arg(roundedPct), bucketCard);
+                    bktPctLbl->setStyleSheet(
+                        QString("color: %1; font-family: 'Consolas', 'JetBrains Mono', monospace; font-size: 13px; font-weight: 800;")
+                            .arg(bucketColorForPercent(b.remainingPct))
+                    );
+                    bktTopRow->addWidget(bktNameLbl);
+                    bktTopRow->addStretch(1);
+                    bktTopRow->addWidget(bktPctLbl);
+                    bktLayout->addLayout(bktTopRow);
+
+                    // Middle: Progress bar
+                    QProgressBar* bktBar = new QProgressBar(bucketCard);
+                    bktBar->setRange(0, 100);
+                    bktBar->setValue(roundedPct);
+                    bktBar->setTextVisible(false);
+                    bktBar->setFixedHeight(7);
+                    bktBar->setStyleSheet(bucketProgressBarStyle(b.remainingPct));
+                    bktLayout->addWidget(bktBar);
+
+                    // Bottom row
+                    QHBoxLayout* bktBottomRow = new QHBoxLayout();
+                    bktBottomRow->setContentsMargins(0, 0, 0, 0);
+                    bktBottomRow->setSpacing(4);
+
+                    QString winBadgeText;
+                    if (b.window == "weekly") {
+                        winBadgeText = "WEEKLY";
+                    } else if (b.window == "5h" || b.window == "five_hour") {
+                        winBadgeText = "5-HOUR";
+                    } else if (!b.window.empty()) {
+                        winBadgeText = QString::fromStdString(b.window).toUpper();
+                    } else {
+                        winBadgeText = "LIMIT";
+                    }
+
+                    QLabel* winBadge = new QLabel(winBadgeText, bucketCard);
+                    winBadge->setStyleSheet(
+                        "background-color: rgba(255, 255, 255, 0.06); color: #94a3b8; "
+                        "border-radius: 4px; padding: 1px 6px; font-size: 9px; font-weight: 700; letter-spacing: 0.4px;"
+                    );
+
+                    QLabel* timerLbl = new QLabel(
+                        QString::fromStdString(formatBucketTimerText(b.remainingPct, b.resetSeconds, b.description)),
+                        bucketCard
+                    );
+                    timerLbl->setStyleSheet(
+                        "color: #00f2fe; font-family: 'Consolas', 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600;"
+                    );
+
+                    _agCountdownBindings.push_back({timerLbl, b.remainingPct, b.resetSeconds, b.description, true});
+
+                    bktBottomRow->addWidget(winBadge);
+                    bktBottomRow->addStretch(1);
+                    bktBottomRow->addWidget(timerLbl);
+                    bktLayout->addLayout(bktBottomRow);
+
+                    bucketsGrid->addWidget(bucketCard, static_cast<int>(bIdx / 2), static_cast<int>(bIdx % 2));
+                }
+                grpLayout->addLayout(bucketsGrid);
+                _agQuotaGroupsLayout->addWidget(groupCard);
+            }
+        }
+
+        for (const auto& m : snap.agModels) {
             auto [baseModelName, tierStr] = splitModelNameAndTier(m.name);
 
             QWidget* rowWidget = new QWidget(_agModelsContainer);
@@ -1320,7 +1562,7 @@ void EdaTrayWindow::populateQuotasUi(const AimonQuotaSnapshot& snap) {
             }
             nameContainer->setMinimumWidth(180);
 
-            const int roundedPct = static_cast<int>(m.remainingPct + 0.5);
+            const int roundedPct = static_cast<int>(std::round(m.remainingPct));
             QProgressBar* bar = new QProgressBar(rowWidget);
             bar->setRange(0, 100);
             bar->setValue(roundedPct);
@@ -1337,17 +1579,17 @@ void EdaTrayWindow::populateQuotasUi(const AimonQuotaSnapshot& snap) {
             );
 
             QLabel* resetLbl = new QLabel(
-                m.resetSeconds > 0
-                    ? QString::fromStdString(formatDurationCompact(m.resetSeconds))
-                    : QString("Ready"),
+                QString::fromStdString(formatModelTimerText(m.remainingPct, m.resetSeconds)),
                 rowWidget
             );
-            resetLbl->setMinimumWidth(68);
+            resetLbl->setMinimumWidth(80);
             resetLbl->setAlignment(Qt::AlignCenter);
             resetLbl->setStyleSheet(
                 "background-color: #0f172a; border: 1px solid #1e293b; "
                 "border-radius: 6px; padding: 2px 6px; color: #94a3b8; font-size: 11px;"
             );
+
+            _agCountdownBindings.push_back({resetLbl, m.remainingPct, m.resetSeconds, "", false});
 
             rowLayout->addWidget(providerBadge);
             rowLayout->addWidget(nameContainer);
@@ -1356,13 +1598,42 @@ void EdaTrayWindow::populateQuotasUi(const AimonQuotaSnapshot& snap) {
             rowLayout->addWidget(resetLbl);
             _agModelsLayout->addWidget(rowWidget);
         }
+
+        _agModelsToggleBtn->setText(
+            QString("Individual Model Capacities (%1)  %2")
+                .arg(snap.agModels.size())
+                .arg(_agModelsExpanded ? "˄" : "˅")
+        );
+        _agModelsContainer->setVisible(_agModelsExpanded && !snap.agModels.empty());
+
         if (_actSummaryAg) {
-            if (!minModel.empty()) {
+            double minPct = 100.0;
+            std::string minLabel;
+            bool foundBucket = false;
+            for (const auto& g : snap.agQuotaGroups) {
+                for (const auto& b : g.buckets) {
+                    if (!foundBucket || b.remainingPct < minPct) {
+                        minPct = b.remainingPct;
+                        minLabel = g.displayName + " - " + b.displayName;
+                        foundBucket = true;
+                    }
+                }
+            }
+            if (!foundBucket) {
+                for (const auto& m : snap.agModels) {
+                    if (!foundBucket || m.remainingPct < minPct) {
+                        minPct = m.remainingPct;
+                        minLabel = m.name;
+                        foundBucket = true;
+                    }
+                }
+            }
+            if (foundBucket) {
                 _actSummaryAg->setText(
                     QString("Antigravity (%1): %2% min (%3)")
                         .arg(QString::fromStdString(snap.agPlanTier))
-                        .arg(static_cast<int>(minPct + 0.5))
-                        .arg(QString::fromStdString(minModel))
+                        .arg(static_cast<int>(std::round(minPct)))
+                        .arg(QString::fromStdString(minLabel))
                 );
             } else {
                 _actSummaryAg->setText(
@@ -1371,19 +1642,19 @@ void EdaTrayWindow::populateQuotasUi(const AimonQuotaSnapshot& snap) {
             }
         }
     } else {
+        _agStatusDot->setStyleSheet("color: #ef4444; font-size: 13px;");
         _agHeaderLabel->setText(
             snap.agError.empty()
                 ? QString("○ OFFLINE")
                 : QString("○ %1").arg(QString::fromStdString(snap.agError))
         );
         _agHeaderLabel->setStyleSheet(offlineStatusPillStyle);
-        if (agPlanPill) {
-            agPlanPill->setVisible(false);
-        }
-        _agCreditsLabel->setText("--");
-        if (agFlowVal) {
-            agFlowVal->setText("--");
-        }
+        _agHeaderLabel->setVisible(true);
+        _agPlanPill->setVisible(false);
+        _agGoogleOneCreditsVal->setText("--");
+        _agPromptFlowVal->setText("--");
+        _agModelsToggleBtn->setText("Individual Model Capacities (0)  ˅");
+        _agModelsContainer->setVisible(false);
         if (_actSummaryAg) {
             _actSummaryAg->setText("Antigravity: Offline");
         }
@@ -1636,6 +1907,7 @@ void EdaTrayWindow::populateQuotasUi(const AimonQuotaSnapshot& snap) {
 
     QString tsStr = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
     _quotaLastUpdatedLabel->setText(QString("Last updated: %1").arg(tsStr));
+    updateQuotaCountdowns();
 }
 
 void EdaTrayWindow::onDeployPluginsClicked() {
@@ -1867,6 +2139,95 @@ std::string EdaTrayWindow::formatNumberWithCommas(int64_t value) {
         out.push_back(raw[i]);
     }
     return out;
+}
+
+void EdaTrayWindow::updateQuotaCountdowns() {
+    const int64_t nowSteady = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+    const int64_t elapsed = (_lastQuotaFetchSteadySec > 0 && nowSteady > _lastQuotaFetchSteadySec)
+        ? (nowSteady - _lastQuotaFetchSteadySec)
+        : 0;
+    for (const auto& b : _agCountdownBindings) {
+        if (!b.label) {
+            continue;
+        }
+        const int64_t rem = (b.initialResetSeconds > 0)
+            ? std::max<int64_t>(0, b.initialResetSeconds - elapsed)
+            : b.initialResetSeconds;
+        b.label->setText(QString::fromStdString(
+            b.isBucket ? formatBucketTimerText(b.remainingPct, rem, b.description)
+                       : formatModelTimerText(b.remainingPct, rem)
+        ));
+    }
+}
+
+std::string EdaTrayWindow::formatCountdown(int64_t totalSeconds) {
+    if (totalSeconds < 0) {
+        totalSeconds = 0;
+    }
+    const int64_t days = totalSeconds / 86400;
+    const int64_t hours = (totalSeconds % 86400) / 3600;
+    const int64_t minutes = (totalSeconds % 3600) / 60;
+    const int64_t seconds = totalSeconds % 60;
+
+    std::ostringstream oss;
+    if (days > 0) {
+        oss << days << "d " << hours << "h "
+            << std::setfill('0') << std::setw(2) << minutes << "m";
+    } else if (hours > 0) {
+        oss << hours << "h "
+            << std::setfill('0') << std::setw(2) << minutes << "m "
+            << std::setfill('0') << std::setw(2) << seconds << "s";
+    } else {
+        oss << minutes << "m "
+            << std::setfill('0') << std::setw(2) << seconds << "s";
+    }
+    return oss.str();
+}
+
+std::string EdaTrayWindow::formatBucketTimerText(double remainingPct,
+                                                 int64_t remainingSeconds,
+                                                 const std::string& description) {
+    if (remainingPct >= 99.9 && remainingSeconds <= 0) {
+        return "Active";
+    }
+    if (remainingSeconds > 8 * 86400 || remainingSeconds < 0) {
+        std::string lowerDesc = description;
+        for (char& c : lowerDesc) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        const std::string needle = "refresh in ";
+        const auto pos = lowerDesc.find(needle);
+        if (pos != std::string::npos) {
+            std::string extracted = description.substr(pos + needle.size());
+            while (!extracted.empty() &&
+                   (extracted.back() == '.' || std::isspace(static_cast<unsigned char>(extracted.back())))) {
+                extracted.pop_back();
+            }
+            while (!extracted.empty() && std::isspace(static_cast<unsigned char>(extracted.front()))) {
+                extracted.erase(extracted.begin());
+            }
+            if (!extracted.empty()) {
+                return "Resets in " + extracted;
+            }
+        }
+    }
+    if (remainingSeconds > 0) {
+        return "Resets in " + formatCountdown(remainingSeconds);
+    }
+    return (remainingPct >= 99.9) ? "Active" : "Ready to reset";
+}
+
+std::string EdaTrayWindow::formatModelTimerText(double remainingPct,
+                                                int64_t remainingSeconds) {
+    if (remainingPct >= 99.9 && remainingSeconds <= 0) {
+        return "Active";
+    }
+    if (remainingSeconds > 0) {
+        return "Resets in " + formatCountdown(remainingSeconds);
+    }
+    return (remainingPct >= 99.9) ? "Active" : "Ready";
 }
 
 } // namespace aimon

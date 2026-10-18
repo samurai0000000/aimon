@@ -1070,6 +1070,23 @@ TEST(EdaAccelerators_Unit, EdaBridgeLiveAutoroutePcbStateAuditRouteMergeReaudit)
     CHECK_FALSE(nativeOffline.value("ok", true));
     CHECK_TRUE(nativeOffline.value("error", "").find("offline pcb_state") != std::string::npos);
 
+    // 4b. Empty board (e.g. EasyEDA on its Start Page) is an error, never "No unrouted nets to route"
+    nlohmann::json emptyBoard = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", {{"units", "mil"}, {"pads", nlohmann::json::array()},
+                       {"tracks", nlohmann::json::array()}, {"vias", nlohmann::json::array()},
+                       {"active_document", "Start Page"}}},
+        {"apply_to_pcb", true}
+    });
+    CHECK_FALSE(emptyBoard.value("ok", true));
+    CHECK_TRUE(emptyBoard.value("error", "").find("no pads") != std::string::npos);
+    CHECK_FALSE(emptyBoard.contains("routed_nets"));
+    CHECK_FALSE(emptyBoard.contains("pre_route_audit"));
+    STRCMP_EQUAL("Start Page", emptyBoard.value("active_document", "").c_str());
+    nlohmann::json noPadsKey = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", {{"units", "mil"}, {"tracks", state["tracks"]}}}
+    });
+    CHECK_FALSE(noPadsKey.value("ok", true));
+
     // 5. Classic request (nets with pad objects) still goes straight to the accelerator
     nlohmann::json classic = bridge.callTool("eda_calc_pcb_autoroute", {
         {"units", "mil"},
@@ -2186,6 +2203,203 @@ TEST(EdaAccelerators_Unit, EasyEdaFourTupleWireSegmentsNetStubsAndParameterAlias
     }, ok, summary);
     CHECK_TRUE(ok);
     CHECK_TRUE(mechRes.value("ok", false));
+}
+
+TEST(EdaAccelerators_Unit, CalcPcbAutorouteEasyEdaPadArrayAndViaInSmdPadGuard) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // 1. EasyEDA Pro style pad with size_x=0/size_y=0 and raw pad=["OVAL", 62.99, 23.62]:
+    // Foreign net N_ROUTE must detour around the full 62.99 x 23.62 mil (1.60 x 0.60 mm) pad
+    // at (1500, 1000) rotated 90 deg (so its vertical half-span is 31.495 mil = 0.80 mm).
+    // Also verify N_VIA (Top SMD pad -> Bottom SMD pad) never places a via inside either SMD pad.
+    nlohmann::json args = {
+        {"units", "mil"},
+        {"rules", {
+            {"track_width_mm", 0.254},
+            {"clearance_mm", 0.16},
+            {"via_size_mm", 0.61},
+            {"via_drill_mm", 0.305},
+            {"grid_step_mm", 0.1}
+        }},
+        {"all_pads", nlohmann::json::array({
+            {{"id", "p_obs"}, {"net", "FOREIGN"}, {"x", 1500.0}, {"y", 1000.0},
+             {"size_x", 0.0}, {"size_y", 0.0}, {"pad", nlohmann::json::array({"OVAL", 62.99, 23.62})},
+             {"rotation", 90.0}, {"layer", "1"}},
+            {{"id", "p_r1"}, {"net", "N_ROUTE"}, {"x", 1200.0}, {"y", 1000.0},
+             {"size_x", 0.0}, {"size_y", 0.0}, {"pad", nlohmann::json::array({"RECT", 24.0, 24.0})},
+             {"layer", "1"}},
+            {{"id", "p_r2"}, {"net", "N_ROUTE"}, {"x", 1800.0}, {"y", 1000.0},
+             {"size_x", 0.0}, {"size_y", 0.0}, {"pad", nlohmann::json::array({"RECT", 24.0, 24.0})},
+             {"layer", "1"}},
+            {{"id", "p_v1"}, {"net", "N_VIA"}, {"x", 1200.0}, {"y", 1250.0},
+             {"size_x", 0.0}, {"size_y", 0.0}, {"pad", nlohmann::json::array({"RECT", 40.0, 40.0})},
+             {"layer", "1"}},
+            {{"id", "p_v2"}, {"net", "N_VIA"}, {"x", 1800.0}, {"y", 1250.0},
+             {"size_x", 0.0}, {"size_y", 0.0}, {"pad", nlohmann::json::array({"RECT", 40.0, 40.0})},
+             {"layer", "2"}}
+        })},
+        {"nets", nlohmann::json::array({
+            {{"name", "N_ROUTE"}, {"pads", nlohmann::json::array({
+                {{"id", "p_r1"}, {"net", "N_ROUTE"}, {"x", 1200.0}, {"y", 1000.0},
+                 {"size_x", 0.0}, {"size_y", 0.0}, {"pad", nlohmann::json::array({"RECT", 24.0, 24.0})},
+                 {"layer", "1"}},
+                {{"id", "p_r2"}, {"net", "N_ROUTE"}, {"x", 1800.0}, {"y", 1000.0},
+                 {"size_x", 0.0}, {"size_y", 0.0}, {"pad", nlohmann::json::array({"RECT", 24.0, 24.0})},
+                 {"layer", "1"}}
+            })}},
+            {{"name", "N_VIA"}, {"pads", nlohmann::json::array({
+                {{"id", "p_v1"}, {"net", "N_VIA"}, {"x", 1200.0}, {"y", 1250.0},
+                 {"size_x", 0.0}, {"size_y", 0.0}, {"pad", nlohmann::json::array({"RECT", 40.0, 40.0})},
+                 {"layer", "1"}},
+                {{"id", "p_v2"}, {"net", "N_VIA"}, {"x", 1800.0}, {"y", 1250.0},
+                 {"size_x", 0.0}, {"size_y", 0.0}, {"pad", nlohmann::json::array({"RECT", 40.0, 40.0})},
+                 {"layer", "2"}}
+            })}}
+        })}
+    };
+
+    nlohmann::json res = acc.calcPcbAutoroute(args, ok, summary);
+    CHECK_TRUE_TEXT(ok, summary.c_str());
+    CHECK_EQUAL(2, res.value("routed_nets", 0));
+    CHECK_EQUAL(0, res.value("drc_violations", -1));
+    CHECK_TRUE(res["vias"].size() >= 1);
+
+    // Verify no top-layer N_ROUTE segment passes through the 90-deg rotated 62.99x23.62 mil FOREIGN pad
+    const double obsX = 1500.0 * 0.0254;
+    const double obsY = 1000.0 * 0.0254;
+    for (const auto& t : res["tracks"]) {
+        if (t.value("net", "") != "N_ROUTE" || t.value("layer", "") != "1") continue;
+        double dCenter = testPtSegDist(obsX, obsY, t["x1_mm"], t["y1_mm"], t["x2_mm"], t["y2_mm"]);
+        // Because the pad's vertical half-height is 0.80 mm when rotated 90 deg, a horizontal bypass
+        // on layer 1 must clear the center by at least 0.80 + 0.16 + 0.127 = 1.087 mm (or detour on layer 2).
+        CHECK_TRUE_TEXT(dCenter > 0.95, t.dump().c_str());
+    }
+
+    // Verify no via is placed inside any SMD pad and via size/diameter meet >= 0.61 mm (24.0157 mil)
+    for (const auto& v : res["vias"]) {
+        DOUBLES_EQUAL(0.61, v.value("size_mm", 0.0), 1e-4);
+        CHECK_TRUE(v.value("size", 0.0) >= 24.015);
+        CHECK_TRUE(v.value("diameter", 0.0) >= 24.015);
+        double vxMil = v.value("x", 0.0);
+        double vyMil = v.value("y", 0.0);
+        // Must not sit inside p_v1 (1200, 1250, 40x40 mil) or p_v2 (1800, 1250, 40x40 mil)
+        bool insideV1 = (std::fabs(vxMil - 1200.0) <= 20.0 && std::fabs(vyMil - 1250.0) <= 20.0);
+        bool insideV2 = (std::fabs(vxMil - 1800.0) <= 20.0 && std::fabs(vyMil - 1250.0) <= 20.0);
+        CHECK_FALSE_TEXT(insideV1, v.dump().c_str());
+        CHECK_FALSE_TEXT(insideV2, v.dump().c_str());
+    }
+}
+
+TEST(EdaAccelerators_Unit, CalcPcbConnectivityAuditRotatedRectPadAndEasyEdaArrays) {
+    EdaAccelerators acc(_accCfg);
+    bool ok = false;
+    std::string summary;
+
+    // Pad 1 at (1000, 1000) is 80 x 20 mil unrotated (half-spans: hx=40, hy=10).
+    // Track ends at (1000, 1028) with width=10 mil (half-width=5 mil).
+    // A circular approximation using max(80, 20)/2 = 40 mil would falsely treat (1000, 1028) as
+    // touching Pad 1 (dist 28 <= 40 + 5), whereas true rectangular distance is 28 - 10 = 18 > 5 + tol!
+    nlohmann::json stateMiss = {
+        {"units", "mil"},
+        {"pads", nlohmann::json::array({
+            {{"id", "p1"}, {"ref", "U1"}, {"number", "1"}, {"net", "NET_RECT"},
+             {"x", 1000.0}, {"y", 1000.0}, {"size_x", 0.0}, {"size_y", 0.0},
+             {"pad", nlohmann::json::array({"RECT", 80.0, 20.0})}, {"rotation", 0.0}, {"layer", "1"}},
+            {{"id", "p2"}, {"ref", "U1"}, {"number", "2"}, {"net", "NET_RECT"},
+             {"x", 1500.0}, {"y", 1028.0}, {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}}
+        })},
+        {"tracks", nlohmann::json::array({
+            {{"id", "t1"}, {"net", "NET_RECT"}, {"layer", "1"},
+             {"x1", 1000.0}, {"y1", 1028.0}, {"x2", 1500.0}, {"y2", 1028.0}, {"width", 10.0}}
+        })}
+    };
+    nlohmann::json auditMiss = acc.calcPcbConnectivityAudit(stateMiss, ok, summary);
+    CHECK_FALSE(auditMiss.value("all_connected", true));
+    CHECK_EQUAL(1, auditMiss.value("unrouted_nets_count", 0));
+    CHECK_EQUAL(1, auditMiss.value("dangling_tracks_count", 0));
+
+    // Rotate Pad 1 by 90 degrees: now its vertical half-span is 40 mil, so (1000, 1028) lies inside Pad 1!
+    nlohmann::json stateHit = stateMiss;
+    stateHit["pads"][0]["rotation"] = 90.0;
+    nlohmann::json auditHit = acc.calcPcbConnectivityAudit(stateHit, ok, summary);
+    CHECK_TRUE_TEXT(auditHit.value("all_connected", false), auditHit.dump().c_str());
+    CHECK_EQUAL(0, auditHit.value("unrouted_nets_count", -1));
+    CHECK_EQUAL(0, auditHit.value("dangling_tracks_count", -1));
+}
+
+TEST(EdaAccelerators_Unit, EdaBridgeLiveAutorouteRulePrecedenceAndOutlineWarning) {
+    EdaBridgeConfig cfg;
+    cfg.enabled = false;
+    cfg.accelerators.enabled = true;
+    EdaBridge bridge(cfg);
+
+    nlohmann::json basePads = nlohmann::json::array({
+        {{"id", "p1"}, {"ref", "U1"}, {"pad", "1"}, {"net", "SIG"}, {"x", 1000.0}, {"y", 1000.0},
+         {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}},
+        {{"id", "p2"}, {"ref", "U1"}, {"pad", "2"}, {"net", "SIG"}, {"x", 1400.0}, {"y", 1000.0},
+         {"size_x", 24.0}, {"size_y", 24.0}, {"layer", "1"}}
+    });
+
+    // 1. Copperless board without board_design_rules or explicit rules must refuse to guess
+    nlohmann::json copperless = {
+        {"units", "mil"},
+        {"pads", basePads},
+        {"tracks", nlohmann::json::array()},
+        {"vias", nlohmann::json::array()}
+    };
+    nlohmann::json failRes = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", copperless}, {"apply_to_pcb", false}
+    });
+    CHECK_FALSE(failRes.value("ok", true));
+    CHECK_TRUE(failRes.value("error", "").find("Cannot determine PCB design rules") != std::string::npos);
+
+    // 2. existing_copper inference + empty board_outline warning
+    nlohmann::json withCopper = copperless;
+    withCopper["tracks"] = nlohmann::json::array({
+        {{"id", "t_existing"}, {"net", "OTHER"}, {"layer", "1"},
+         {"x1", 1000.0}, {"y1", 1200.0}, {"x2", 1400.0}, {"y2", 1200.0}, {"width", 12.0}}
+    });
+    nlohmann::json copperRes = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", withCopper}, {"apply_to_pcb", false}
+    });
+    CHECK_TRUE_TEXT(copperRes.value("ok", false), copperRes.dump().c_str());
+    STRCMP_EQUAL("existing_copper", copperRes.value("rules_source", "").c_str());
+    DOUBLES_EQUAL(12.0 * 0.0254, copperRes["rules"].value("track_width_mm", 0.0), 1e-3);
+    DOUBLES_EQUAL(0.61, copperRes["rules"].value("via_size_mm", 0.0), 1e-4);
+    CHECK_TRUE(copperRes.contains("warnings") && copperRes["warnings"].is_array() && !copperRes["warnings"].empty());
+
+    // 3. board_design_rules overrides existing_copper
+    nlohmann::json withBoardRules = withCopper;
+    withBoardRules["board_design_rules"] = {
+        {"track_width_mm", 0.20},
+        {"clearance_mm", 0.18},
+        {"via_size_mm", 0.65},
+        {"via_drill_mm", 0.35}
+    };
+    nlohmann::json brdRes = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", withBoardRules}, {"apply_to_pcb", false}
+    });
+    CHECK_TRUE_TEXT(brdRes.value("ok", false), brdRes.dump().c_str());
+    STRCMP_EQUAL("board_design_rules", brdRes.value("rules_source", "").c_str());
+    DOUBLES_EQUAL(0.20, brdRes["rules"].value("track_width_mm", 0.0), 1e-4);
+    DOUBLES_EQUAL(0.18, brdRes["rules"].value("clearance_mm", 0.0), 1e-4);
+    DOUBLES_EQUAL(0.65, brdRes["rules"].value("via_size_mm", 0.0), 1e-4);
+
+    // 4. explicit caller rules override board_design_rules
+    nlohmann::json expRes = bridge.callTool("eda_calc_pcb_autoroute", {
+        {"pcb_state", withBoardRules},
+        {"apply_to_pcb", false},
+        {"track_width_mm", 0.33},
+        {"clearance_mm", 0.22}
+    });
+    CHECK_TRUE_TEXT(expRes.value("ok", false), expRes.dump().c_str());
+    STRCMP_EQUAL("explicit", expRes.value("rules_source", "").c_str());
+    DOUBLES_EQUAL(0.33, expRes["rules"].value("track_width_mm", 0.0), 1e-4);
+    DOUBLES_EQUAL(0.22, expRes["rules"].value("clearance_mm", 0.0), 1e-4);
+    STRCMP_EQUAL("explicit", expRes["rules"]["sources"].value("track_width_mm", "").c_str());
+    STRCMP_EQUAL("board_design_rules", expRes["rules"]["sources"].value("via_size_mm", "").c_str());
 }
 
 

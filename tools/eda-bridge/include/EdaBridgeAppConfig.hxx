@@ -43,6 +43,23 @@ struct AimonModelQuotaItem {
     std::string name;
     double remainingPct = 100.0;
     int64_t resetSeconds = 0;
+    std::string resetTimeIso;
+};
+
+struct AimonQuotaBucketItem {
+    std::string bucketId;
+    std::string displayName;
+    std::string window;
+    std::string description;
+    double remainingPct = 100.0;
+    int64_t resetSeconds = 0;
+    std::string resetTimeIso;
+};
+
+struct AimonQuotaGroupItem {
+    std::string displayName;
+    std::string description;
+    std::vector<AimonQuotaBucketItem> buckets;
 };
 
 struct AimonClaudeAccountSummary {
@@ -68,8 +85,14 @@ struct AimonQuotaSnapshot {
     // Antigravity
     bool agRunning = false;
     std::string agPlanTier = "Unknown";
+    bool agHasGoogleOneCredits = false;
+    int agGoogleOneCredits = 0;
+    int agMinCreditPerReq = 0;
     int agPromptCredits = 0;
     int agFlowCredits = 0;
+    int agMonthlyPromptCredits = 0;
+    int agMonthlyFlowCredits = 0;
+    std::vector<AimonQuotaGroupItem> agQuotaGroups;
     std::vector<AimonModelQuotaItem> agModels;
     std::string agError;
 
