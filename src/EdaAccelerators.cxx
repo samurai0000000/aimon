@@ -1914,18 +1914,20 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             }
         }
         ns.startIsland = 0;
-        if (!elems.empty()) {
-            for (size_t ei = 0; ei < elems.size(); ++ei) {
-                int isl = rootToIsland[ds.find(static_cast<int>(ei))];
-                if (hasPad[isl]) {
-                    ns.startIsland = isl;
-                    break;
-                }
-            }
-        }
+        std::vector<int> islandCellCounts(static_cast<size_t>(ns.islandCount), 0);
         for (const auto& rc : raw) {
             int isl = rootToIsland[ds.find(rc.elem)];
-            if (hasPad[isl]) ns.copper.push_back({rc.cid, isl, rc.ex, rc.ey, rc.isInterior});
+            if (hasPad[isl]) {
+                ns.copper.push_back({rc.cid, isl, rc.ex, rc.ey, rc.isInterior});
+                islandCellCounts[static_cast<size_t>(isl)] += 1;
+            }
+        }
+        int bestCount = -1;
+        for (int isl = 0; isl < ns.islandCount; ++isl) {
+            if (hasPad[isl] && islandCellCounts[static_cast<size_t>(isl)] > bestCount) {
+                bestCount = islandCellCounts[static_cast<size_t>(isl)];
+                ns.startIsland = isl;
+            }
         }
     }
 
@@ -2101,8 +2103,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             }
 
             if (reached == std::numeric_limits<size_t>::max()) {
-                net.bridges.clear();
-                return false;
+                return !net.bridges.empty();
             }
 
             Bridge br;

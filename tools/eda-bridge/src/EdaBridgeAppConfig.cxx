@@ -550,9 +550,9 @@ var edaEsbuildExportName = (function () {
         const summaryOnly = Boolean(args && args.summary_only === true);
         const allSheets = (args && args.all_sheets !== undefined) ? Boolean(args.all_sheets) : true;
         const reqSheet = (args && (args.page_uuid || args.sheet || args.page)) || "";
-        const refFilter = (args && Array.isArray(args.references)) ? args.references.map(String) : [];
-        const netFilter = (args && Array.isArray(args.nets)) ? args.nets.map(String) : [];
-        const typeFilter = (args && Array.isArray(args.component_types)) ? args.component_types.map(String) : [];
+        const refFilter = normalizeStringArray(args && (args.references || args.reference || args.ref_filter));
+        const netFilter = normalizeStringArray(args && (args.nets || args.net_filter || args.net));
+        const typeFilter = normalizeStringArray(args && (args.component_types || args.component_type));
         const fullForBridge = Boolean(args && args._full_for_bridge === true);
 
         if (typeof eda !== "undefined") {
@@ -748,6 +748,161 @@ var edaEsbuildExportName = (function () {
             }
         }
 
+        function extractLineVertices(line) {
+            const pts = [];
+            if (!Array.isArray(line)) return pts;
+            if (line.length > 0 && typeof line[0] === "number") {
+                for (let i = 0; i + 1 < line.length; i += 2) {
+                    pts.push({ x: Number(line[i]), y: Number(line[i + 1]) });
+                }
+            } else {
+                for (let i = 0; i < line.length; i++) {
+                    const pt = line[i];
+                    if (pt && typeof pt === "object") {
+                        if (Array.isArray(pt) && pt.length >= 2) {
+                            pts.push({ x: Number(pt[0]), y: Number(pt[1]) });
+                        } else if (pt.x !== undefined && pt.y !== undefined) {
+                            pts.push({ x: Number(pt.x), y: Number(pt.y) });
+                        }
+                    }
+                }
+            }
+            return pts;
+        }
+
+        // Geometric wire-to-pin net hydration:
+        // On live EasyEDA Pro, sch_PrimitivePin.getState_Net() often returns "" even when
+        // a named wire or netflag is connected to that pin's coordinate.
+        const wireVertsList = [];
+        for (let wi = 0; wi < wires.length; wi++) {
+            wireVertsList.push({
+                index: wi,
+                net: String(wires[wi].net || "").trim(),
+                verts: extractLineVertices(wires[wi].line)
+            });
+        }
+
+        const anchorNets = [];
+        for (const comp of components) {
+            const cType = String(comp.component_type || "").toLowerCase();
+            const cRef = String(comp.reference || "");
+            const cVal = String(comp.value || "");
+            const isNetSymbol = (cType === "netflag" || cType === "netport" || cType === "netlabel" ||
+                                 cType === "power" || cRef.indexOf("#") === 0 || cRef === "GND" || cRef === "VCC");
+            const symNet = String(comp.net || (isNetSymbol ? (cVal || cRef) : "")).trim();
+            if (symNet) {
+                anchorNets.push({ x: Number(comp.x || 0), y: Number(comp.y || 0), net: symNet });
+            }
+            if (Array.isArray(comp.pins)) {
+                for (const p of comp.pins) {
+                    const pn = String(p.net || "").trim();
+                    if (pn) {
+                        anchorNets.push({ x: Number(p.x || 0), y: Number(p.y || 0), net: pn });
+                    }
+                }
+            }
+        }
+
+        const wireNetMap = {};
+        for (let i = 0; i < wireVertsList.length; i++) {
+            if (wireVertsList[i].net) {
+                wireNetMap[i] = wireVertsList[i].net;
+            }
+        }
+        for (let i = 0; i < wireVertsList.length; i++) {
+            if (!wireNetMap[i]) {
+                for (const anc of anchorNets) {
+                    for (const v of wireVertsList[i].verts) {
+                        if (Math.abs(v.x - anc.x) <= 2.5 && (Math.abs(v.y - anc.y) <= 2.5 || Math.abs(Math.abs(v.y) - Math.abs(anc.y)) <= 2.5)) {
+                            wireNetMap[i] = anc.net;
+                            break;
+                        }
+                    }
+                    if (wireNetMap[i]) break;
+                }
+            }
+        }
+
+        let propagated = true;
+        let pass = 0;
+        while (propagated && pass < 50) {
+            propagated = false;
+            pass++;
+            for (let i = 0; i < wireVertsList.length; i++) {
+                for (let j = i + 1; j < wireVertsList.length; j++) {
+                    const netI = wireNetMap[i];
+                    const netJ = wireNetMap[j];
+                    if (netI === netJ) continue;
+                    if (!netI && !netJ) continue;
+                    let connected = false;
+                    for (const vi of wireVertsList[i].verts) {
+                        for (const vj of wireVertsList[j].verts) {
+                            if (Math.abs(vi.x - vj.x) <= 2.0 && (Math.abs(vi.y - vj.y) <= 2.0 || Math.abs(Math.abs(vi.y) - Math.abs(vj.y)) <= 2.0)) {
+                                connected = true;
+                                break;
+                            }
+                        }
+                        if (connected) break;
+                    }
+                    if (connected) {
+                        const targetNet = netI || netJ;
+                        if (!netI) { wireNetMap[i] = targetNet; propagated = true; }
+                        if (!netJ) { wireNetMap[j] = targetNet; propagated = true; }
+                    }
+                }
+            }
+        }
+
+        for (let i = 0; i < wireVertsList.length; i++) {
+            if (wireNetMap[i] && (!wires[i].net || String(wires[i].net).trim() === "")) {
+                wires[i].net = wireNetMap[i];
+            }
+        }
+
+        for (const comp of components) {
+            if (!Array.isArray(comp.pins)) continue;
+            for (const p of comp.pins) {
+                if (p.net && String(p.net).trim() !== "") continue;
+                const px = Number(p.x || 0);
+                const py = Number(p.y || 0);
+                let matchedNet = "";
+                for (let i = 0; i < wireVertsList.length; i++) {
+                    const wNet = wireNetMap[i] || String(wires[i].net || "").trim();
+                    if (!wNet) continue;
+                    for (const v of wireVertsList[i].verts) {
+                        if (Math.abs(v.x - px) <= 2.5 && (Math.abs(v.y - py) <= 2.5 || Math.abs(Math.abs(v.y) - Math.abs(py)) <= 2.5)) {
+                            matchedNet = wNet;
+                            break;
+                        }
+                    }
+                    if (matchedNet) break;
+                }
+                if (!matchedNet) {
+                    for (const anc of anchorNets) {
+                        if (Math.abs(anc.x - px) <= 2.5 && (Math.abs(anc.y - py) <= 2.5 || Math.abs(Math.abs(anc.y) - Math.abs(py)) <= 2.5)) {
+                            matchedNet = anc.net;
+                            break;
+                        }
+                    }
+                }
+                if (matchedNet) {
+                    p.net = matchedNet;
+                }
+            }
+        }
+
+        const subcircuitComponents = [];
+        for (const comp of components) {
+            if (String(comp.component_type || "").toLowerCase() === "subcircuit") {
+                subcircuitComponents.push({
+                    id: String(comp.id || ""),
+                    reference: String(comp.reference || ""),
+                    value: String(comp.value || ""),
+                    footprint: String(comp.footprint || "")
+                });
+            }
+        }
+
         let filteredComponents = components;
         let filteredWires = wires;
         if (!fullForBridge) {
@@ -776,6 +931,27 @@ var edaEsbuildExportName = (function () {
             });
         }
 
+        const namedNetsSet = {};
+        for (const w of filteredWires) {
+            const wn = String(w.net || "").trim();
+            if (wn) namedNetsSet[wn] = true;
+        }
+        for (const c of filteredComponents) {
+            const cn = String(c.net || "").trim();
+            if (cn) namedNetsSet[cn] = true;
+            if (Array.isArray(c.pins)) {
+                for (const p of c.pins) {
+                    const pn = String(p.net || "").trim();
+                    if (pn) namedNetsSet[pn] = true;
+                }
+            }
+        }
+        let unnamedWiresCount = 0;
+        for (const w of filteredWires) {
+            const wn = String(w.net || "").trim();
+            if (!wn) unnamedWiresCount += 1;
+        }
+
         const out = {
             ok: true,
             active_document: cachedActiveDocument,
@@ -783,12 +959,21 @@ var edaEsbuildExportName = (function () {
             document: documentInfo,
             components_count: filteredComponents.length,
             wires_count: filteredWires.length,
-            netlist: netlist
+            unnamed_wires_count: unnamedWiresCount,
+            named_nets_count: Object.keys(namedNetsSet).length,
+            subcircuit_components: subcircuitComponents,
+            subcircuit_components_count: subcircuitComponents.length
         };
+        if (args && args.include_netlist === true) {
+            out.netlist = netlist;
+        }
         if (!summaryOnly || fullForBridge) {
             out.components = filteredComponents;
             if (includeWires || fullForBridge) {
                 out.wires = filteredWires;
+            }
+            if (out.netlist === undefined) {
+                out.netlist = netlist;
             }
         }
         return out;
@@ -923,6 +1108,8 @@ var edaEsbuildExportName = (function () {
         let placedComponents = 0;
         let modifiedComponents = 0;
         let modifiedPins = 0;
+        let modifiedWires = 0;
+        const modifiedWireIds = [];
         let placedNetflags = 0;
         let deletedPrimitives = 0;
         let placedWires = 0;
@@ -1056,6 +1243,9 @@ var edaEsbuildExportName = (function () {
                 }
                 if (mc.value !== undefined || mc.name !== undefined) modProps.name = String(mc.value !== undefined ? mc.value : mc.name);
                 if (mc.unique_id !== undefined || mc.uniqueId !== undefined) modProps.uniqueId = String(mc.unique_id !== undefined ? mc.unique_id : mc.uniqueId);
+                if (mc.component_type !== undefined || mc.componentType !== undefined) {
+                    modProps.componentType = String(mc.component_type || mc.componentType);
+                }
                 if (mc.footprint !== undefined) modProps.footprint = mc.footprint;
                 if (mc.add_into_bom !== undefined) modProps.addIntoBom = Boolean(mc.add_into_bom);
                 if (mc.add_into_pcb !== undefined) modProps.addIntoPcb = Boolean(mc.add_into_pcb);
@@ -1244,7 +1434,10 @@ var edaEsbuildExportName = (function () {
             }
         }
 
-        const delPrims = (args && args.delete_primitives) || [];
+        const delPrims = [].concat(
+            (args && Array.isArray(args.delete_primitives)) ? args.delete_primitives : [],
+            (args && Array.isArray(args.delete_ids)) ? args.delete_ids : []
+        );
         if (Array.isArray(delPrims) && delPrims.length > 0 && typeof eda !== "undefined") {
             const ids = delPrims.map(function (d) {
                 return (d && typeof d === "object") ? String(d.id || d.primitive_id || "") : String(d || "");
@@ -1351,6 +1544,62 @@ var edaEsbuildExportName = (function () {
             }
         }
 
+        const modWires = (args && args.modify_wires) || [];
+        if (Array.isArray(modWires) && modWires.length > 0 && typeof eda !== "undefined" && eda.sch_PrimitiveWire) {
+            let wireById = {};
+            if (typeof eda.sch_PrimitiveWire.getAll === "function") {
+                try {
+                    const allW = await eda.sch_PrimitiveWire.getAll();
+                    if (Array.isArray(allW)) {
+                        for (const w of allW) {
+                            const wid = String(callGetter(w, "getState_PrimitiveId", "primitiveId", "id", ""));
+                            if (wid) wireById[wid] = w;
+                        }
+                    }
+                } catch (eW) {}
+            }
+            for (const mw of modWires) {
+                if (!mw || typeof mw !== "object") continue;
+                const wId = String(mw.id || mw.wire_id || mw.primitive_id || "");
+                if (!wId) continue;
+                const patch = {};
+                if (mw.net !== undefined) patch.net = String(mw.net);
+                if (Array.isArray(mw.line || mw.points)) patch.line = mw.line || mw.points;
+                let modified = false;
+                if (typeof eda.sch_PrimitiveWire.modify === "function") {
+                    try {
+                        const mRes = await eda.sch_PrimitiveWire.modify(wId, patch);
+                        if (mRes !== false) {
+                            modified = true;
+                        }
+                    } catch (mErr) {}
+                }
+                if (!modified && wireById[wId] && typeof eda.sch_PrimitiveWire.delete === "function" && typeof eda.sch_PrimitiveWire.create === "function") {
+                    try {
+                        const oldW = wireById[wId];
+                        const oldLine = callGetter(oldW, "getState_Line", "line", "", []);
+                        const oldNet = String(callGetter(oldW, "getState_Net", "net", "", ""));
+                        const targetLine = patch.line || oldLine;
+                        const targetNet = (patch.net !== undefined) ? patch.net : oldNet;
+                        await eda.sch_PrimitiveWire.delete([wId]);
+                        const createdW = await eda.sch_PrimitiveWire.create(targetLine, targetNet);
+                        const newWid = (createdW && typeof createdW === "object")
+                            ? String(callGetter(createdW, "getState_PrimitiveId", "primitiveId", "id", "") || "")
+                            : String(createdW || "");
+                        if (newWid) {
+                            modifiedWireIds.push(newWid);
+                            modifiedWires += 1;
+                            modified = true;
+                        }
+                    } catch (recErr) {}
+                }
+                if (modified && modifiedWireIds.indexOf(wId) < 0) {
+                    modifiedWireIds.push(wId);
+                    modifiedWires += 1;
+                }
+            }
+        }
+
         try {
             if (typeof eda !== "undefined" && eda.dmt_EditorControl && typeof eda.dmt_EditorControl.zoomToAllPrimitives === "function") {
                 await eda.dmt_EditorControl.zoomToAllPrimitives();
@@ -1364,6 +1613,8 @@ var edaEsbuildExportName = (function () {
             placed_components: placedComponents,
             modified_components: modifiedComponents,
             modified_pins: modifiedPins,
+            modified_wires: modifiedWires,
+            modified_wire_ids: modifiedWireIds,
             placed_netflags: placedNetflags,
             added_netflags: placedNetflags,
             deleted_primitives: deletedPrimitives,
@@ -1376,120 +1627,209 @@ var edaEsbuildExportName = (function () {
     }
 
     async function handleSyncSchToPcb(args) {
-        if (args && args.dry_run === true) {
-            const schInfo = await handleInspectSchematic({ include_pins: true, include_wires: true });
-            const pcbInfo = await handleInspectPcb({ _full_for_bridge: true });
-            const schComps = Array.isArray(schInfo.components) ? schInfo.components : [];
-            const pcbComps = Array.isArray(pcbInfo.components) ? pcbInfo.components : [];
-            const pcbPads = Array.isArray(pcbInfo.pads) ? pcbInfo.pads : [];
-            const pcbTracks = Array.isArray(pcbInfo.tracks) ? pcbInfo.tracks : [];
+        const schInfo = await handleInspectSchematic({ include_pins: true, include_wires: true, _full_for_bridge: true });
+        const pcbInfo = await handleInspectPcb({ _full_for_bridge: true });
+        const schComps = Array.isArray(schInfo.components) ? schInfo.components : [];
+        const pcbComps = Array.isArray(pcbInfo.components) ? pcbInfo.components : [];
+        const pcbPads = Array.isArray(pcbInfo.pads) ? pcbInfo.pads : [];
+        const pcbTracks = Array.isArray(pcbInfo.tracks) ? pcbInfo.tracks : [];
+        const schWires = Array.isArray(schInfo.wires) ? schInfo.wires : [];
 
-            const componentsToAdd = [];
-            const componentsToRemove = [];
-            const footprintMismatches = [];
-            const unannotatedReferences = [];
-            const missingFootprints = [];
-            const padNetDeltas = [];
-            const orphanedTracks = [];
+        const componentsToAdd = [];
+        const componentsToRemove = [];
+        const footprintMismatches = [];
+        const unannotatedReferences = [];
+        const missingFootprints = [];
+        const padNetDeltas = [];
+        const orphanedTracks = [];
+        const uniqueIdMismatches = [];
+        const subcircuitFatalErrors = [];
+        const unnamedWireDeltas = [];
 
-            const schByRef = {};
-            for (const sc of schComps) {
-                const ref = String(sc.reference || "");
-                const compType = String(sc.component_type || "").toLowerCase();
-                const fp = String(sc.footprint || "");
-                if (compType === "netflag" || compType === "netport" || compType === "sheet" ||
-                    compType === "frame" || compType === "power" || compType === "netlabel" ||
-                    ref.indexOf("#") === 0 || ref.indexOf("FRAME") === 0 || ref === "GND" || ref === "VCC") {
-                    continue;
-                }
-                if (!ref || ref.indexOf("?") !== -1 || !/[0-9]/.test(ref)) {
-                    unannotatedReferences.push(ref || "<empty>");
-                    continue;
-                }
-                if (!fp) {
-                    missingFootprints.push(ref);
-                }
-                schByRef[ref] = sc;
+        const schByRef = {};
+        for (const sc of schComps) {
+            const ref = String(sc.reference || "");
+            const compType = String(sc.component_type || "").toLowerCase();
+            const fp = String(sc.footprint || "");
+            if (compType === "subcircuit") {
+                subcircuitFatalErrors.push({
+                    reference: ref,
+                    id: String(sc.id || ""),
+                    value: String(sc.value || ""),
+                    footprint: fp,
+                    component_type: "subcircuit"
+                });
             }
+            if (compType === "netflag" || compType === "netport" || compType === "sheet" ||
+                compType === "frame" || compType === "power" || compType === "netlabel" ||
+                ref.indexOf("#") === 0 || ref.indexOf("FRAME") === 0 || ref === "GND" || ref === "VCC") {
+                continue;
+            }
+            if (!ref || ref.indexOf("?") !== -1 || !/[0-9]/.test(ref)) {
+                unannotatedReferences.push(ref || "<empty>");
+                continue;
+            }
+            if (!fp) {
+                missingFootprints.push(ref);
+            }
+            schByRef[ref] = sc;
+        }
 
-            const pcbByRef = {};
-            for (const pc of pcbComps) {
-                const ref = String(pc.reference || "");
-                if (!ref) continue;
-                pcbByRef[ref] = pc;
-                if (!schByRef[ref]) {
-                    componentsToRemove.push({
+        const pcbByRef = {};
+        for (const pc of pcbComps) {
+            const ref = String(pc.reference || "");
+            if (!ref) continue;
+            pcbByRef[ref] = pc;
+            if (!schByRef[ref]) {
+                componentsToRemove.push({
+                    reference: ref,
+                    footprint: String(pc.footprint || "")
+                });
+            }
+        }
+
+        for (const ref of Object.keys(schByRef)) {
+            const sc = schByRef[ref];
+            const schFp = String(sc.footprint || "");
+            const pc = pcbByRef[ref];
+            if (!pc) {
+                componentsToAdd.push({
+                    reference: ref,
+                    value: String(sc.value || ""),
+                    footprint: schFp
+                });
+            } else {
+                const pcbFp = String(pc.footprint || "");
+                if (schFp && pcbFp && schFp !== pcbFp) {
+                    footprintMismatches.push({
                         reference: ref,
-                        footprint: String(pc.footprint || "")
+                        schematic_footprint: schFp,
+                        pcb_footprint: pcbFp
+                    });
+                }
+                const scUid = String(sc.unique_id || sc.uniqueId || "");
+                const pcUid = String(pc.unique_id || pc.uniqueId || "");
+                if (scUid && pcUid && scUid !== pcUid) {
+                    uniqueIdMismatches.push({
+                        reference: ref,
+                        schematic_id: String(sc.id || ""),
+                        pcb_id: String(pc.id || ""),
+                        schematic_unique_id: scUid,
+                        pcb_unique_id: pcUid
                     });
                 }
             }
+        }
 
-            for (const ref of Object.keys(schByRef)) {
-                const sc = schByRef[ref];
-                const schFp = String(sc.footprint || "");
-                const pc = pcbByRef[ref];
-                if (!pc) {
-                    componentsToAdd.push({
-                        reference: ref,
-                        value: String(sc.value || ""),
-                        footprint: schFp
-                    });
-                } else {
-                    const pcbFp = String(pc.footprint || "");
-                    if (schFp && pcbFp && schFp !== pcbFp) {
-                        footprintMismatches.push({
+        const pcbPadByRefPin = {};
+        for (const pad of pcbPads) {
+            const pref = String(pad.ref || pad.reference || "");
+            const pnum = String(pad.number || pad.pad || "");
+            if (pref && pnum) {
+                pcbPadByRefPin[pref + ":" + pnum] = pad;
+            }
+        }
+
+        const activeSchematicNets = {};
+        for (const w of schWires) {
+            if (w && w.net) activeSchematicNets[String(w.net)] = true;
+        }
+        for (const sc of schComps) {
+            const ref = String(sc.reference || "");
+            if (sc && sc.net) activeSchematicNets[String(sc.net)] = true;
+            if (!ref || !Array.isArray(sc.pins)) continue;
+            for (const p of sc.pins) {
+                const pNum = String(p.number || p.name || "");
+                const pNet = String(p.net || "");
+                if (pNet) activeSchematicNets[pNet] = true;
+                const pad = pcbPadByRefPin[ref + ":" + pNum];
+                if (pad) {
+                    const oldNet = String(pad.net || "");
+                    if (pNet && oldNet !== pNet) {
+                        padNetDeltas.push({
                             reference: ref,
-                            schematic_footprint: schFp,
-                            pcb_footprint: pcbFp
+                            pad: pNum,
+                            pad_id: String(pad.id || pad.primitive_id || ""),
+                            old_net: oldNet,
+                            new_net: pNet
                         });
                     }
                 }
             }
+        }
 
-            const activeSchematicNets = {};
-            if (Array.isArray(schInfo.wires)) {
-                for (const w of schInfo.wires) {
-                    if (w && w.net) activeSchematicNets[String(w.net)] = true;
-                }
+        for (const trk of pcbTracks) {
+            const tNet = String(trk.net || "");
+            if (tNet && Object.keys(activeSchematicNets).length > 0 && !activeSchematicNets[tNet]) {
+                orphanedTracks.push({
+                    id: String(trk.id || ""),
+                    net: tNet,
+                    layer: String(trk.layer || "")
+                });
             }
-            for (const sc of schComps) {
-                const ref = String(sc.reference || "");
-                if (sc && sc.net) activeSchematicNets[String(sc.net)] = true;
-                if (!ref || !Array.isArray(sc.pins)) continue;
-                for (const p of sc.pins) {
-                    const pNum = String(p.number || p.name || "");
-                    const pNet = String(p.net || "");
-                    if (pNet) activeSchematicNets[pNet] = true;
-                    for (const pad of pcbPads) {
-                        const padRef = String(pad.ref || pad.reference || "");
-                        if (padRef === ref && String(pad.number || pad.pad || "") === pNum) {
-                            const oldNet = String(pad.net || "");
-                            if (pNet && oldNet !== pNet) {
-                                padNetDeltas.push({
-                                    reference: ref,
-                                    pad: pNum,
-                                    old_net: oldNet,
-                                    new_net: pNet
-                                });
-                            }
+        }
+
+        function getWirePts(line) {
+            const pts = [];
+            if (!Array.isArray(line)) return pts;
+            if (line.length > 0 && typeof line[0] === "number") {
+                for (let i = 0; i + 1 < line.length; i += 2) {
+                    pts.push({ x: Number(line[i]), y: Number(line[i + 1]) });
+                }
+            } else {
+                for (let i = 0; i < line.length; i++) {
+                    const pt = line[i];
+                    if (pt && typeof pt === "object") {
+                        if (Array.isArray(pt) && pt.length >= 2) {
+                            pts.push({ x: Number(pt[0]), y: Number(pt[1]) });
+                        } else if (pt.x !== undefined && pt.y !== undefined) {
+                            pts.push({ x: Number(pt.x), y: Number(pt.y) });
                         }
                     }
                 }
             }
+            return pts;
+        }
 
-            for (const trk of pcbTracks) {
-                const tNet = String(trk.net || "");
-                if (tNet && Object.keys(activeSchematicNets).length > 0 && !activeSchematicNets[tNet]) {
-                    orphanedTracks.push({
-                        id: String(trk.id || ""),
-                        net: tNet,
-                        layer: String(trk.layer || "")
-                    });
+        for (const w of schWires) {
+            const wNet = String(w.net || "").trim();
+            if (wNet !== "") continue;
+            const wPts = getWirePts(w.line);
+            if (wPts.length === 0) continue;
+            let matchedDelta = null;
+            for (const sc of schComps) {
+                const ref = String(sc.reference || "");
+                if (!ref || !Array.isArray(sc.pins)) continue;
+                for (const p of sc.pins) {
+                    const pNum = String(p.number || p.name || "");
+                    const pad = pcbPadByRefPin[ref + ":" + pNum];
+                    const targetNet = pad ? String(pad.net || "").trim() : "";
+                    if (!targetNet) continue;
+                    const px = Number(p.x || 0);
+                    const py = Number(p.y || 0);
+                    for (const pt of wPts) {
+                        if (Math.abs(pt.x - px) <= 2.5 && (Math.abs(pt.y - py) <= 2.5 || Math.abs(Math.abs(pt.y) - Math.abs(py)) <= 2.5)) {
+                            matchedDelta = {
+                                wire_id: String(w.id || ""),
+                                net: targetNet,
+                                reference: ref,
+                                pin: pNum
+                            };
+                            break;
+                        }
+                    }
+                    if (matchedDelta) break;
                 }
+                if (matchedDelta) break;
             }
+            if (matchedDelta) {
+                unnamedWireDeltas.push(matchedDelta);
+            }
+        }
 
-            const readyToSync = (unannotatedReferences.length === 0 && missingFootprints.length === 0);
+        const readyToSync = (unannotatedReferences.length === 0 && missingFootprints.length === 0 && subcircuitFatalErrors.length === 0);
+
+        if (args && args.dry_run === true) {
             return {
                 ok: true,
                 dry_run: true,
@@ -1499,6 +1839,9 @@ var edaEsbuildExportName = (function () {
                 components_to_add: componentsToAdd,
                 components_to_remove: componentsToRemove,
                 footprint_mismatches: footprintMismatches,
+                unique_id_mismatches: uniqueIdMismatches,
+                subcircuit_fatal_errors: subcircuitFatalErrors,
+                unnamed_wire_deltas: unnamedWireDeltas,
                 unannotated_references: unannotatedReferences,
                 missing_footprints: missingFootprints,
                 pad_net_deltas: padNetDeltas,
@@ -1506,18 +1849,91 @@ var edaEsbuildExportName = (function () {
             };
         }
 
-        let synced = false;
-        if (typeof eda !== "undefined") {
-            let pcbUuid = (args && args.pcb_uuid) || undefined;
-            if (!pcbUuid && eda.dmt_Project && typeof eda.dmt_Project.getCurrentProjectInfo === "function") {
-                try {
-                    const proj = await eda.dmt_Project.getCurrentProjectInfo();
-                    if (proj && Array.isArray(proj.data) && proj.data[0] && proj.data[0].pcb && proj.data[0].pcb.uuid) {
-                        pcbUuid = String(proj.data[0].pcb.uuid);
-                    }
-                } catch (err) {
+        let fixedSubcircuitBlocks = 0;
+        if (args && args.fix_subcircuit_blocks === true && typeof eda !== "undefined" && eda.sch_PrimitiveComponent && typeof eda.sch_PrimitiveComponent.modify === "function") {
+            for (const sub of subcircuitFatalErrors) {
+                if (sub.id) {
+                    try {
+                        await eda.sch_PrimitiveComponent.modify(sub.id, { componentType: "part" });
+                        fixedSubcircuitBlocks += 1;
+                    } catch (errSub) {}
                 }
             }
+        }
+
+        let syncedUniqueIds = 0;
+        if (args && args.sync_unique_ids === true && typeof eda !== "undefined" && eda.pcb_PrimitiveComponent && typeof eda.pcb_PrimitiveComponent.modify === "function") {
+            for (const m of uniqueIdMismatches) {
+                if (m.pcb_id && m.schematic_unique_id) {
+                    try {
+                        await eda.pcb_PrimitiveComponent.modify(m.pcb_id, { uniqueId: m.schematic_unique_id });
+                        syncedUniqueIds += 1;
+                    } catch (errUid) {}
+                }
+            }
+        }
+
+        let reconciledWires = 0;
+        let appliedPadNetDeltas = 0;
+        if (args && args.reconcile_net_names === true && typeof eda !== "undefined") {
+            if (eda.sch_PrimitiveWire && typeof eda.sch_PrimitiveWire.modify === "function") {
+                for (const uwd of unnamedWireDeltas) {
+                    if (uwd.wire_id && uwd.net) {
+                        try {
+                            await eda.sch_PrimitiveWire.modify(uwd.wire_id, { net: uwd.net });
+                            reconciledWires += 1;
+                        } catch (errRw) {}
+                    }
+                }
+            }
+            if (eda.pcb_PrimitivePad && typeof eda.pcb_PrimitivePad.modify === "function") {
+                for (const pnd of padNetDeltas) {
+                    if (pnd.pad_id && pnd.new_net) {
+                        try {
+                            await eda.pcb_PrimitivePad.modify(pnd.pad_id, { net: pnd.new_net });
+                            appliedPadNetDeltas += 1;
+                        } catch (errPad) {}
+                    }
+                }
+            }
+        }
+
+        let pushedSynthesizedNetlist = false;
+        let pcbUuid = (args && args.pcb_uuid) || undefined;
+        if (!pcbUuid && typeof eda !== "undefined" && eda.dmt_Project && typeof eda.dmt_Project.getCurrentProjectInfo === "function") {
+            try {
+                const proj = await eda.dmt_Project.getCurrentProjectInfo();
+                if (proj && Array.isArray(proj.data) && proj.data[0] && proj.data[0].pcb && proj.data[0].pcb.uuid) {
+                    pcbUuid = String(proj.data[0].pcb.uuid);
+                }
+            } catch (errProj) {}
+        }
+
+        if (args && args.push_synthesized_netlist === true && typeof eda !== "undefined") {
+            try {
+                if (eda.pcb_Net && typeof eda.pcb_Net.setNetlist === "function") {
+                    const synthNetlist = {};
+                    for (const sc of schComps) {
+                        if (!Array.isArray(sc.pins)) continue;
+                        for (const p of sc.pins) {
+                            const pNet = String(p.net || "");
+                            if (!pNet) continue;
+                            if (!synthNetlist[pNet]) synthNetlist[pNet] = [];
+                            synthNetlist[pNet].push(String(sc.reference) + "." + String(p.number || p.name || ""));
+                        }
+                    }
+                    await eda.pcb_Net.setNetlist("JLCEDA", synthNetlist);
+                    pushedSynthesizedNetlist = true;
+                }
+                if (eda.pcb_Document && typeof eda.pcb_Document.importChanges === "function") {
+                    await eda.pcb_Document.importChanges(pcbUuid, true);
+                    pushedSynthesizedNetlist = true;
+                }
+            } catch (errNet) {}
+        }
+
+        let synced = false;
+        if (typeof eda !== "undefined") {
             if (eda.dmt_Pcb && eda.dmt_Pcb.syncFromSchematic) {
                 await eda.dmt_Pcb.syncFromSchematic(pcbUuid);
                 synced = true;
@@ -1543,9 +1959,9 @@ var edaEsbuildExportName = (function () {
                         }
                     }
                     if (typeof eda.pcb_PrimitiveComponent.getAll === "function") {
-                        const pcbComps = await eda.pcb_PrimitiveComponent.getAll();
-                        if (Array.isArray(pcbComps)) {
-                            for (const pc of pcbComps) {
+                        const pcbCompsNow = await eda.pcb_PrimitiveComponent.getAll();
+                        if (Array.isArray(pcbCompsNow)) {
+                            for (const pc of pcbCompsNow) {
                                 const cid = String(callGetter(pc, "getState_PrimitiveId", "primitiveId", "id", ""));
                                 const des = String(callGetter(pc, "getState_Designator", "designator", "reference", ""));
                                 const curName = String(callGetter(pc, "getState_Name", "name", "value", ""));
@@ -1575,7 +1991,16 @@ var edaEsbuildExportName = (function () {
         return {
             ok: true,
             synced: synced,
-            active_document: await resolveActiveDocumentTitle()
+            active_document: await resolveActiveDocumentTitle(),
+            unique_id_mismatches: uniqueIdMismatches,
+            subcircuit_fatal_errors: subcircuitFatalErrors,
+            unnamed_wire_deltas: unnamedWireDeltas,
+            pad_net_deltas: padNetDeltas,
+            fixed_subcircuit_blocks: fixedSubcircuitBlocks,
+            synced_unique_ids: syncedUniqueIds,
+            reconciled_wires: reconciledWires,
+            applied_pad_net_deltas: appliedPadNetDeltas,
+            pushed_synthesized_netlist: pushedSynthesizedNetlist
         };
     }
 
@@ -1589,7 +2014,8 @@ var edaEsbuildExportName = (function () {
         const outline = [];
         const includeOtherProp = Boolean(args && args.include_other_property === true);
         const summaryOnly = Boolean(args && args.summary_only === true);
-        const fullForBridge = Boolean(args && (args._full_for_bridge === true || args.include_raw_primitives === true));
+        const fullForBridge = Boolean(args && args._full_for_bridge === true);
+        const includeRawPrimitives = Boolean(args && (args.include_raw_primitives === true || args.include_primitives === true));
         const refFilter = normalizeStringArray(args && (args.references || args.reference || args.ref_filter));
         const netFilter = normalizeStringArray(args && (args.nets || args.net_filter || args.net));
         const layerFilter = normalizeStringArray(args && (args.layers || args.layer)).map(normalizePcbLayer);
@@ -2062,31 +2488,73 @@ var edaEsbuildExportName = (function () {
                     const rawPours = await eda.pcb_PrimitivePour.getAll();
                     if (Array.isArray(rawPours)) {
                         for (const pr of rawPours) {
-                            let pts = callGetter(pr, "getState_Polygon", "polygon", "points", []);
-                            const cpoly = callGetter(pr, "getState_ComplexPolygon", "complexPolygon", "", null);
-                            if ((!Array.isArray(pts) || pts.length === 0) && cpoly && typeof cpoly === "object") {
-                                const rawArr = Array.isArray(cpoly.polygon) ? cpoly.polygon : (Array.isArray(cpoly.points) ? cpoly.points : []);
-                                const parsedPts = [];
-                                for (let i = 0; i + 1 < rawArr.length; i++) {
-                                    if (typeof rawArr[i] === "number" && typeof rawArr[i + 1] === "number") {
-                                        parsedPts.push({ x: Number(rawArr[i]), y: Number(rawArr[i + 1]) });
+                            let rawPoly = callGetter(pr, "getState_ComplexPolygon", "complexPolygon", "polygon", null);
+                            if (!rawPoly) {
+                                rawPoly = callGetter(pr, "getState_Polygon", "polygon", "points", []);
+                            }
+                            let srcArr = null;
+                            if (Array.isArray(rawPoly)) {
+                                srcArr = rawPoly;
+                            } else if (rawPoly && typeof rawPoly === "object") {
+                                for (const pk of ["polygon", "points", "source", "Source"]) {
+                                    if (Array.isArray(rawPoly[pk])) {
+                                        srcArr = rawPoly[pk];
+                                        break;
+                                    }
+                                }
+                            }
+                            const pts = [];
+                            if (Array.isArray(srcArr)) {
+                                for (let i = 0; i < srcArr.length; i += 1) {
+                                    const tok = srcArr[i];
+                                    if (typeof tok === "string") {
+                                        if (tok.toUpperCase() === "ARC" && i + 1 < srcArr.length && typeof srcArr[i + 1] === "number") {
+                                            i += 1;
+                                        }
+                                        continue;
+                                    }
+                                    if (Array.isArray(tok) && tok.length >= 2 && typeof tok[0] === "number" && typeof tok[1] === "number") {
+                                        pts.push([Number(tok[0]), Number(tok[1])]);
+                                    } else if (tok && typeof tok === "object" && typeof tok.x === "number" && typeof tok.y === "number") {
+                                        pts.push([Number(tok.x), Number(tok.y)]);
+                                    } else if (typeof tok === "number" && i + 1 < srcArr.length && typeof srcArr[i + 1] === "number") {
+                                        pts.push([Number(tok), Number(srcArr[i + 1])]);
                                         i += 1;
                                     }
                                 }
-                                if (parsedPts.length >= 3) {
-                                    pts = parsedPts;
+                            }
+                            let px = Number(callGetter(pr, "getState_X", "x", "", 0) || 0);
+                            let py = Number(callGetter(pr, "getState_Y", "y", "", 0) || 0);
+                            let pw = Number(callGetter(pr, "getState_Width", "width", "", 0) || 0);
+                            let ph = Number(callGetter(pr, "getState_Height", "height", "", 0) || 0);
+                            let minX = px, minY = py, maxX = px + pw, maxY = py + ph;
+                            if (pts.length > 0) {
+                                minX = maxX = pts[0][0];
+                                minY = maxY = pts[0][1];
+                                for (const pt of pts) {
+                                    if (pt[0] < minX) minX = pt[0];
+                                    if (pt[0] > maxX) maxX = pt[0];
+                                    if (pt[1] < minY) minY = pt[1];
+                                    if (pt[1] > maxY) maxY = pt[1];
                                 }
+                                px = minX;
+                                py = minY;
+                                pw = maxX - minX;
+                                ph = maxY - minY;
                             }
                             pours.push({
                                 id: String(callGetter(pr, "getState_PrimitiveId", "primitiveId", "id", "")),
                                 net: String(callGetter(pr, "getState_Net", "net", "", "")),
                                 layer: String(callGetter(pr, "getState_Layer", "layer", "", "TopLayer")),
-                                x: Number(callGetter(pr, "getState_X", "x", "", 0) || 0),
-                                y: Number(callGetter(pr, "getState_Y", "y", "", 0) || 0),
-                                width: Number(callGetter(pr, "getState_Width", "width", "", 0) || 0),
-                                height: Number(callGetter(pr, "getState_Height", "height", "", 0) || 0),
-                                points: pts,
-                                complexPolygon: cpoly
+                                x: px,
+                                y: py,
+                                min_x: minX,
+                                min_y: minY,
+                                max_x: maxX,
+                                max_y: maxY,
+                                width: pw,
+                                height: ph,
+                                points: pts
                             });
                         }
                     }
@@ -2185,13 +2653,18 @@ var edaEsbuildExportName = (function () {
         if (boardDesignRules) {
             out.board_design_rules = boardDesignRules;
         }
+        const hasFilter = (refFilter.length > 0 || netFilter.length > 0 || layerFilter.length > 0 || bbox !== null);
         if (!summaryOnly || fullForBridge) {
             out.components = filteredComponents;
-            out.schematic_components = schematicComponents;
-            out.pads = filteredPads;
-            out.tracks = filteredTracks;
-            out.vias = filteredVias;
-            out.pours = filteredPours;
+            if (fullForBridge || Boolean(args && args.include_schematic_components === true)) {
+                out.schematic_components = schematicComponents;
+            }
+            if (fullForBridge || includeRawPrimitives || hasFilter) {
+                out.pads = filteredPads;
+                out.tracks = filteredTracks;
+                out.vias = filteredVias;
+                out.pours = filteredPours;
+            }
         }
         return out;
     }
@@ -2637,7 +3110,10 @@ var edaEsbuildExportName = (function () {
             }
         }
 
-        const delPrims = (args && args.delete_primitives) || [];
+        const delPrims = [].concat(
+            (args && Array.isArray(args.delete_primitives)) ? args.delete_primitives : [],
+            (args && Array.isArray(args.delete_ids)) ? args.delete_ids : []
+        );
         const skippedChildPrimitives = [];
         if (Array.isArray(delPrims) && delPrims.length > 0 && typeof eda !== "undefined") {
             // Footprint child sub-primitives ("<componentId>e<digits>", e.g. pads) must never be
@@ -2769,13 +3245,14 @@ var edaEsbuildExportName = (function () {
             return null;
         }
 
-        const zonesList = [].concat(
-            (args && Array.isArray(args.zones)) ? args.zones : [],
-            (args && Array.isArray(args.pours)) ? args.pours : [],
-            (args && Array.isArray(args.copper_pours)) ? args.copper_pours : []
-        );
         const createdPourIds = [];
-        if (zonesList.length > 0 && typeof eda !== "undefined" && eda.pcb_PrimitivePour) {
+        async function processZonesAndRebuildPours() {
+            const zonesList = [].concat(
+                (args && Array.isArray(args.zones)) ? args.zones : [],
+                (args && Array.isArray(args.pours)) ? args.pours : [],
+                (args && Array.isArray(args.copper_pours)) ? args.copper_pours : []
+            );
+            if (zonesList.length > 0 && typeof eda !== "undefined" && eda.pcb_PrimitivePour) {
             let cachedBoardBbox = null;
             for (const z of zonesList) {
                 let scaledPts = [];
@@ -3022,6 +3499,7 @@ var edaEsbuildExportName = (function () {
                 }
             }
         }
+    }
 
         const createdTrackIds = [];
         const directTrackIds = {};
@@ -3063,53 +3541,113 @@ var edaEsbuildExportName = (function () {
             }
             for (const t of tracks) {
                 const tNet = String(t.net || "");
-                const tX1 = coordToMil(t, "x1", "x1_mm", units, 0);
-                const tY1 = coordToMil(t, "y1", "y1_mm", units, 0);
-                const tX2 = coordToMil(t, "x2", "x2_mm", units, 0);
-                const tY2 = coordToMil(t, "y2", "y2_mm", units, 0);
-                const tW = coordToMil(t, "width", "width_mm", units, 10.0);
                 const layerId = resolveEasyEdaCopperLayerId(t.layer || "TopLayer");
-                requestedTrackSegments.push({
-                    net: tNet,
-                    layerId: layerId,
-                    layer: normalizePcbLayer(t.layer || "TopLayer"),
-                    x1: tX1,
-                    y1: tY1,
-                    x2: tX2,
-                    y2: tY2,
-                    width: tW
-                });
-                if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.create === "function") {
-                    const createdTrk = await eda.pcb_PrimitiveTrack.create(
-                        tNet,
-                        normalizePcbLayer(t.layer || "TopLayer"),
-                        tX1,
-                        tY1,
-                        tX2,
-                        tY2,
-                        tW
-                    );
+                const layerNorm = normalizePcbLayer(t.layer || "TopLayer");
+                const tW = coordToMil(t, "width", "width_mm", units, 10.0);
+
+                const rawPts = t.points || t.line;
+                const segsToCreate = [];
+                if (Array.isArray(rawPts)) {
+                    const parsedPts = [];
+                    if (rawPts.length > 0 && typeof rawPts[0] === "number") {
+                        for (let i = 0; i + 1 < rawPts.length; i += 2) {
+                            parsedPts.push({
+                                x: toCanvasUnits(rawPts[i], units),
+                                y: toCanvasUnits(rawPts[i + 1], units)
+                            });
+                        }
+                    } else {
+                        for (let i = 0; i < rawPts.length; i++) {
+                            const pt = rawPts[i];
+                            if (pt && typeof pt === "object") {
+                                if (Array.isArray(pt) && pt.length >= 2) {
+                                    parsedPts.push({
+                                        x: toCanvasUnits(pt[0], units),
+                                        y: toCanvasUnits(pt[1], units)
+                                    });
+                                } else if (pt.x !== undefined || pt.x_mm !== undefined || pt.y !== undefined || pt.y_mm !== undefined) {
+                                    parsedPts.push({
+                                        x: coordToMil(pt, "x", "x_mm", units, 0),
+                                        y: coordToMil(pt, "y", "y_mm", units, 0)
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    for (let i = 0; i + 1 < parsedPts.length; i++) {
+                        segsToCreate.push({
+                            x1: parsedPts[i].x,
+                            y1: parsedPts[i].y,
+                            x2: parsedPts[i + 1].x,
+                            y2: parsedPts[i + 1].y
+                        });
+                    }
+                } else if (t.x1 !== undefined || t.x1_mm !== undefined || t.x2 !== undefined || t.x2_mm !== undefined) {
+                    segsToCreate.push({
+                        x1: coordToMil(t, "x1", "x1_mm", units, 0),
+                        y1: coordToMil(t, "y1", "y1_mm", units, 0),
+                        x2: coordToMil(t, "x2", "x2_mm", units, 0),
+                        y2: coordToMil(t, "y2", "y2_mm", units, 0)
+                    });
+                }
+
+                for (const seg of segsToCreate) {
+                    if (Math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1) < 1e-3) continue;
+
+                    requestedTrackSegments.push({
+                        net: tNet,
+                        layerId: layerId,
+                        layer: layerNorm,
+                        x1: seg.x1,
+                        y1: seg.y1,
+                        x2: seg.x2,
+                        y2: seg.y2,
+                        width: tW
+                    });
+
+                    let createdTrk = null;
+                    const passLayer = (eda.pcb_PrimitiveLine ? layerId : layerNorm);
+                    if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.create === "function") {
+                        try {
+                            createdTrk = await eda.pcb_PrimitiveTrack.create(
+                                tNet,
+                                passLayer,
+                                seg.x1,
+                                seg.y1,
+                                seg.x2,
+                                seg.y2,
+                                tW
+                            );
+                            if (createdTrk && eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.create === "function") {
+                                const actualLayerId = resolveEasyEdaCopperLayerId(callGetter(createdTrk, "getState_Layer", "layer", "", layerId));
+                                if (actualLayerId !== layerId) {
+                                    const delId = extractCreatedPrimitiveId(createdTrk);
+                                    if (delId && typeof eda.pcb_PrimitiveTrack.delete === "function") {
+                                        try { await eda.pcb_PrimitiveTrack.delete([delId]); } catch (dErr) {}
+                                    }
+                                    createdTrk = null;
+                                }
+                            }
+                        } catch (e1) {}
+                    }
+                    if (!createdTrk && eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.create === "function") {
+                        try {
+                            createdTrk = await eda.pcb_PrimitiveLine.create(
+                                tNet,
+                                layerId,
+                                seg.x1,
+                                seg.y1,
+                                seg.x2,
+                                seg.y2,
+                                tW,
+                                false
+                            );
+                        } catch (e2) {}
+                    }
                     const newTid = extractCreatedPrimitiveId(createdTrk);
                     if (newTid) {
                         directTrackIds[newTid] = true;
                         if (createdTrackIds.indexOf(newTid) < 0) createdTrackIds.push(newTid);
-                    }
-                    addedTracks += 1;
-                } else if (eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.create === "function") {
-                    const createdLn = await eda.pcb_PrimitiveLine.create(
-                        tNet,
-                        layerId,
-                        tX1,
-                        tY1,
-                        tX2,
-                        tY2,
-                        tW,
-                        false
-                    );
-                    const newLid = extractCreatedPrimitiveId(createdLn);
-                    if (newLid) {
-                        directTrackIds[newLid] = true;
-                        if (createdTrackIds.indexOf(newLid) < 0) createdTrackIds.push(newLid);
                     }
                     addedTracks += 1;
                 }
@@ -3287,9 +3825,20 @@ var edaEsbuildExportName = (function () {
                         const layerCopperId = resolveEasyEdaCopperLayerId(newLayer);
                         if (eda.pcb_PrimitiveTrack && typeof eda.pcb_PrimitiveTrack.create === "function") {
                             try {
+                                const passLayer = (eda.pcb_PrimitiveLine ? layerCopperId : normalizePcbLayer(newLayer));
                                 created = await eda.pcb_PrimitiveTrack.create(
-                                    newNet, normalizePcbLayer(newLayer), newX1, newY1, newX2, newY2, newW
+                                    newNet, passLayer, newX1, newY1, newX2, newY2, newW
                                 );
+                                if (created && eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.create === "function") {
+                                    const actualLayer = resolveEasyEdaCopperLayerId(callGetter(created, "getState_Layer", "layer", "", layerCopperId));
+                                    if (actualLayer !== layerCopperId) {
+                                        const delId = extractCreatedPrimitiveId(created);
+                                        if (delId && typeof eda.pcb_PrimitiveTrack.delete === "function") {
+                                            try { await eda.pcb_PrimitiveTrack.delete([delId]); } catch (dErr) {}
+                                        }
+                                        created = null;
+                                    }
+                                }
                             } catch (e1) {}
                         }
                         if (!created && eda.pcb_PrimitiveLine && typeof eda.pcb_PrimitiveLine.create === "function") {
@@ -3360,6 +3909,9 @@ var edaEsbuildExportName = (function () {
             }
         }
 
+        await processZonesAndRebuildPours();
+        const needsWin32PourRebuild = Boolean(args && (args.rebuild_pours === true || addedZones > 0));
+
         try {
             if (typeof eda !== "undefined" && eda.dmt_EditorControl && typeof eda.dmt_EditorControl.zoomToAllPrimitives === "function") {
                 await eda.dmt_EditorControl.zoomToAllPrimitives();
@@ -3391,6 +3943,7 @@ var edaEsbuildExportName = (function () {
             created_via_ids: createdViaIds,
             split_existing_track_ids: splitExistingTrackIds,
             committed_ids: committedIds,
+            rebuild_pours_requested: needsWin32PourRebuild,
             rubber_banded_tracks: rubberBandedTracks,
             rubber_banded_tracks_count: rubberBandedTracks.length
         };
@@ -3720,13 +4273,14 @@ var edaEsbuildExportName = (function () {
         }
 
         const summaryOnly = Boolean(args && args.summary_only === true);
+        const fullForBridge = Boolean(args && args._full_for_bridge === true);
         const maxViolations = (args && typeof args.max_violations === "number" && args.max_violations > 0)
             ? args.max_violations
             : (args && args.include_verbose_error === true ? 1000 : 200);
 
         let resultViolations = filteredViolations;
         let truncated = false;
-        if (summaryOnly) {
+        if (summaryOnly && !fullForBridge) {
             resultViolations = [];
         } else if (resultViolations.length > maxViolations) {
             resultViolations = resultViolations.slice(0, maxViolations);
@@ -3744,7 +4298,7 @@ var edaEsbuildExportName = (function () {
             violation_summary: violationSummary,
             violations: resultViolations
         };
-        if (summaryOnly) {
+        if (summaryOnly && !fullForBridge) {
             out.violations_omitted = true;
         }
         if (truncated) {
@@ -3824,7 +4378,7 @@ var edaEsbuildExportName = (function () {
             rawPath = "eda." + rawPath;
         }
         const apiPath = rawPath;
-        const callArgs = Array.isArray(args.args) ? args.args : [];
+        const callArgs = Array.isArray(args.args) ? args.args.slice() : [];
         const allowed = ALLOWED_PREFIXES.some(function (pfx) {
             return apiPath.indexOf(pfx) === 0;
         });

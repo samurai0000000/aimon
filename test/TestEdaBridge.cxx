@@ -2802,6 +2802,246 @@ TEST(EdaBridge, V1_1_11NetlistGuardAndComplexPolygonPours) {
     CHECK_TRUE(inspRes["connectivity_audit"].value("all_connected", false));
 }
 
+TEST(EdaBridge, EasyEdaBridgeV1_1_12PerformanceAndSyncUpgrades) {
+    EdaBridgeConfig cfg;
+    cfg.enabled = true;
+    cfg.mode = "gateway";
+    cfg.easyeda.enabled = true;
+    cfg.accelerators.enabled = true;
+    EdaBridge bridge(cfg);
+
+    // 1. easyeda_inspect_schematic summary_only and net_filter
+    nlohmann::json schState = {
+        {"units", "mil"},
+        {"components", nlohmann::json::array({
+            {
+                {"id", "c_r1"}, {"reference", "R1"}, {"value", "10k"}, {"component_type", "part"},
+                {"footprint", "0603"}, {"unique_id", "uid_r1"}, {"x", 100.0}, {"y", 100.0},
+                {"pins", nlohmann::json::array({
+                    {{"number", "1"}, {"net", "VCC"}, {"x", 50.0}, {"y", 100.0}},
+                    {{"number", "2"}, {"net", "NET_A"}, {"x", 150.0}, {"y", 100.0}}
+                })}
+            },
+            {
+                {"id", "c_r2"}, {"reference", "R2"}, {"value", "1k"}, {"component_type", "part"},
+                {"footprint", "0603"}, {"unique_id", "uid_r2"}, {"x", 300.0}, {"y", 100.0},
+                {"pins", nlohmann::json::array({
+                    {{"number", "1"}, {"net", "NET_A"}, {"x", 250.0}, {"y", 100.0}},
+                    {{"number", "2"}, {"net", "GND"}, {"x", 350.0}, {"y", 100.0}}
+                })}
+            },
+            {
+                {"id", "c_sub1"}, {"reference", "B1"}, {"value", "PowerBlock"}, {"component_type", "subcircuit"},
+                {"footprint", ""}, {"unique_id", "uid_b1"}, {"x", 500.0}, {"y", 100.0},
+                {"pins", nlohmann::json::array()}
+            }
+        })},
+        {"wires", nlohmann::json::array({
+            {{"id", "w1"}, {"net", "VCC"}, {"line", nlohmann::json::array({{0.0, 100.0}, {50.0, 100.0}})}},
+            {{"id", "w2"}, {"net", "NET_A"}, {"line", nlohmann::json::array({{150.0, 100.0}, {250.0, 100.0}})}},
+            {{"id", "w3"}, {"net", "GND"}, {"line", nlohmann::json::array({{350.0, 100.0}, {400.0, 100.0}})}},
+            {{"id", "w4_unnamed"}, {"net", ""}, {"line", nlohmann::json::array({{400.0, 100.0}, {450.0, 100.0}})}}
+        })}
+    };
+
+    // 1a. summary_only pruning & payload size check (< 2 KB)
+    nlohmann::json schSummary = bridge.callTool("easyeda_inspect_schematic", {
+        {"schematic_state", schState},
+        {"summary_only", true}
+    });
+    CHECK_TRUE(schSummary.value("ok", false));
+    CHECK_FALSE(schSummary.contains("components"));
+    CHECK_FALSE(schSummary.contains("wires"));
+    CHECK_FALSE(schSummary.contains("netlist"));
+    CHECK_EQUAL(3, schSummary.value("component_count", 0));
+    CHECK_EQUAL(4, schSummary.value("wire_count", 0));
+    CHECK_EQUAL(1, schSummary.value("subcircuit_components_count", 0));
+    CHECK_EQUAL(1, schSummary.value("unnamed_wires_count", 0));
+    CHECK_TRUE(schSummary.value("named_nets_count", 0) >= 3);
+    std::string dumpSchSummary = schSummary.dump();
+    CHECK_TRUE_TEXT(dumpSchSummary.size() < 2048, ("Schematic summary payload exceeds 2KB: " + std::to_string(dumpSchSummary.size())).c_str());
+
+    // 1b. net_filter filtering
+    nlohmann::json schFiltered = bridge.callTool("easyeda_inspect_schematic", {
+        {"schematic_state", schState},
+        {"net_filter", nlohmann::json::array({"VCC"})}
+    });
+    CHECK_TRUE(schFiltered.value("ok", false));
+    CHECK_TRUE(schFiltered.contains("components"));
+    CHECK_EQUAL(1, static_cast<int>(schFiltered["components"].size()));
+    STRCMP_EQUAL("R1", schFiltered["components"][0].value("reference", "").c_str());
+
+    // 2. easyeda_edit_schematic: modify_wires and component_type in modify_components
+    nlohmann::json editSchRes = bridge.callTool("easyeda_edit_schematic", {
+        {"schematic_state", schState},
+        {"modify_wires", nlohmann::json::array({
+            {{"id", "w4_unnamed"}, {"net", "NET_RESOLVED"}}
+        })},
+        {"modify_components", nlohmann::json::array({
+            {{"reference", "B1"}, {"component_type", "part"}, {"footprint", "MODULE_PW1"}}
+        })},
+        {"delete_ids", nlohmann::json::array({"w1"})}
+    });
+    CHECK_TRUE(editSchRes.value("ok", false));
+    CHECK_EQUAL(1, editSchRes.value("modified_wires", 0));
+    CHECK_EQUAL(1, editSchRes.value("modified_components", 0));
+    CHECK_EQUAL(1, editSchRes.value("deleted_primitives", 0));
+    const auto& modSchState = editSchRes["schematic_state"];
+    bool foundW4 = false;
+    for (const auto& w : modSchState["wires"]) {
+        if (w.value("id", "") == "w4_unnamed") {
+            foundW4 = true;
+            STRCMP_EQUAL("NET_RESOLVED", w.value("net", "").c_str());
+        }
+        CHECK_FALSE(w.value("id", "") == "w1");
+    }
+    CHECK_TRUE(foundW4);
+    bool foundB1 = false;
+    for (const auto& c : modSchState["components"]) {
+        if (c.value("reference", "") == "B1") {
+            foundB1 = true;
+            STRCMP_EQUAL("part", c.value("component_type", "").c_str());
+            STRCMP_EQUAL("MODULE_PW1", c.value("footprint", "").c_str());
+        }
+    }
+    CHECK_TRUE(foundB1);
+
+    // 3. easyeda_edit_pcb polyline points expansion, zero-length segment guard, and numeric layerId
+    nlohmann::json pcbState = {
+        {"units", "mil"},
+        {"components", nlohmann::json::array({
+            {{"id", "pcb_r1"}, {"reference", "R1"}, {"footprint", "0603"}, {"unique_id", "uid_diff_r1"},
+             {"pads", nlohmann::json::array({
+                 {{"id", "p_r1_1"}, {"number", "1"}, {"net", "VCC"}, {"x", 50.0}, {"y", 100.0}},
+                 {{"id", "p_r1_2"}, {"number", "2"}, {"net", "NET_A"}, {"x", 150.0}, {"y", 100.0}}
+             })}},
+            {{"id", "pcb_r2"}, {"reference", "R2"}, {"footprint", "0603"}, {"unique_id", "uid_r2"},
+             {"pads", nlohmann::json::array({
+                 {{"id", "p_r2_1"}, {"number", "1"}, {"net", "NET_A"}, {"x", 250.0}, {"y", 100.0}},
+                 {{"id", "p_r2_2"}, {"number", "2"}, {"net", "GND"}, {"x", 350.0}, {"y", 100.0}}
+             })}}
+        })},
+        {"tracks", nlohmann::json::array()},
+        {"vias", nlohmann::json::array()}
+    };
+
+    // Polyline with 3 points where first 2 are identical (degenerate zero-length segment dropped)
+    nlohmann::json editPcbRes = bridge.callTool("easyeda_edit_pcb", {
+        {"pcb_state", pcbState},
+        {"tracks", nlohmann::json::array({
+            {
+                {"net", "VCC"},
+                {"layer", 15}, // InnerLayer1
+                {"width", 12.0},
+                {"points", nlohmann::json::array({
+                    {{"x", 50.0}, {"y", 100.0}},
+                    {{"x", 50.0}, {"y", 100.0}}, // Duplicate -> dropped by zero-length guard
+                    {{"x", 100.0}, {"y", 100.0}}
+                })}
+            },
+            {
+                {"net", "GND"},
+                {"layerId", 2}, // BottomLayer
+                {"width", 15.0},
+                {"line", nlohmann::json::array({350.0, 100.0, 400.0, 100.0, 450.0, 100.0})} // 2 consecutive segments
+            }
+        })}
+    });
+    CHECK_TRUE(editPcbRes.value("ok", false));
+    CHECK_EQUAL(3, editPcbRes.value("added_tracks", 0));
+    const auto& resPcbTracks = editPcbRes["pcb_state"]["tracks"];
+    CHECK_EQUAL(3, static_cast<int>(resPcbTracks.size()));
+    CHECK_EQUAL(15, resPcbTracks[0].value("layerId", 0));
+    STRCMP_EQUAL("InnerLayer1", resPcbTracks[0].value("layer", "").c_str());
+    CHECK_EQUAL(2, resPcbTracks[1].value("layerId", 0));
+    STRCMP_EQUAL("BottomLayer", resPcbTracks[1].value("layer", "").c_str());
+
+    // 4. easyeda_sync_sch_to_pcb: subcircuit fatal error handling and unique_id sync
+    // 4a. Subcircuit B1 has no footprint and fix_subcircuit_blocks is false -> fatal error and ready_to_sync == false
+    nlohmann::json syncFaultRes = bridge.callTool("easyeda_sync_sch_to_pcb", {
+        {"schematic_state", schState},
+        {"pcb_state", pcbState},
+        {"dry_run", true},
+        {"fix_subcircuit_blocks", false}
+    });
+    CHECK_TRUE(syncFaultRes.value("ok", false));
+    CHECK_FALSE(syncFaultRes.value("ready_to_sync", true));
+    CHECK_TRUE(syncFaultRes.contains("subcircuit_fatal_errors"));
+    CHECK_EQUAL(1, static_cast<int>(syncFaultRes["subcircuit_fatal_errors"].size()));
+    STRCMP_EQUAL("B1", syncFaultRes["subcircuit_fatal_errors"][0].value("reference", "").c_str());
+
+    // 4b. With fix_subcircuit_blocks: true and sync_unique_ids: true -> ready_to_sync == true and unique_id synced
+    nlohmann::json syncFixedRes = bridge.callTool("easyeda_sync_sch_to_pcb", {
+        {"schematic_state", schState},
+        {"pcb_state", pcbState},
+        {"dry_run", true},
+        {"fix_subcircuit_blocks", true},
+        {"sync_unique_ids", true},
+        {"reconcile_net_names", true},
+        {"push_synthesized_netlist", true}
+    });
+    CHECK_TRUE(syncFixedRes.value("ok", false));
+    CHECK_TRUE(syncFixedRes.value("ready_to_sync", false));
+    CHECK_EQUAL(1, syncFixedRes.value("fixed_subcircuit_blocks", 0));
+    CHECK_EQUAL(1, syncFixedRes.value("synced_unique_ids", 0));
+    CHECK_TRUE(syncFixedRes.contains("unique_id_mismatches"));
+    CHECK_EQUAL(1, static_cast<int>(syncFixedRes["unique_id_mismatches"].size()));
+    STRCMP_EQUAL("R1", syncFixedRes["unique_id_mismatches"][0].value("reference", "").c_str());
+    STRCMP_EQUAL("uid_r1", syncFixedRes["unique_id_mismatches"][0].value("schematic_unique_id", "").c_str());
+    STRCMP_EQUAL("uid_diff_r1", syncFixedRes["unique_id_mismatches"][0].value("pcb_unique_id", "").c_str());
+    CHECK_TRUE(syncFixedRes.value("pushed_synthesized_netlist", false));
+
+    // 5. easyeda_run_drc summary_only preservation of violation_count & default audit trimming
+    nlohmann::json mockDrcState = {
+        {"violations", nlohmann::json::array()},
+        {"violations_omitted", true},
+        {"violation_count", 42},
+        {"passed", false},
+        {"connectivity_audit", {
+            {"all_connected", true},
+            {"unassigned_pads", nlohmann::json::array({
+                {{"pad", "1"}, {"net", ""}}
+            })},
+            {"decoupling_distance_warnings", nlohmann::json::array({
+                {{"cap_reference", "C1"}, {"ic_reference", "U1"}}
+            })}
+        }}
+    };
+    nlohmann::json drcRes = bridge.callTool("easyeda_run_drc", {
+        {"in_memory_drc", mockDrcState},
+        {"summary_only", true}
+    });
+    CHECK_TRUE(drcRes.value("ok", false));
+    CHECK_FALSE(drcRes.value("passed", true));
+    CHECK_EQUAL(42, drcRes.value("violation_count", 0));
+    CHECK_TRUE(drcRes.value("violations_omitted", false));
+    CHECK_FALSE(drcRes.contains("violations"));
+    // Audit details trimmed by default
+    const auto& drcAudit = drcRes["connectivity_audit"];
+    CHECK_TRUE(drcAudit.value("audit_details_omitted", false));
+    CHECK_FALSE(drcAudit.contains("unassigned_pads"));
+    CHECK_FALSE(drcAudit.contains("decoupling_distance_warnings"));
+    CHECK_EQUAL(1, drcAudit.value("unassigned_pads_count", 0));
+    CHECK_EQUAL(1, drcAudit.value("decoupling_distance_warnings_count", 0));
+
+    // 6. Boundary case: empty schematic / pcb inputs
+    nlohmann::json emptySchRes = bridge.callTool("easyeda_inspect_schematic", {
+        {"schematic_state", nlohmann::json::object()},
+        {"summary_only", true}
+    });
+    CHECK_TRUE(emptySchRes.value("ok", false));
+    CHECK_EQUAL(0, emptySchRes.value("component_count", -1));
+    CHECK_EQUAL(0, emptySchRes.value("wire_count", -1));
+
+    // Delete non-existent ID handled safely
+    nlohmann::json delEmptyRes = bridge.callTool("easyeda_edit_pcb", {
+        {"pcb_state", pcbState},
+        {"delete_primitives", nlohmann::json::array({"non_existent_id"})}
+    });
+    CHECK_TRUE(delEmptyRes.value("ok", false));
+    CHECK_EQUAL(0, delEmptyRes.value("deleted_primitives", -1));
+}
+
 
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {

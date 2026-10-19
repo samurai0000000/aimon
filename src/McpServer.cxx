@@ -384,6 +384,7 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
                 {"schematic_path", {{"type", "string"}, {"description", "Optional schematic file path fallback"}}},
                 {"references", {{"type", "array"}, {"description", "Optional list of component designators to filter (e.g. ['XT1', 'R16']); aliases: refs, component_refs"}}},
                 {"nets", {{"type", "array"}, {"description", "Optional list of net names to filter components and wires (e.g. ['SDA', 'GND'])"}}},
+                {"net_filter", {{"type", "string"}, {"description", "Optional single net name filter (alias for nets: [net])"}}},
                 {"component_types", {{"type", "array"}, {"description", "Optional component types to include (e.g. ['part', 'netflag'])"}}},
                 {"include_pins", {{"type", "boolean"}, {"default", true}, {"description", "Include component pin arrays (default: true)"}}},
                 {"include_wires", {{"type", "boolean"}, {"default", true}, {"description", "Include wire segments array (default: true)"}}},
@@ -405,11 +406,13 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
                 {"connect_to_net", {{"type", "array"}, {"description", "Outward 50-mil grid wire stub + net label/netflag router ({reference, pin_number, net, stub_length_mils, use_netflag})"}}},
                 {"modify_components", {{"type", "array"}, {"description", "Modify existing schematic components ({id, reference, value, unique_id, footprint, x, y, rotation, preserve_connections})"}}},
                 {"modify_pins", {{"type", "array"}, {"description", "Modify schematic pins ({pin_id, no_connected})"}}},
+                {"modify_wires", {{"type", "array"}, {"description", "Modify schematic wires ({id, net, line})"}}},
                 {"add_netflags", {{"type", "array"}, {"description", "Add power/ground netflags ({net, type, x, y, rotation})"}}},
                 {"wires", {{"type", "array"}, {"description", "Wire segments"}}},
                 {"add_wires", {{"type", "array"}, {"description", "Declarative wire segments ({points, x1, y1, x2, y2, net})"}}},
                 {"connect_pins", {{"type", "array"}, {"description", "Auto-wire pin pairs ({from, to, net})"}}},
-                {"delete_primitives", {{"type", "array"}, {"description", "Primitive IDs to delete from schematic"}}}
+                {"delete_primitives", {{"type", "array"}, {"description", "Primitive IDs to delete from schematic"}}},
+                {"delete_ids", {{"type", "array"}, {"description", "Primitive IDs to delete from schematic (alias for delete_primitives)"}}}
             },
             {}
         },
@@ -420,7 +423,11 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
             {
                 {"dry_run", {{"type", "boolean"}, {"default", false}, {"description", "Preview pre-sync netlist/footprint diff without mutating the PCB (default: false)"}}},
                 {"trigger_native_import", {{"type", "boolean"}, {"default", false}, {"description", "Trigger native EasyEDA Pro Import Changes via Windows UI Automation on Windows (default: false)"}}},
-                {"resolve_value_templates", {{"type", "boolean"}, {"default", false}, {"description", "Resolve ={Value} and ={Manufacturer Part} parameter templates to real values on the PCB (default: false)"}}}
+                {"resolve_value_templates", {{"type", "boolean"}, {"default", false}, {"description", "Resolve ={Value} and ={Manufacturer Part} parameter templates to real values on the PCB (default: false)"}}},
+                {"reconcile_net_names", {{"type", "boolean"}, {"default", false}, {"description", "Reconcile unnamed schematic wire nets with matching PCB pad nets (default: false)"}}},
+                {"sync_unique_ids", {{"type", "boolean"}, {"default", false}, {"description", "Align uniqueId between schematic and PCB components by reference (default: false)"}}},
+                {"fix_subcircuit_blocks", {{"type", "boolean"}, {"default", false}, {"description", "Demote broken subcircuit blocks causing netlist fatalError to annotations (default: false)"}}},
+                {"push_synthesized_netlist", {{"type", "boolean"}, {"default", false}, {"description", "Push synthesized schematic pin net assignments directly to PCB pads and tracks (default: false)"}}}
             },
             {}
         },
@@ -457,7 +464,8 @@ std::vector<EdaToolDescriptor> getEdaToolDescriptors() {
                 {"resolve_value_templates", {{"type", "boolean"}, {"default", false}, {"description", "Resolve ={Value} and ={Manufacturer Part} parameter templates on components to concrete values"}}},
                 {"rebuild_pours", {{"type", "boolean"}, {"default", false}, {"description", "Rebuild/re-pour all copper pours on the active PCB after edits"}}},
                 {"delete_primitives", {{"type", "array"}, {"description", "Delete PCB tracks, copper lines, vias, or components ({id, type} or primitive ID string)"}}},
-                {"tracks", {{"type", "array"}, {"description", "PCB trace segments"}}},
+                {"delete_ids", {{"type", "array"}, {"description", "Delete PCB tracks, copper lines, vias, or components (alias for delete_primitives)"}}},
+                {"tracks", {{"type", "array"}, {"description", "PCB trace segments or polyline points/line ({net, layer, x1, y1, x2, y2, width, points, line})"}}},
                 {"add_tracks", {{"type", "array"}, {"description", "Declarative PCB trace segments ({net, layer, x1, y1, x2, y2, width})"}}},
                 {"vias", {{"type", "array"}, {"description", "PCB vias"}}},
                 {"add_vias", {{"type", "array"}, {"description", "Declarative PCB vias ({net, x, y, drill, size})"}}},

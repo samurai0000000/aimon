@@ -599,6 +599,52 @@ bool triggerEasyEdaImportChangesWin32(int dialogTimeoutMs, nlohmann::json& outDi
     outDiag["stage"] = "triggered";
     return true;
 }
+
+static bool triggerEasyEdaRebuildPoursWin32(nlohmann::json& outDiag) {
+    HWND hwnd = findEasyEdaProWindow();
+    if (hwnd == nullptr) {
+        outDiag["error"] = "EasyEDA Pro window not found";
+        return false;
+    }
+    wchar_t title[512] = {0};
+    int nTitle = ::GetWindowTextW(hwnd, title, 511);
+    std::string utf8Title;
+    if (nTitle > 0) {
+        int sizeNeeded = ::WideCharToMultiByte(CP_UTF8, 0, title, nTitle, nullptr, 0, nullptr, nullptr);
+        if (sizeNeeded > 0) {
+            utf8Title.resize(sizeNeeded);
+            ::WideCharToMultiByte(CP_UTF8, 0, title, nTitle, &utf8Title[0], sizeNeeded, nullptr, nullptr);
+        }
+    }
+    outDiag["hwnd"] = reinterpret_cast<uintptr_t>(hwnd);
+    outDiag["window_title"] = utf8Title;
+
+    if (::IsIconic(hwnd)) {
+        ::ShowWindow(hwnd, SW_RESTORE);
+        ::Sleep(150);
+    }
+    ::SetForegroundWindow(hwnd);
+    ::Sleep(150);
+
+    INPUT inputs[4] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_SHIFT;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'B';
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'B';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_SHIFT;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    ::SendInput(4, inputs, sizeof(INPUT));
+    ::Sleep(250);
+
+    outDiag["method"] = "SendInput_Shift_B";
+    outDiag["triggered"] = true;
+    return true;
+}
 #else
 bool triggerEasyEdaNativeAutoRouteWin32(int /*dialogTimeoutMs*/, nlohmann::json& outDiag) {
     outDiag["error"] = "Win32 UI Automation is only available when aimon-eda-bridge runs on Windows";
@@ -606,6 +652,11 @@ bool triggerEasyEdaNativeAutoRouteWin32(int /*dialogTimeoutMs*/, nlohmann::json&
 }
 
 bool triggerEasyEdaImportChangesWin32(int /*dialogTimeoutMs*/, nlohmann::json& outDiag) {
+    outDiag["error"] = "Win32 UI Automation not available on this platform";
+    return false;
+}
+
+static bool triggerEasyEdaRebuildPoursWin32(nlohmann::json& outDiag) {
     outDiag["error"] = "Win32 UI Automation not available on this platform";
     return false;
 }
@@ -3696,6 +3747,14 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
         }
     }
 
+    bool drcRebuildPours = false;
+    nlohmann::json drcPourDiag = nlohmann::json::object();
+    bool drcPourOk = false;
+    if (toolName == "easyeda_run_drc" && args.value("rebuild_pours", false)) {
+        drcRebuildPours = true;
+        drcPourOk = triggerEasyEdaRebuildPoursWin32(drcPourDiag);
+    }
+
     int defaultTimeout = std::max(_options.defaultTimeoutMs, 25000);
     int timeoutMs = effectiveArgs.value("timeout_ms", defaultTimeout);
     nlohmann::json plugRes;
@@ -3705,6 +3764,10 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
             {"ok", false},
             {"error", plugErr}
         };
+    }
+
+    if (drcRebuildPours && plugRes.is_object()) {
+        plugRes["pour_rebuild"] = {{"triggered", drcPourOk}, {"diagnostics", drcPourDiag}};
     }
 
     if (toolName == "easyeda_export_jlcpcb" && plugRes.is_object()) {
@@ -3742,6 +3805,14 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
         }
     }
 
+    if (toolName == "easyeda_edit_pcb" && plugRes.is_object() &&
+        (args.value("rebuild_pours", false) || plugRes.value("rebuild_pours_requested", false) ||
+         plugRes.value("added_zones", 0) > 0)) {
+        nlohmann::json pourDiag = nlohmann::json::object();
+        bool pourOk = triggerEasyEdaRebuildPoursWin32(pourDiag);
+        plugRes["pour_rebuild"] = {{"triggered", pourOk}, {"diagnostics", pourDiag}};
+    }
+
     if (toolName == "easyeda_sync_sch_to_pcb" && plugRes.is_object() &&
         !args.value("dry_run", false) && args.value("trigger_native_import", false)) {
         nlohmann::json uiaDiag = nlohmann::json::object();
@@ -3759,6 +3830,30 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
             bool ercOk = false;
             std::string ercSummary;
             plugRes["erc_audit"] = acc.calcSchematicErcAudit(plugRes, ercOk, ercSummary);
+        }
+        if (args.value("summary_only", false)) {
+            if (!plugRes.contains("components_count") && plugRes.contains("components") && plugRes["components"].is_array()) {
+                plugRes["components_count"] = static_cast<int>(plugRes["components"].size());
+            }
+            if (!plugRes.contains("component_count")) {
+                plugRes["component_count"] = plugRes.value("components_count", 0);
+            }
+            if (!plugRes.contains("wires_count") && plugRes.contains("wires") && plugRes["wires"].is_array()) {
+                plugRes["wires_count"] = static_cast<int>(plugRes["wires"].size());
+            }
+            if (!plugRes.contains("wire_count")) {
+                plugRes["wire_count"] = plugRes.value("wires_count", 0);
+            }
+            if (!plugRes.contains("subcircuit_components_count") && plugRes.contains("subcircuit_components") && plugRes["subcircuit_components"].is_array()) {
+                plugRes["subcircuit_components_count"] = static_cast<int>(plugRes["subcircuit_components"].size());
+            }
+            plugRes.erase("components");
+            plugRes.erase("wires");
+            plugRes.erase("netlist");
+            plugRes.erase("subcircuit_components");
+            if (plugRes.contains("erc_audit") && plugRes["erc_audit"].is_object()) {
+                plugRes["erc_audit"].erase("inferred_nets");
+            }
         }
     }
 
@@ -3843,7 +3938,7 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
             plugRes.erase("vias");
             plugRes.erase("schematic_components");
         }
-        if (summaryOnly && !args.value("include_audit_details", false) &&
+        if (!args.value("include_audit_details", false) &&
             plugRes.contains("connectivity_audit") && plugRes["connectivity_audit"].is_object()) {
             auto& ca = plugRes["connectivity_audit"];
             if (!ca.contains("decoupling_distance_warnings_count") &&
