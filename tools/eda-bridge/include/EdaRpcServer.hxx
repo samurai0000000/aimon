@@ -9,6 +9,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -68,6 +70,63 @@ struct PluginPendingCall {
     std::string errorMessage;
 };
 
+struct EdaBridgeFunctionStat {
+    std::string functionName;
+    std::string toolName;
+    std::string subFunction;
+    std::string component; // "easyeda" | "kicad" | "freecad" | "accelerators"
+    uint64_t totalCalls = 0;
+    uint64_t successCalls = 0;
+    uint64_t failedCalls = 0;
+    int lastDurationMs = 0;
+    int maxDurationMs = 0;
+    double avgDurationMs = 0.0;
+    int64_t lastCallEpoch = 0;
+    std::string lastTargetDocument;
+    std::string lastSummary;
+};
+
+struct EdaBridgeComponentStat {
+    std::string component; // "easyeda" | "kicad" | "freecad" | "accelerators"
+    uint64_t totalCalls = 0;
+    uint64_t successCalls = 0;
+    uint64_t failedCalls = 0;
+    int lastDurationMs = -1;
+    double avgDurationMs = 0.0;
+    int64_t lastCallEpoch = 0;
+    std::string lastFunctionCalled;
+    std::string activeDocument;
+    std::string lastSummary;
+};
+
+struct EdaBridgeCallLogEntry {
+    int64_t timestampEpoch = 0;
+    std::string component;
+    std::string toolName;
+    std::string functionName;
+    std::string targetDocument;
+    int durationMs = 0;
+    bool success = true;
+    std::string summary;
+};
+
+struct EdaBridgeTelemetrySnapshot {
+    uint64_t totalCalls = 0;
+    uint64_t successCalls = 0;
+    uint64_t failedCalls = 0;
+    double avgDurationMs = 0.0;
+    int maxDurationMs = 0;
+    int lastDurationMs = -1;
+    int64_t lastCallEpoch = 0;
+    std::string lastFunctionCalled;
+    std::string mostUsedFunction;
+    uint64_t mostUsedFunctionCalls = 0;
+    std::string mostActiveComponent;
+    std::map<std::string, EdaBridgeComponentStat> components;
+    std::vector<EdaBridgeFunctionStat> functions;
+    std::vector<EdaBridgeCallLogEntry> recentCalls;
+};
+
 class EdaRpcServer {
 public:
     explicit EdaRpcServer(const EdaRpcServerOptions& options = EdaRpcServerOptions());
@@ -96,6 +155,10 @@ public:
     nlohmann::json buildStatusPayload() const;
     nlohmann::json dispatchToolCall(const std::string& toolName,
                                     const nlohmann::json& arguments);
+
+    EdaBridgeTelemetrySnapshot getTelemetrySnapshot() const;
+    void clearTelemetry();
+    static std::string classifyToolComponent(const std::string& toolName);
 
     static bool constantTimeEquals(const std::string& a, const std::string& b);
     bool validateSandboxPath(const std::string& pathStr, std::string& outError) const;
@@ -134,6 +197,13 @@ private:
                     int timeoutMs);
 
     void gatewayReadLoop(int gwFd);
+
+    nlohmann::json dispatchToolCallInternal(const std::string& toolName,
+                                            const nlohmann::json& arguments);
+    void recordToolInvocation(const std::string& toolName,
+                              const nlohmann::json& arguments,
+                              const nlohmann::json& result,
+                              int durationMs);
 
     nlohmann::json handleKiCadTool(const std::string& toolName, const nlohmann::json& args);
     nlohmann::json handleFreeCadTool(const std::string& toolName, const nlohmann::json& args);
@@ -177,6 +247,19 @@ private:
     mutable std::mutex _docStateMutex;
     std::map<std::string, nlohmann::json> _freecadDocs;
     std::map<std::string, nlohmann::json> _freecadPrevDocs;
+
+    mutable std::mutex _telemetryMutex;
+    uint64_t _telemetryTotalCalls = 0;
+    uint64_t _telemetrySuccessCalls = 0;
+    uint64_t _telemetryFailedCalls = 0;
+    double _telemetryTotalDurationMs = 0.0;
+    int _telemetryMaxDurationMs = 0;
+    int _telemetryLastDurationMs = -1;
+    int64_t _telemetryLastCallEpoch = 0;
+    std::string _telemetryLastFunctionCalled;
+    std::map<std::string, EdaBridgeComponentStat> _componentStats;
+    std::map<std::string, EdaBridgeFunctionStat> _functionStats;
+    std::deque<EdaBridgeCallLogEntry> _recentCalls;
 };
 
 } // namespace aimon

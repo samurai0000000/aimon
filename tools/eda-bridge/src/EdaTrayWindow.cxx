@@ -7,6 +7,7 @@
 #ifdef AIMON_EDA_BRIDGE_WITH_QT
 
 #include "EdaTrayWindow.hxx"
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -808,7 +809,7 @@ void EdaTrayWindow::buildUi() {
     _tabWidget->addTab(quotasTab, "AI Quotas");
 
     // =========================================================================
-    // TAB 2: EDA / CAD Bridges & Settings
+    // TAB 2: EDA/CAD
     // =========================================================================
     QWidget* bridgesTab = new QWidget(this);
     QVBoxLayout* bridgesLayout = new QVBoxLayout(bridgesTab);
@@ -838,7 +839,7 @@ void EdaTrayWindow::buildUi() {
     QVBoxLayout* statusCardLayout = new QVBoxLayout(statusCard);
     statusCardLayout->setContentsMargins(14, 14, 14, 14);
     statusCardLayout->setSpacing(10);
-    QLabel* statusTitle = new QLabel("✦  Live Bridge & Companion Plugin Telemetry", statusCard);
+    QLabel* statusTitle = new QLabel("✦  Live Bridge & Companion Plugin Status", statusCard);
     statusTitle->setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: 800; letter-spacing: 0.3px;");
     statusCardLayout->addWidget(statusTitle);
 
@@ -856,6 +857,201 @@ void EdaTrayWindow::buildUi() {
     statusGrid->addWidget(_lblFreeCadStatus, 2, 0, 1, 2);
     statusCardLayout->addLayout(statusGrid);
     settingsVBox->addWidget(statusCard);
+
+    // Bridge Function Invocation Telemetry Card
+    QFrame* telemetryCard = new QFrame(settingsContent);
+    telemetryCard->setObjectName("telemetryCard");
+    telemetryCard->setStyleSheet(
+        "#telemetryCard { background-color: #0b1120; border: 1px solid #1e293b; border-radius: 12px; }"
+    );
+    QVBoxLayout* telemetryLayout = new QVBoxLayout(telemetryCard);
+    telemetryLayout->setContentsMargins(14, 14, 14, 14);
+    telemetryLayout->setSpacing(12);
+
+    QHBoxLayout* telHeaderRow = new QHBoxLayout();
+    telHeaderRow->setContentsMargins(0, 0, 0, 0);
+    telHeaderRow->setSpacing(8);
+    QLabel* telTitle = new QLabel("✦  Bridge Function Invocation Telemetry", telemetryCard);
+    telTitle->setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: 800; letter-spacing: 0.3px;");
+
+    _lblTelemetryStatusPill = new QLabel("○ IDLE (0 CALLS)", telemetryCard);
+    _lblTelemetryStatusPill->setStyleSheet(
+        "background-color: rgba(148, 163, 184, 0.12); color: #94a3b8; "
+        "border: 1px solid #334155; border-radius: 6px; "
+        "padding: 2px 8px; font-size: 11px; font-weight: 700;"
+    );
+
+    _btnResetTelemetry = new QPushButton("Reset", telemetryCard);
+    _btnResetTelemetry->setToolTip("Clear function invocation counters and recent call log");
+    _btnResetTelemetry->setStyleSheet(
+        "QPushButton { background-color: #0f172a; color: #94a3b8; border: 1px solid #1e293b; "
+        "border-radius: 6px; padding: 2px 10px; font-size: 11px; font-weight: 600; } "
+        "QPushButton:hover { background-color: #1e293b; color: #f8fafc; border-color: #38bdf8; }"
+    );
+    QObject::connect(_btnResetTelemetry, &QPushButton::clicked, [this]() {
+        _server.clearTelemetry();
+        _telemetryResetEpoch = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        populateTelemetryUi(_server.getTelemetrySnapshot(), true);
+    });
+
+    telHeaderRow->addWidget(telTitle);
+    telHeaderRow->addStretch(1);
+    telHeaderRow->addWidget(_lblTelemetryStatusPill);
+    telHeaderRow->addWidget(_btnResetTelemetry);
+    telemetryLayout->addLayout(telHeaderRow);
+
+    // 4-Column KPI Summary Strip
+    QHBoxLayout* telKpiRow = new QHBoxLayout();
+    telKpiRow->setSpacing(8);
+
+    auto makeKpiBox = [&](const char* caption, QLabel*& outVal, QLabel*& outSub) -> QFrame* {
+        QFrame* box = new QFrame(telemetryCard);
+        box->setStyleSheet(statBoxStyle);
+        QVBoxLayout* boxLayout = new QVBoxLayout(box);
+        boxLayout->setContentsMargins(8, 6, 8, 6);
+        boxLayout->setSpacing(3);
+        QLabel* cap = new QLabel(caption, box);
+        cap->setStyleSheet(statCaptionStyle);
+        outVal = new QLabel("--", box);
+        outVal->setStyleSheet(
+            "color: #f8fafc; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+            "font-size: 15px; font-weight: 800; border: none; padding: 0;"
+        );
+        outSub = new QLabel("--", box);
+        outSub->setStyleSheet("color: #64748b; font-size: 10px; font-weight: 600; border: none; padding: 0;");
+        boxLayout->addWidget(cap);
+        boxLayout->addWidget(outVal);
+        boxLayout->addWidget(outSub);
+        return box;
+    };
+
+    telKpiRow->addWidget(makeKpiBox("TOTAL INVOCATIONS", _lblTelTotalCalls, _lblTelTotalSub), 1);
+    telKpiRow->addWidget(makeKpiBox("SUCCESS RATE", _lblTelSuccessRate, _lblTelSuccessSub), 1);
+    telKpiRow->addWidget(makeKpiBox("BRIDGE LATENCY", _lblTelAvgLatency, _lblTelLatencySub), 1);
+    telKpiRow->addWidget(makeKpiBox("TOP FUNCTION", _lblTelTopFunc, _lblTelTopFuncSub), 1);
+    telemetryLayout->addLayout(telKpiRow);
+
+    // Per-Bridge Usage Breakdown (2x2 Grid: EasyEDA Pro, KiCad, FreeCAD, CPU Accelerators)
+    QLabel* domSectionTitle = new QLabel("USAGE BY BRIDGE & ENGINE", telemetryCard);
+    domSectionTitle->setStyleSheet(
+        "color: #94a3b8; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;"
+    );
+    telemetryLayout->addWidget(domSectionTitle);
+
+    QGridLayout* domGrid = new QGridLayout();
+    domGrid->setSpacing(8);
+    domGrid->setColumnStretch(0, 1);
+    domGrid->setColumnStretch(1, 1);
+
+    auto makeDomainCard = [&](const char* title,
+                              const char* accentHex,
+                              BridgeDomainCardWidgets& outWidgets) -> QFrame* {
+        QFrame* card = new QFrame(telemetryCard);
+        card->setObjectName("edaDomainCard");
+        card->setStyleSheet(
+            "#edaDomainCard { background-color: rgba(255, 255, 255, 0.025); "
+            "border: 1px solid #1e293b; border-radius: 8px; }"
+        );
+        QVBoxLayout* cardLayout = new QVBoxLayout(card);
+        cardLayout->setContentsMargins(10, 8, 10, 8);
+        cardLayout->setSpacing(5);
+
+        QHBoxLayout* topRow = new QHBoxLayout();
+        topRow->setContentsMargins(0, 0, 0, 0);
+        topRow->setSpacing(6);
+        QLabel* nameLbl = new QLabel(title, card);
+        nameLbl->setStyleSheet(
+            QString("color: %1; font-size: 12px; font-weight: 700;").arg(accentHex)
+        );
+        outWidgets.callsBadge = new QLabel("0 calls (0%)", card);
+        outWidgets.callsBadge->setStyleSheet(
+            "color: #e2e8f0; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+            "font-size: 11px; font-weight: 700;"
+        );
+        topRow->addWidget(nameLbl);
+        topRow->addStretch(1);
+        topRow->addWidget(outWidgets.callsBadge);
+        cardLayout->addLayout(topRow);
+
+        outWidgets.shareBar = new QProgressBar(card);
+        outWidgets.shareBar->setRange(0, 100);
+        outWidgets.shareBar->setValue(0);
+        outWidgets.shareBar->setTextVisible(false);
+        outWidgets.shareBar->setFixedHeight(5);
+        outWidgets.shareBar->setStyleSheet(
+            QString("QProgressBar { border: none; border-radius: 2px; "
+                    "background-color: rgba(255, 255, 255, 0.07); min-height: 5px; max-height: 5px; } "
+                    "QProgressBar::chunk { background-color: %1; border-radius: 2px; }")
+                .arg(accentHex)
+        );
+        cardLayout->addWidget(outWidgets.shareBar);
+
+        outWidgets.detailLabel = new QLabel("No calls recorded", card);
+        outWidgets.detailLabel->setStyleSheet("color: #64748b; font-size: 10px; font-weight: 600;");
+        cardLayout->addWidget(outWidgets.detailLabel);
+        return card;
+    };
+
+    domGrid->addWidget(makeDomainCard("EasyEDA Pro", "#38bdf8", _domCardEasyEda), 0, 0);
+    domGrid->addWidget(makeDomainCard("KiCad", "#c084fc", _domCardKiCad), 0, 1);
+    domGrid->addWidget(makeDomainCard("FreeCAD", "#34d399", _domCardFreeCad), 1, 0);
+    domGrid->addWidget(makeDomainCard("CPU Accelerators", "#fbbf24", _domCardAccelerators), 1, 1);
+    telemetryLayout->addLayout(domGrid);
+
+    // Invoked Functions Breakdown Section
+    QFrame* fnDivider = new QFrame(telemetryCard);
+    fnDivider->setFixedHeight(1);
+    fnDivider->setStyleSheet("background-color: rgba(255, 255, 255, 0.06); border: none;");
+    telemetryLayout->addWidget(fnDivider);
+
+    _lblFunctionsHeader = new QLabel("INVOKED FUNCTIONS BREAKDOWN (0)", telemetryCard);
+    _lblFunctionsHeader->setStyleSheet(
+        "color: #94a3b8; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;"
+    );
+    telemetryLayout->addWidget(_lblFunctionsHeader);
+
+    _edaFunctionsContainer = new QWidget(telemetryCard);
+    _edaFunctionsLayout = new QVBoxLayout(_edaFunctionsContainer);
+    _edaFunctionsLayout->setContentsMargins(0, 0, 0, 0);
+    _edaFunctionsLayout->setSpacing(6);
+    telemetryLayout->addWidget(_edaFunctionsContainer);
+
+    // Recent Invocations Feed Section
+    QFrame* recentDivider = new QFrame(telemetryCard);
+    recentDivider->setFixedHeight(1);
+    recentDivider->setStyleSheet("background-color: rgba(255, 255, 255, 0.06); border: none;");
+    telemetryLayout->addWidget(recentDivider);
+
+    _btnToggleRecentCalls = new QPushButton("Recent Bridge Invocations (0)  ˄", telemetryCard);
+    _btnToggleRecentCalls->setStyleSheet(
+        "QPushButton { background: transparent; border: none; color: #94a3b8; "
+        "font-size: 12px; font-weight: 600; text-align: left; padding: 2px 2px; } "
+        "QPushButton:hover { color: #f8fafc; background: transparent; border: none; }"
+    );
+    telemetryLayout->addWidget(_btnToggleRecentCalls);
+
+    _edaRecentCallsContainer = new QWidget(telemetryCard);
+    _edaRecentCallsLayout = new QVBoxLayout(_edaRecentCallsContainer);
+    _edaRecentCallsLayout->setContentsMargins(0, 2, 0, 0);
+    _edaRecentCallsLayout->setSpacing(4);
+    telemetryLayout->addWidget(_edaRecentCallsContainer);
+
+    QObject::connect(_btnToggleRecentCalls, &QPushButton::clicked, [this]() {
+        _edaRecentCallsExpanded = !_edaRecentCallsExpanded;
+        _edaRecentCallsContainer->setVisible(_edaRecentCallsExpanded);
+        const EdaBridgeTelemetrySnapshot merged = EdaBridgeAppConfig::mergeTelemetrySnapshots(
+            _server.getTelemetrySnapshot(), _lastQuotaSnap, _telemetryResetEpoch
+        );
+        _btnToggleRecentCalls->setText(
+            QString("Recent Bridge Invocations (%1)  %2")
+                .arg(merged.recentCalls.size())
+                .arg(_edaRecentCallsExpanded ? "˄" : "˅")
+        );
+    });
+
+    settingsVBox->addWidget(telemetryCard);
 
     // Persisted Checkboxes Card
     QFrame* togglesCard = new QFrame(settingsContent);
@@ -971,7 +1167,7 @@ void EdaTrayWindow::buildUi() {
     bridgeButtons->addWidget(btnExportEext);
     bridgesLayout->addLayout(bridgeButtons);
 
-    _tabWidget->addTab(bridgesTab, "EDA / CAD Bridges & Settings");
+    _tabWidget->addTab(bridgesTab, "EDA/CAD");
 }
 
 void EdaTrayWindow::buildTrayIcon() {
@@ -1005,7 +1201,7 @@ void EdaTrayWindow::buildTrayIcon() {
         showQuotasTab();
     });
 
-    QAction* actShowBridges = _trayMenu->addAction("EDA / CAD Bridge Settings...");
+    QAction* actShowBridges = _trayMenu->addAction("Show EDA/CAD...");
     QObject::connect(actShowBridges, &QAction::triggered, [this]() {
         showBridgesTab();
     });
@@ -1274,15 +1470,514 @@ void EdaTrayWindow::refreshLiveStatus() {
         _trayIcon->setToolTip(QString::fromStdString(tooltip));
     }
 
+    const EdaBridgeTelemetrySnapshot mergedTel = EdaBridgeAppConfig::mergeTelemetrySnapshots(
+        _server.getTelemetrySnapshot(), _lastQuotaSnap, _telemetryResetEpoch
+    );
+    populateTelemetryUi(mergedTel, false);
+
     if (_actSummaryBridges) {
         _actSummaryBridges->setText(
-            QString("Bridges: EE=%1 | KC=%2 | FC=%3")
+            QString("Bridges: EE=%1 | KC=%2 | FC=%3 (%4 calls)")
                 .arg(!_settings.enableEasyEda ? "Off" : (eeConn ? "Live" : "Ready"))
                 .arg(!_settings.enableKiCad ? "Off" : (kcConn ? "Live" : "Ready"))
                 .arg(!_settings.enableFreeCad ? "Off" : (fcConn ? "Live" : "Ready"))
+                .arg(mergedTel.totalCalls)
         );
     }
     updateQuotaCountdowns();
+}
+
+std::string EdaTrayWindow::formatRelativeAgo(int64_t epochSec, int64_t nowEpochSec) {
+    if (epochSec <= 0) {
+        return "never";
+    }
+    int64_t diff = (nowEpochSec > epochSec) ? (nowEpochSec - epochSec) : 0;
+    if (diff < 3) {
+        return "just now";
+    }
+    if (diff < 60) {
+        return std::to_string(diff) + "s ago";
+    }
+    if (diff < 3600) {
+        return std::to_string(diff / 60) + "m " + std::to_string(diff % 60) + "s ago";
+    }
+    if (diff < 86400) {
+        return std::to_string(diff / 3600) + "h " + std::to_string((diff % 3600) / 60) + "m ago";
+    }
+    return std::to_string(diff / 86400) + "d ago";
+}
+
+void EdaTrayWindow::updateTelemetryRelativeTimes() {
+    const int64_t nowEpoch = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+    for (const auto& b : _edaRelativeTimeBindings) {
+        if (!b.label) continue;
+        std::string txt = b.prefix + formatRelativeAgo(b.callEpoch, nowEpoch);
+        b.label->setText(QString::fromStdString(txt));
+    }
+}
+
+void EdaTrayWindow::populateTelemetryUi(const EdaBridgeTelemetrySnapshot& snap,
+                                        bool forceRebuild) {
+    const int64_t nowEpoch = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+
+    // 1. Update Header Status Pill & 4 KPI Summary Boxes
+    if (snap.totalCalls == 0) {
+        _lblTelemetryStatusPill->setText("○ IDLE (0 CALLS)");
+        _lblTelemetryStatusPill->setStyleSheet(
+            "background-color: rgba(148, 163, 184, 0.12); color: #94a3b8; "
+            "border: 1px solid #334155; border-radius: 6px; "
+            "padding: 2px 8px; font-size: 11px; font-weight: 700;"
+        );
+
+        _lblTelTotalCalls->setText("0");
+        _lblTelTotalCalls->setStyleSheet(
+            "color: #94a3b8; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+            "font-size: 15px; font-weight: 800; border: none; padding: 0;"
+        );
+        _lblTelTotalSub->setText("0 functions used");
+
+        _lblTelSuccessRate->setText("--");
+        _lblTelSuccessRate->setStyleSheet(
+            "color: #94a3b8; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+            "font-size: 15px; font-weight: 800; border: none; padding: 0;"
+        );
+        _lblTelSuccessSub->setText("0 OK / 0 ERR");
+
+        _lblTelAvgLatency->setText("--");
+        _lblTelAvgLatency->setStyleSheet(
+            "color: #94a3b8; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+            "font-size: 15px; font-weight: 800; border: none; padding: 0;"
+        );
+        _lblTelLatencySub->setText("Last: -- · Max: --");
+
+        _lblTelTopFunc->setText("None yet");
+        _lblTelTopFunc->setStyleSheet(
+            "color: #94a3b8; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+            "font-size: 13px; font-weight: 700; border: none; padding: 0;"
+        );
+        _lblTelTopFunc->setToolTip("");
+        _lblTelTopFuncSub->setText("Waiting for tool calls");
+    } else {
+        const double succPct = (100.0 * static_cast<double>(snap.successCalls)) /
+                               static_cast<double>(snap.totalCalls);
+        const bool allOk = (snap.failedCalls == 0);
+
+        _lblTelemetryStatusPill->setText(
+            QString("● %1 %2 · %3")
+                .arg(snap.totalCalls)
+                .arg(snap.totalCalls == 1 ? "CALL" : "CALLS")
+                .arg(QString::fromStdString(formatRelativeAgo(snap.lastCallEpoch, nowEpoch)).toUpper())
+        );
+        _lblTelemetryStatusPill->setStyleSheet(
+            allOk
+                ? "background-color: rgba(16, 185, 129, 0.14); color: #10b981; "
+                  "border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 6px; "
+                  "padding: 2px 8px; font-size: 11px; font-weight: 700;"
+                : "background-color: rgba(245, 158, 11, 0.14); color: #fbbf24; "
+                  "border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 6px; "
+                  "padding: 2px 8px; font-size: 11px; font-weight: 700;"
+        );
+
+        int activeDomains = 0;
+        for (const auto& kv : snap.components) {
+            if (kv.second.totalCalls > 0) ++activeDomains;
+        }
+        _lblTelTotalCalls->setText(
+            QString::fromStdString(formatNumberWithCommas(static_cast<int64_t>(snap.totalCalls)))
+        );
+        _lblTelTotalCalls->setStyleSheet(
+            "color: #00f2fe; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+            "font-size: 16px; font-weight: 800; border: none; padding: 0;"
+        );
+        _lblTelTotalSub->setText(
+            QString("%1 %2 · %3 %4")
+                .arg(snap.functions.size())
+                .arg(snap.functions.size() == 1 ? "func" : "funcs")
+                .arg(activeDomains)
+                .arg(activeDomains == 1 ? "bridge" : "bridges")
+        );
+
+        QString rateColor = "#10b981";
+        if (succPct < 80.0) {
+            rateColor = "#f87171";
+        } else if (succPct < 98.0) {
+            rateColor = "#fbbf24";
+        }
+        _lblTelSuccessRate->setText(QString("%1%").arg(succPct, 0, 'f', succPct >= 99.95 ? 0 : 1));
+        _lblTelSuccessRate->setStyleSheet(
+            QString("color: %1; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+                    "font-size: 16px; font-weight: 800; border: none; padding: 0;")
+                .arg(rateColor)
+        );
+        _lblTelSuccessSub->setText(
+            QString("%1 OK · %2 ERR").arg(snap.successCalls).arg(snap.failedCalls)
+        );
+
+        _lblTelAvgLatency->setText(
+            QString("%1 ms").arg(static_cast<int>(std::round(snap.avgDurationMs)))
+        );
+        _lblTelAvgLatency->setStyleSheet(
+            "color: #f8fafc; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+            "font-size: 16px; font-weight: 800; border: none; padding: 0;"
+        );
+        _lblTelLatencySub->setText(
+            QString("Last: %1 ms · Max: %2 ms")
+                .arg(std::max(0, snap.lastDurationMs))
+                .arg(snap.maxDurationMs)
+        );
+
+        QString topFnDisplay = QString::fromStdString(snap.mostUsedFunction);
+        if (topFnDisplay.length() > 24) {
+            topFnDisplay = topFnDisplay.left(22) + "…";
+        }
+        _lblTelTopFunc->setText(topFnDisplay);
+        _lblTelTopFunc->setToolTip(QString::fromStdString(snap.mostUsedFunction));
+        _lblTelTopFunc->setStyleSheet(
+            "color: #38bdf8; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+            "font-size: 12px; font-weight: 800; border: none; padding: 0;"
+        );
+        _lblTelTopFuncSub->setText(
+            QString("%1× (%2% of calls)")
+                .arg(snap.mostUsedFunctionCalls)
+                .arg(static_cast<int>(std::round(
+                    100.0 * static_cast<double>(snap.mostUsedFunctionCalls) /
+                    static_cast<double>(snap.totalCalls)
+                )))
+        );
+    }
+
+    // 2. Update Per-Bridge Usage Breakdown Cards
+    auto updateDomainCard = [&](const std::string& compKey, BridgeDomainCardWidgets& w) {
+        if (!w.callsBadge || !w.shareBar || !w.detailLabel) return;
+        EdaBridgeComponentStat st;
+        auto it = snap.components.find(compKey);
+        if (it != snap.components.end()) {
+            st = it->second;
+        }
+        if (st.totalCalls == 0 || snap.totalCalls == 0) {
+            w.callsBadge->setText("0 calls (0%)");
+            w.shareBar->setValue(0);
+            if (!st.activeDocument.empty()) {
+                QFileInfo fi(QString::fromStdString(st.activeDocument));
+                w.detailLabel->setText(
+                    QString("Idle · Doc: %1").arg(fi.fileName().isEmpty()
+                        ? QString::fromStdString(st.activeDocument)
+                        : fi.fileName())
+                );
+            } else {
+                w.detailLabel->setText("No calls recorded");
+            }
+            w.detailLabel->setToolTip("");
+            return;
+        }
+
+        const int sharePct = static_cast<int>(std::round(
+            (100.0 * static_cast<double>(st.totalCalls)) / static_cast<double>(snap.totalCalls)
+        ));
+        w.callsBadge->setText(QString("%1 %2 (%3%)")
+                                  .arg(st.totalCalls)
+                                  .arg(st.totalCalls == 1 ? "call" : "calls")
+                                  .arg(sharePct));
+        w.shareBar->setValue(std::clamp(sharePct, 0, 100));
+
+        QString lastFnShort = QString::fromStdString(st.lastFunctionCalled);
+        if (lastFnShort.length() > 26) {
+            lastFnShort = lastFnShort.left(24) + "…";
+        }
+        w.detailLabel->setText(
+            QString("%1 OK · %2 ERR · avg %3 ms · %4")
+                .arg(st.successCalls)
+                .arg(st.failedCalls)
+                .arg(static_cast<int>(std::round(st.avgDurationMs)))
+                .arg(lastFnShort)
+        );
+        w.detailLabel->setToolTip(
+            QString("Last function: %1\nActive document: %2\nLast summary: %3")
+                .arg(QString::fromStdString(st.lastFunctionCalled))
+                .arg(QString::fromStdString(st.activeDocument.empty() ? "N/A" : st.activeDocument))
+                .arg(QString::fromStdString(st.lastSummary.empty() ? "N/A" : st.lastSummary))
+        );
+    };
+
+    updateDomainCard("easyeda", _domCardEasyEda);
+    updateDomainCard("kicad", _domCardKiCad);
+    updateDomainCard("freecad", _domCardFreeCad);
+    updateDomainCard("accelerators", _domCardAccelerators);
+
+    // 3. Check if Dynamic Function & Recent Call Rows Need Rebuilding
+    const bool unchanged = !forceRebuild &&
+                           (_lastRenderedTelTotalCalls == snap.totalCalls) &&
+                           (_lastRenderedTelSuccessCalls == snap.successCalls) &&
+                           (_lastRenderedTelFailedCalls == snap.failedCalls) &&
+                           (_lastRenderedTelLastEpoch == snap.lastCallEpoch) &&
+                           (_lastRenderedTelFuncCount == snap.functions.size()) &&
+                           (_lastRenderedTelRecentCount == snap.recentCalls.size());
+    if (unchanged) {
+        updateTelemetryRelativeTimes();
+        return;
+    }
+
+    _lastRenderedTelTotalCalls = snap.totalCalls;
+    _lastRenderedTelSuccessCalls = snap.successCalls;
+    _lastRenderedTelFailedCalls = snap.failedCalls;
+    _lastRenderedTelLastEpoch = snap.lastCallEpoch;
+    _lastRenderedTelFuncCount = snap.functions.size();
+    _lastRenderedTelRecentCount = snap.recentCalls.size();
+
+    _edaRelativeTimeBindings.clear();
+    clearLayoutWidgets(_edaFunctionsLayout);
+    clearLayoutWidgets(_edaRecentCallsLayout);
+
+    _lblFunctionsHeader->setText(
+        QString("INVOKED FUNCTIONS BREAKDOWN (%1)")
+            .arg(snap.functions.size())
+    );
+    _btnToggleRecentCalls->setText(
+        QString("Recent Bridge Invocations (%1)  %2")
+            .arg(snap.recentCalls.size())
+            .arg(_edaRecentCallsExpanded ? "˄" : "˅")
+    );
+    _edaRecentCallsContainer->setVisible(_edaRecentCallsExpanded);
+
+    auto makeComponentBadge = [](const std::string& comp, QWidget* parent, bool compact) -> QLabel* {
+        QString text = "OTHER";
+        QString style =
+            "background-color: rgba(148, 163, 184, 0.14); color: #cbd5e1; "
+            "border: 1px solid #334155; border-radius: 5px; "
+            "padding: 1px 6px; font-size: 10px; font-weight: 700;";
+        if (comp == "easyeda") {
+            text = compact ? "EE" : "EasyEDA";
+            style =
+                "background-color: rgba(56, 189, 248, 0.16); color: #38bdf8; "
+                "border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 5px; "
+                "padding: 1px 6px; font-size: 10px; font-weight: 700;";
+        } else if (comp == "kicad") {
+            text = compact ? "KC" : "KiCad";
+            style =
+                "background-color: rgba(168, 85, 247, 0.16); color: #c084fc; "
+                "border: 1px solid rgba(168, 85, 247, 0.35); border-radius: 5px; "
+                "padding: 1px 6px; font-size: 10px; font-weight: 700;";
+        } else if (comp == "freecad") {
+            text = compact ? "FC" : "FreeCAD";
+            style =
+                "background-color: rgba(16, 185, 129, 0.16); color: #34d399; "
+                "border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 5px; "
+                "padding: 1px 6px; font-size: 10px; font-weight: 700;";
+        } else if (comp == "accelerators") {
+            text = compact ? "ACC" : "Accel";
+            style =
+                "background-color: rgba(245, 158, 11, 0.16); color: #fbbf24; "
+                "border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 5px; "
+                "padding: 1px 6px; font-size: 10px; font-weight: 700;";
+        }
+        QLabel* badge = new QLabel(text, parent);
+        badge->setFixedWidth(compact ? 36 : 58);
+        badge->setAlignment(Qt::AlignCenter);
+        badge->setStyleSheet(style);
+        return badge;
+    };
+
+    // 4. Populate Invoked Functions Breakdown
+    if (snap.functions.empty()) {
+        QLabel* emptyFnLbl = new QLabel(
+            "No bridge functions invoked yet in this session — waiting for AI tool calls...",
+            _edaFunctionsContainer
+        );
+        emptyFnLbl->setStyleSheet("color: #64748b; font-size: 11px; padding: 2px 0;");
+        _edaFunctionsLayout->addWidget(emptyFnLbl);
+    } else {
+        const uint64_t maxFnCalls = std::max<uint64_t>(1, snap.functions.front().totalCalls);
+        const size_t maxFnRows = std::min<size_t>(15, snap.functions.size());
+        for (size_t i = 0; i < maxFnRows; ++i) {
+            const auto& fn = snap.functions[i];
+            QFrame* fnRow = new QFrame(_edaFunctionsContainer);
+            fnRow->setObjectName("edaFunctionRow");
+            fnRow->setStyleSheet(
+                "#edaFunctionRow { background-color: rgba(0, 0, 0, 0.22); "
+                "border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 7px; }"
+            );
+            QHBoxLayout* rowLayout = new QHBoxLayout(fnRow);
+            rowLayout->setContentsMargins(8, 5, 8, 5);
+            rowLayout->setSpacing(8);
+
+            QLabel* compBadge = makeComponentBadge(fn.component, fnRow, false);
+
+            QLabel* fnNameLbl = new QLabel(QString::fromStdString(fn.functionName), fnRow);
+            fnNameLbl->setMinimumWidth(185);
+            fnNameLbl->setStyleSheet(
+                "color: #f8fafc; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+                "font-size: 11px; font-weight: 700;"
+            );
+            fnNameLbl->setToolTip(
+                QString("Function: %1\nCalls: %2 (%3 OK, %4 ERR)\nAvg Latency: %5 ms (Max: %6 ms)\nLast Target: %7\nLast Result: %8")
+                    .arg(QString::fromStdString(fn.functionName))
+                    .arg(fn.totalCalls)
+                    .arg(fn.successCalls)
+                    .arg(fn.failedCalls)
+                    .arg(static_cast<int>(std::round(fn.avgDurationMs)))
+                    .arg(fn.maxDurationMs)
+                    .arg(QString::fromStdString(fn.lastTargetDocument.empty() ? "N/A" : fn.lastTargetDocument))
+                    .arg(QString::fromStdString(fn.lastSummary.empty() ? "N/A" : fn.lastSummary))
+            );
+
+            const int barPct = static_cast<int>(std::round(
+                (100.0 * static_cast<double>(fn.totalCalls)) / static_cast<double>(maxFnCalls)
+            ));
+            QProgressBar* shareBar = new QProgressBar(fnRow);
+            shareBar->setRange(0, 100);
+            shareBar->setValue(std::clamp(barPct, 4, 100));
+            shareBar->setTextVisible(false);
+            shareBar->setFixedHeight(5);
+            QString barColor = "#00f2fe";
+            if (fn.failedCalls > 0 && fn.successCalls == 0) {
+                barColor = "#f87171";
+            } else if (fn.failedCalls > 0) {
+                barColor = "#fbbf24";
+            }
+            shareBar->setStyleSheet(
+                QString("QProgressBar { border: none; border-radius: 2px; "
+                        "background-color: rgba(255, 255, 255, 0.07); min-height: 5px; max-height: 5px; } "
+                        "QProgressBar::chunk { background-color: %1; border-radius: 2px; }")
+                    .arg(barColor)
+            );
+
+            QString countText = (fn.failedCalls == 0)
+                ? QString("%1× OK").arg(fn.totalCalls)
+                : QString("%1× (%2 ERR)").arg(fn.totalCalls).arg(fn.failedCalls);
+            QLabel* countLbl = new QLabel(countText, fnRow);
+            countLbl->setMinimumWidth(68);
+            countLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            countLbl->setStyleSheet(
+                QString("color: %1; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+                        "font-size: 11px; font-weight: 700;")
+                    .arg(fn.failedCalls == 0 ? "#10b981" : "#fbbf24")
+            );
+
+            QLabel* latLbl = new QLabel(
+                QString("%1 ms avg").arg(static_cast<int>(std::round(fn.avgDurationMs))),
+                fnRow
+            );
+            latLbl->setMinimumWidth(66);
+            latLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            latLbl->setStyleSheet(
+                "color: #94a3b8; font-family: 'Consolas', 'JetBrains Mono', monospace; font-size: 11px;"
+            );
+
+            QLabel* agoLbl = new QLabel(
+                QString::fromStdString(formatRelativeAgo(fn.lastCallEpoch, nowEpoch)),
+                fnRow
+            );
+            agoLbl->setMinimumWidth(64);
+            agoLbl->setAlignment(Qt::AlignCenter);
+            agoLbl->setStyleSheet(
+                "background-color: #0f172a; border: 1px solid #1e293b; "
+                "border-radius: 5px; padding: 1px 5px; color: #94a3b8; font-size: 10px;"
+            );
+            _edaRelativeTimeBindings.push_back({agoLbl, fn.lastCallEpoch, ""});
+
+            rowLayout->addWidget(compBadge);
+            rowLayout->addWidget(fnNameLbl, 2);
+            rowLayout->addWidget(shareBar, 1);
+            rowLayout->addWidget(countLbl);
+            rowLayout->addWidget(latLbl);
+            rowLayout->addWidget(agoLbl);
+            _edaFunctionsLayout->addWidget(fnRow);
+        }
+    }
+
+    // 5. Populate Recent Invocations Activity Feed
+    if (snap.recentCalls.empty()) {
+        QLabel* emptyRecLbl = new QLabel(
+            "No recent invocations recorded.",
+            _edaRecentCallsContainer
+        );
+        emptyRecLbl->setStyleSheet("color: #64748b; font-size: 11px; padding: 2px 0;");
+        _edaRecentCallsLayout->addWidget(emptyRecLbl);
+    } else {
+        const size_t maxRecent = std::min<size_t>(12, snap.recentCalls.size());
+        for (size_t i = 0; i < maxRecent; ++i) {
+            const auto& rc = snap.recentCalls[i];
+            QWidget* logRow = new QWidget(_edaRecentCallsContainer);
+            QHBoxLayout* logLayout = new QHBoxLayout(logRow);
+            logLayout->setContentsMargins(2, 2, 2, 2);
+            logLayout->setSpacing(6);
+
+            QLabel* statusBadge = new QLabel(rc.success ? "OK" : "ERR", logRow);
+            statusBadge->setFixedWidth(32);
+            statusBadge->setAlignment(Qt::AlignCenter);
+            statusBadge->setStyleSheet(
+                rc.success
+                    ? "background-color: rgba(16, 185, 129, 0.15); color: #10b981; "
+                      "border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 4px; "
+                      "padding: 1px 4px; font-size: 9px; font-weight: 800;"
+                    : "background-color: rgba(239, 68, 68, 0.16); color: #f87171; "
+                      "border: 1px solid rgba(239, 68, 68, 0.40); border-radius: 4px; "
+                      "padding: 1px 4px; font-size: 9px; font-weight: 800;"
+            );
+
+            QLabel* compBadge = makeComponentBadge(rc.component, logRow, true);
+
+            const std::string fnDisp = !rc.functionName.empty() ? rc.functionName : rc.toolName;
+            QString detailText = QString::fromStdString(fnDisp);
+            if (!rc.targetDocument.empty()) {
+                QFileInfo fi(QString::fromStdString(rc.targetDocument));
+                QString docShort = fi.fileName().isEmpty()
+                    ? QString::fromStdString(rc.targetDocument)
+                    : fi.fileName();
+                detailText += QString(" · %1").arg(docShort);
+            }
+            if (!rc.summary.empty() &&
+                rc.summary != ("Executed " + rc.toolName) &&
+                rc.summary != ("Executed " + fnDisp)) {
+                QString sumShort = QString::fromStdString(rc.summary);
+                if (sumShort.length() > 42) {
+                    sumShort = sumShort.left(40) + "…";
+                }
+                detailText += QString(" — %1").arg(sumShort);
+            }
+
+            QLabel* detailLbl = new QLabel(detailText, logRow);
+            detailLbl->setStyleSheet(
+                "color: #e2e8f0; font-family: 'Consolas', 'JetBrains Mono', monospace; font-size: 11px;"
+            );
+            detailLbl->setToolTip(
+                QString("Function: %1\nTarget: %2\nStatus: %3 (%4 ms)\nSummary: %5")
+                    .arg(QString::fromStdString(fnDisp))
+                    .arg(QString::fromStdString(rc.targetDocument.empty() ? "N/A" : rc.targetDocument))
+                    .arg(rc.success ? "OK" : "ERROR")
+                    .arg(rc.durationMs)
+                    .arg(QString::fromStdString(rc.summary))
+            );
+
+            QLabel* durLbl = new QLabel(QString("%1 ms").arg(rc.durationMs), logRow);
+            durLbl->setMinimumWidth(52);
+            durLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            durLbl->setStyleSheet(
+                "color: #38bdf8; font-family: 'Consolas', 'JetBrains Mono', monospace; "
+                "font-size: 11px; font-weight: 600;"
+            );
+
+            QLabel* timeLbl = new QLabel(
+                QString::fromStdString(formatRelativeAgo(rc.timestampEpoch, nowEpoch)),
+                logRow
+            );
+            timeLbl->setMinimumWidth(62);
+            timeLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            timeLbl->setStyleSheet("color: #64748b; font-size: 10px; font-weight: 600;");
+            _edaRelativeTimeBindings.push_back({timeLbl, rc.timestampEpoch, ""});
+
+            logLayout->addWidget(statusBadge);
+            logLayout->addWidget(compBadge);
+            logLayout->addWidget(detailLbl, 1);
+            logLayout->addWidget(durLbl);
+            logLayout->addWidget(timeLbl);
+            _edaRecentCallsLayout->addWidget(logRow);
+        }
+    }
 }
 
 void EdaTrayWindow::refreshAiQuotas(bool triggerRemoteRefresh) {

@@ -3208,6 +3208,119 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, Win32UiaProcessIdScopingAndNoCloseBut
     CHECK_TRUE(win32Triggers.find("::GetForegroundWindow() == hwnd") != std::string::npos);
 }
 
+TEST(EdaBridge_UnifiedAppConfigAndToggles, BridgeFunctionTelemetryRecordingAndSnapshotMerge) {
+    EdaRpcServerOptions opts;
+    opts.listenHost = "127.0.0.1";
+    opts.port = 0;
+    opts.pluginPort = 0;
+    opts.allowedRoot = _ws;
+
+    EdaRpcServer srv(opts);
+    EdaBridgeTelemetrySnapshot initSnap = srv.getTelemetrySnapshot();
+    CHECK_EQUAL(0, static_cast<int>(initSnap.totalCalls));
+    CHECK_TRUE(initSnap.functions.empty());
+    CHECK_TRUE(initSnap.recentCalls.empty());
+
+    // Internal status probes must not pollute function invocation telemetry
+    nlohmann::json stProbe = srv.dispatchToolCall("eda_bridge_status", nlohmann::json::object());
+    CHECK_TRUE(stProbe.value("ok", false));
+    CHECK_EQUAL(0, static_cast<int>(srv.getTelemetrySnapshot().totalCalls));
+
+    // Invoke KiCad library search twice
+    nlohmann::json kc1 = srv.dispatchToolCall("kicad_search_library", {{"query", "ESP32"}});
+    CHECK_TRUE(kc1.value("ok", false));
+    nlohmann::json kc2 = srv.dispatchToolCall("kicad_search_library", {{"query", "LM1117"}});
+    CHECK_TRUE(kc2.value("ok", false));
+
+    // Invoke FreeCAD API sub-function
+    nlohmann::json fc1 = srv.dispatchToolCall("freecad_invoke_api", {
+        {"module", "Part"},
+        {"method", "makeBox"}
+    });
+    CHECK_TRUE(fc1.value("ok", false));
+
+    // Invoke EasyEDA API introspection and a disallowed API (error path)
+    nlohmann::json ee1 = srv.dispatchToolCall("easyeda_invoke_api", {
+        {"describe_api", "eda.pcb_PrimitiveLine.create"}
+    });
+    CHECK_TRUE(ee1.value("ok", false));
+
+    nlohmann::json eeFail = srv.dispatchToolCall("easyeda_invoke_api", {
+        {"api_path", "window.eval"}
+    });
+    CHECK_FALSE(eeFail.value("ok", true));
+
+    EdaBridgeTelemetrySnapshot snap = srv.getTelemetrySnapshot();
+    CHECK_EQUAL(5, static_cast<int>(snap.totalCalls));
+    CHECK_EQUAL(4, static_cast<int>(snap.successCalls));
+    CHECK_EQUAL(1, static_cast<int>(snap.failedCalls));
+    CHECK_EQUAL("kicad_search_library", snap.mostUsedFunction);
+    CHECK_EQUAL(2, static_cast<int>(snap.mostUsedFunctionCalls));
+    CHECK_EQUAL(4, static_cast<int>(snap.functions.size()));
+    CHECK_EQUAL(5, static_cast<int>(snap.recentCalls.size()));
+
+    CHECK_EQUAL(2, static_cast<int>(snap.components["kicad"].totalCalls));
+    CHECK_EQUAL(1, static_cast<int>(snap.components["freecad"].totalCalls));
+    CHECK_EQUAL("freecad_invoke_api (Part.makeBox)", snap.components["freecad"].lastFunctionCalled);
+    CHECK_EQUAL(2, static_cast<int>(snap.components["easyeda"].totalCalls));
+    CHECK_EQUAL(1, static_cast<int>(snap.components["easyeda"].successCalls));
+    CHECK_EQUAL(1, static_cast<int>(snap.components["easyeda"].failedCalls));
+
+    // Verify buildStatusPayload includes function_stats and recent_calls
+    nlohmann::json payload = srv.buildStatusPayload();
+    CHECK_TRUE(payload.contains("function_stats") && payload["function_stats"].is_array());
+    CHECK_EQUAL(4, static_cast<int>(payload["function_stats"].size()));
+    CHECK_TRUE(payload.contains("recent_calls") && payload["recent_calls"].is_array());
+    CHECK_EQUAL(5, static_cast<int>(payload["recent_calls"].size()));
+
+    // Verify parseQuotaSnapshotJson parses root["eda"] and mergeTelemetrySnapshots combines accelerators
+    nlohmann::json mockStatus = {
+        {"last_updated_epoch", 1775000100},
+        {"eda", {
+            {"tools", nlohmann::json::array({
+                {
+                    {"name", "accelerators"},
+                    {"total_calls", 3},
+                    {"success_calls", 3},
+                    {"failed_calls", 0},
+                    {"last_call_duration_ms", 14},
+                    {"avg_call_duration_ms", 12.0},
+                    {"last_tool_called", "eda_calc_schematic_layout"},
+                    {"last_call_epoch", 1775000090},
+                    {"last_validation_summary", "Laid out 12 symbols"}
+                }
+            })},
+            {"recent_calls", nlohmann::json::array({
+                {
+                    {"timestamp_epoch", 1775000090},
+                    {"component", "accelerators"},
+                    {"tool_name", "eda_calc_schematic_layout"},
+                    {"target_document", "board.kicad_sch"},
+                    {"duration_ms", 14},
+                    {"success", true},
+                    {"summary", "Laid out 12 symbols"}
+                }
+            })}
+        }}
+    };
+
+    AimonQuotaSnapshot qSnap;
+    std::string parseErr;
+    CHECK_TRUE(EdaBridgeAppConfig::parseQuotaSnapshotJson(mockStatus.dump(), qSnap, parseErr));
+    CHECK_EQUAL(1, static_cast<int>(qSnap.edaComponents.size()));
+    CHECK_EQUAL(1, static_cast<int>(qSnap.edaRecentCalls.size()));
+
+    EdaBridgeTelemetrySnapshot merged = EdaBridgeAppConfig::mergeTelemetrySnapshots(snap, qSnap, 0);
+    CHECK_EQUAL(8, static_cast<int>(merged.totalCalls));
+    CHECK_EQUAL(7, static_cast<int>(merged.successCalls));
+    CHECK_EQUAL(1, static_cast<int>(merged.failedCalls));
+    CHECK_EQUAL(3, static_cast<int>(merged.components["accelerators"].totalCalls));
+    CHECK_EQUAL(5, static_cast<int>(merged.functions.size()));
+
+    srv.clearTelemetry();
+    CHECK_EQUAL(0, static_cast<int>(srv.getTelemetrySnapshot().totalCalls));
+}
+
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {
         if (std::strcmp(av[i], "--negative-control") == 0) {

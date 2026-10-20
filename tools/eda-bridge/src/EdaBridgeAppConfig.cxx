@@ -7577,6 +7577,45 @@ bool EdaBridgeAppConfig::parseQuotaSnapshotJson(const std::string& jsonBody,
         }
     }
 
+    if (root.contains("eda") && root["eda"].is_object()) {
+        const auto& eda = root["eda"];
+        if (eda.contains("tools") && eda["tools"].is_array()) {
+            for (const auto& t : eda["tools"]) {
+                if (!t.is_object()) continue;
+                EdaBridgeComponentStat cs;
+                cs.component = t.value("name", "");
+                if (cs.component.empty()) continue;
+                cs.totalCalls = t.value("total_calls", uint64_t(0));
+                cs.successCalls = t.value("success_calls", uint64_t(0));
+                cs.failedCalls = t.value("failed_calls", uint64_t(0));
+                cs.lastDurationMs = t.value("last_call_duration_ms", -1);
+                cs.avgDurationMs = t.value("avg_call_duration_ms", 0.0);
+                cs.lastCallEpoch = t.value("last_call_epoch", int64_t(0));
+                cs.lastFunctionCalled = t.value("last_tool_called", "");
+                cs.activeDocument = t.value("active_document", "");
+                cs.lastSummary = t.value("last_validation_summary", "");
+                outSnap.edaComponents.push_back(cs);
+            }
+        }
+        if (eda.contains("recent_calls") && eda["recent_calls"].is_array()) {
+            for (const auto& rc : eda["recent_calls"]) {
+                if (!rc.is_object()) continue;
+                EdaBridgeCallLogEntry entry;
+                entry.timestampEpoch = rc.value("timestamp_epoch", int64_t(0));
+                entry.component = rc.value("component", "");
+                entry.toolName = rc.value("tool_name", "");
+                entry.functionName = rc.value("function_name", entry.toolName);
+                entry.targetDocument = rc.value("target_document", "");
+                entry.durationMs = rc.value("duration_ms", 0);
+                entry.success = rc.value("success", true);
+                entry.summary = rc.value("summary", "");
+                if (!entry.toolName.empty()) {
+                    outSnap.edaRecentCalls.push_back(entry);
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -7805,6 +7844,230 @@ static void replaceAll(std::string& str, const std::string& from, const std::str
 }
 
 } // namespace
+
+EdaBridgeTelemetrySnapshot EdaBridgeAppConfig::mergeTelemetrySnapshots(
+    const EdaBridgeTelemetrySnapshot& localSnap,
+    const AimonQuotaSnapshot& quotaSnap,
+    int64_t minEpoch) {
+    EdaBridgeTelemetrySnapshot merged = localSnap;
+    for (const char* comp : {"easyeda", "kicad", "freecad", "accelerators"}) {
+        if (merged.components.find(comp) == merged.components.end()) {
+            EdaBridgeComponentStat cs;
+            cs.component = comp;
+            merged.components[comp] = cs;
+        }
+    }
+
+    if (!quotaSnap.reachable ||
+        (quotaSnap.edaComponents.empty() && quotaSnap.edaRecentCalls.empty())) {
+        return merged;
+    }
+
+    std::map<std::string, EdaBridgeFunctionStat> fnMap;
+    for (const auto& fn : merged.functions) {
+        fnMap[fn.functionName] = fn;
+    }
+
+    // Track which remote recent calls are not already in localSnap.recentCalls
+    std::map<std::string, std::vector<EdaBridgeCallLogEntry>> unmatchedRemoteByTool;
+    for (const auto& rc : quotaSnap.edaRecentCalls) {
+        if (rc.timestampEpoch <= minEpoch) {
+            continue;
+        }
+        bool matchedLocal = false;
+        for (const auto& lc : localSnap.recentCalls) {
+            if (lc.toolName == rc.toolName && lc.component == rc.component &&
+                std::abs(lc.timestampEpoch - rc.timestampEpoch) <= 3) {
+                matchedLocal = true;
+                break;
+            }
+        }
+        if (!matchedLocal) {
+            merged.recentCalls.push_back(rc);
+            const std::string fnKey = !rc.functionName.empty() ? rc.functionName : rc.toolName;
+            unmatchedRemoteByTool[fnKey].push_back(rc);
+        }
+    }
+
+    for (const auto& kv : unmatchedRemoteByTool) {
+        const std::string& fnKey = kv.first;
+        const auto& entries = kv.second;
+        if (entries.empty()) continue;
+
+        // If this function was not invoked locally (e.g. server-side CPU accelerator
+        // or prior session call), synthesize or augment its function stat
+        auto it = fnMap.find(fnKey);
+        if (it == fnMap.end()) {
+            EdaBridgeFunctionStat fs;
+            fs.functionName = fnKey;
+            fs.toolName = entries.front().toolName;
+            fs.component = entries.front().component;
+            double sumMs = 0.0;
+            for (const auto& e : entries) {
+                fs.totalCalls += 1;
+                if (e.success) {
+                    fs.successCalls += 1;
+                } else {
+                    fs.failedCalls += 1;
+                }
+                sumMs += static_cast<double>(e.durationMs);
+                if (e.durationMs > fs.maxDurationMs) {
+                    fs.maxDurationMs = e.durationMs;
+                }
+                if (e.timestampEpoch >= fs.lastCallEpoch) {
+                    fs.lastCallEpoch = e.timestampEpoch;
+                    fs.lastDurationMs = e.durationMs;
+                    if (!e.targetDocument.empty()) {
+                        fs.lastTargetDocument = e.targetDocument;
+                    }
+                    if (!e.summary.empty()) {
+                        fs.lastSummary = e.summary;
+                    }
+                }
+            }
+            fs.avgDurationMs = sumMs / static_cast<double>(fs.totalCalls);
+            fnMap[fnKey] = fs;
+
+            EdaBridgeComponentStat& cStat = merged.components[fs.component];
+            if (cStat.component.empty()) {
+                cStat.component = fs.component;
+            }
+            const double prevCompMs = static_cast<double>(cStat.totalCalls) * cStat.avgDurationMs;
+            cStat.totalCalls += fs.totalCalls;
+            cStat.successCalls += fs.successCalls;
+            cStat.failedCalls += fs.failedCalls;
+            cStat.avgDurationMs = (cStat.totalCalls > 0)
+                ? ((prevCompMs + sumMs) / static_cast<double>(cStat.totalCalls))
+                : 0.0;
+            if (fs.lastCallEpoch >= cStat.lastCallEpoch) {
+                cStat.lastCallEpoch = fs.lastCallEpoch;
+                cStat.lastDurationMs = fs.lastDurationMs;
+                cStat.lastFunctionCalled = fs.functionName;
+                if (!fs.lastTargetDocument.empty() && cStat.activeDocument.empty()) {
+                    cStat.activeDocument = fs.lastTargetDocument;
+                }
+                if (!fs.lastSummary.empty()) {
+                    cStat.lastSummary = fs.lastSummary;
+                }
+            }
+        }
+    }
+
+    // Also incorporate server-level component totals if minEpoch == 0 and server has higher counts
+    if (minEpoch == 0) {
+        for (const auto& rc : quotaSnap.edaComponents) {
+            if (rc.component.empty() || rc.lastCallEpoch <= minEpoch) continue;
+            EdaBridgeComponentStat& mc = merged.components[rc.component];
+            if (mc.component.empty()) mc.component = rc.component;
+            if (mc.activeDocument.empty() && !rc.activeDocument.empty()) {
+                mc.activeDocument = rc.activeDocument;
+            }
+            if (rc.totalCalls > mc.totalCalls) {
+                mc.totalCalls = rc.totalCalls;
+                mc.successCalls = std::max(mc.successCalls, rc.successCalls);
+                mc.failedCalls = std::max(mc.failedCalls, rc.failedCalls);
+                if (rc.avgDurationMs > 0.0) {
+                    mc.avgDurationMs = rc.avgDurationMs;
+                }
+                if (rc.lastCallEpoch >= mc.lastCallEpoch) {
+                    mc.lastCallEpoch = rc.lastCallEpoch;
+                    mc.lastDurationMs = rc.lastDurationMs;
+                    if (!rc.lastFunctionCalled.empty()) {
+                        mc.lastFunctionCalled = rc.lastFunctionCalled;
+                    }
+                    if (!rc.lastSummary.empty()) {
+                        mc.lastSummary = rc.lastSummary;
+                    }
+                }
+                if (!rc.lastFunctionCalled.empty() &&
+                    fnMap.find(rc.lastFunctionCalled) == fnMap.end()) {
+                    EdaBridgeFunctionStat fs;
+                    fs.functionName = rc.lastFunctionCalled;
+                    fs.toolName = rc.lastFunctionCalled;
+                    fs.component = rc.component;
+                    fs.totalCalls = rc.totalCalls;
+                    fs.successCalls = rc.successCalls;
+                    fs.failedCalls = rc.failedCalls;
+                    fs.lastDurationMs = std::max(0, rc.lastDurationMs);
+                    fs.maxDurationMs = std::max(0, rc.lastDurationMs);
+                    fs.avgDurationMs = rc.avgDurationMs;
+                    fs.lastCallEpoch = rc.lastCallEpoch;
+                    fs.lastTargetDocument = rc.activeDocument;
+                    fs.lastSummary = rc.lastSummary;
+                    fnMap[fs.functionName] = fs;
+                }
+            }
+        }
+    }
+
+    merged.functions.clear();
+    merged.functions.reserve(fnMap.size());
+    for (const auto& kv : fnMap) {
+        merged.functions.push_back(kv.second);
+        if (kv.second.maxDurationMs > merged.maxDurationMs) {
+            merged.maxDurationMs = kv.second.maxDurationMs;
+        }
+    }
+    std::sort(merged.functions.begin(), merged.functions.end(),
+              [](const EdaBridgeFunctionStat& a, const EdaBridgeFunctionStat& b) {
+                  if (a.totalCalls != b.totalCalls) return a.totalCalls > b.totalCalls;
+                  if (a.lastCallEpoch != b.lastCallEpoch) return a.lastCallEpoch > b.lastCallEpoch;
+                  return a.functionName < b.functionName;
+              });
+
+    std::sort(merged.recentCalls.begin(), merged.recentCalls.end(),
+              [](const EdaBridgeCallLogEntry& a, const EdaBridgeCallLogEntry& b) {
+                  return a.timestampEpoch > b.timestampEpoch;
+              });
+    if (merged.recentCalls.size() > 50) {
+        merged.recentCalls.resize(50);
+    }
+
+    uint64_t sumCalls = 0;
+    uint64_t sumSucc = 0;
+    uint64_t sumFail = 0;
+    double weightedMs = 0.0;
+    uint64_t bestCompCalls = 0;
+    std::string bestComp;
+    int64_t newestEpoch = merged.lastCallEpoch;
+    int newestDur = merged.lastDurationMs;
+    std::string newestFn = merged.lastFunctionCalled;
+
+    for (const auto& kv : merged.components) {
+        const auto& c = kv.second;
+        sumCalls += c.totalCalls;
+        sumSucc += c.successCalls;
+        sumFail += c.failedCalls;
+        weightedMs += static_cast<double>(c.totalCalls) * c.avgDurationMs;
+        if (c.totalCalls > bestCompCalls) {
+            bestCompCalls = c.totalCalls;
+            bestComp = kv.first;
+        }
+        if (c.lastCallEpoch > newestEpoch) {
+            newestEpoch = c.lastCallEpoch;
+            newestDur = c.lastDurationMs;
+            newestFn = c.lastFunctionCalled;
+        }
+    }
+
+    merged.totalCalls = sumCalls;
+    merged.successCalls = sumSucc;
+    merged.failedCalls = sumFail;
+    merged.avgDurationMs = (sumCalls > 0) ? (weightedMs / static_cast<double>(sumCalls)) : 0.0;
+    merged.lastCallEpoch = newestEpoch;
+    merged.lastDurationMs = newestDur;
+    merged.lastFunctionCalled = newestFn;
+    merged.mostActiveComponent = bestComp;
+    if (!merged.functions.empty()) {
+        merged.mostUsedFunction = merged.functions.front().functionName;
+        merged.mostUsedFunctionCalls = merged.functions.front().totalCalls;
+    } else {
+        merged.mostUsedFunction.clear();
+        merged.mostUsedFunctionCalls = 0;
+    }
+
+    return merged;
+}
 
 std::string EdaBridgeAppConfig::formatTrayTooltipSummary(const AimonQuotaSnapshot& snap,
                                                          bool eeConn,

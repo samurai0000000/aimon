@@ -1519,6 +1519,7 @@ EdaRpcServer::EdaRpcServer(const EdaRpcServerOptions& options)
         _options.kicadBinaryPath, _options.symbolLibDir, _options.footprintLibDir);
     _freecadInfo = ToolDiscovery::discoverFreeCad(_options.freecadBinaryPath);
     _easyedaInfo = ToolDiscovery::discoverEasyEda(_options.easyedaBinaryPath);
+    clearTelemetry();
 }
 
 EdaRpcServer::~EdaRpcServer() {
@@ -2696,6 +2697,20 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
         }
     }
 
+    const EdaBridgeTelemetrySnapshot tel = getTelemetrySnapshot();
+    auto getCompStat = [&](const std::string& compName) -> EdaBridgeComponentStat {
+        auto it = tel.components.find(compName);
+        if (it != tel.components.end()) {
+            return it->second;
+        }
+        EdaBridgeComponentStat empty;
+        empty.component = compName;
+        return empty;
+    };
+    const EdaBridgeComponentStat eeStat = getCompStat("easyeda");
+    const EdaBridgeComponentStat kcStat = getCompStat("kicad");
+    const EdaBridgeComponentStat fcStat = getCompStat("freecad");
+
 #ifdef _WIN32
     std::string platform = "windows-x64";
 #else
@@ -2711,7 +2726,14 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
             {"binary_path", _easyedaInfo.binaryPath},
             {"version", eeVer},
             {"bridge_version", AIMON_VERSION_STRING},
-            {"active_document", eeDoc}
+            {"active_document", !eeDoc.empty() ? eeDoc : eeStat.activeDocument},
+            {"total_calls", eeStat.totalCalls},
+            {"success_calls", eeStat.successCalls},
+            {"failed_calls", eeStat.failedCalls},
+            {"last_call_duration_ms", eeStat.lastDurationMs},
+            {"avg_call_duration_ms", eeStat.avgDurationMs},
+            {"last_tool_called", eeStat.lastFunctionCalled},
+            {"last_call_epoch", eeStat.lastCallEpoch}
         },
         {
             {"name", "kicad"},
@@ -2721,7 +2743,14 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
             {"binary_path", _kicadInfo.binaryPath},
             {"version", kcVer},
             {"bridge_version", AIMON_VERSION_STRING},
-            {"active_document", kcDoc}
+            {"active_document", !kcDoc.empty() ? kcDoc : kcStat.activeDocument},
+            {"total_calls", kcStat.totalCalls},
+            {"success_calls", kcStat.successCalls},
+            {"failed_calls", kcStat.failedCalls},
+            {"last_call_duration_ms", kcStat.lastDurationMs},
+            {"avg_call_duration_ms", kcStat.avgDurationMs},
+            {"last_tool_called", kcStat.lastFunctionCalled},
+            {"last_call_epoch", kcStat.lastCallEpoch}
         },
         {
             {"name", "freecad"},
@@ -2731,9 +2760,49 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
             {"binary_path", _freecadInfo.binaryPath},
             {"version", fcVer},
             {"bridge_version", AIMON_VERSION_STRING},
-            {"active_document", fcDoc}
+            {"active_document", !fcDoc.empty() ? fcDoc : fcStat.activeDocument},
+            {"total_calls", fcStat.totalCalls},
+            {"success_calls", fcStat.successCalls},
+            {"failed_calls", fcStat.failedCalls},
+            {"last_call_duration_ms", fcStat.lastDurationMs},
+            {"avg_call_duration_ms", fcStat.avgDurationMs},
+            {"last_tool_called", fcStat.lastFunctionCalled},
+            {"last_call_epoch", fcStat.lastCallEpoch}
         }
     });
+
+    nlohmann::json funcArr = nlohmann::json::array();
+    for (const auto& fn : tel.functions) {
+        funcArr.push_back({
+            {"function_name", fn.functionName},
+            {"tool_name", fn.toolName},
+            {"sub_function", fn.subFunction},
+            {"component", fn.component},
+            {"total_calls", fn.totalCalls},
+            {"success_calls", fn.successCalls},
+            {"failed_calls", fn.failedCalls},
+            {"last_duration_ms", fn.lastDurationMs},
+            {"max_duration_ms", fn.maxDurationMs},
+            {"avg_duration_ms", fn.avgDurationMs},
+            {"last_call_epoch", fn.lastCallEpoch},
+            {"last_target_document", fn.lastTargetDocument},
+            {"last_summary", fn.lastSummary}
+        });
+    }
+
+    nlohmann::json recentArr = nlohmann::json::array();
+    for (const auto& rc : tel.recentCalls) {
+        recentArr.push_back({
+            {"timestamp_epoch", rc.timestampEpoch},
+            {"component", rc.component},
+            {"tool_name", rc.toolName},
+            {"function_name", rc.functionName},
+            {"target_document", rc.targetDocument},
+            {"duration_ms", rc.durationMs},
+            {"success", rc.success},
+            {"summary", rc.summary}
+        });
+    }
 
     return {
         {"ok", true},
@@ -2742,12 +2811,394 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
         {"rpc_port", _boundPort.load()},
         {"plugin_port", _boundPluginPort.load()},
         {"disallow_exports", _disallowExports.load()},
-        {"tools", tools}
+        {"tools", tools},
+        {"function_stats", funcArr},
+        {"recent_calls", recentArr}
     };
+}
+
+std::string EdaRpcServer::classifyToolComponent(const std::string& toolName) {
+    if (toolName == "eda_bridge_status") {
+        return "";
+    }
+    if (toolName.rfind("easyeda_", 0) == 0) {
+        return "easyeda";
+    }
+    if (toolName.rfind("kicad_", 0) == 0) {
+        return "kicad";
+    }
+    if (toolName.rfind("freecad_", 0) == 0) {
+        return "freecad";
+    }
+    if (EdaAccelerators::isAcceleratorTool(toolName)) {
+        return "accelerators";
+    }
+    return "other";
+}
+
+void EdaRpcServer::clearTelemetry() {
+    std::lock_guard<std::mutex> lock(_telemetryMutex);
+    _telemetryTotalCalls = 0;
+    _telemetrySuccessCalls = 0;
+    _telemetryFailedCalls = 0;
+    _telemetryTotalDurationMs = 0.0;
+    _telemetryMaxDurationMs = 0;
+    _telemetryLastDurationMs = -1;
+    _telemetryLastCallEpoch = 0;
+    _telemetryLastFunctionCalled.clear();
+    _functionStats.clear();
+    _recentCalls.clear();
+    _componentStats.clear();
+
+    for (const char* comp : {"easyeda", "kicad", "freecad", "accelerators"}) {
+        EdaBridgeComponentStat st;
+        st.component = comp;
+        _componentStats[comp] = st;
+    }
+}
+
+EdaBridgeTelemetrySnapshot EdaRpcServer::getTelemetrySnapshot() const {
+    std::string eeDoc, kcDoc, fcDoc;
+    {
+        std::lock_guard<std::mutex> pLock(_pluginsMutex);
+        for (const auto& kv : _pluginSessions) {
+            if (!kv.second->active.load()) continue;
+            if (kv.second->app == "easyeda" && !kv.second->activeDocument.empty()) {
+                eeDoc = kv.second->activeDocument;
+            } else if (kv.second->app == "kicad" && !kv.second->activeDocument.empty()) {
+                kcDoc = kv.second->activeDocument;
+            } else if (kv.second->app == "freecad" && !kv.second->activeDocument.empty()) {
+                fcDoc = kv.second->activeDocument;
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(_telemetryMutex);
+    EdaBridgeTelemetrySnapshot snap;
+    snap.totalCalls = _telemetryTotalCalls;
+    snap.successCalls = _telemetrySuccessCalls;
+    snap.failedCalls = _telemetryFailedCalls;
+    snap.avgDurationMs = (_telemetryTotalCalls > 0)
+        ? (_telemetryTotalDurationMs / static_cast<double>(_telemetryTotalCalls))
+        : 0.0;
+    snap.maxDurationMs = _telemetryMaxDurationMs;
+    snap.lastDurationMs = _telemetryLastDurationMs;
+    snap.lastCallEpoch = _telemetryLastCallEpoch;
+    snap.lastFunctionCalled = _telemetryLastFunctionCalled;
+    snap.components = _componentStats;
+
+    if (!eeDoc.empty() && snap.components.count("easyeda")) {
+        snap.components["easyeda"].activeDocument = eeDoc;
+    }
+    if (!kcDoc.empty() && snap.components.count("kicad")) {
+        snap.components["kicad"].activeDocument = kcDoc;
+    }
+    if (!fcDoc.empty() && snap.components.count("freecad")) {
+        snap.components["freecad"].activeDocument = fcDoc;
+    }
+
+    uint64_t bestCompCalls = 0;
+    for (const auto& kv : snap.components) {
+        if (kv.second.totalCalls > bestCompCalls) {
+            bestCompCalls = kv.second.totalCalls;
+            snap.mostActiveComponent = kv.first;
+        }
+    }
+
+    snap.functions.reserve(_functionStats.size());
+    for (const auto& kv : _functionStats) {
+        snap.functions.push_back(kv.second);
+    }
+    std::sort(snap.functions.begin(), snap.functions.end(),
+              [](const EdaBridgeFunctionStat& a, const EdaBridgeFunctionStat& b) {
+                  if (a.totalCalls != b.totalCalls) {
+                      return a.totalCalls > b.totalCalls;
+                  }
+                  if (a.lastCallEpoch != b.lastCallEpoch) {
+                      return a.lastCallEpoch > b.lastCallEpoch;
+                  }
+                  return a.functionName < b.functionName;
+              });
+
+    if (!snap.functions.empty()) {
+        snap.mostUsedFunction = snap.functions.front().functionName;
+        snap.mostUsedFunctionCalls = snap.functions.front().totalCalls;
+    }
+
+    snap.recentCalls.assign(_recentCalls.begin(), _recentCalls.end());
+    return snap;
+}
+
+void EdaRpcServer::recordToolInvocation(const std::string& toolName,
+                                        const nlohmann::json& arguments,
+                                        const nlohmann::json& result,
+                                        int durationMs) {
+    const std::string comp = classifyToolComponent(toolName);
+    if (comp.empty()) {
+        return;
+    }
+
+    auto safeStr = [](const nlohmann::json& obj, const char* key) -> std::string {
+        if (!obj.is_object()) return "";
+        auto it = obj.find(key);
+        if (it == obj.end() || !it->is_string()) return "";
+        return it->get<std::string>();
+    };
+    auto safeIntOrArraySize = [](const nlohmann::json& obj,
+                                 const char* countKey,
+                                 const char* arrKey) -> int {
+        if (!obj.is_object()) return -1;
+        if (countKey) {
+            auto it = obj.find(countKey);
+            if (it != obj.end() && it->is_number()) {
+                return static_cast<int>(it->get<double>());
+            }
+        }
+        if (arrKey) {
+            auto it = obj.find(arrKey);
+            if (it != obj.end() && it->is_array()) {
+                return static_cast<int>(it->size());
+            }
+        }
+        return -1;
+    };
+
+    std::string subFunction;
+    if (toolName == "easyeda_invoke_api" && arguments.is_object()) {
+        std::string apiPath = safeStr(arguments, "api_path");
+        if (apiPath.empty()) apiPath = safeStr(arguments, "api");
+        if (apiPath.empty()) apiPath = safeStr(arguments, "method");
+        if (!apiPath.empty()) {
+            if (apiPath.rfind("eda.", 0) != 0 &&
+                (apiPath.rfind("sch_", 0) == 0 || apiPath.rfind("pcb_", 0) == 0)) {
+                apiPath = "eda." + apiPath;
+            }
+            subFunction = apiPath;
+        } else if (!safeStr(arguments, "describe_api").empty()) {
+            subFunction = "describe:" + safeStr(arguments, "describe_api");
+        } else if (!safeStr(arguments, "search_api").empty()) {
+            subFunction = "search:" + safeStr(arguments, "search_api");
+        } else if (arguments.contains("list_apis") && arguments["list_apis"].is_boolean() &&
+                   arguments["list_apis"].get<bool>()) {
+            subFunction = "list_apis";
+        }
+    } else if (toolName == "freecad_invoke_api" && arguments.is_object()) {
+        std::string mod = safeStr(arguments, "module");
+        std::string meth = safeStr(arguments, "method");
+        if (meth.empty()) meth = safeStr(arguments, "callable");
+        if (meth.empty()) meth = safeStr(arguments, "api_path");
+        if (!mod.empty() && !meth.empty()) {
+            subFunction = mod + "." + meth;
+        } else if (!meth.empty()) {
+            subFunction = meth;
+        } else if (!mod.empty()) {
+            subFunction = mod;
+        }
+    }
+
+    const std::string functionName = !subFunction.empty()
+        ? (toolName + " (" + subFunction + ")")
+        : toolName;
+
+    bool ok = true;
+    if (result.is_object() && result.contains("ok") && result["ok"].is_boolean()) {
+        ok = result["ok"].get<bool>();
+    } else if (!result.is_object()) {
+        ok = false;
+    }
+
+    std::string targetDoc;
+    for (const char* k : {"active_document", "schematic_path", "pcb_path", "document_path",
+                          "project_path", "file_path", "output_path", "output_dir"}) {
+        targetDoc = safeStr(result, k);
+        if (!targetDoc.empty()) break;
+    }
+    if (targetDoc.empty()) {
+        for (const char* k : {"schematic_path", "pcb_path", "document_path", "project_path",
+                              "file_path", "path", "output_path", "output_dir", "part_name",
+                              "body_name"}) {
+            targetDoc = safeStr(arguments, k);
+            if (!targetDoc.empty()) break;
+        }
+    }
+    if (targetDoc.empty() && (comp == "easyeda" || comp == "kicad" || comp == "freecad")) {
+        std::lock_guard<std::mutex> pLock(_pluginsMutex);
+        for (const auto& kv : _pluginSessions) {
+            if (kv.second->active.load() && kv.second->app == comp &&
+                !kv.second->activeDocument.empty()) {
+                targetDoc = kv.second->activeDocument;
+                break;
+            }
+        }
+    }
+
+    std::string summary;
+    if (!ok) {
+        summary = safeStr(result, "error");
+        if (summary.empty()) {
+            summary = "Execution failed";
+        }
+    } else if (result.is_object()) {
+        summary = safeStr(result, "summary");
+        if (summary.empty()) {
+            if (toolName == "easyeda_inspect_schematic" || toolName == "kicad_inspect_project") {
+                int comps = safeIntOrArraySize(result, "components_count", "components");
+                if (comps < 0) comps = safeIntOrArraySize(result, "component_count", "footprints");
+                int wires = safeIntOrArraySize(result, "wires_count", "wires");
+                if (wires < 0) wires = safeIntOrArraySize(result, "tracks_count", "tracks");
+                if (comps >= 0 && wires >= 0) {
+                    summary = std::to_string(comps) + " components, " + std::to_string(wires) + " wires/tracks";
+                } else if (comps >= 0) {
+                    summary = std::to_string(comps) + " components";
+                }
+            } else if (toolName == "easyeda_inspect_pcb") {
+                int comps = safeIntOrArraySize(result, "components_count", "components");
+                if (comps < 0) comps = safeIntOrArraySize(result, "footprints_count", "footprints");
+                int pads = safeIntOrArraySize(result, "pads_count", "pads");
+                int tracks = safeIntOrArraySize(result, "tracks_count", "tracks");
+                std::vector<std::string> parts;
+                if (comps >= 0) parts.push_back(std::to_string(comps) + " footprints");
+                if (pads >= 0) parts.push_back(std::to_string(pads) + " pads");
+                if (tracks >= 0) parts.push_back(std::to_string(tracks) + " tracks");
+                for (size_t i = 0; i < parts.size(); ++i) {
+                    if (i > 0) summary += ", ";
+                    summary += parts[i];
+                }
+            } else if (toolName == "easyeda_run_drc" || toolName == "kicad_run_drc" ||
+                       toolName == "kicad_run_erc") {
+                int viols = safeIntOrArraySize(result, "violation_count", "violations");
+                if (viols >= 0) {
+                    summary = std::to_string(viols) + (viols == 1 ? " violation" : " violations");
+                }
+            } else if (toolName == "easyeda_search_library" || toolName == "kicad_search_library") {
+                std::string q = safeStr(arguments, "query");
+                int cnt = safeIntOrArraySize(result, "symbols_count", "results");
+                if (cnt < 0) cnt = safeIntOrArraySize(result, "count", "items");
+                if (!q.empty() && cnt >= 0) {
+                    summary = "'" + q + "' -> " + std::to_string(cnt) + " matches";
+                } else if (!q.empty()) {
+                    summary = "Query '" + q + "'";
+                }
+            } else if (toolName == "freecad_generate_cad") {
+                std::string body = safeStr(result, "body_name");
+                if (!body.empty()) {
+                    summary = "Generated " + body;
+                }
+            } else if (toolName == "freecad_analyze_printability") {
+                bool pass = result.contains("printability_pass") &&
+                            result["printability_pass"].is_boolean() &&
+                            result["printability_pass"].get<bool>();
+                summary = pass ? "DFM printability pass" : "DFM warnings detected";
+            }
+        }
+        if (summary.empty()) {
+            summary = !subFunction.empty()
+                ? ("Invoked " + subFunction)
+                : ("Executed " + toolName);
+        }
+    } else {
+        summary = "Executed " + functionName;
+    }
+
+    const int clampedDurationMs = std::max(0, durationMs);
+    const int64_t nowEpoch = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+
+    std::lock_guard<std::mutex> lock(_telemetryMutex);
+    _telemetryTotalCalls += 1;
+    if (ok) {
+        _telemetrySuccessCalls += 1;
+    } else {
+        _telemetryFailedCalls += 1;
+    }
+    _telemetryTotalDurationMs += static_cast<double>(clampedDurationMs);
+    if (clampedDurationMs > _telemetryMaxDurationMs) {
+        _telemetryMaxDurationMs = clampedDurationMs;
+    }
+    _telemetryLastDurationMs = clampedDurationMs;
+    _telemetryLastCallEpoch = nowEpoch;
+    _telemetryLastFunctionCalled = functionName;
+
+    EdaBridgeComponentStat& cStat = _componentStats[comp];
+    if (cStat.component.empty()) {
+        cStat.component = comp;
+    }
+    const double prevCompTotalMs = static_cast<double>(cStat.totalCalls) * cStat.avgDurationMs;
+    cStat.totalCalls += 1;
+    if (ok) {
+        cStat.successCalls += 1;
+    } else {
+        cStat.failedCalls += 1;
+    }
+    cStat.lastDurationMs = clampedDurationMs;
+    cStat.avgDurationMs = (prevCompTotalMs + static_cast<double>(clampedDurationMs)) /
+                          static_cast<double>(cStat.totalCalls);
+    cStat.lastCallEpoch = nowEpoch;
+    cStat.lastFunctionCalled = functionName;
+    if (!targetDoc.empty()) {
+        cStat.activeDocument = targetDoc;
+    }
+    cStat.lastSummary = summary;
+
+    EdaBridgeFunctionStat& fStat = _functionStats[functionName];
+    if (fStat.functionName.empty()) {
+        fStat.functionName = functionName;
+        fStat.toolName = toolName;
+        fStat.subFunction = subFunction;
+        fStat.component = comp;
+    }
+    const double prevFuncTotalMs = static_cast<double>(fStat.totalCalls) * fStat.avgDurationMs;
+    fStat.totalCalls += 1;
+    if (ok) {
+        fStat.successCalls += 1;
+    } else {
+        fStat.failedCalls += 1;
+    }
+    fStat.lastDurationMs = clampedDurationMs;
+    if (clampedDurationMs > fStat.maxDurationMs) {
+        fStat.maxDurationMs = clampedDurationMs;
+    }
+    fStat.avgDurationMs = (prevFuncTotalMs + static_cast<double>(clampedDurationMs)) /
+                          static_cast<double>(fStat.totalCalls);
+    fStat.lastCallEpoch = nowEpoch;
+    if (!targetDoc.empty()) {
+        fStat.lastTargetDocument = targetDoc;
+    }
+    fStat.lastSummary = summary;
+
+    EdaBridgeCallLogEntry logEntry;
+    logEntry.timestampEpoch = nowEpoch;
+    logEntry.component = comp;
+    logEntry.toolName = toolName;
+    logEntry.functionName = functionName;
+    logEntry.targetDocument = targetDoc;
+    logEntry.durationMs = clampedDurationMs;
+    logEntry.success = ok;
+    logEntry.summary = summary;
+
+    _recentCalls.push_front(logEntry);
+    while (_recentCalls.size() > 50) {
+        _recentCalls.pop_back();
+    }
 }
 
 nlohmann::json EdaRpcServer::dispatchToolCall(const std::string& toolName,
                                               const nlohmann::json& arguments) {
+    if (toolName == "eda_bridge_status") {
+        return buildStatusPayload();
+    }
+    const auto startTp = std::chrono::steady_clock::now();
+    nlohmann::json result = dispatchToolCallInternal(toolName, arguments);
+    const int elapsedMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - startTp
+    ).count());
+    recordToolInvocation(toolName, arguments, result, elapsedMs);
+    return result;
+}
+
+nlohmann::json EdaRpcServer::dispatchToolCallInternal(const std::string& toolName,
+                                                      const nlohmann::json& arguments) {
     if (toolName == "eda_bridge_status") {
         return buildStatusPayload();
     }

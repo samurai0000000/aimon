@@ -56,6 +56,9 @@ private:
     void refreshLiveStatus();
     void refreshAiQuotas(bool triggerRemoteRefresh);
     void populateQuotasUi(const AimonQuotaSnapshot& snap);
+    void populateTelemetryUi(const EdaBridgeTelemetrySnapshot& snap, bool forceRebuild = false);
+    void updateTelemetryRelativeTimes();
+    static std::string formatRelativeAgo(int64_t epochSec, int64_t nowEpochSec);
 
     void syncControlsFromSettings();
     void collectSettingsFromControls();
@@ -129,12 +132,58 @@ private:
     QPushButton* _btnRefreshQuotas = nullptr;
     QPushButton* _btnOpenWebDashboard = nullptr;
 
-    // Tab 2: EDA / CAD Bridges & Settings
+    // Tab 2: EDA/CAD
+    struct LiveRelativeTimeBinding {
+        QLabel* label = nullptr;
+        int64_t callEpoch = 0;
+        std::string prefix;
+    };
+
+    struct BridgeDomainCardWidgets {
+        QLabel* callsBadge = nullptr;
+        QProgressBar* shareBar = nullptr;
+        QLabel* detailLabel = nullptr;
+    };
+
+    std::vector<LiveRelativeTimeBinding> _edaRelativeTimeBindings;
+    int64_t _telemetryResetEpoch = 0;
+    uint64_t _lastRenderedTelTotalCalls = UINT64_MAX;
+    uint64_t _lastRenderedTelSuccessCalls = 0;
+    uint64_t _lastRenderedTelFailedCalls = 0;
+    int64_t _lastRenderedTelLastEpoch = -1;
+    size_t _lastRenderedTelFuncCount = 0;
+    size_t _lastRenderedTelRecentCount = 0;
+    bool _edaRecentCallsExpanded = true;
+
     QLabel* _lblRpcStatus = nullptr;
     QLabel* _lblGatewayStatus = nullptr;
     QLabel* _lblEasyEdaStatus = nullptr;
     QLabel* _lblKiCadStatus = nullptr;
     QLabel* _lblFreeCadStatus = nullptr;
+
+    QLabel* _lblTelemetryStatusPill = nullptr;
+    QPushButton* _btnResetTelemetry = nullptr;
+    QLabel* _lblTelTotalCalls = nullptr;
+    QLabel* _lblTelTotalSub = nullptr;
+    QLabel* _lblTelSuccessRate = nullptr;
+    QLabel* _lblTelSuccessSub = nullptr;
+    QLabel* _lblTelAvgLatency = nullptr;
+    QLabel* _lblTelLatencySub = nullptr;
+    QLabel* _lblTelTopFunc = nullptr;
+    QLabel* _lblTelTopFuncSub = nullptr;
+
+    BridgeDomainCardWidgets _domCardEasyEda;
+    BridgeDomainCardWidgets _domCardKiCad;
+    BridgeDomainCardWidgets _domCardFreeCad;
+    BridgeDomainCardWidgets _domCardAccelerators;
+
+    QLabel* _lblFunctionsHeader = nullptr;
+    QWidget* _edaFunctionsContainer = nullptr;
+    QVBoxLayout* _edaFunctionsLayout = nullptr;
+
+    QPushButton* _btnToggleRecentCalls = nullptr;
+    QWidget* _edaRecentCallsContainer = nullptr;
+    QVBoxLayout* _edaRecentCallsLayout = nullptr;
 
     QCheckBox* _chkEnableEasyEda = nullptr;
     QCheckBox* _chkEnableKiCad = nullptr;

@@ -110,6 +110,10 @@ struct AimonQuotaSnapshot {
     // Claude Code
     bool claudeEnabled = false;
     std::vector<AimonClaudeAccountSummary> claudeAccounts;
+
+    // EDA / CAD Bridge Telemetry (from aimon /api/status root["eda"])
+    std::vector<EdaBridgeComponentStat> edaComponents;
+    std::vector<EdaBridgeCallLogEntry> edaRecentCalls;
 };
 
 class EdaBridgeAppConfig {
@@ -149,6 +153,10 @@ public:
                                    bool triggerRefresh,
                                    AimonQuotaSnapshot& outSnap,
                                    int timeoutMs = 3000);
+    static EdaBridgeTelemetrySnapshot mergeTelemetrySnapshots(
+        const EdaBridgeTelemetrySnapshot& localSnap,
+        const AimonQuotaSnapshot& quotaSnap,
+        int64_t minEpoch = 0);
     static std::string formatTrayTooltipSummary(const AimonQuotaSnapshot& snap,
                                                 bool eeConn = false,
                                                 bool kcConn = false,
