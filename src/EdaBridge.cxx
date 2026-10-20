@@ -2244,7 +2244,8 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                     nlohmann::json remoteRes;
                     std::string remoteErr;
                     if (gw->callTool(toolName, gwArgs, remoteRes, remoteErr, cfg.timeoutMs) &&
-                        remoteRes.is_object() && remoteRes.value("ok", false)) {
+                        remoteRes.is_object() && remoteRes.contains("ok")) {
+                        const bool remoteOk = remoteRes.value("ok", false);
                         {
                             std::lock_guard<std::mutex> lock(_mutex);
                             _connected = true;
@@ -2262,9 +2263,11 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                         remoteRes["provider_capability_score"] = actualScore;
                         int elapsedMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - startTp).count());
-                        std::string rSummary = remoteRes.value("summary", "Executed on remote accelerator");
+                        std::string rSummary = remoteRes.value("summary",
+                            remoteOk ? "Executed on remote accelerator" : remoteRes.value("error", "Failed"));
                         std::string targetDoc = devName.empty() ? actualAddr : (devName + " @ " + actualAddr);
-                        recordToolCall("accelerators", toolName, targetDoc, elapsedMs, true, rSummary, "");
+                        recordToolCall("accelerators", toolName, targetDoc, elapsedMs, remoteOk,
+                                       rSummary, remoteOk ? "" : remoteRes.value("error", ""));
                         return remoteRes;
                     }
                     fellBackFromRemote = true;
@@ -2285,24 +2288,30 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                     if (sendTcpJsonRpcRequest(cfg.host, cfg.port, req, cfg.timeoutMs,
                                               static_cast<size_t>(cfg.maxOutputBytes),
                                               remoteRes, remoteErr, remoteCode) &&
-                        remoteRes.is_object() && remoteRes.value("ok", false)) {
+                        remoteRes.is_object() && remoteRes.contains("ok")) {
+                        const bool remoteOk = remoteRes.value("ok", false);
+                        int64_t actualScore = remoteRes.value("capability_score", clientScore);
+                        std::string devName = remoteRes.value("compute_device", clientCaps.deviceName);
                         {
                             std::lock_guard<std::mutex> lock(_mutex);
                             _connected = true;
                             _activeTransport = "client";
                             _hadRemoteAcceleratorProvider = true;
+                            if (actualScore != clientScore) {
+                                _hasRemoteClientAcceleratorCaps = false;
+                            }
                         }
                         std::string endpoint = cfg.host + ":" + std::to_string(cfg.port);
-                        int64_t actualScore = remoteRes.value("capability_score", clientScore);
-                        std::string devName = remoteRes.value("compute_device", clientCaps.deviceName);
                         remoteRes["routed_via"] = "client";
                         remoteRes["routed_to"] = endpoint;
                         remoteRes["provider_capability_score"] = actualScore;
                         int elapsedMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - startTp).count());
-                        std::string rSummary = remoteRes.value("summary", "Executed on remote accelerator");
+                        std::string rSummary = remoteRes.value("summary",
+                            remoteOk ? "Executed on remote accelerator" : remoteRes.value("error", "Failed"));
                         std::string targetDoc = devName.empty() ? endpoint : (devName + " @ " + endpoint);
-                        recordToolCall("accelerators", toolName, targetDoc, elapsedMs, true, rSummary, "");
+                        recordToolCall("accelerators", toolName, targetDoc, elapsedMs, remoteOk,
+                                       rSummary, remoteOk ? "" : remoteRes.value("error", ""));
                         return remoteRes;
                     }
                     {

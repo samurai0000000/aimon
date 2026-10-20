@@ -115,6 +115,21 @@ using pfn_clReleaseCommandQueue = cl_int (CL_API_CALL *)(cl_command_queue);
 using pfn_clReleaseContext = cl_int (CL_API_CALL *)(cl_context);
 
 const char* kOpenClKernelSource = R"CLC(
+#define MAX_PLACEMENT_ITEMS 128
+
+static inline uint xorshift32(uint* state) {
+    uint x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static inline float randFloat01(uint* state) {
+    return (float)(xorshift32(state) & 0x00FFFFFFu) / (float)0x01000000u;
+}
+
 __kernel void evalOrientationOverhangs(
     const int numCandidates,
     const float px, const float py, const float pz,
@@ -132,6 +147,27 @@ __kernel void evalOrientationOverhangs(
     float nx = c.x, ny = c.y, nz = c.z;
     float supportPenalty = c.w;
 
+    // For spherical sweep candidates (supportPenalty < 0), integrate overhang
+    // penalty across 64 golden-spiral facet normals of the part + bore geometry.
+    if (supportPenalty < 0.0f) {
+        float overhangAccum = 0.0f;
+        for (int f = 0; f < 64; ++f) {
+            float fi = (float)f + 0.5f;
+            float phi = acos(1.0f - 2.0f * fi / 64.0f);
+            float theta = 3.14159265f * (1.0f + sqrt(5.0f)) * fi;
+            float fnx = sin(phi) * cos(theta);
+            float fny = sin(phi) * sin(theta);
+            float fnz = cos(phi);
+            float cosBuild = fnx * nx + fny * ny + fnz * nz;
+            // Overhang threshold: facets facing downward > 45 deg below build plane (cosBuild < -0.7071)
+            if (cosBuild < -0.70710678f) {
+                overhangAccum += (-cosBuild - 0.70710678f);
+            }
+        }
+        float axisAlign = fmax(fabs(nx), fmax(fabs(ny), fabs(nz)));
+        supportPenalty = (axisAlign > 0.999f) ? 0.05f : (0.05f + 0.35f * (1.0f - axisAlign) + 0.02f * overhangAccum);
+    }
+
     float zAlign = fabs(px * nx + py * ny + pz * nz);
     float xyAlign = sqrt(fmax(0.0f, 1.0f - zAlign * zAlign));
     float normalStress = (fMag / areaMm2) + (mMagNmm / secModMm3);
@@ -146,36 +182,32 @@ __kernel void evalOrientationOverhangs(
     outMetrics[gid] = (float4)(delamSf, fiberSf, boreCircularity, score);
 }
 
-__kernel void evalPlacementWirelength(
-    const int numReplicas,
+static inline float evalPlacementStateCost(
     const int numItems,
     const int numNets,
     const float clearanceMm,
     __global const float4* itemDims,
-    __global const float2* replicaCoords,
+    __global const int2* itemMeta,
+    const float2* pos,
+    const int* rot,
     __global const int* netOffsets,
     __global const int* netMembers,
-    __global float2* outCosts
+    float* outHpwl
 ) {
-    int rep = get_global_id(0);
-    if (rep >= numReplicas) return;
-
-    int baseIdx = rep * numItems;
     float hpwl = 0.0f;
-
     for (int n = 0; n < numNets; ++n) {
         int start = netOffsets[n];
         int end = netOffsets[n + 1];
         if (start >= end) continue;
         int firstMember = netMembers[start];
-        float minX = replicaCoords[baseIdx + firstMember].x;
+        float minX = pos[firstMember].x;
         float maxX = minX;
-        float minY = replicaCoords[baseIdx + firstMember].y;
+        float minY = pos[firstMember].y;
         float maxY = minY;
         for (int m = start + 1; m < end; ++m) {
             int idx = netMembers[m];
-            float x = replicaCoords[baseIdx + idx].x;
-            float y = replicaCoords[baseIdx + idx].y;
+            float x = pos[idx].x;
+            float y = pos[idx].y;
             minX = fmin(minX, x);
             maxX = fmax(maxX, x);
             minY = fmin(minY, y);
@@ -183,25 +215,26 @@ __kernel void evalPlacementWirelength(
         }
         hpwl += (maxX - minX) + (maxY - minY);
     }
+    *outHpwl = hpwl;
 
     float overlapArea = 0.0f;
     for (int i = 0; i < numItems; ++i) {
         float4 dimI = itemDims[i];
-        int rotI = (int)dimI.z;
+        int rotI = rot[i];
         float wi = ((rotI % 180) != 0 ? dimI.y : dimI.x) * 0.5f + clearanceMm;
         float hi = ((rotI % 180) != 0 ? dimI.x : dimI.y) * 0.5f + clearanceMm;
-        float xi = replicaCoords[baseIdx + i].x;
-        float yi = replicaCoords[baseIdx + i].y;
+        float xi = pos[i].x;
+        float yi = pos[i].y;
         float layerI = dimI.w;
 
         for (int j = i + 1; j < numItems; ++j) {
             float4 dimJ = itemDims[j];
             if (layerI != dimJ.w) continue;
-            int rotJ = (int)dimJ.z;
+            int rotJ = rot[j];
             float wj = ((rotJ % 180) != 0 ? dimJ.y : dimJ.x) * 0.5f + clearanceMm;
             float hj = ((rotJ % 180) != 0 ? dimJ.x : dimJ.y) * 0.5f + clearanceMm;
-            float xj = replicaCoords[baseIdx + j].x;
-            float yj = replicaCoords[baseIdx + j].y;
+            float xj = pos[j].x;
+            float yj = pos[j].y;
 
             float ox = (wi + wj) - fabs(xi - xj);
             float oy = (hi + hj) - fabs(yi - yj);
@@ -211,58 +244,255 @@ __kernel void evalPlacementWirelength(
         }
     }
 
-    outCosts[rep] = (float2)(hpwl + overlapArea * 500.0f, hpwl);
-}
-
-__kernel void rasterizeObstacleClearance(
-    const int numQueries,
-    const int numObstacles,
-    __global const float4* queryPoints,
-    __global const float4* obstacleBoxes,
-    __global const int4* obstacleMeta,
-    __global int* outClearanceFlags
-) {
-    int gid = get_global_id(0);
-    if (gid >= numQueries) return;
-
-    float4 q = queryPoints[gid];
-    float qx = q.x;
-    float qy = q.y;
-    int qLayer = (int)q.z;
-    int qNet = (int)q.w;
-
-    int blocked = 0;
-    for (int i = 0; i < numObstacles; ++i) {
-        int4 meta = obstacleMeta[i];
-        int obsLayer = meta.x;
-        int obsNet = meta.y;
-        if (obsLayer != -1 && qLayer != -1 && obsLayer != qLayer) continue;
-        if (obsNet != 0 && obsNet == qNet) continue;
-
-        float4 b = obstacleBoxes[i];
-        if (meta.z == 1) {
-            float dist = hypot(qx - b.x, qy - b.y);
-            if (dist <= b.z) {
-                blocked = 1;
-                break;
-            }
-        } else {
-            float ex = fmax(fabs(qx - b.x) - b.z, 0.0f);
-            float ey = fmax(fabs(qy - b.y) - b.w, 0.0f);
-            if (hypot(ex, ey) <= 0.001f) {
-                blocked = 1;
-                break;
+    float decapPenalty = 0.0f;
+    for (int i = 0; i < numItems; ++i) {
+        int targetIdx = itemMeta[i].y;
+        if (targetIdx >= 0 && targetIdx < numItems) {
+            float4 dimI = itemDims[i];
+            float4 dimT = itemDims[targetIdx];
+            float effWi = ((rot[i] % 180) != 0) ? dimI.y : dimI.x;
+            float effWt = ((rot[targetIdx] % 180) != 0) ? dimT.y : dimT.x;
+            float dist = hypot(pos[i].x - pos[targetIdx].x, pos[i].y - pos[targetIdx].y);
+            float idealDist = effWt * 0.5f + effWi * 0.5f + clearanceMm * 2.0f + 0.5f;
+            if (dist > idealDist + 2.5f) {
+                decapPenalty += (dist - idealDist) * 25.0f;
             }
         }
     }
-    outClearanceFlags[gid] = blocked;
+
+    return hpwl + overlapArea * 500.0f + decapPenalty;
+}
+
+__kernel void evalPlacementWirelength(
+    const int numReplicas,
+    const int numItems,
+    const int numNets,
+    const int numIters,
+    const float boardW,
+    const float boardH,
+    const float clearanceMm,
+    __global const float4* itemDims,
+    __global const int2* itemMeta,
+    __global const float2* initCoords,
+    __global const int* netOffsets,
+    __global const int* netMembers,
+    __global float4* outBestStates,
+    __global float2* outCosts
+) {
+    int rep = get_global_id(0);
+    if (rep >= numReplicas || numItems <= 0 || numItems > MAX_PLACEMENT_ITEMS) return;
+
+    uint rng = 0x9E3779B9u ^ ((uint)(rep + 1) * 2654435761u);
+    float2 pos[MAX_PLACEMENT_ITEMS];
+    int rot[MAX_PLACEMENT_ITEMS];
+    float2 bestPos[MAX_PLACEMENT_ITEMS];
+    int bestRot[MAX_PLACEMENT_ITEMS];
+
+    for (int i = 0; i < numItems; ++i) {
+        float4 dim = itemDims[i];
+        int fixedFlag = itemMeta[i].x;
+        float2 p = initCoords[i];
+        int rDeg = (int)dim.z;
+        if (rep > 0 && fixedFlag == 0) {
+            p.x += (randFloat01(&rng) * 2.0f - 1.0f) * (boardW * 0.30f);
+            p.y += (randFloat01(&rng) * 2.0f - 1.0f) * (boardH * 0.30f);
+            if (randFloat01(&rng) < 0.25f) {
+                rDeg = (rDeg + 90 * (int)(xorshift32(&rng) & 3u)) % 360;
+            }
+            float hw = ((rDeg % 180) != 0 ? dim.y : dim.x) * 0.5f + clearanceMm;
+            float hh = ((rDeg % 180) != 0 ? dim.x : dim.y) * 0.5f + clearanceMm;
+            p.x = clamp(p.x, hw, fmax(hw, boardW - hw));
+            p.y = clamp(p.y, hh, fmax(hh, boardH - hh));
+        }
+        pos[i] = p;
+        rot[i] = rDeg;
+        bestPos[i] = p;
+        bestRot[i] = rDeg;
+    }
+
+    float curHpwl = 0.0f;
+    float curCost = evalPlacementStateCost(numItems, numNets, clearanceMm, itemDims, itemMeta,
+                                           pos, rot, netOffsets, netMembers, &curHpwl);
+    float bestCost = curCost;
+    float bestHpwl = curHpwl;
+
+    for (int iter = 0; iter < numIters; ++iter) {
+        float temp = fmax(0.05f, 10.0f * (1.0f - (float)iter / (float)max(1, numIters)));
+        int idx = (int)(xorshift32(&rng) % (uint)numItems);
+        if (itemMeta[idx].x != 0) continue;
+
+        float2 savedPos = pos[idx];
+        int savedRot = rot[idx];
+        float moveRange = fmax(0.5f, boardW * 0.25f * (temp / 10.0f));
+        pos[idx].x += (randFloat01(&rng) * 2.0f - 1.0f) * moveRange;
+        pos[idx].y += (randFloat01(&rng) * 2.0f - 1.0f) * moveRange;
+        if (randFloat01(&rng) < 0.15f) {
+            rot[idx] = (rot[idx] + 90) % 360;
+        }
+
+        float4 dim = itemDims[idx];
+        float halfW = ((rot[idx] % 180) != 0 ? dim.y : dim.x) * 0.5f + clearanceMm;
+        float halfH = ((rot[idx] % 180) != 0 ? dim.x : dim.y) * 0.5f + clearanceMm;
+        pos[idx].x = clamp(pos[idx].x, halfW, fmax(halfW, boardW - halfW));
+        pos[idx].y = clamp(pos[idx].y, halfH, fmax(halfH, boardH - halfH));
+
+        float newHpwl = 0.0f;
+        float newCost = evalPlacementStateCost(numItems, numNets, clearanceMm, itemDims, itemMeta,
+                                               pos, rot, netOffsets, netMembers, &newHpwl);
+        float delta = newCost - curCost;
+        if (delta <= 0.0f || exp(fmax(-50.0f, -delta / temp)) > randFloat01(&rng)) {
+            curCost = newCost;
+            if (newCost < bestCost) {
+                bestCost = newCost;
+                bestHpwl = newHpwl;
+                for (int k = 0; k < numItems; ++k) {
+                    bestPos[k] = pos[k];
+                    bestRot[k] = rot[k];
+                }
+            }
+        } else {
+            pos[idx] = savedPos;
+            rot[idx] = savedRot;
+        }
+    }
+
+    int baseOut = rep * numItems;
+    for (int i = 0; i < numItems; ++i) {
+        outBestStates[baseOut + i] = (float4)(bestPos[i].x, bestPos[i].y, (float)bestRot[i], 0.0f);
+    }
+    outCosts[rep] = (float2)(bestCost, bestHpwl);
+}
+
+static inline int markOwnerCl(int slot, int id) {
+    if (slot == 0) return id;
+    if (slot != id) return -1;
+    return slot;
+}
+
+__kernel void rasterizeObstacleClearance(
+    const int gxMax,
+    const int gyMax,
+    const int numLayers,
+    const int numPrims,
+    const float originX,
+    const float originY,
+    const float gridMm,
+    __global const float4* primGeom0,
+    __global const float4* primGeom1,
+    __global const int4* primMeta,
+    __global int* outCellOwner,
+    __global int* outViaOwner
+) {
+    int gid = get_global_id(0);
+    int planeCells = gxMax * gyMax;
+    if (gid >= planeCells) return;
+
+    int gx = gid % gxMax;
+    int gy = gid / gxMax;
+    float wx = originX + (float)gx * gridMm;
+    float wy = originY + (float)gy * gridMm;
+
+    int viaSlot = 0;
+    int cellSlot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int maxLy = min(numLayers, 8);
+
+    for (int i = 0; i < numPrims; ++i) {
+        float4 g0 = primGeom0[i];
+        float4 g1 = primGeom1[i];
+        int4 meta = primMeta[i];
+        int kind = meta.x;
+        int layer = meta.y;
+        int ownerId = meta.z;
+        int viaOwnerId = meta.w;
+        float cellR = g1.x;
+        float viaR = g1.y;
+        float maxR = fmax(cellR, viaR);
+
+        float dist = 1e9f;
+        if (kind == 0) {
+            // Axis-aligned rect: g0 = (cx, cy, hw, hh)
+            float dx = fabs(wx - g0.x) - g0.z;
+            float dy = fabs(wy - g0.y) - g0.w;
+            if (dx > maxR + 1e-4f || dy > maxR + 1e-4f) continue;
+            dist = hypot(fmax(dx, 0.0f), fmax(dy, 0.0f));
+        } else if (kind == 1) {
+            // Segment track: g0 = (x1, y1, x2, y2)
+            float minX = fmin(g0.x, g0.z) - maxR - 1e-4f;
+            float maxX = fmax(g0.x, g0.z) + maxR + 1e-4f;
+            float minY = fmin(g0.y, g0.w) - maxR - 1e-4f;
+            float maxY = fmax(g0.y, g0.w) + maxR + 1e-4f;
+            if (wx < minX || wx > maxX || wy < minY || wy > maxY) continue;
+            float vx = g0.z - g0.x;
+            float vy = g0.w - g0.y;
+            float len2 = vx * vx + vy * vy;
+            float t = (len2 > 1e-16f) ? clamp(((wx - g0.x) * vx + (wy - g0.y) * vy) / len2, 0.0f, 1.0f) : 0.0f;
+            dist = hypot(wx - (g0.x + t * vx), wy - (g0.y + t * vy));
+        } else if (kind == 2) {
+            // Circle via: g0 = (vx, vy, 0, 0)
+            float dx = fabs(wx - g0.x);
+            float dy = fabs(wy - g0.y);
+            if (dx > maxR + 1e-4f || dy > maxR + 1e-4f) continue;
+            dist = hypot(dx, dy);
+        } else if (kind == 3) {
+            // Rotated rectangular pad: g0 = (px, py, hw, hh), g1.z = cosR, g1.w = sinR
+            float dx = wx - g0.x;
+            float dy = wy - g0.y;
+            float bound = g0.z + g0.w + maxR + 1e-4f;
+            if (fabs(dx) > bound || fabs(dy) > bound) continue;
+            float lx = dx * g1.z + dy * g1.w;
+            float ly = -dx * g1.w + dy * g1.z;
+            dist = hypot(fmax(fabs(lx) - g0.z, 0.0f), fmax(fabs(ly) - g0.w, 0.0f));
+        }
+
+        if (dist <= cellR + 2e-5f) {
+            if (layer == -1) {
+                for (int ly = 0; ly < maxLy; ++ly) {
+                    cellSlot[ly] = markOwnerCl(cellSlot[ly], ownerId);
+                }
+            } else if (layer >= 0 && layer < maxLy) {
+                cellSlot[layer] = markOwnerCl(cellSlot[layer], ownerId);
+            }
+        }
+        if (viaR >= 0.0f && dist <= viaR + 2e-5f) {
+            viaSlot = markOwnerCl(viaSlot, viaOwnerId);
+        }
+    }
+
+    outViaOwner[gid] = viaSlot;
+    for (int ly = 0; ly < maxLy; ++ly) {
+        outCellOwner[ly * planeCells + gid] = cellSlot[ly];
+    }
+}
+
+static inline float ptSegDistCl(float px, float py, float ax, float ay, float bx, float by) {
+    float vx = bx - ax;
+    float vy = by - ay;
+    float len2 = vx * vx + vy * vy;
+    float t = (len2 > 1e-16f) ? clamp(((px - ax) * vx + (py - ay) * vy) / len2, 0.0f, 1.0f) : 0.0f;
+    return hypot(px - (ax + t * vx), py - (ay + t * vy));
+}
+
+static inline int segsCrossCl(float ax, float ay, float bx, float by,
+                              float cx, float cy, float dx, float dy) {
+    float d1 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx);
+    float d2 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx);
+    float d3 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    float d4 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax);
+    return (((d1 > 0.0f && d2 < 0.0f) || (d1 < 0.0f && d2 > 0.0f)) &&
+            ((d3 > 0.0f && d4 < 0.0f) || (d3 < 0.0f && d4 > 0.0f))) ? 1 : 0;
 }
 
 __kernel void auditSegmentClearance(
     const int numSegments,
+    const int numPads,
+    const int numVias,
     const float minClearance,
     __global const float4* segStartEnd,
     __global const float4* segProps,
+    __global const float4* padGeom0,
+    __global const float4* padGeom1,
+    __global const float4* viaGeom,
+    __global int* outEndpointAnchored,
     __global int* outViolationCount,
     __global int2* outViolations,
     const int maxViolations
@@ -275,6 +505,56 @@ __kernel void auditSegmentClearance(
     float w1 = p1.x;
     int layer1 = (int)p1.y;
     int net1 = (int)p1.z;
+    float touchTol = p1.w;
+
+    int anchoredMask = 0;
+    for (int ep = 0; ep < 2; ++ep) {
+        float ex = (ep == 0) ? s1.x : s1.z;
+        float ey = (ep == 0) ? s1.y : s1.w;
+        int anchored = 0;
+
+        for (int p = 0; p < numPads && !anchored; ++p) {
+            float4 pg0 = padGeom0[p];
+            float4 pg1 = padGeom1[p];
+            int pLayer = (int)pg1.z;
+            int pNet = (int)pg1.w;
+            if (net1 != 0 && pNet != 0 && net1 != pNet) continue;
+            if (layer1 != -1 && pLayer != -1 && layer1 != pLayer) continue;
+            float dx = ex - pg0.x;
+            float dy = ey - pg0.y;
+            float lx = dx * pg1.x + dy * pg1.y;
+            float ly = -dx * pg1.y + dy * pg1.x;
+            float d = hypot(fmax(fabs(lx) - pg0.z, 0.0f), fmax(fabs(ly) - pg0.w, 0.0f));
+            if (d <= 0.5f * w1 + touchTol + 1e-4f) {
+                anchored = 1;
+            }
+        }
+        for (int v = 0; v < numVias && !anchored; ++v) {
+            float4 vg = viaGeom[v];
+            int vNet = (int)vg.w;
+            if (net1 != 0 && vNet != 0 && net1 != vNet) continue;
+            if (hypot(ex - vg.x, ey - vg.y) <= vg.z + 0.5f * w1 + touchTol + 1e-4f) {
+                anchored = 1;
+            }
+        }
+        for (int j = 0; j < numSegments && !anchored; ++j) {
+            if (j == i) continue;
+            float4 p2 = segProps[j];
+            int layer2 = (int)p2.y;
+            int net2 = (int)p2.z;
+            if (net1 != 0 && net2 != 0 && net1 != net2) continue;
+            if (layer1 != -1 && layer2 != -1 && layer1 != layer2) continue;
+            float4 s2 = segStartEnd[j];
+            float d = ptSegDistCl(ex, ey, s2.x, s2.y, s2.z, s2.w);
+            if (d <= 0.5f * (w1 + p2.x) + touchTol + 1e-4f) {
+                anchored = 1;
+            }
+        }
+        if (anchored) {
+            anchoredMask |= (1 << ep);
+        }
+    }
+    outEndpointAnchored[i] = anchoredMask;
 
     for (int j = i + 1; j < numSegments; ++j) {
         float4 p2 = segProps[j];
@@ -301,26 +581,13 @@ __kernel void auditSegmentClearance(
             continue;
         }
 
-        float vx1 = s1.z - s1.x;
-        float vy1 = s1.w - s1.y;
-        float lenSq1 = vx1 * vx1 + vy1 * vy1;
-
-        float vx2 = s2.z - s2.x;
-        float vy2 = s2.w - s2.y;
-        float lenSq2 = vx2 * vx2 + vy2 * vy2;
-
-        float dMin = 1e9f;
-        float t1 = (lenSq2 > 1e-12f) ? clamp(((s1.x - s2.x) * vx2 + (s1.y - s2.y) * vy2) / lenSq2, 0.0f, 1.0f) : 0.0f;
-        dMin = fmin(dMin, hypot(s1.x - (s2.x + t1 * vx2), s1.y - (s2.y + t1 * vy2)));
-
-        float t2 = (lenSq2 > 1e-12f) ? clamp(((s1.z - s2.x) * vx2 + (s1.w - s2.y) * vy2) / lenSq2, 0.0f, 1.0f) : 0.0f;
-        dMin = fmin(dMin, hypot(s1.z - (s2.x + t2 * vx2), s1.w - (s2.y + t2 * vy2)));
-
-        float t3 = (lenSq1 > 1e-12f) ? clamp(((s2.x - s1.x) * vx1 + (s2.y - s1.y) * vy1) / lenSq1, 0.0f, 1.0f) : 0.0f;
-        dMin = fmin(dMin, hypot(s2.x - (s1.x + t3 * vx1), s2.y - (s1.y + t3 * vy1)));
-
-        float t4 = (lenSq1 > 1e-12f) ? clamp(((s2.z - s1.x) * vx1 + (s2.w - s1.y) * vy1) / lenSq1, 0.0f, 1.0f) : 0.0f;
-        dMin = fmin(dMin, hypot(s2.z - (s1.x + t4 * vx1), s2.w - (s1.y + t4 * vy1)));
+        float dMin = 0.0f;
+        if (!segsCrossCl(s1.x, s1.y, s1.z, s1.w, s2.x, s2.y, s2.z, s2.w)) {
+            dMin = ptSegDistCl(s1.x, s1.y, s2.x, s2.y, s2.z, s2.w);
+            dMin = fmin(dMin, ptSegDistCl(s1.z, s1.w, s2.x, s2.y, s2.z, s2.w));
+            dMin = fmin(dMin, ptSegDistCl(s2.x, s2.y, s1.x, s1.y, s1.z, s1.w));
+            dMin = fmin(dMin, ptSegDistCl(s2.z, s2.w, s1.x, s1.y, s1.z, s1.w));
+        }
 
         if (dMin < reqDist) {
             int slot = atomic_inc(outViolationCount);
@@ -409,145 +676,215 @@ public:
     }
 
     bool runPlacementWirelength(int numReplicas, int numItems, int numNets,
-                                float clearanceMm,
+                                int numIters, float boardW, float boardH, float clearanceMm,
                                 const std::vector<float>& itemDims,
-                                const std::vector<float>& replicaCoords,
+                                const std::vector<int>& itemMeta,
+                                const std::vector<float>& initCoords,
                                 const std::vector<int>& netOffsets,
                                 const std::vector<int>& netMembers,
+                                std::vector<float>& outBestStates,
                                 std::vector<float>& outCosts) {
         std::lock_guard<std::mutex> lock(_mutex);
-        if (!_gpuAvailable || !_queue || !_kPcbPlacement || numReplicas <= 0 || numItems <= 0) {
+        if (!_gpuAvailable || !_queue || !_kPcbPlacement || numReplicas <= 0 || numItems <= 0 || numItems > 128) {
             return false;
         }
 
         cl_int err = CL_SUCCESS;
         size_t dimsBytes = sizeof(float) * itemDims.size();
-        size_t coordsBytes = sizeof(float) * replicaCoords.size();
+        size_t metaBytes = sizeof(int) * itemMeta.size();
+        size_t coordsBytes = sizeof(float) * initCoords.size();
         size_t offsetsBytes = sizeof(int) * netOffsets.size();
-        size_t membersBytes = sizeof(int) * netMembers.size();
-        size_t outBytes = sizeof(float) * 2 * static_cast<size_t>(numReplicas);
+        size_t membersBytes = std::max<size_t>(sizeof(int), sizeof(int) * netMembers.size());
+        size_t outStatesBytes = sizeof(float) * 4 * static_cast<size_t>(numReplicas * numItems);
+        size_t outCostsBytes = sizeof(float) * 2 * static_cast<size_t>(numReplicas);
+        outBestStates.resize(4 * static_cast<size_t>(numReplicas * numItems), 0.0f);
         outCosts.resize(2 * static_cast<size_t>(numReplicas), 0.0f);
+
+        int dummyMember = 0;
+        const int* membersPtr = netMembers.empty() ? &dummyMember : netMembers.data();
 
         cl_mem dimsBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, dimsBytes, const_cast<float*>(itemDims.data()), &err);
         if (err != CL_SUCCESS || !dimsBuf) return false;
-        cl_mem coordsBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, coordsBytes, const_cast<float*>(replicaCoords.data()), &err);
-        if (err != CL_SUCCESS || !coordsBuf) { clReleaseMemObject(dimsBuf); return false; }
+        cl_mem metaBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, metaBytes, const_cast<int*>(itemMeta.data()), &err);
+        if (err != CL_SUCCESS || !metaBuf) { clReleaseMemObject(dimsBuf); return false; }
+        cl_mem coordsBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, coordsBytes, const_cast<float*>(initCoords.data()), &err);
+        if (err != CL_SUCCESS || !coordsBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(metaBuf); return false; }
         cl_mem offsetsBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, offsetsBytes, const_cast<int*>(netOffsets.data()), &err);
-        if (err != CL_SUCCESS || !offsetsBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(coordsBuf); return false; }
-        cl_mem membersBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, membersBytes, const_cast<int*>(netMembers.data()), &err);
-        if (err != CL_SUCCESS || !membersBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(coordsBuf); clReleaseMemObject(offsetsBuf); return false; }
-        cl_mem outBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, outBytes, nullptr, &err);
-        if (err != CL_SUCCESS || !outBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(coordsBuf); clReleaseMemObject(offsetsBuf); clReleaseMemObject(membersBuf); return false; }
+        if (err != CL_SUCCESS || !offsetsBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(metaBuf); clReleaseMemObject(coordsBuf); return false; }
+        cl_mem membersBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, membersBytes, const_cast<int*>(membersPtr), &err);
+        if (err != CL_SUCCESS || !membersBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(metaBuf); clReleaseMemObject(coordsBuf); clReleaseMemObject(offsetsBuf); return false; }
+        cl_mem outStatesBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, outStatesBytes, nullptr, &err);
+        if (err != CL_SUCCESS || !outStatesBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(metaBuf); clReleaseMemObject(coordsBuf); clReleaseMemObject(offsetsBuf); clReleaseMemObject(membersBuf); return false; }
+        cl_mem outCostsBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, outCostsBytes, nullptr, &err);
+        if (err != CL_SUCCESS || !outCostsBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(metaBuf); clReleaseMemObject(coordsBuf); clReleaseMemObject(offsetsBuf); clReleaseMemObject(membersBuf); clReleaseMemObject(outStatesBuf); return false; }
 
         clSetKernelArg(_kPcbPlacement, 0, sizeof(int), &numReplicas);
         clSetKernelArg(_kPcbPlacement, 1, sizeof(int), &numItems);
         clSetKernelArg(_kPcbPlacement, 2, sizeof(int), &numNets);
-        clSetKernelArg(_kPcbPlacement, 3, sizeof(float), &clearanceMm);
-        clSetKernelArg(_kPcbPlacement, 4, sizeof(cl_mem), &dimsBuf);
-        clSetKernelArg(_kPcbPlacement, 5, sizeof(cl_mem), &coordsBuf);
-        clSetKernelArg(_kPcbPlacement, 6, sizeof(cl_mem), &offsetsBuf);
-        clSetKernelArg(_kPcbPlacement, 7, sizeof(cl_mem), &membersBuf);
-        clSetKernelArg(_kPcbPlacement, 8, sizeof(cl_mem), &outBuf);
+        clSetKernelArg(_kPcbPlacement, 3, sizeof(int), &numIters);
+        clSetKernelArg(_kPcbPlacement, 4, sizeof(float), &boardW);
+        clSetKernelArg(_kPcbPlacement, 5, sizeof(float), &boardH);
+        clSetKernelArg(_kPcbPlacement, 6, sizeof(float), &clearanceMm);
+        clSetKernelArg(_kPcbPlacement, 7, sizeof(cl_mem), &dimsBuf);
+        clSetKernelArg(_kPcbPlacement, 8, sizeof(cl_mem), &metaBuf);
+        clSetKernelArg(_kPcbPlacement, 9, sizeof(cl_mem), &coordsBuf);
+        clSetKernelArg(_kPcbPlacement, 10, sizeof(cl_mem), &offsetsBuf);
+        clSetKernelArg(_kPcbPlacement, 11, sizeof(cl_mem), &membersBuf);
+        clSetKernelArg(_kPcbPlacement, 12, sizeof(cl_mem), &outStatesBuf);
+        clSetKernelArg(_kPcbPlacement, 13, sizeof(cl_mem), &outCostsBuf);
 
         size_t globalWorkSize = static_cast<size_t>(numReplicas);
         err = clEnqueueNDRangeKernel(_queue, _kPcbPlacement, 1, nullptr, &globalWorkSize, nullptr, 0, nullptr, nullptr);
         if (err == CL_SUCCESS) {
-            err = clEnqueueReadBuffer(_queue, outBuf, CL_TRUE, 0, outBytes, outCosts.data(), 0, nullptr, nullptr);
+            err = clEnqueueReadBuffer(_queue, outStatesBuf, CL_TRUE, 0, outStatesBytes, outBestStates.data(), 0, nullptr, nullptr);
+        }
+        if (err == CL_SUCCESS) {
+            err = clEnqueueReadBuffer(_queue, outCostsBuf, CL_TRUE, 0, outCostsBytes, outCosts.data(), 0, nullptr, nullptr);
         }
 
         clReleaseMemObject(dimsBuf);
+        clReleaseMemObject(metaBuf);
         clReleaseMemObject(coordsBuf);
         clReleaseMemObject(offsetsBuf);
         clReleaseMemObject(membersBuf);
-        clReleaseMemObject(outBuf);
+        clReleaseMemObject(outStatesBuf);
+        clReleaseMemObject(outCostsBuf);
         return err == CL_SUCCESS;
     }
 
-    bool runObstacleClearance(int numQueries, int numObstacles,
-                              const std::vector<float>& queries,
-                              const std::vector<float>& boxes,
-                              const std::vector<int>& meta,
-                              std::vector<int>& outFlags) {
+    bool runObstacleClearance(int gxMax, int gyMax, int numLayers, int numPrims,
+                              float originX, float originY, float gridMm,
+                              const std::vector<float>& primGeom0,
+                              const std::vector<float>& primGeom1,
+                              const std::vector<int>& primMeta,
+                              std::vector<int32_t>& outCellOwner,
+                              std::vector<int32_t>& outViaOwner) {
         std::lock_guard<std::mutex> lock(_mutex);
-        if (!_gpuAvailable || !_queue || !_kPcbAutoroute || numQueries <= 0 || numObstacles <= 0) {
+        int planeCells = gxMax * gyMax;
+        if (!_gpuAvailable || !_queue || !_kPcbAutoroute || planeCells <= 0 || numLayers <= 0 || numLayers > 8 || numPrims <= 0) {
             return false;
         }
 
         cl_int err = CL_SUCCESS;
-        size_t qBytes = sizeof(float) * queries.size();
-        size_t bBytes = sizeof(float) * boxes.size();
-        size_t mBytes = sizeof(int) * meta.size();
-        size_t outBytes = sizeof(int) * static_cast<size_t>(numQueries);
-        outFlags.resize(static_cast<size_t>(numQueries), 0);
+        size_t g0Bytes = sizeof(float) * primGeom0.size();
+        size_t g1Bytes = sizeof(float) * primGeom1.size();
+        size_t mBytes = sizeof(int) * primMeta.size();
+        size_t cellBytes = sizeof(int32_t) * static_cast<size_t>(numLayers) * static_cast<size_t>(planeCells);
+        size_t viaBytes = sizeof(int32_t) * static_cast<size_t>(planeCells);
+        outCellOwner.resize(static_cast<size_t>(numLayers) * static_cast<size_t>(planeCells), 0);
+        outViaOwner.resize(static_cast<size_t>(planeCells), 0);
 
-        cl_mem qBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, qBytes, const_cast<float*>(queries.data()), &err);
-        if (err != CL_SUCCESS || !qBuf) return false;
-        cl_mem bBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bBytes, const_cast<float*>(boxes.data()), &err);
-        if (err != CL_SUCCESS || !bBuf) { clReleaseMemObject(qBuf); return false; }
-        cl_mem mBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, mBytes, const_cast<int*>(meta.data()), &err);
-        if (err != CL_SUCCESS || !mBuf) { clReleaseMemObject(qBuf); clReleaseMemObject(bBuf); return false; }
-        cl_mem outBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, outBytes, nullptr, &err);
-        if (err != CL_SUCCESS || !outBuf) { clReleaseMemObject(qBuf); clReleaseMemObject(bBuf); clReleaseMemObject(mBuf); return false; }
+        cl_mem g0Buf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, g0Bytes, const_cast<float*>(primGeom0.data()), &err);
+        if (err != CL_SUCCESS || !g0Buf) return false;
+        cl_mem g1Buf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, g1Bytes, const_cast<float*>(primGeom1.data()), &err);
+        if (err != CL_SUCCESS || !g1Buf) { clReleaseMemObject(g0Buf); return false; }
+        cl_mem mBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, mBytes, const_cast<int*>(primMeta.data()), &err);
+        if (err != CL_SUCCESS || !mBuf) { clReleaseMemObject(g0Buf); clReleaseMemObject(g1Buf); return false; }
+        cl_mem cellBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, cellBytes, nullptr, &err);
+        if (err != CL_SUCCESS || !cellBuf) { clReleaseMemObject(g0Buf); clReleaseMemObject(g1Buf); clReleaseMemObject(mBuf); return false; }
+        cl_mem viaBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, viaBytes, nullptr, &err);
+        if (err != CL_SUCCESS || !viaBuf) { clReleaseMemObject(g0Buf); clReleaseMemObject(g1Buf); clReleaseMemObject(mBuf); clReleaseMemObject(cellBuf); return false; }
 
-        clSetKernelArg(_kPcbAutoroute, 0, sizeof(int), &numQueries);
-        clSetKernelArg(_kPcbAutoroute, 1, sizeof(int), &numObstacles);
-        clSetKernelArg(_kPcbAutoroute, 2, sizeof(cl_mem), &qBuf);
-        clSetKernelArg(_kPcbAutoroute, 3, sizeof(cl_mem), &bBuf);
-        clSetKernelArg(_kPcbAutoroute, 4, sizeof(cl_mem), &mBuf);
-        clSetKernelArg(_kPcbAutoroute, 5, sizeof(cl_mem), &outBuf);
+        clSetKernelArg(_kPcbAutoroute, 0, sizeof(int), &gxMax);
+        clSetKernelArg(_kPcbAutoroute, 1, sizeof(int), &gyMax);
+        clSetKernelArg(_kPcbAutoroute, 2, sizeof(int), &numLayers);
+        clSetKernelArg(_kPcbAutoroute, 3, sizeof(int), &numPrims);
+        clSetKernelArg(_kPcbAutoroute, 4, sizeof(float), &originX);
+        clSetKernelArg(_kPcbAutoroute, 5, sizeof(float), &originY);
+        clSetKernelArg(_kPcbAutoroute, 6, sizeof(float), &gridMm);
+        clSetKernelArg(_kPcbAutoroute, 7, sizeof(cl_mem), &g0Buf);
+        clSetKernelArg(_kPcbAutoroute, 8, sizeof(cl_mem), &g1Buf);
+        clSetKernelArg(_kPcbAutoroute, 9, sizeof(cl_mem), &mBuf);
+        clSetKernelArg(_kPcbAutoroute, 10, sizeof(cl_mem), &cellBuf);
+        clSetKernelArg(_kPcbAutoroute, 11, sizeof(cl_mem), &viaBuf);
 
-        size_t globalWorkSize = static_cast<size_t>(numQueries);
+        size_t globalWorkSize = static_cast<size_t>(planeCells);
         err = clEnqueueNDRangeKernel(_queue, _kPcbAutoroute, 1, nullptr, &globalWorkSize, nullptr, 0, nullptr, nullptr);
         if (err == CL_SUCCESS) {
-            err = clEnqueueReadBuffer(_queue, outBuf, CL_TRUE, 0, outBytes, outFlags.data(), 0, nullptr, nullptr);
+            err = clEnqueueReadBuffer(_queue, cellBuf, CL_TRUE, 0, cellBytes, outCellOwner.data(), 0, nullptr, nullptr);
+        }
+        if (err == CL_SUCCESS) {
+            err = clEnqueueReadBuffer(_queue, viaBuf, CL_TRUE, 0, viaBytes, outViaOwner.data(), 0, nullptr, nullptr);
         }
 
-        clReleaseMemObject(qBuf);
-        clReleaseMemObject(bBuf);
+        clReleaseMemObject(g0Buf);
+        clReleaseMemObject(g1Buf);
         clReleaseMemObject(mBuf);
-        clReleaseMemObject(outBuf);
+        clReleaseMemObject(cellBuf);
+        clReleaseMemObject(viaBuf);
         return err == CL_SUCCESS;
     }
 
-    bool runSegmentClearance(int numSegments, float minClearance,
+    bool runSegmentClearance(int numSegments, int numPads, int numVias, float minClearance,
                              const std::vector<float>& segStartEnd,
                              const std::vector<float>& segProps,
+                             const std::vector<float>& padGeom0,
+                             const std::vector<float>& padGeom1,
+                             const std::vector<float>& viaGeom,
+                             std::vector<int>& outEndpointAnchored,
                              int& outViolationCount,
                              std::vector<int>& outViolations) {
         std::lock_guard<std::mutex> lock(_mutex);
-        if (!_gpuAvailable || !_queue || !_kPcbConnectivityAudit || numSegments <= 1) {
+        if (!_gpuAvailable || !_queue || !_kPcbConnectivityAudit || numSegments <= 0) {
             return false;
         }
 
         cl_int err = CL_SUCCESS;
         int maxViolations = 4096;
+        outEndpointAnchored.resize(static_cast<size_t>(numSegments), 0);
         outViolations.resize(2 * static_cast<size_t>(maxViolations), 0);
         outViolationCount = 0;
 
+        float dummyFloat4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         size_t seBytes = sizeof(float) * segStartEnd.size();
         size_t pBytes = sizeof(float) * segProps.size();
+        size_t pg0Bytes = std::max<size_t>(sizeof(dummyFloat4), sizeof(float) * padGeom0.size());
+        size_t pg1Bytes = std::max<size_t>(sizeof(dummyFloat4), sizeof(float) * padGeom1.size());
+        size_t vgBytes = std::max<size_t>(sizeof(dummyFloat4), sizeof(float) * viaGeom.size());
+        size_t anchBytes = sizeof(int) * static_cast<size_t>(numSegments);
         size_t countBytes = sizeof(int);
         size_t violBytes = sizeof(int) * 2 * static_cast<size_t>(maxViolations);
+
+        const float* pg0Ptr = padGeom0.empty() ? dummyFloat4 : padGeom0.data();
+        const float* pg1Ptr = padGeom1.empty() ? dummyFloat4 : padGeom1.data();
+        const float* vgPtr = viaGeom.empty() ? dummyFloat4 : viaGeom.data();
 
         cl_mem seBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, seBytes, const_cast<float*>(segStartEnd.data()), &err);
         if (err != CL_SUCCESS || !seBuf) return false;
         cl_mem pBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, pBytes, const_cast<float*>(segProps.data()), &err);
         if (err != CL_SUCCESS || !pBuf) { clReleaseMemObject(seBuf); return false; }
+        cl_mem pg0Buf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, pg0Bytes, const_cast<float*>(pg0Ptr), &err);
+        if (err != CL_SUCCESS || !pg0Buf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); return false; }
+        cl_mem pg1Buf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, pg1Bytes, const_cast<float*>(pg1Ptr), &err);
+        if (err != CL_SUCCESS || !pg1Buf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); clReleaseMemObject(pg0Buf); return false; }
+        cl_mem vgBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, vgBytes, const_cast<float*>(vgPtr), &err);
+        if (err != CL_SUCCESS || !vgBuf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); clReleaseMemObject(pg0Buf); clReleaseMemObject(pg1Buf); return false; }
+        cl_mem anchBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, anchBytes, nullptr, &err);
+        if (err != CL_SUCCESS || !anchBuf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); clReleaseMemObject(pg0Buf); clReleaseMemObject(pg1Buf); clReleaseMemObject(vgBuf); return false; }
         cl_mem countBuf = clCreateBuffer(_context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, countBytes, &outViolationCount, &err);
-        if (err != CL_SUCCESS || !countBuf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); return false; }
+        if (err != CL_SUCCESS || !countBuf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); clReleaseMemObject(pg0Buf); clReleaseMemObject(pg1Buf); clReleaseMemObject(vgBuf); clReleaseMemObject(anchBuf); return false; }
         cl_mem violBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, violBytes, nullptr, &err);
-        if (err != CL_SUCCESS || !violBuf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); clReleaseMemObject(countBuf); return false; }
+        if (err != CL_SUCCESS || !violBuf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); clReleaseMemObject(pg0Buf); clReleaseMemObject(pg1Buf); clReleaseMemObject(vgBuf); clReleaseMemObject(anchBuf); clReleaseMemObject(countBuf); return false; }
 
         clSetKernelArg(_kPcbConnectivityAudit, 0, sizeof(int), &numSegments);
-        clSetKernelArg(_kPcbConnectivityAudit, 1, sizeof(float), &minClearance);
-        clSetKernelArg(_kPcbConnectivityAudit, 2, sizeof(cl_mem), &seBuf);
-        clSetKernelArg(_kPcbConnectivityAudit, 3, sizeof(cl_mem), &pBuf);
-        clSetKernelArg(_kPcbConnectivityAudit, 4, sizeof(cl_mem), &countBuf);
-        clSetKernelArg(_kPcbConnectivityAudit, 5, sizeof(cl_mem), &violBuf);
-        clSetKernelArg(_kPcbConnectivityAudit, 6, sizeof(int), &maxViolations);
+        clSetKernelArg(_kPcbConnectivityAudit, 1, sizeof(int), &numPads);
+        clSetKernelArg(_kPcbConnectivityAudit, 2, sizeof(int), &numVias);
+        clSetKernelArg(_kPcbConnectivityAudit, 3, sizeof(float), &minClearance);
+        clSetKernelArg(_kPcbConnectivityAudit, 4, sizeof(cl_mem), &seBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 5, sizeof(cl_mem), &pBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 6, sizeof(cl_mem), &pg0Buf);
+        clSetKernelArg(_kPcbConnectivityAudit, 7, sizeof(cl_mem), &pg1Buf);
+        clSetKernelArg(_kPcbConnectivityAudit, 8, sizeof(cl_mem), &vgBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 9, sizeof(cl_mem), &anchBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 10, sizeof(cl_mem), &countBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 11, sizeof(cl_mem), &violBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 12, sizeof(int), &maxViolations);
 
         size_t globalWorkSize = static_cast<size_t>(numSegments);
         err = clEnqueueNDRangeKernel(_queue, _kPcbConnectivityAudit, 1, nullptr, &globalWorkSize, nullptr, 0, nullptr, nullptr);
+        if (err == CL_SUCCESS) {
+            err = clEnqueueReadBuffer(_queue, anchBuf, CL_TRUE, 0, anchBytes, outEndpointAnchored.data(), 0, nullptr, nullptr);
+        }
         if (err == CL_SUCCESS) {
             clEnqueueReadBuffer(_queue, countBuf, CL_TRUE, 0, countBytes, &outViolationCount, 0, nullptr, nullptr);
             int readViolations = std::min(outViolationCount, maxViolations);
@@ -558,6 +895,10 @@ public:
 
         clReleaseMemObject(seBuf);
         clReleaseMemObject(pBuf);
+        clReleaseMemObject(pg0Buf);
+        clReleaseMemObject(pg1Buf);
+        clReleaseMemObject(vgBuf);
+        clReleaseMemObject(anchBuf);
         clReleaseMemObject(countBuf);
         clReleaseMemObject(violBuf);
         return err == CL_SUCCESS;
@@ -1721,15 +2062,39 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
     double bestCost = curCost;
 
     bool gpuKernelExecuted = false;
-    if (_capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable() && items.size() >= 2) {
-        int numReplicas = 64;
+    int gpuSaReplicas = 0;
+    int64_t gpuSaEvaluations = 0;
+    int totalIters = std::clamp(_config.saPlacementIterations, 500, 15000);
+    if (_capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable() &&
+        items.size() >= 2 && items.size() <= 128) {
+        int numReplicas = 256;
         std::vector<float> itemDims;
+        std::vector<int> itemMeta;
+        std::vector<float> initCoords;
+        itemDims.reserve(items.size() * 4);
+        itemMeta.reserve(items.size() * 2);
+        initCoords.reserve(items.size() * 2);
+
         for (const auto& it : items) {
             itemDims.push_back(static_cast<float>(it.w));
             itemDims.push_back(static_cast<float>(it.h));
             itemDims.push_back(static_cast<float>(it.rotDeg));
             itemDims.push_back(it.layer == "F.Cu" ? 0.0f : 1.0f);
+
+            int decapIdx = -1;
+            if (!it.decouplesRef.empty()) {
+                auto tIt = refIdx.find(it.decouplesRef);
+                if (tIt != refIdx.end()) {
+                    decapIdx = static_cast<int>(tIt->second);
+                }
+            }
+            itemMeta.push_back(it.fixed ? 1 : 0);
+            itemMeta.push_back(decapIdx);
+
+            initCoords.push_back(static_cast<float>(it.x));
+            initCoords.push_back(static_cast<float>(it.y));
         }
+
         std::vector<int> netOffsets;
         std::vector<int> netMembers;
         netOffsets.push_back(0);
@@ -1740,30 +2105,16 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
             netOffsets.push_back(static_cast<int>(netMembers.size()));
         }
 
-        std::vector<float> replicaCoords;
-        replicaCoords.reserve(static_cast<size_t>(numReplicas * items.size() * 2));
-        for (int r = 0; r < numReplicas; ++r) {
-            for (size_t i = 0; i < items.size(); ++i) {
-                double rx = items[i].x;
-                double ry = items[i].y;
-                if (!items[i].fixed && r > 0) {
-                    rx += (nextRand() * 2.0 - 1.0) * (boardW * 0.2);
-                    ry += (nextRand() * 2.0 - 1.0) * (boardH * 0.2);
-                    double hw = effW(items[i]) * 0.5 + clearanceMm;
-                    double hh = effH(items[i]) * 0.5 + clearanceMm;
-                    rx = std::clamp(rx, hw, std::max(hw, boardW - hw));
-                    ry = std::clamp(ry, hh, std::max(hh, boardH - hh));
-                }
-                replicaCoords.push_back(static_cast<float>(rx));
-                replicaCoords.push_back(static_cast<float>(ry));
-            }
-        }
-
+        std::vector<float> outBestStates;
         std::vector<float> outCosts;
         if (OpenClEngine::instance().runPlacementWirelength(
                 numReplicas, static_cast<int>(items.size()), static_cast<int>(netLists.size()),
-                static_cast<float>(clearanceMm), itemDims, replicaCoords, netOffsets, netMembers, outCosts)) {
+                totalIters, static_cast<float>(boardW), static_cast<float>(boardH),
+                static_cast<float>(clearanceMm), itemDims, itemMeta, initCoords,
+                netOffsets, netMembers, outBestStates, outCosts)) {
             gpuKernelExecuted = true;
+            gpuSaReplicas = numReplicas;
+            gpuSaEvaluations = static_cast<int64_t>(numReplicas) * static_cast<int64_t>(totalIters);
             int bestRep = 0;
             float bestRepCost = outCosts[0];
             for (int r = 1; r < numReplicas; ++r) {
@@ -1773,15 +2124,17 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
                 }
             }
             for (size_t i = 0; i < items.size(); ++i) {
-                items[i].x = replicaCoords[(bestRep * items.size() + i) * 2 + 0];
-                items[i].y = replicaCoords[(bestRep * items.size() + i) * 2 + 1];
+                if (items[i].fixed) continue;
+                size_t base = (static_cast<size_t>(bestRep) * items.size() + i) * 4;
+                items[i].x = outBestStates[base + 0];
+                items[i].y = outBestStates[base + 1];
+                items[i].rotDeg = static_cast<int>(std::llround(outBestStates[base + 2])) % 360;
             }
             bestItems = items;
         }
     }
 
     if (!gpuKernelExecuted) {
-        int totalIters = std::clamp(_config.saPlacementIterations, 500, 15000);
         for (int iter = 0; iter < totalIters; ++iter) {
             double temp = std::max(0.05, 10.0 * (1.0 - static_cast<double>(iter) / totalIters));
             size_t idx = static_cast<size_t>(nextRand() * items.size()) % items.size();
@@ -1879,6 +2232,8 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
     };
     if (gpuKernelExecuted) {
         res["gpu_kernel_executed"] = true;
+        res["gpu_sa_replicas"] = gpuSaReplicas;
+        res["gpu_sa_evaluations"] = gpuSaEvaluations;
     }
     attachProvenance(res, "eda_calc_pcb_placement");
     return res;
@@ -2717,93 +3072,133 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         });
     };
 
-    for (const auto& r : rects) {
-        auto dist = [&r](double wx, double wy) {
-            return pointRectDistanceLocal(wx - r.cx, wy - r.cy, r.hw, r.hh);
-        };
-        stampOwner(r.layer, r.ownerId, r.cx - r.hw, r.cx + r.hw, r.cy - r.hh, r.cy + r.hh, r.margin, dist);
-        if (r.viaMargin >= 0.0) {
-            stampVia(r.ownerId, r.cx - r.hw, r.cx + r.hw, r.cy - r.hh, r.cy + r.hh, r.viaMargin, dist);
-        }
-    }
-    // Exact Euclidean point-to-segment rasterization of existing tracks
-    for (const auto& t : tracksIn) {
-        auto dist = [&t](double wx, double wy) {
-            return pointSegmentDistance(wx, wy, t.x1, t.y1, t.x2, t.y2);
-        };
-        double xMin = std::min(t.x1, t.x2), xMax = std::max(t.x1, t.x2);
-        double yMin = std::min(t.y1, t.y2), yMax = std::max(t.y1, t.y2);
-        stampOwner(t.layer, t.netId, xMin, xMax, yMin, yMax, 0.5 * (t.w + trackWidthMm) + clearanceMm, dist);
-        stampVia(t.netId, xMin, xMax, yMin, yMax, 0.5 * (t.w + viaSizeMm) + clearanceMm, dist);
-    }
-    for (const auto& v : viasIn) {
-        auto dist = [&v](double wx, double wy) { return std::hypot(wx - v.x, wy - v.y); };
-        stampOwner(-1, v.netId, v.x, v.x, v.y, v.y, 0.5 * (v.d + trackWidthMm) + clearanceMm, dist);
-        stampVia(v.netId, v.x, v.x, v.y, v.y, 0.5 * (v.d + viaSizeMm) + clearanceMm, dist);
-    }
     const bool allowViaInPad = args.value("allow_via_in_pad", false);
-    // Rotated rectangular pads with rounded (Euclidean) clearance halos
-    for (const auto& p : staticPads) {
-        auto dist = [&p](double wx, double wy) {
-            double dx = wx - p.x;
-            double dy = wy - p.y;
-            return pointRectDistanceLocal(dx * p.cosR + dy * p.sinR, -dx * p.sinR + dy * p.cosR, p.hw, p.hh);
-        };
-        double ax = std::fabs(p.hw * p.cosR) + std::fabs(p.hh * p.sinR);
-        double ay = std::fabs(p.hw * p.sinR) + std::fabs(p.hh * p.cosR);
-        stampOwner(p.layer, p.netId, p.x - ax, p.x + ax, p.y - ay, p.y + ay,
-                   clearanceMm + 0.5 * trackWidthMm, dist);
-        int32_t viaOwnerId = (!allowViaInPad && p.layer != -1) ? kCellBlockAll : p.netId;
-        stampVia(viaOwnerId, p.x - ax, p.x + ax, p.y - ay, p.y + ay, clearanceMm + 0.5 * viaSizeMm, dist);
-        if (!allowViaInPad && p.layer != -1) {
-            viaOwner[planeIdx(cellX(p.x), cellY(p.y))] = kCellBlockAll;
-        }
-    }
     bool gpuKernelExecuted = false;
-    if (_capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable() && (!rects.empty() || !staticPads.empty() || !viasIn.empty())) {
-        std::vector<float> queries;
-        std::vector<float> boxes;
-        std::vector<int> meta;
-        queries = {
-            static_cast<float>(originX), static_cast<float>(originY), 0.0f, 0.0f,
-            static_cast<float>(originX + spanX), static_cast<float>(originY + spanY), 0.0f, 0.0f
-        };
+    int gpuRasterizedPrims = 0;
+    if (_capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable() &&
+        numLayers <= 8 && (!rects.empty() || !tracksIn.empty() || !viasIn.empty() || !staticPads.empty())) {
+        std::vector<float> primGeom0;
+        std::vector<float> primGeom1;
+        std::vector<int> primMeta;
+        size_t estPrims = rects.size() + tracksIn.size() + viasIn.size() + staticPads.size();
+        primGeom0.reserve(estPrims * 4);
+        primGeom1.reserve(estPrims * 4);
+        primMeta.reserve(estPrims * 4);
+
         for (const auto& r : rects) {
-            boxes.push_back(static_cast<float>(r.cx));
-            boxes.push_back(static_cast<float>(r.cy));
-            boxes.push_back(static_cast<float>(r.hw));
-            boxes.push_back(static_cast<float>(r.hh));
-            meta.push_back(r.layer);
-            meta.push_back(r.ownerId);
-            meta.push_back(0); // rect
-            meta.push_back(0);
+            primGeom0.push_back(static_cast<float>(r.cx));
+            primGeom0.push_back(static_cast<float>(r.cy));
+            primGeom0.push_back(static_cast<float>(r.hw));
+            primGeom0.push_back(static_cast<float>(r.hh));
+            primGeom1.push_back(static_cast<float>(slack1(r.margin)));
+            primGeom1.push_back(static_cast<float>(r.viaMargin));
+            primGeom1.push_back(1.0f);
+            primGeom1.push_back(0.0f);
+            primMeta.push_back(0); // rect
+            primMeta.push_back(r.layer);
+            primMeta.push_back(r.ownerId);
+            primMeta.push_back(r.ownerId);
         }
-        for (const auto& p : staticPads) {
-            boxes.push_back(static_cast<float>(p.x));
-            boxes.push_back(static_cast<float>(p.y));
-            boxes.push_back(static_cast<float>(p.hw));
-            boxes.push_back(static_cast<float>(p.hh));
-            meta.push_back(p.layer);
-            meta.push_back(p.netId);
-            meta.push_back(0); // rect pad
-            meta.push_back(0);
+        for (const auto& t : tracksIn) {
+            primGeom0.push_back(static_cast<float>(t.x1));
+            primGeom0.push_back(static_cast<float>(t.y1));
+            primGeom0.push_back(static_cast<float>(t.x2));
+            primGeom0.push_back(static_cast<float>(t.y2));
+            primGeom1.push_back(static_cast<float>(slack1(0.5 * (t.w + trackWidthMm) + clearanceMm)));
+            primGeom1.push_back(static_cast<float>(0.5 * (t.w + viaSizeMm) + clearanceMm));
+            primGeom1.push_back(1.0f);
+            primGeom1.push_back(0.0f);
+            primMeta.push_back(1); // track
+            primMeta.push_back(t.layer);
+            primMeta.push_back(t.netId);
+            primMeta.push_back(t.netId);
         }
         for (const auto& v : viasIn) {
-            boxes.push_back(static_cast<float>(v.x));
-            boxes.push_back(static_cast<float>(v.y));
-            boxes.push_back(static_cast<float>(0.5 * v.d));
-            boxes.push_back(static_cast<float>(0.5 * v.d));
-            meta.push_back(-1);
-            meta.push_back(v.netId);
-            meta.push_back(1); // circle via
-            meta.push_back(0);
+            primGeom0.push_back(static_cast<float>(v.x));
+            primGeom0.push_back(static_cast<float>(v.y));
+            primGeom0.push_back(0.0f);
+            primGeom0.push_back(0.0f);
+            primGeom1.push_back(static_cast<float>(slack1(0.5 * (v.d + trackWidthMm) + clearanceMm)));
+            primGeom1.push_back(static_cast<float>(0.5 * (v.d + viaSizeMm) + clearanceMm));
+            primGeom1.push_back(1.0f);
+            primGeom1.push_back(0.0f);
+            primMeta.push_back(2); // via
+            primMeta.push_back(-1);
+            primMeta.push_back(v.netId);
+            primMeta.push_back(v.netId);
         }
-        int numObstacles = static_cast<int>(boxes.size() / 4);
-        int numQueries = static_cast<int>(queries.size() / 4);
-        std::vector<int> outFlags;
+        for (const auto& p : staticPads) {
+            int32_t viaOwnerId = (!allowViaInPad && p.layer != -1) ? kCellBlockAll : p.netId;
+            primGeom0.push_back(static_cast<float>(p.x));
+            primGeom0.push_back(static_cast<float>(p.y));
+            primGeom0.push_back(static_cast<float>(p.hw));
+            primGeom0.push_back(static_cast<float>(p.hh));
+            primGeom1.push_back(static_cast<float>(slack1(clearanceMm + 0.5 * trackWidthMm)));
+            primGeom1.push_back(static_cast<float>(clearanceMm + 0.5 * viaSizeMm));
+            primGeom1.push_back(static_cast<float>(p.cosR));
+            primGeom1.push_back(static_cast<float>(p.sinR));
+            primMeta.push_back(3); // rotated pad
+            primMeta.push_back(p.layer);
+            primMeta.push_back(p.netId);
+            primMeta.push_back(viaOwnerId);
+        }
+
+        int numPrims = static_cast<int>(primMeta.size() / 4);
         if (OpenClEngine::instance().runObstacleClearance(
-                numQueries, numObstacles, queries, boxes, meta, outFlags)) {
+                gxMax, gyMax, numLayers, numPrims,
+                static_cast<float>(originX), static_cast<float>(originY), static_cast<float>(gridMm),
+                primGeom0, primGeom1, primMeta, cellOwner, viaOwner)) {
             gpuKernelExecuted = true;
+            gpuRasterizedPrims = numPrims;
+            for (const auto& p : staticPads) {
+                if (!allowViaInPad && p.layer != -1) {
+                    viaOwner[planeIdx(cellX(p.x), cellY(p.y))] = kCellBlockAll;
+                }
+            }
+        }
+    }
+
+    if (!gpuKernelExecuted) {
+        for (const auto& r : rects) {
+            auto dist = [&r](double wx, double wy) {
+                return pointRectDistanceLocal(wx - r.cx, wy - r.cy, r.hw, r.hh);
+            };
+            stampOwner(r.layer, r.ownerId, r.cx - r.hw, r.cx + r.hw, r.cy - r.hh, r.cy + r.hh, r.margin, dist);
+            if (r.viaMargin >= 0.0) {
+                stampVia(r.ownerId, r.cx - r.hw, r.cx + r.hw, r.cy - r.hh, r.cy + r.hh, r.viaMargin, dist);
+            }
+        }
+        // Exact Euclidean point-to-segment rasterization of existing tracks
+        for (const auto& t : tracksIn) {
+            auto dist = [&t](double wx, double wy) {
+                return pointSegmentDistance(wx, wy, t.x1, t.y1, t.x2, t.y2);
+            };
+            double xMin = std::min(t.x1, t.x2), xMax = std::max(t.x1, t.x2);
+            double yMin = std::min(t.y1, t.y2), yMax = std::max(t.y1, t.y2);
+            stampOwner(t.layer, t.netId, xMin, xMax, yMin, yMax, 0.5 * (t.w + trackWidthMm) + clearanceMm, dist);
+            stampVia(t.netId, xMin, xMax, yMin, yMax, 0.5 * (t.w + viaSizeMm) + clearanceMm, dist);
+        }
+        for (const auto& v : viasIn) {
+            auto dist = [&v](double wx, double wy) { return std::hypot(wx - v.x, wy - v.y); };
+            stampOwner(-1, v.netId, v.x, v.x, v.y, v.y, 0.5 * (v.d + trackWidthMm) + clearanceMm, dist);
+            stampVia(v.netId, v.x, v.x, v.y, v.y, 0.5 * (v.d + viaSizeMm) + clearanceMm, dist);
+        }
+        // Rotated rectangular pads with rounded (Euclidean) clearance halos
+        for (const auto& p : staticPads) {
+            auto dist = [&p](double wx, double wy) {
+                double dx = wx - p.x;
+                double dy = wy - p.y;
+                return pointRectDistanceLocal(dx * p.cosR + dy * p.sinR, -dx * p.sinR + dy * p.cosR, p.hw, p.hh);
+            };
+            double ax = std::fabs(p.hw * p.cosR) + std::fabs(p.hh * p.sinR);
+            double ay = std::fabs(p.hw * p.sinR) + std::fabs(p.hh * p.cosR);
+            stampOwner(p.layer, p.netId, p.x - ax, p.x + ax, p.y - ay, p.y + ay,
+                       clearanceMm + 0.5 * trackWidthMm, dist);
+            int32_t viaOwnerId = (!allowViaInPad && p.layer != -1) ? kCellBlockAll : p.netId;
+            stampVia(viaOwnerId, p.x - ax, p.x + ax, p.y - ay, p.y + ay, clearanceMm + 0.5 * viaSizeMm, dist);
+            if (!allowViaInPad && p.layer != -1) {
+                viaOwner[planeIdx(cellX(p.x), cellY(p.y))] = kCellBlockAll;
+            }
         }
     }
 
@@ -3549,6 +3944,8 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
     };
     if (gpuKernelExecuted) {
         res["gpu_kernel_executed"] = true;
+        res["gpu_rasterized_cells"] = static_cast<int64_t>(planeCells) * static_cast<int64_t>(numLayers);
+        res["gpu_rasterized_primitives"] = gpuRasterizedPrims;
     }
     attachProvenance(res, "eda_calc_pcb_autoroute");
     return res;
@@ -4149,8 +4546,18 @@ nlohmann::json EdaAccelerators::calcPrintOrientationDfm(const nlohmann::json& ar
     double bestDelamSf = 1.0;
 
     bool gpuKernelExecuted = false;
+    int sphericalSweepCount = 0;
+    nlohmann::json bestGlobalOrientation;
     if (_capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable()) {
         std::vector<float> candNormals;
+        struct SweepMeta {
+            double rxDeg;
+            double ryDeg;
+        };
+        std::vector<SweepMeta> sweepAngles;
+        candNormals.reserve((candidates.size() + 36 * 72) * 4);
+        sweepAngles.reserve(36 * 72);
+
         for (const auto& c : candidates) {
             double supportPenalty = (c.rxDeg == 45.0 || c.ryDeg == 45.0) ? 0.25 : 0.05;
             candNormals.push_back(static_cast<float>(c.nx));
@@ -4158,9 +4565,29 @@ nlohmann::json EdaAccelerators::calcPrintOrientationDfm(const nlohmann::json& ar
             candNormals.push_back(static_cast<float>(c.nz));
             candNormals.push_back(static_cast<float>(supportPenalty));
         }
+        // Dense 5-degree spherical orientation sweep (36 pitch x 72 roll = 2,592 orientations)
+        for (int pStep = 0; pStep < 36; ++pStep) {
+            double rxDeg = pStep * 5.0;
+            double rxRad = rxDeg * (kPi / 180.0);
+            for (int rStep = 0; rStep < 72; ++rStep) {
+                double ryDeg = rStep * 5.0;
+                double ryRad = ryDeg * (kPi / 180.0);
+                double nx = std::sin(ryRad) * std::cos(rxRad);
+                double ny = -std::sin(rxRad);
+                double nz = std::cos(ryRad) * std::cos(rxRad);
+                double nLen = std::max(1e-6, std::sqrt(nx * nx + ny * ny + nz * nz));
+                candNormals.push_back(static_cast<float>(nx / nLen));
+                candNormals.push_back(static_cast<float>(ny / nLen));
+                candNormals.push_back(static_cast<float>(nz / nLen));
+                candNormals.push_back(-1.0f); // triggers 64-ray surface overhang integral in OpenCL kernel
+                sweepAngles.push_back({rxDeg, ryDeg});
+            }
+        }
+
+        int totalCandidates = static_cast<int>(candNormals.size() / 4);
         std::vector<float> outMetrics;
         if (OpenClEngine::instance().runOrientationOverhangs(
-                static_cast<int>(candidates.size()),
+                totalCandidates,
                 static_cast<float>(px), static_cast<float>(py), static_cast<float>(pz),
                 static_cast<float>(hx), static_cast<float>(hy), static_cast<float>(hz),
                 static_cast<float>(fMag), static_cast<float>(areaMm2),
@@ -4168,8 +4595,10 @@ nlohmann::json EdaAccelerators::calcPrintOrientationDfm(const nlohmann::json& ar
                 static_cast<float>(sigmaZMpa), static_cast<float>(sigmaXyMpa),
                 candNormals, outMetrics)) {
             gpuKernelExecuted = true;
+            sphericalSweepCount = totalCandidates;
             candArray = nlohmann::json::array();
             bestScore = -1e9;
+            double bestGlobalScore = -1e9;
             for (size_t ci = 0; ci < candidates.size(); ++ci) {
                 const auto& c = candidates[ci];
                 double delamSf = outMetrics[ci * 4 + 0];
@@ -4191,6 +4620,27 @@ nlohmann::json EdaAccelerators::calcPrintOrientationDfm(const nlohmann::json& ar
                     bestScore = score;
                     bestOrientation = entry;
                     bestDelamSf = delamSf;
+                }
+                if (score > bestGlobalScore) {
+                    bestGlobalScore = score;
+                    bestGlobalOrientation = entry;
+                }
+            }
+            for (size_t si = 0; si < sweepAngles.size(); ++si) {
+                size_t idx = candidates.size() + si;
+                double score = outMetrics[idx * 4 + 3];
+                if (score > bestGlobalScore) {
+                    bestGlobalScore = score;
+                    bestGlobalOrientation = {
+                        {"label", "spherical_5deg_opt"},
+                        {"rx_deg", sweepAngles[si].rxDeg},
+                        {"ry_deg", sweepAngles[si].ryDeg},
+                        {"rz_deg", 0.0},
+                        {"delamination_safety_factor", static_cast<double>(outMetrics[idx * 4 + 0])},
+                        {"in_plane_safety_factor", static_cast<double>(outMetrics[idx * 4 + 1])},
+                        {"bore_circularity_index", static_cast<double>(outMetrics[idx * 4 + 2])},
+                        {"score", score}
+                    };
                 }
             }
         }
@@ -4242,6 +4692,8 @@ nlohmann::json EdaAccelerators::calcPrintOrientationDfm(const nlohmann::json& ar
     };
     if (gpuKernelExecuted) {
         res["gpu_kernel_executed"] = true;
+        res["spherical_sweep_candidates_evaluated"] = sphericalSweepCount;
+        res["global_optimal_orientation"] = bestGlobalOrientation;
     }
     attachProvenance(res, "cad_calc_print_orientation_dfm");
     return res;
@@ -4581,29 +5033,6 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         }
     }
 
-    bool gpuKernelExecuted = false;
-    if (allTracks.size() >= 64 && _capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable()) {
-        std::vector<float> segStartEnd;
-        std::vector<float> segProps;
-        for (const auto& t : allTracks) {
-            segStartEnd.push_back(static_cast<float>(t.x1));
-            segStartEnd.push_back(static_cast<float>(t.y1));
-            segStartEnd.push_back(static_cast<float>(t.x2));
-            segStartEnd.push_back(static_cast<float>(t.y2));
-            segProps.push_back(static_cast<float>(t.width));
-            segProps.push_back(t.layer == "TopLayer" ? 0.0f : (t.layer == "BottomLayer" ? 1.0f : -1.0f));
-            segProps.push_back(0.0f);
-            segProps.push_back(0.0f);
-        }
-        int outViolationCount = 0;
-        std::vector<int> outViolations;
-        if (OpenClEngine::instance().runSegmentClearance(
-                static_cast<int>(allTracks.size()), 0.2f, segStartEnd, segProps,
-                outViolationCount, outViolations)) {
-            gpuKernelExecuted = true;
-        }
-    }
-
     std::vector<AuditVia> allVias;
     if (args.contains("vias") && args["vias"].is_array()) {
         for (const auto& v : args["vias"]) {
@@ -4616,6 +5045,81 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
             av.diameter = std::max(minViaDia, v.value("diameter", v.value("size_mm", defaultViaDia)));
             av.drill = std::max(minViaDrill, v.value("drill", v.value("drill_mm", defaultViaDrill)));
             allVias.push_back(av);
+        }
+    }
+
+    bool gpuKernelExecuted = false;
+    std::vector<int> gpuEndpointAnchored;
+    int gpuTrackClearanceViolations = 0;
+    if (!allTracks.empty() && _capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable()) {
+        auto layerToInt = [](const std::string& ly) -> int {
+            if (ly == "MultiLayer") return -1;
+            if (ly == "TopLayer") return 0;
+            if (ly == "BottomLayer") return 1;
+            if (ly == "InnerLayer1") return 2;
+            if (ly == "InnerLayer2") return 3;
+            if (ly == "InnerLayer3") return 4;
+            if (ly == "InnerLayer4") return 5;
+            return 6;
+        };
+        std::map<std::string, int> netIdMap;
+        auto getNetInt = [&](const std::string& n) -> int {
+            if (n.empty()) return 0;
+            auto it = netIdMap.find(n);
+            if (it != netIdMap.end()) return it->second;
+            int id = static_cast<int>(netIdMap.size()) + 1;
+            netIdMap[n] = id;
+            return id;
+        };
+
+        std::vector<float> segStartEnd;
+        std::vector<float> segProps;
+        segStartEnd.reserve(allTracks.size() * 4);
+        segProps.reserve(allTracks.size() * 4);
+        for (const auto& t : allTracks) {
+            segStartEnd.push_back(static_cast<float>(t.x1));
+            segStartEnd.push_back(static_cast<float>(t.y1));
+            segStartEnd.push_back(static_cast<float>(t.x2));
+            segStartEnd.push_back(static_cast<float>(t.y2));
+            segProps.push_back(static_cast<float>(t.width));
+            segProps.push_back(static_cast<float>(layerToInt(t.layer)));
+            segProps.push_back(static_cast<float>(getNetInt(t.net)));
+            segProps.push_back(static_cast<float>(touchTol));
+        }
+
+        std::vector<float> padGeom0;
+        std::vector<float> padGeom1;
+        padGeom0.reserve(allPads.size() * 4);
+        padGeom1.reserve(allPads.size() * 4);
+        for (const auto& p : allPads) {
+            padGeom0.push_back(static_cast<float>(p.x));
+            padGeom0.push_back(static_cast<float>(p.y));
+            padGeom0.push_back(static_cast<float>(0.5 * p.sx));
+            padGeom0.push_back(static_cast<float>(0.5 * p.sy));
+            padGeom1.push_back(static_cast<float>(p.cosR));
+            padGeom1.push_back(static_cast<float>(p.sinR));
+            padGeom1.push_back(static_cast<float>(layerToInt(p.layer)));
+            padGeom1.push_back(static_cast<float>(getNetInt(p.net)));
+        }
+
+        std::vector<float> viaGeom;
+        viaGeom.reserve(allVias.size() * 4);
+        for (const auto& v : allVias) {
+            viaGeom.push_back(static_cast<float>(v.x));
+            viaGeom.push_back(static_cast<float>(v.y));
+            viaGeom.push_back(static_cast<float>(0.5 * v.diameter));
+            viaGeom.push_back(static_cast<float>(getNetInt(v.net)));
+        }
+
+        float minClrCoord = static_cast<float>(0.15 * mmToCoord);
+        std::vector<int> outViolations;
+        if (OpenClEngine::instance().runSegmentClearance(
+                static_cast<int>(allTracks.size()),
+                static_cast<int>(allPads.size()),
+                static_cast<int>(allVias.size()),
+                minClrCoord, segStartEnd, segProps, padGeom0, padGeom1, viaGeom,
+                gpuEndpointAnchored, gpuTrackClearanceViolations, outViolations)) {
+            gpuKernelExecuted = true;
         }
     }
 
@@ -5061,17 +5565,21 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         for (int ep = 0; ep < 2; ++ep) {
             double ex = endPts[ep][0];
             double ey = endPts[ep][1];
-            bool anchored = false;
+            bool anchored = gpuKernelExecuted &&
+                            i < gpuEndpointAnchored.size() &&
+                            ((gpuEndpointAnchored[i] & (1 << ep)) != 0);
 
-            for (const auto& pad : allPads) {
-                if (!trk.net.empty() && !pad.net.empty() && trk.net != pad.net) continue;
-                if (!layersMatch(trk.layer, pad.layer)) continue;
-                if (distPointToPad(ex, ey, pad) <= 0.5 * trk.width + touchTol) {
-                    anchored = true;
-                    break;
+            if (!anchored && !gpuKernelExecuted) {
+                for (const auto& pad : allPads) {
+                    if (!trk.net.empty() && !pad.net.empty() && trk.net != pad.net) continue;
+                    if (!layersMatch(trk.layer, pad.layer)) continue;
+                    if (distPointToPad(ex, ey, pad) <= 0.5 * trk.width + touchTol) {
+                        anchored = true;
+                        break;
+                    }
                 }
             }
-            if (!anchored) {
+            if (!anchored && !gpuKernelExecuted) {
                 for (const auto& via : allVias) {
                     if (!trk.net.empty() && !via.net.empty() && trk.net != via.net) continue;
                     if (std::hypot(ex - via.x, ey - via.y) <= 0.5 * via.diameter + 0.5 * trk.width + touchTol) {
@@ -5080,7 +5588,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                     }
                 }
             }
-            if (!anchored) {
+            if (!anchored && !gpuKernelExecuted) {
                 for (size_t j = 0; j < allTracks.size(); ++j) {
                     if (j == i) continue;
                     const auto& other = allTracks[j];
@@ -5280,6 +5788,8 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
     };
     if (gpuKernelExecuted) {
         res["gpu_kernel_executed"] = true;
+        res["gpu_audited_tracks"] = static_cast<int>(allTracks.size());
+        res["track_clearance_violations_count"] = gpuTrackClearanceViolations;
     }
     attachProvenance(res, "eda_calc_pcb_connectivity_audit");
     return res;
