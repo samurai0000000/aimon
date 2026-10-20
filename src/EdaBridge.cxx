@@ -83,6 +83,18 @@ void EdaBridge::setConfig(const EdaBridgeConfig& config) {
     std::lock_guard<std::mutex> lock(_mutex);
     _config = config;
     _accelerators.setConfig(config.accelerators);
+    _hasRemoteClientAcceleratorCaps = false;
+    _lastClientCapsProbeFailEpoch = 0;
+    _hadRemoteAcceleratorProvider = false;
+    initRuntimeToolsLocked();
+}
+
+void EdaBridge::setSimulatedLocalCapabilitiesForTest(const AcceleratorCapabilities& caps) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _accelerators.setSimulatedCapabilitiesForTest(caps);
+    _hasRemoteClientAcceleratorCaps = false;
+    _lastClientCapsProbeFailEpoch = 0;
+    _hadRemoteAcceleratorProvider = false;
     initRuntimeToolsLocked();
 }
 
@@ -115,6 +127,7 @@ void EdaBridge::initRuntimeToolsLocked() {
 
     std::vector<EdaToolRuntimeInfo> updated;
 
+    const auto& localCaps = _accelerators.getCapabilities();
     EdaToolRuntimeInfo acc;
     acc.name = "accelerators";
     acc.enabled = _config.accelerators.enabled;
@@ -122,9 +135,11 @@ void EdaBridge::initRuntimeToolsLocked() {
     acc.resolvedPort = 0;
     acc.available = _config.accelerators.enabled;
     acc.pluginConnected = _config.accelerators.enabled;
-    acc.binaryPath = "aimon::EdaAccelerators (C++17)";
+    acc.binaryPath = localCaps.backend + ": " + localCaps.deviceName;
     acc.version = AIMON_VERSION_STRING;
-    acc.activeDocument = "9 C++17 Solvers";
+    acc.activeDocument = localCaps.gpuAvailable
+        ? (localCaps.deviceName + " (" + std::to_string(localCaps.computeUnits) + " CUs)")
+        : ("CPU C++17 (" + std::to_string(localCaps.cpuThreads) + " threads)");
     acc.lastProbeLatencyMs = 0;
     preserveStats("accelerators", acc);
     updated.push_back(acc);
@@ -463,23 +478,95 @@ void EdaBridge::recordToolCall(const std::string& component,
 }
 
 EdaBridgeStatus EdaBridge::getStatus() const {
-    std::lock_guard<std::mutex> lock(_mutex);
     EdaBridgeStatus st;
-    st.enabled = _config.enabled;
-    st.connected = _connected;
-    st.mode = _config.mode;
-    st.activeTransport = _activeTransport;
-    st.host = _config.host;
-    st.port = _config.port;
-    st.authConfigured = !_config.authSecret.empty();
-    st.healthPollIntervalSec = _config.healthPollIntervalSec;
-    st.lastProbeEpoch = _lastProbeEpoch;
-    st.lastLatencyMs = _lastLatencyMs;
-    st.remotePlatform = _remotePlatform;
-    st.tools = _toolInfos;
-    st.recentCalls.assign(_recentCalls.begin(), _recentCalls.end());
-    st.configSnapshot = _config.toJson(true);
-    st.errorMessage = _lastError;
+    EdaBridgeConfig cfg;
+    TcpGateway* gw = nullptr;
+    AcceleratorCapabilities localCaps;
+    bool hasClientCaps = false;
+    AcceleratorCapabilities clientCaps;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        st.enabled = _config.enabled;
+        st.connected = _connected;
+        st.mode = _config.mode;
+        st.activeTransport = _activeTransport;
+        st.host = _config.host;
+        st.port = _config.port;
+        st.authConfigured = !_config.authSecret.empty();
+        st.healthPollIntervalSec = _config.healthPollIntervalSec;
+        st.lastProbeEpoch = _lastProbeEpoch;
+        st.lastLatencyMs = _lastLatencyMs;
+        st.remotePlatform = _remotePlatform;
+        st.tools = _toolInfos;
+        st.recentCalls.assign(_recentCalls.begin(), _recentCalls.end());
+        st.configSnapshot = _config.toJson(true);
+        st.errorMessage = _lastError;
+
+        cfg = _config;
+        gw = _gateway;
+        localCaps = _accelerators.getCapabilities();
+        hasClientCaps = _hasRemoteClientAcceleratorCaps;
+        clientCaps = _remoteClientAcceleratorCaps;
+    }
+
+    if (cfg.enabled && cfg.accelerators.enabled) {
+        DynamicTool bestTool;
+        std::string bestAddr;
+        nlohmann::json bestClientCaps = nlohmann::json::object();
+        bool hasGw = false;
+        if ((cfg.mode == "gateway" || cfg.mode == "bidirectional") && gw != nullptr) {
+            hasGw = gw->getBestToolProvider("cad_calc_print_orientation_dfm",
+                                            bestTool, bestAddr, &bestClientCaps);
+        }
+        const int64_t localScore = localCaps.capabilityScore;
+        const int64_t gwScore = hasGw ? bestTool.capabilityScore : 0;
+        const int64_t clientScore =
+            ((cfg.mode == "client" || cfg.mode == "bidirectional") && hasClientCaps)
+                ? clientCaps.capabilityScore
+                : 0;
+
+        for (auto& info : st.tools) {
+            if (info.name != "accelerators") continue;
+            if (gwScore > localScore && gwScore >= clientScore) {
+                AcceleratorCapabilities gwCaps =
+                    (bestClientCaps.is_object() && bestClientCaps.contains("accelerators") &&
+                     bestClientCaps["accelerators"].is_object())
+                        ? AcceleratorCapabilities::fromJson(bestClientCaps["accelerators"])
+                        : AcceleratorCapabilities::fromJson(bestClientCaps);
+                std::string backend = !gwCaps.backend.empty()
+                    ? gwCaps.backend
+                    : (bestTool.gpuAccelerated ? "opencl_gpu" : "cpu_cpp17");
+                std::string devName = !bestTool.computeDevice.empty()
+                    ? bestTool.computeDevice
+                    : gwCaps.deviceName;
+                info.resolvedHost = bestAddr + " (gateway)";
+                info.resolvedPort = 0;
+                info.available = true;
+                info.pluginConnected = true;
+                info.binaryPath = backend + ": " + devName;
+                info.activeDocument = devName + " (score " + std::to_string(bestTool.capabilityScore) + ")";
+            } else if (clientScore > localScore && clientScore > gwScore) {
+                info.resolvedHost = cfg.host + ":" + std::to_string(cfg.port);
+                info.resolvedPort = cfg.port;
+                info.available = true;
+                info.pluginConnected = true;
+                info.binaryPath = clientCaps.backend + ": " + clientCaps.deviceName;
+                info.activeDocument = clientCaps.deviceName + " (score " +
+                                      std::to_string(clientCaps.capabilityScore) + ")";
+            } else {
+                info.resolvedHost = "local (aimon)";
+                info.resolvedPort = 0;
+                info.available = cfg.accelerators.enabled;
+                info.pluginConnected = cfg.accelerators.enabled;
+                info.binaryPath = localCaps.backend + ": " + localCaps.deviceName;
+                info.activeDocument = localCaps.gpuAvailable
+                    ? (localCaps.deviceName + " (" + std::to_string(localCaps.computeUnits) + " CUs)")
+                    : ("CPU C++17 (" + std::to_string(localCaps.cpuThreads) + " threads)");
+            }
+            break;
+        }
+    }
+
     return st;
 }
 
@@ -1056,12 +1143,50 @@ EdaBridgeStatus EdaBridge::probeNow() {
 
         if (ok && statusPayload.is_object()) {
             _remotePlatform = statusPayload.value("platform", _remotePlatform);
+            if (statusPayload.contains("accelerator_capabilities") &&
+                statusPayload["accelerator_capabilities"].is_object()) {
+                _remoteClientAcceleratorCaps = AcceleratorCapabilities::fromJson(
+                    statusPayload["accelerator_capabilities"]);
+                _hasRemoteClientAcceleratorCaps = (usedTransport == "client");
+                _lastClientCapsProbeFailEpoch = 0;
+            }
+            const auto& localCaps = _accelerators.getCapabilities();
             if (statusPayload.contains("tools") && statusPayload["tools"].is_array()) {
                 for (const auto& rt : statusPayload["tools"]) {
                     if (!rt.is_object()) continue;
                     std::string tName = rt.value("name", "");
                     EdaToolRuntimeInfo* info = findToolInfoLocked(tName);
-                    if (info) {
+                    if (!info) continue;
+                    if (tName == "accelerators") {
+                        int64_t remoteScore = rt.value("capability_score", int64_t(0));
+                        if (remoteScore <= 0 && _hasRemoteClientAcceleratorCaps) {
+                            remoteScore = _remoteClientAcceleratorCaps.capabilityScore;
+                        }
+                        if (_config.accelerators.enabled && remoteScore > localCaps.capabilityScore) {
+                            info->available = rt.value("available", info->available);
+                            info->pluginConnected = rt.value("plugin_connected", true);
+                            info->binaryPath = rt.value("binary_path", info->binaryPath);
+                            info->version = rt.value("version", info->version);
+                            info->activeDocument = rt.value("active_document", info->activeDocument);
+                            info->resolvedHost = (usedTransport == "client")
+                                ? (cfg.host + ":" + std::to_string(cfg.port))
+                                : "gateway";
+                            info->resolvedPort = (usedTransport == "client") ? cfg.port : 0;
+                            info->lastProbeLatencyMs = latencyMs;
+                            info->errorMessage.clear();
+                        } else {
+                            info->resolvedHost = "local (aimon)";
+                            info->resolvedPort = 0;
+                            info->available = _config.accelerators.enabled;
+                            info->pluginConnected = _config.accelerators.enabled;
+                            info->binaryPath = localCaps.backend + ": " + localCaps.deviceName;
+                            info->activeDocument = localCaps.gpuAvailable
+                                ? (localCaps.deviceName + " (" + std::to_string(localCaps.computeUnits) + " CUs)")
+                                : ("CPU C++17 (" + std::to_string(localCaps.cpuThreads) + " threads)");
+                            info->lastProbeLatencyMs = 0;
+                            info->errorMessage.clear();
+                        }
+                    } else {
                         info->available = rt.value("available", info->available);
                         info->pluginConnected = rt.value("plugin_connected", false);
                         info->binaryPath = rt.value("binary_path", info->binaryPath);
@@ -1073,11 +1198,23 @@ EdaBridgeStatus EdaBridge::probeNow() {
                 }
             }
         } else {
+            _hasRemoteClientAcceleratorCaps = false;
+            const auto& localCaps = _accelerators.getCapabilities();
             for (auto& info : _toolInfos) {
                 if (info.name != "accelerators") {
                     info.available = false;
                     info.pluginConnected = false;
                     info.lastProbeLatencyMs = -1;
+                } else {
+                    info.resolvedHost = "local (aimon)";
+                    info.resolvedPort = 0;
+                    info.available = _config.accelerators.enabled;
+                    info.pluginConnected = _config.accelerators.enabled;
+                    info.binaryPath = localCaps.backend + ": " + localCaps.deviceName;
+                    info.activeDocument = localCaps.gpuAvailable
+                        ? (localCaps.deviceName + " (" + std::to_string(localCaps.computeUnits) + " CUs)")
+                        : ("CPU C++17 (" + std::to_string(localCaps.cpuThreads) + " threads)");
+                    info.lastProbeLatencyMs = 0;
                 }
             }
         }
@@ -1640,7 +1777,37 @@ nlohmann::json EdaBridge::runLiveAutoroute(const std::string& toolName,
 
     bool arOk = false;
     std::string arSummary;
-    nlohmann::json ar = accCopy.calcPcbAutoroute(req, arOk, arSummary);
+    nlohmann::json ar;
+    bool routedRemotely = false;
+    {
+        TcpGateway* gw = nullptr;
+        EdaBridgeConfig cfg;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            gw = _gateway;
+            cfg = _config;
+        }
+        const int64_t localScore = accCopy.getCapabilities().scoreForTool("eda_calc_pcb_autoroute");
+        DynamicTool gwBestTool;
+        std::string gwPeerAddr;
+        if (cfg.enabled && (cfg.mode == "gateway" || cfg.mode == "bidirectional") && gw != nullptr &&
+            gw->getBestToolProvider("eda_calc_pcb_autoroute", gwBestTool, gwPeerAddr) &&
+            gwBestTool.capabilityScore > localScore) {
+            nlohmann::json gwArgs = req;
+            gwArgs["execution_target"] = "local";
+            if (!cfg.authSecret.empty()) gwArgs["_auth_token"] = cfg.authSecret;
+            std::string gwErr;
+            if (gw->callTool("eda_calc_pcb_autoroute", gwArgs, ar, gwErr, cfg.timeoutMs) &&
+                ar.is_object() && !ar.contains("error")) {
+                arOk = ar.value("ok", false);
+                arSummary = ar.value("summary", "");
+                routedRemotely = true;
+            }
+        }
+    }
+    if (!routedRemotely) {
+        ar = accCopy.calcPcbAutoroute(req, arOk, arSummary);
+    }
     if (!ar.is_object() || ar.contains("error")) {
         return finish(false, "", "calcPcbAutoroute failed: " + jsonStr(ar, "error", arSummary));
     }
@@ -1973,10 +2140,22 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
     if (EdaAccelerators::isAcceleratorTool(toolName)) {
         EdaAccelerators accCopy;
         bool accEnabled = true;
+        EdaBridgeConfig cfg;
+        TcpGateway* gw = nullptr;
+        bool hasClientCaps = false;
+        AcceleratorCapabilities clientCaps;
+        int64_t lastClientFailEpoch = 0;
+        bool hadRemoteProvider = false;
         {
             std::lock_guard<std::mutex> lock(_mutex);
             accEnabled = _config.accelerators.enabled;
             accCopy = _accelerators;
+            cfg = _config;
+            gw = _gateway;
+            hasClientCaps = _hasRemoteClientAcceleratorCaps;
+            clientCaps = _remoteClientAcceleratorCaps;
+            lastClientFailEpoch = _lastClientCapsProbeFailEpoch;
+            hadRemoteProvider = _hadRemoteAcceleratorProvider;
         }
         if (!accEnabled) {
             recordToolCall("accelerators", toolName, "local", 0, false,
@@ -1987,9 +2166,170 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
             };
         }
 
+        const bool forceLocal = arguments.is_object() &&
+            (arguments.value("execution_target", "") == "local" ||
+             arguments.value("_routed_from_aimon", false));
+        const bool forceRemote = !forceLocal && arguments.is_object() &&
+            (arguments.value("execution_target", "") == "remote");
+        const int64_t localScore = accCopy.getCapabilities().scoreForTool(toolName);
+        bool fellBackFromRemote = false;
+
+        if (!forceLocal && cfg.enabled) {
+            DynamicTool gwBestTool;
+            std::string gwPeerAddr;
+            nlohmann::json gwClientCaps = nlohmann::json::object();
+            int64_t gwScore = 0;
+            if ((cfg.mode == "gateway" || cfg.mode == "bidirectional") && gw != nullptr) {
+                if (gw->getBestToolProvider(toolName, gwBestTool, gwPeerAddr, &gwClientCaps)) {
+                    gwScore = gwBestTool.capabilityScore;
+                }
+            }
+
+            if (!hasClientCaps && gwScore <= localScore &&
+                (cfg.mode == "client" || cfg.mode == "bidirectional") &&
+                !cfg.host.empty() && cfg.port > 0) {
+                int64_t nowEpoch = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                if (nowEpoch - lastClientFailEpoch >= 3) {
+                    nlohmann::json statusReq = {
+                        {"jsonrpc", "2.0"},
+                        {"id", "acc-probe-1"},
+                        {"method", "eda/status"},
+                        {"auth_token", cfg.authSecret},
+                        {"params", nlohmann::json::object()}
+                    };
+                    nlohmann::json statusPayload;
+                    std::string statusErr;
+                    int statusCode = 0;
+                    if (sendTcpJsonRpcRequest(cfg.host, cfg.port, statusReq, 500,
+                                              static_cast<size_t>(cfg.maxOutputBytes),
+                                              statusPayload, statusErr, statusCode) &&
+                        statusPayload.is_object() &&
+                        statusPayload.contains("accelerator_capabilities") &&
+                        statusPayload["accelerator_capabilities"].is_object()) {
+                        clientCaps = AcceleratorCapabilities::fromJson(
+                            statusPayload["accelerator_capabilities"]);
+                        hasClientCaps = true;
+                        std::lock_guard<std::mutex> lock(_mutex);
+                        _remoteClientAcceleratorCaps = clientCaps;
+                        _hasRemoteClientAcceleratorCaps = true;
+                        _lastClientCapsProbeFailEpoch = 0;
+                    } else {
+                        std::lock_guard<std::mutex> lock(_mutex);
+                        _lastClientCapsProbeFailEpoch = nowEpoch;
+                    }
+                }
+            }
+
+            int64_t clientScore = 0;
+            if ((cfg.mode == "client" || cfg.mode == "bidirectional") && hasClientCaps) {
+                clientScore = clientCaps.scoreForTool(toolName);
+            }
+
+            const int64_t bestRemoteScore = std::max(gwScore, clientScore);
+            if (bestRemoteScore > localScore || (forceRemote && bestRemoteScore > 0)) {
+                nlohmann::json forwardArgs = arguments.is_object() ? arguments : nlohmann::json::object();
+                forwardArgs["execution_target"] = "local";
+                std::string pathErr;
+                if (!validateJsonPaths(forwardArgs, pathErr)) {
+                    recordToolCall("accelerators", toolName, "", 0, false, "", pathErr);
+                    return {{"ok", false}, {"error", pathErr}, {"code", -32602}};
+                }
+
+                if (gwScore >= clientScore && gwScore > 0 && gw != nullptr) {
+                    nlohmann::json gwArgs = forwardArgs;
+                    if (!cfg.authSecret.empty()) {
+                        gwArgs["_auth_token"] = cfg.authSecret;
+                    }
+                    nlohmann::json remoteRes;
+                    std::string remoteErr;
+                    if (gw->callTool(toolName, gwArgs, remoteRes, remoteErr, cfg.timeoutMs) &&
+                        remoteRes.is_object() && remoteRes.value("ok", false)) {
+                        {
+                            std::lock_guard<std::mutex> lock(_mutex);
+                            _connected = true;
+                            _activeTransport = "gateway";
+                            _hadRemoteAcceleratorProvider = true;
+                        }
+                        DynamicTool actualTool = gwBestTool;
+                        std::string actualAddr = gwPeerAddr;
+                        gw->getBestToolProvider(toolName, actualTool, actualAddr);
+                        int64_t actualScore = remoteRes.value("capability_score",
+                            actualTool.capabilityScore > 0 ? actualTool.capabilityScore : gwScore);
+                        std::string devName = remoteRes.value("compute_device", actualTool.computeDevice);
+                        remoteRes["routed_via"] = "gateway";
+                        remoteRes["routed_to"] = actualAddr;
+                        remoteRes["provider_capability_score"] = actualScore;
+                        int elapsedMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - startTp).count());
+                        std::string rSummary = remoteRes.value("summary", "Executed on remote accelerator");
+                        std::string targetDoc = devName.empty() ? actualAddr : (devName + " @ " + actualAddr);
+                        recordToolCall("accelerators", toolName, targetDoc, elapsedMs, true, rSummary, "");
+                        return remoteRes;
+                    }
+                    fellBackFromRemote = true;
+                } else if (clientScore > 0) {
+                    nlohmann::json req = {
+                        {"jsonrpc", "2.0"},
+                        {"id", "acc-call-1"},
+                        {"method", "tools/call"},
+                        {"auth_token", cfg.authSecret},
+                        {"params", {
+                            {"name", toolName},
+                            {"arguments", forwardArgs}
+                        }}
+                    };
+                    nlohmann::json remoteRes;
+                    std::string remoteErr;
+                    int remoteCode = 0;
+                    if (sendTcpJsonRpcRequest(cfg.host, cfg.port, req, cfg.timeoutMs,
+                                              static_cast<size_t>(cfg.maxOutputBytes),
+                                              remoteRes, remoteErr, remoteCode) &&
+                        remoteRes.is_object() && remoteRes.value("ok", false)) {
+                        {
+                            std::lock_guard<std::mutex> lock(_mutex);
+                            _connected = true;
+                            _activeTransport = "client";
+                            _hadRemoteAcceleratorProvider = true;
+                        }
+                        std::string endpoint = cfg.host + ":" + std::to_string(cfg.port);
+                        int64_t actualScore = remoteRes.value("capability_score", clientScore);
+                        std::string devName = remoteRes.value("compute_device", clientCaps.deviceName);
+                        remoteRes["routed_via"] = "client";
+                        remoteRes["routed_to"] = endpoint;
+                        remoteRes["provider_capability_score"] = actualScore;
+                        int elapsedMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - startTp).count());
+                        std::string rSummary = remoteRes.value("summary", "Executed on remote accelerator");
+                        std::string targetDoc = devName.empty() ? endpoint : (devName + " @ " + endpoint);
+                        recordToolCall("accelerators", toolName, targetDoc, elapsedMs, true, rSummary, "");
+                        return remoteRes;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(_mutex);
+                        _hasRemoteClientAcceleratorCaps = false;
+                        _lastClientCapsProbeFailEpoch = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                    }
+                    fellBackFromRemote = true;
+                }
+            } else if (hadRemoteProvider && bestRemoteScore == 0) {
+                fellBackFromRemote = true;
+            }
+        }
+
         bool ok = false;
         std::string summary;
         nlohmann::json res = accCopy.executeTool(toolName, arguments, ok, summary);
+        if (res.is_object()) {
+            if (fellBackFromRemote) {
+                res["fallback_from_remote"] = true;
+                res["routed_via"] = "local_fallback";
+            } else if (!res.contains("routed_via")) {
+                res["routed_via"] = "local";
+            }
+            res["provider_capability_score"] = res.value("capability_score", localScore);
+        }
         int elapsedMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - startTp).count());
         recordToolCall("accelerators", toolName, "in-process solver", elapsedMs, ok,

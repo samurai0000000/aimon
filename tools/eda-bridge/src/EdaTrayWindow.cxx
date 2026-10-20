@@ -850,11 +850,13 @@ void EdaTrayWindow::buildUi() {
     _lblEasyEdaStatus = new QLabel("EasyEDA Pro: ...", statusCard);
     _lblKiCadStatus = new QLabel("KiCad: ...", statusCard);
     _lblFreeCadStatus = new QLabel("FreeCAD: ...", statusCard);
+    _lblAcceleratorStatus = new QLabel("Accelerators: ...", statusCard);
     statusGrid->addWidget(_lblRpcStatus, 0, 0);
     statusGrid->addWidget(_lblGatewayStatus, 0, 1);
     statusGrid->addWidget(_lblEasyEdaStatus, 1, 0);
     statusGrid->addWidget(_lblKiCadStatus, 1, 1);
-    statusGrid->addWidget(_lblFreeCadStatus, 2, 0, 1, 2);
+    statusGrid->addWidget(_lblFreeCadStatus, 2, 0);
+    statusGrid->addWidget(_lblAcceleratorStatus, 2, 1);
     statusCardLayout->addLayout(statusGrid);
     settingsVBox->addWidget(statusCard);
 
@@ -997,7 +999,7 @@ void EdaTrayWindow::buildUi() {
     domGrid->addWidget(makeDomainCard("EasyEDA Pro", "#38bdf8", _domCardEasyEda), 0, 0);
     domGrid->addWidget(makeDomainCard("KiCad", "#c084fc", _domCardKiCad), 0, 1);
     domGrid->addWidget(makeDomainCard("FreeCAD", "#34d399", _domCardFreeCad), 1, 0);
-    domGrid->addWidget(makeDomainCard("CPU Accelerators", "#fbbf24", _domCardAccelerators), 1, 1);
+    domGrid->addWidget(makeDomainCard("GPU / CPU Accelerators", "#fbbf24", _domCardAccelerators), 1, 1);
     telemetryLayout->addLayout(domGrid);
 
     // Invoked Functions Breakdown Section
@@ -1460,6 +1462,35 @@ void EdaTrayWindow::refreshLiveStatus() {
         !_settings.enableFreeCad ? mutedSlatePillStyle : (fcConn ? greenPillStyle : skyBluePillStyle)
     );
 
+    const auto& accCaps = _server.getAcceleratorCapabilities();
+    if (_lblAcceleratorStatus) {
+        if (accCaps.gpuAvailable) {
+            _lblAcceleratorStatus->setText(
+                QString("●  GPU Accel: %1 (%2 CUs)")
+                    .arg(QString::fromStdString(accCaps.deviceName))
+                    .arg(accCaps.computeUnits)
+            );
+            _lblAcceleratorStatus->setStyleSheet(greenPillStyle);
+            uint64_t vramMib = accCaps.globalMemBytes / (1024ULL * 1024ULL);
+            QString tip = QString("Vendor: %1\nClock: %2 MHz\nVRAM: %3 MiB\nCapability Score: %4")
+                .arg(QString::fromStdString(accCaps.vendor))
+                .arg(accCaps.clockMhz)
+                .arg(vramMib)
+                .arg(accCaps.capabilityScore);
+            _lblAcceleratorStatus->setToolTip(tip);
+        } else {
+            _lblAcceleratorStatus->setText(
+                QString("◐  CPU Accel: C++17 (%1 threads)")
+                    .arg(accCaps.cpuThreads)
+            );
+            _lblAcceleratorStatus->setStyleSheet(skyBluePillStyle);
+            QString tip = QString("Backend: %1\nCapability Score: %2")
+                .arg(QString::fromStdString(accCaps.backend))
+                .arg(accCaps.capabilityScore);
+            _lblAcceleratorStatus->setToolTip(tip);
+        }
+    }
+
     const bool anyPlugin = eeConn || kcConn || fcConn;
     const bool healthy = rpcRunning && _lastQuotaSnap.reachable;
     if (_trayIcon) {
@@ -1662,12 +1693,18 @@ void EdaTrayWindow::populateTelemetryUi(const EdaBridgeTelemetrySnapshot& snap,
             w.callsBadge->setText("0 calls (0%)");
             w.shareBar->setValue(0);
             if (!st.activeDocument.empty()) {
-                QFileInfo fi(QString::fromStdString(st.activeDocument));
-                w.detailLabel->setText(
-                    QString("Idle · Doc: %1").arg(fi.fileName().isEmpty()
-                        ? QString::fromStdString(st.activeDocument)
-                        : fi.fileName())
-                );
+                if (compKey == "accelerators") {
+                    w.detailLabel->setText(
+                        QString("Ready · %1").arg(QString::fromStdString(st.activeDocument))
+                    );
+                } else {
+                    QFileInfo fi(QString::fromStdString(st.activeDocument));
+                    w.detailLabel->setText(
+                        QString("Idle · Doc: %1").arg(fi.fileName().isEmpty()
+                            ? QString::fromStdString(st.activeDocument)
+                            : fi.fileName())
+                    );
+                }
             } else {
                 w.detailLabel->setText("No calls recorded");
             }

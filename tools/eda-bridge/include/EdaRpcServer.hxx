@@ -19,6 +19,7 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "ToolDiscovery.hxx"
+#include "EdaAccelerators.hxx"
 
 namespace aimon {
 
@@ -158,6 +159,8 @@ public:
 
     EdaBridgeTelemetrySnapshot getTelemetrySnapshot() const;
     void clearTelemetry();
+    const AcceleratorCapabilities& getAcceleratorCapabilities() const { return _accelerators.getCapabilities(); }
+    void setSimulatedAcceleratorCapabilitiesForTest(const AcceleratorCapabilities& caps);
     static std::string classifyToolComponent(const std::string& toolName);
 
     static bool constantTimeEquals(const std::string& a, const std::string& b);
@@ -212,6 +215,7 @@ private:
     nlohmann::json handleEasyEdaNativeAutoRoute(const nlohmann::json& args);
 
     EdaRpcServerOptions _options;
+    EdaAccelerators _accelerators;
     mutable std::mutex _allowedRootMutex;
     DiscoveredToolInfo _kicadInfo;
     DiscoveredToolInfo _freecadInfo;

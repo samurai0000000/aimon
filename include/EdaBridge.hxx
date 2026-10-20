@@ -71,6 +71,7 @@ public:
     const EdaAccelerators& getAccelerators() const {
         return _accelerators;
     }
+    void setSimulatedLocalCapabilitiesForTest(const AcceleratorCapabilities& caps);
 
 private:
     void initRuntimeToolsLocked();
@@ -87,6 +88,11 @@ private:
     EdaBridgeConfig _config;
     EdaAccelerators _accelerators;
     TcpGateway* _gateway = nullptr;
+
+    AcceleratorCapabilities _remoteClientAcceleratorCaps{};
+    bool _hasRemoteClientAcceleratorCaps = false;
+    int64_t _lastClientCapsProbeFailEpoch = 0;
+    bool _hadRemoteAcceleratorProvider = false;
 
     bool _connected = false;
     std::string _activeTransport = "none";

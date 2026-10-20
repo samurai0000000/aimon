@@ -32,6 +32,9 @@ struct ClientConnection {
     int priority = 100;
     int webPort = 0;
     std::string webPath = "/";
+    int rpcPort = 0;
+    int64_t capabilityScore = 0;
+    nlohmann::json capabilities = nlohmann::json::object();
     std::atomic<bool> active{true};
     std::atomic<bool> webReachable{false};
     std::atomic<int64_t> lastSeenEpoch{0};
@@ -65,6 +68,11 @@ public:
                   std::string& outErrorMessage,
                   int timeoutMs = 45000);
 
+    bool getBestToolProvider(const std::string& toolName,
+                             DynamicTool& outTool,
+                             std::string& outRemoteAddress,
+                             nlohmann::json* outClientCapabilities = nullptr) const;
+
     void setToolsChangedCallback(ToolsChangedCallback cb);
 
     std::vector<DiscoveredMonitor> getDiscoveredMonitors(int selfWebPort = 3883) const;
@@ -91,7 +99,7 @@ private:
     std::atomic<bool> _running{false};
     std::unique_ptr<std::thread> _listenerThread;
 
-    std::mutex _clientsMutex;
+    mutable std::mutex _clientsMutex;
     std::map<int, std::shared_ptr<ClientConnection>> _clients;
     std::atomic<int> _nextClientId{1};
 

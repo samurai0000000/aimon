@@ -2050,7 +2050,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnfo
     CHECK_TRUE(srv.isBridgeEnabled("kicad"));
     CHECK_TRUE(srv.isBridgeEnabled("freecad"));
     CHECK_FALSE(srv.isDisallowExports());
-    CHECK_EQUAL(31, static_cast<int>(srv.enabledRemoteToolDescriptors().size()));
+    CHECK_EQUAL(40, static_cast<int>(srv.enabledRemoteToolDescriptors().size()));
 
     // Verify plugin/status dynamically updates active_document in eda/status
     {
@@ -2098,11 +2098,11 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnfo
         ::close(sock);
     }
 
-    // Disable EasyEDA bridge: 12 easyeda_* tools removed -> 19 tools remain
+    // Disable EasyEDA bridge: 12 easyeda_* tools removed -> 28 tools remain
     srv.setBridgeEnabled("easyeda", false);
     CHECK_FALSE(srv.isBridgeEnabled("easyeda"));
     auto toolsNoEe = srv.enabledRemoteToolDescriptors();
-    CHECK_EQUAL(19, static_cast<int>(toolsNoEe.size()));
+    CHECK_EQUAL(28, static_cast<int>(toolsNoEe.size()));
     for (const auto& td : toolsNoEe) {
         CHECK_TRUE(td.value("name", "").rfind("easyeda_", 0) != 0);
     }
@@ -2148,7 +2148,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RuntimeBridgeTogglesAndExportLockEnfo
     srv.setBridgeEnabled("freecad", false);
     CHECK_FALSE(srv.isBridgeEnabled("kicad"));
     CHECK_FALSE(srv.isBridgeEnabled("freecad"));
-    CHECK_EQUAL(13, static_cast<int>(srv.enabledRemoteToolDescriptors().size())); // 12 easyeda + 1 status
+    CHECK_EQUAL(22, static_cast<int>(srv.enabledRemoteToolDescriptors().size())); // 12 easyeda + 9 accelerators + 1 status
 
     CHECK_FALSE(srv.dispatchToolCall("kicad_search_library", {{"query", "R"}}).value("ok", true));
     CHECK_FALSE(srv.dispatchToolCall("freecad_live_status", nlohmann::json::object()).value("ok", true));
@@ -3319,6 +3319,306 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, BridgeFunctionTelemetryRecordingAndSn
 
     srv.clearTelemetry();
     CHECK_EQUAL(0, static_cast<int>(srv.getTelemetrySnapshot().totalCalls));
+}
+
+TEST_GROUP(EdaBridgeDaemon_Integration) {
+    std::string _ws;
+
+    void setup() override {
+        _ws = makeTempWorkspace("integration");
+    }
+
+    void teardown() override {
+        std::error_code ec;
+        fs::remove_all(_ws, ec);
+    }
+};
+
+TEST(EdaBridgeDaemon_Integration, AdvertisesAcceleratorCapabilitiesAndRanksMultipleBridges) {
+    EdaRpcServerOptions optsGpu;
+    optsGpu.listenHost = "127.0.0.1";
+    optsGpu.port = 0;
+    optsGpu.pluginPort = 0;
+    optsGpu.allowedRoot = _ws;
+
+    EdaRpcServer srvGpu(optsGpu);
+
+    AcceleratorCapabilities gpuCaps;
+    gpuCaps.enabled = true;
+    gpuCaps.gpuAvailable = true;
+    gpuCaps.backend = "opencl_gpu";
+    gpuCaps.deviceName = "Simulated OpenCL GPU";
+    gpuCaps.computeUnits = 32;
+    gpuCaps.clockMhz = 2740;
+    gpuCaps.globalMemBytes = 16ULL * 1024 * 1024 * 1024;
+    gpuCaps.capabilityScore = 1089480;
+    srvGpu.setSimulatedAcceleratorCapabilitiesForTest(gpuCaps);
+
+    EdaRpcServerOptions optsCpu;
+    optsCpu.listenHost = "127.0.0.1";
+    optsCpu.port = 0;
+    optsCpu.pluginPort = 0;
+    optsCpu.allowedRoot = _ws;
+
+    EdaRpcServer srvCpu(optsCpu);
+
+    AcceleratorCapabilities cpuCaps;
+    cpuCaps.enabled = true;
+    cpuCaps.gpuAvailable = false;
+    cpuCaps.backend = "cpu_cpp17";
+    cpuCaps.deviceName = "CPU C++17 Solver";
+    cpuCaps.capabilityScore = 1200;
+    srvCpu.setSimulatedAcceleratorCapabilitiesForTest(cpuCaps);
+
+    CHECK_TRUE(srvGpu.start());
+    CHECK_TRUE(srvCpu.start());
+
+    nlohmann::json statusGpu = srvGpu.buildStatusPayload();
+    CHECK_TRUE(statusGpu.contains("accelerator_capabilities"));
+    CHECK_TRUE(statusGpu["accelerator_capabilities"].value("gpu_available", false));
+    CHECK_EQUAL(1089480, statusGpu["accelerator_capabilities"].value("capability_score", 0));
+
+    bool foundAccTool = false;
+    CHECK_TRUE(statusGpu.contains("tools") && statusGpu["tools"].is_array());
+    for (const auto& t : statusGpu["tools"]) {
+        if (t.value("name", "") == "accelerators") {
+            foundAccTool = true;
+            CHECK_TRUE(t.value("gpu_available", false));
+            CHECK_EQUAL(32, t.value("compute_units", 0));
+            CHECK_EQUAL(1089480, t.value("capability_score", 0));
+        }
+    }
+    CHECK_TRUE(foundAccTool);
+
+    DynamicToolRegistry registry;
+    TcpGateway gateway(registry);
+    int gwPort = 39985 + (::getpid() % 4000);
+    if (!gateway.start("127.0.0.1", gwPort)) {
+        gwPort += 239;
+        CHECK_TRUE(gateway.start("127.0.0.1", gwPort));
+    }
+
+    CHECK_TRUE(srvGpu.connectToGateway("127.0.0.1", gwPort));
+    for (int i = 0; i < 50 && registry.getToolClientId("cad_calc_print_orientation_dfm") < 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK_TRUE(registry.getToolClientId("cad_calc_print_orientation_dfm") >= 0);
+
+    CHECK_TRUE(srvCpu.connectToGateway("127.0.0.1", gwPort));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto candidates = registry.getToolCandidates("cad_calc_print_orientation_dfm");
+    CHECK_TRUE(candidates.size() >= 2);
+    CHECK_EQUAL(1089480, candidates[0].capabilityScore);
+    CHECK_EQUAL(1200, candidates[1].capabilityScore);
+
+    nlohmann::json callRes;
+    std::string callErr;
+    bool ok = gateway.callTool("cad_calc_print_orientation_dfm", nlohmann::json::object(), callRes, callErr, 5000);
+    CHECK_TRUE_TEXT(ok, callErr.c_str());
+    CHECK_TRUE(callRes.value("ok", false));
+
+    auto snapGpu1 = srvGpu.getTelemetrySnapshot();
+    auto snapCpu1 = srvCpu.getTelemetrySnapshot();
+    CHECK_EQUAL(1, static_cast<int>(snapGpu1.components["accelerators"].totalCalls));
+    CHECK_EQUAL(0, static_cast<int>(snapCpu1.components["accelerators"].totalCalls));
+
+    srvGpu.disconnectGateway();
+    for (int i = 0; i < 50 && registry.getToolCandidates("cad_calc_print_orientation_dfm").size() > 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    callRes.clear();
+    callErr.clear();
+    ok = gateway.callTool("cad_calc_print_orientation_dfm", nlohmann::json::object(), callRes, callErr, 5000);
+    CHECK_TRUE_TEXT(ok, callErr.c_str());
+    CHECK_TRUE(callRes.value("ok", false));
+
+    auto snapCpu2 = srvCpu.getTelemetrySnapshot();
+    CHECK_EQUAL(1, static_cast<int>(snapCpu2.components["accelerators"].totalCalls));
+
+    srvCpu.disconnectGateway();
+    gateway.stop();
+    srvGpu.stop();
+    srvCpu.stop();
+}
+
+TEST(EdaBridgeDaemon_Integration, EdaBridgeDynamicBestCapabilityRoutingAndLocalFallback) {
+    EdaRpcServerOptions optsLow;
+    optsLow.listenHost = "127.0.0.1";
+    optsLow.port = 0;
+    optsLow.pluginPort = 0;
+    optsLow.allowedRoot = _ws;
+    EdaRpcServer srvLow(optsLow);
+
+    AcceleratorCapabilities lowCaps;
+    lowCaps.enabled = true;
+    lowCaps.gpuAvailable = false;
+    lowCaps.backend = "cpu_cpp17";
+    lowCaps.deviceName = "CPU C++17 Solver";
+    lowCaps.computeUnits = 4;
+    lowCaps.clockMhz = 3000;
+    lowCaps.globalMemBytes = 8ULL * 1024 * 1024 * 1024;
+    lowCaps.capabilityScore = 2400;
+    srvLow.setSimulatedAcceleratorCapabilitiesForTest(lowCaps);
+
+    EdaRpcServerOptions optsHigh;
+    optsHigh.listenHost = "127.0.0.1";
+    optsHigh.port = 0;
+    optsHigh.pluginPort = 0;
+    optsHigh.allowedRoot = _ws;
+    EdaRpcServer srvHighGpu(optsHigh);
+
+    AcceleratorCapabilities highGpuCaps;
+    highGpuCaps.enabled = true;
+    highGpuCaps.gpuAvailable = true;
+    highGpuCaps.backend = "opencl_gpu";
+    highGpuCaps.deviceName = "Simulated OpenCL GPU";
+    highGpuCaps.computeUnits = 32;
+    highGpuCaps.clockMhz = 2740;
+    highGpuCaps.globalMemBytes = 16ULL * 1024 * 1024 * 1024;
+    highGpuCaps.capabilityScore = 1089480;
+    srvHighGpu.setSimulatedAcceleratorCapabilitiesForTest(highGpuCaps);
+
+    CHECK_TRUE(srvLow.start());
+    CHECK_TRUE(srvHighGpu.start());
+
+    DynamicToolRegistry registry;
+    TcpGateway gateway(registry);
+    int gwPort = 40385 + (::getpid() % 4000);
+    if (!gateway.start("127.0.0.1", gwPort)) {
+        gwPort += 239;
+        CHECK_TRUE(gateway.start("127.0.0.1", gwPort));
+    }
+
+    CHECK_TRUE(srvLow.connectToGateway("127.0.0.1", gwPort));
+    for (int i = 0; i < 50 && registry.getToolClientId("cad_calc_print_orientation_dfm") < 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK_TRUE(srvHighGpu.connectToGateway("127.0.0.1", gwPort));
+    for (int i = 0; i < 50 && registry.getToolCandidates("cad_calc_print_orientation_dfm").size() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK_TRUE(registry.getToolCandidates("cad_calc_print_orientation_dfm").size() >= 2);
+
+    EdaBridgeConfig bcfg;
+    bcfg.enabled = true;
+    bcfg.mode = "gateway";
+    bcfg.timeoutMs = 3000;
+
+    EdaBridge bridge(bcfg);
+    bridge.attachGateway(&gateway);
+
+    AcceleratorCapabilities localCaps;
+    localCaps.enabled = true;
+    localCaps.gpuAvailable = false;
+    localCaps.backend = "cpu_cpp17";
+    localCaps.deviceName = "CPU C++17 Solver";
+    localCaps.computeUnits = 2;
+    localCaps.clockMhz = 2400;
+    localCaps.globalMemBytes = 4ULL * 1024 * 1024 * 1024;
+    localCaps.capabilityScore = 1000;
+    bridge.setSimulatedLocalCapabilitiesForTest(localCaps);
+
+    // 1. Nominal routing: dispatches to srvHighGpu (1089480 > 2400 > 1000)
+    nlohmann::json res1 = bridge.callTool("cad_calc_print_orientation_dfm", nlohmann::json::object());
+    CHECK_TRUE(res1.value("ok", false));
+    CHECK_EQUAL(std::string("gateway"), res1.value("routed_via", ""));
+    CHECK_EQUAL(1089480, res1.value("provider_capability_score", 0));
+
+    auto snapHigh1 = srvHighGpu.getTelemetrySnapshot();
+    auto snapLow1 = srvLow.getTelemetrySnapshot();
+    CHECK_EQUAL(1, static_cast<int>(snapHigh1.components["accelerators"].totalCalls));
+    CHECK_EQUAL(0, static_cast<int>(snapLow1.components["accelerators"].totalCalls));
+
+    // Also verify eda_calc_pcb_autoroute and eda_calc_pcb_placement route to srvHighGpu
+    nlohmann::json autorouteArgs = {
+        {"board", {{"width_mm", 30.0}, {"height_mm", 20.0}}},
+        {"nets", nlohmann::json::array({
+            {{"name", "SIG1"}, {"pads", nlohmann::json::array({
+                {{"x_mm", 2.0}, {"y_mm", 2.0}, {"layer", 0}},
+                {{"x_mm", 12.0}, {"y_mm", 8.0}, {"layer", 0}}
+            })}}
+        })}
+    };
+    nlohmann::json resAr = bridge.callTool("eda_calc_pcb_autoroute", autorouteArgs);
+    CHECK_TRUE(resAr.value("ok", false));
+    CHECK_EQUAL(1089480, resAr.value("provider_capability_score", 0));
+
+    nlohmann::json placeArgs = {
+        {"board", {{"width_mm", 40.0}, {"height_mm", 30.0}}},
+        {"components", nlohmann::json::array({
+            {{"reference", "U1"}, {"width_mm", 4.0}, {"height_mm", 4.0}},
+            {{"reference", "C1"}, {"width_mm", 2.0}, {"height_mm", 1.2}, {"decouples", "U1"}}
+        })}
+    };
+    nlohmann::json placeRes = bridge.callTool("eda_calc_pcb_placement", placeArgs);
+    CHECK_TRUE(placeRes.value("ok", false));
+    CHECK_EQUAL(1089480, placeRes.value("provider_capability_score", 0));
+
+    auto snapHighAfter3 = srvHighGpu.getTelemetrySnapshot();
+    CHECK_EQUAL(3, static_cast<int>(snapHighAfter3.components["accelerators"].totalCalls));
+
+    // Verify bridge.getStatus() reflects active remote GPU provider for accelerators
+    EdaBridgeStatus st1 = bridge.getStatus();
+    const EdaToolRuntimeInfo* accInfo1 = nullptr;
+    for (const auto& t : st1.tools) {
+        if (t.name == "accelerators") {
+            accInfo1 = &t;
+            break;
+        }
+    }
+    CHECK_TRUE(accInfo1 != nullptr);
+    CHECK_TRUE(accInfo1->available);
+    CHECK_TRUE(accInfo1->resolvedHost.find("gateway") != std::string::npos);
+    CHECK_TRUE(accInfo1->activeDocument.find("1089480") != std::string::npos);
+
+    // 2. Boundary condition: execution_target = "local" forces local execution
+    nlohmann::json localArgs = {{"execution_target", "local"}};
+    nlohmann::json resLocalForced = bridge.callTool("cad_calc_print_orientation_dfm", localArgs);
+    CHECK_TRUE(resLocalForced.value("ok", false));
+    CHECK_EQUAL(std::string("local"), resLocalForced.value("routed_via", ""));
+    CHECK_EQUAL(1000, resLocalForced.value("provider_capability_score", 0));
+    CHECK_EQUAL(3, static_cast<int>(srvHighGpu.getTelemetrySnapshot().components["accelerators"].totalCalls));
+
+    // 3. Failover: stop srvHighGpu -> routes to srvLow (score 2400 > local 1000)
+    srvHighGpu.disconnectGateway();
+    srvHighGpu.stop();
+    for (int i = 0; i < 50 && registry.getToolCandidates("cad_calc_print_orientation_dfm").size() > 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    nlohmann::json resFailover = bridge.callTool("cad_calc_print_orientation_dfm", nlohmann::json::object());
+    CHECK_TRUE(resFailover.value("ok", false));
+    CHECK_EQUAL(std::string("gateway"), resFailover.value("routed_via", ""));
+    CHECK_EQUAL(2400, resFailover.value("provider_capability_score", 0));
+    CHECK_EQUAL(1, static_cast<int>(srvLow.getTelemetrySnapshot().components["accelerators"].totalCalls));
+
+    // 4. Local fallback: stop srvLow -> falls back cleanly to local EdaCpuAccelerators
+    srvLow.disconnectGateway();
+    srvLow.stop();
+    for (int i = 0; i < 50 && !registry.getToolCandidates("cad_calc_print_orientation_dfm").empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    nlohmann::json resFallback = bridge.callTool("cad_calc_print_orientation_dfm", nlohmann::json::object());
+    CHECK_TRUE(resFallback.value("ok", false));
+    CHECK_TRUE(resFallback.value("fallback_from_remote", false));
+    CHECK_EQUAL(std::string("local_fallback"), resFallback.value("routed_via", ""));
+    CHECK_EQUAL(1000, resFallback.value("provider_capability_score", 0));
+
+    EdaBridgeStatus stFallback = bridge.getStatus();
+    const EdaToolRuntimeInfo* accInfoFallback = nullptr;
+    for (const auto& t : stFallback.tools) {
+        if (t.name == "accelerators") {
+            accInfoFallback = &t;
+            break;
+        }
+    }
+    CHECK_TRUE(accInfoFallback != nullptr);
+    CHECK_EQUAL(std::string("local (aimon)"), accInfoFallback->resolvedHost);
+
+    gateway.stop();
 }
 
 int main(int ac, char** av) {

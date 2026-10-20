@@ -21,6 +21,10 @@ struct DynamicTool {
     nlohmann::json inputSchema;
     std::string subsystem;
     int clientId = -1;
+    int64_t capabilityScore = 0;
+    bool gpuAccelerated = false;
+    std::string computeDevice;
+    nlohmann::json capabilities = nlohmann::json::object();
 };
 
 class DynamicToolRegistry {
@@ -30,13 +34,15 @@ public:
 
     bool registerTools(int clientId, const std::string& subsystem,
                        const nlohmann::json& toolsArray,
-                       std::vector<std::string>& addedToolNames);
+                       std::vector<std::string>& addedToolNames,
+                       const nlohmann::json& clientCapabilities = nlohmann::json::object());
 
     bool unregisterClient(int clientId, std::vector<std::string>& removedToolNames);
 
     bool hasTool(const std::string& toolName) const;
     bool getTool(const std::string& toolName, DynamicTool& outTool) const;
     int getToolClientId(const std::string& toolName) const;
+    std::vector<DynamicTool> getToolCandidates(const std::string& toolName) const;
 
     nlohmann::json getToolsListJson() const;
     std::vector<DynamicTool> getAllTools() const;
@@ -45,6 +51,8 @@ public:
     void clear();
 
 private:
+    void recomputeBestToolLocked(const std::string& toolName);
+
     mutable std::mutex _mutex;
     std::map<std::string, DynamicTool> _tools;
     std::map<int, std::vector<DynamicTool>> _clientTools;

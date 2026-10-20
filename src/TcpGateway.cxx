@@ -318,6 +318,20 @@ void TcpGateway::handleIncomingJson(std::shared_ptr<ClientConnection> client,
             std::string subsystem = params.value("subsystem", "unknown");
             client->subsystem = subsystem;
 
+            nlohmann::json clientCaps = params.value("capabilities", nlohmann::json::object());
+            client->capabilities = clientCaps;
+            client->rpcPort = params.value("rpc_port", 0);
+            int64_t score = 0;
+            if (clientCaps.contains("capability_score") && clientCaps["capability_score"].is_number()) {
+                score = clientCaps["capability_score"].get<int64_t>();
+            } else if (clientCaps.contains("accelerators") &&
+                       clientCaps["accelerators"].is_object() &&
+                       clientCaps["accelerators"].contains("capability_score") &&
+                       clientCaps["accelerators"]["capability_score"].is_number()) {
+                score = clientCaps["accelerators"]["capability_score"].get<int64_t>();
+            }
+            client->capabilityScore = score;
+
             if (params.contains("display_name") && params["display_name"].is_string()) {
                 client->displayName = params["display_name"].get<std::string>();
             } else if (params.contains("title") && params["title"].is_string()) {
@@ -402,19 +416,21 @@ void TcpGateway::handleIncomingJson(std::shared_ptr<ClientConnection> client,
 
             nlohmann::json toolsArray = params.value("tools", nlohmann::json::array());
             std::vector<std::string> addedNames;
-            bool ok = _registry.registerTools(client->clientId, subsystem, toolsArray, addedNames);
+            bool ok = _registry.registerTools(client->clientId, subsystem, toolsArray, addedNames, clientCaps);
 
             std::cout << "[TcpGateway] " << (method == "gateway/register" ? "Registered" : "Updated")
                       << " " << addedNames.size() << " tools from " << subsystem
                       << " (" << client->displayName << " [" << client->shortName << "], priority " << client->priority
-                      << ", client " << client->clientId << ", web_port: " << client->webPort << ")" << std::endl;
+                      << ", client " << client->clientId << ", web_port: " << client->webPort
+                      << ", capability_score: " << client->capabilityScore << ")" << std::endl;
 
             nlohmann::json resp = {
                 {"jsonrpc", "2.0"},
                 {"id", id},
                 {"result", {
                     {"status", ok ? "registered" : "empty"},
-                    {"registered_tools", addedNames.size()}
+                    {"registered_tools", addedNames.size()},
+                    {"capability_score", client->capabilityScore}
                 }}
             };
             sendLine(client->socketFd, resp.dump());
@@ -505,83 +521,125 @@ bool TcpGateway::callTool(const std::string& toolName,
                          nlohmann::json& outResult,
                          std::string& outErrorMessage,
                          int timeoutMs) {
-    int clientId = _registry.getToolClientId(toolName);
-    if (clientId < 0) {
+    auto candidates = _registry.getToolCandidates(toolName);
+    if (candidates.empty()) {
         outErrorMessage = "Tool '" + toolName + "' is not registered";
         return false;
     }
 
-    std::shared_ptr<ClientConnection> client;
-    {
-        std::lock_guard<std::mutex> lock(_clientsMutex);
-        auto it = _clients.find(clientId);
-        if (it != _clients.end()) {
-            client = it->second;
+    bool anyClientAttempted = false;
+
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto& cand = candidates[i];
+        std::shared_ptr<ClientConnection> client;
+        {
+            std::lock_guard<std::mutex> lock(_clientsMutex);
+            auto it = _clients.find(cand.clientId);
+            if (it != _clients.end()) {
+                client = it->second;
+            }
+        }
+
+        if (!client || !client->active.load() || client->socketFd < 0) {
+            continue;
+        }
+
+        anyClientAttempted = true;
+        std::string reqId = "aimon-gw-" + std::to_string(_nextRequestId.fetch_add(1));
+        auto pending = std::make_shared<PendingCall>();
+        pending->reqId = reqId;
+
+        {
+            std::lock_guard<std::mutex> lock(_pendingMutex);
+            _pendingCalls[reqId] = pending;
+        }
+
+        nlohmann::json reqJson = {
+            {"jsonrpc", "2.0"},
+            {"id", reqId},
+            {"method", "tools/call"},
+            {"params", {
+                {"name", toolName},
+                {"arguments", arguments.is_object() ? arguments : nlohmann::json::object()}
+            }}
+        };
+
+        if (!sendLine(client->socketFd, reqJson.dump())) {
+            {
+                std::lock_guard<std::mutex> lock(_pendingMutex);
+                _pendingCalls.erase(reqId);
+            }
+            if (i + 1 < candidates.size()) {
+                continue;
+            }
+            outErrorMessage = "Failed to send request to subsystem '" + client->subsystem + "'";
+            return false;
+        }
+
+        std::unique_lock<std::mutex> lock(pending->mutex);
+        bool received = pending->cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&]() {
+            return pending->completed;
+        });
+
+        {
+            std::lock_guard<std::mutex> pLock(_pendingMutex);
+            _pendingCalls.erase(reqId);
+        }
+
+        if (!received) {
+            outErrorMessage = "Timed out waiting for subsystem '" + client->subsystem + "'";
+            return false;
+        }
+
+        bool clientDisconnected = (!client->active.load() ||
+            pending->errorMessage.find("Subsystem disconnected") != std::string::npos);
+
+        if (clientDisconnected && (i + 1 < candidates.size())) {
+            continue;
+        }
+
+        if (!pending->errorMessage.empty()) {
+            outErrorMessage = pending->errorMessage;
+            return false;
+        }
+
+        if (pending->response.contains("error") && !pending->response["error"].is_null()) {
+            outErrorMessage = pending->response["error"].dump();
+            return false;
+        }
+
+        if (pending->response.contains("result")) {
+            outResult = pending->response["result"];
+            return true;
+        }
+
+        outErrorMessage = "Malformed response from subsystem '" + client->subsystem + "'";
+        return false;
+    }
+
+    if (!anyClientAttempted) {
+        outErrorMessage = "Subsystem host for tool '" + toolName + "' is offline";
+    }
+    return false;
+}
+
+bool TcpGateway::getBestToolProvider(const std::string& toolName,
+                                     DynamicTool& outTool,
+                                     std::string& outRemoteAddress,
+                                     nlohmann::json* outClientCapabilities) const {
+    auto candidates = _registry.getToolCandidates(toolName);
+    std::lock_guard<std::mutex> lock(_clientsMutex);
+    for (const auto& cand : candidates) {
+        auto it = _clients.find(cand.clientId);
+        if (it != _clients.end() && it->second && it->second->active.load() && it->second->socketFd >= 0) {
+            outTool = cand;
+            outRemoteAddress = it->second->remoteAddress;
+            if (outClientCapabilities) {
+                *outClientCapabilities = it->second->capabilities;
+            }
+            return true;
         }
     }
-
-    if (!client || !client->active.load() || client->socketFd < 0) {
-        outErrorMessage = "Subsystem host for tool '" + toolName + "' is offline";
-        return false;
-    }
-
-    std::string reqId = "aimon-gw-" + std::to_string(_nextRequestId.fetch_add(1));
-    auto pending = std::make_shared<PendingCall>();
-    pending->reqId = reqId;
-
-    {
-        std::lock_guard<std::mutex> lock(_pendingMutex);
-        _pendingCalls[reqId] = pending;
-    }
-
-    nlohmann::json reqJson = {
-        {"jsonrpc", "2.0"},
-        {"id", reqId},
-        {"method", "tools/call"},
-        {"params", {
-            {"name", toolName},
-            {"arguments", arguments.is_object() ? arguments : nlohmann::json::object()}
-        }}
-    };
-
-    if (!sendLine(client->socketFd, reqJson.dump())) {
-        std::lock_guard<std::mutex> lock(_pendingMutex);
-        _pendingCalls.erase(reqId);
-        outErrorMessage = "Failed to send request to subsystem '" + client->subsystem + "'";
-        return false;
-    }
-
-    std::unique_lock<std::mutex> lock(pending->mutex);
-    bool received = pending->cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&]() {
-        return pending->completed;
-    });
-
-    {
-        std::lock_guard<std::mutex> pLock(_pendingMutex);
-        _pendingCalls.erase(reqId);
-    }
-
-    if (!received) {
-        outErrorMessage = "Timed out waiting for subsystem '" + client->subsystem + "'";
-        return false;
-    }
-
-    if (!pending->errorMessage.empty()) {
-        outErrorMessage = pending->errorMessage;
-        return false;
-    }
-
-    if (pending->response.contains("error") && !pending->response["error"].is_null()) {
-        outErrorMessage = pending->response["error"].dump();
-        return false;
-    }
-
-    if (pending->response.contains("result")) {
-        outResult = pending->response["result"];
-        return true;
-    }
-
-    outErrorMessage = "Malformed response from subsystem '" + client->subsystem + "'";
     return false;
 }
 

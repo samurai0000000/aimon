@@ -3022,6 +3022,159 @@ TEST(EdaBridge, EasyEdaBridgeV1_1_12PerformanceAndSyncUpgrades) {
     CHECK_EQUAL(0, delEmptyRes.value("deleted_primitives", -1));
 }
 
+TEST(EdaAccelerators_Unit, AcceleratorCapabilitiesProbingScoringAndProvenance) {
+    // 1. Nominal Probing and Capabilities Round-Trip
+    AcceleratorCapabilities probed = EdaAccelerators::probeSystemCapabilities(true);
+    CHECK_TRUE(probed.enabled);
+    CHECK_TRUE(probed.capabilityScore >= 100);
+    CHECK_TRUE(probed.cpuThreads >= 1);
+    CHECK_TRUE(!probed.backend.empty());
+    CHECK_TRUE(!probed.deviceName.empty());
+
+    nlohmann::json probedJson = probed.toJson();
+    CHECK_TRUE(probedJson.is_object());
+    CHECK_EQUAL(probed.enabled, probedJson["enabled"].get<bool>());
+    CHECK_EQUAL(probed.backend, probedJson["backend"].get<std::string>());
+    CHECK_EQUAL(probed.deviceName, probedJson["device_name"].get<std::string>());
+    CHECK_EQUAL(probed.capabilityScore, probedJson["capability_score"].get<int64_t>());
+
+    AcceleratorCapabilities roundTrip = AcceleratorCapabilities::fromJson(probedJson);
+    CHECK_EQUAL(probed.enabled, roundTrip.enabled);
+    CHECK_EQUAL(probed.gpuAvailable, roundTrip.gpuAvailable);
+    CHECK_EQUAL(probed.backend, roundTrip.backend);
+    CHECK_EQUAL(probed.deviceName, roundTrip.deviceName);
+    CHECK_EQUAL(probed.capabilityScore, roundTrip.capabilityScore);
+    CHECK_EQUAL(probed.computeUnits, roundTrip.computeUnits);
+
+    // Verify isGpuAccelerableTool classification across all 9 accelerator tools
+    CHECK_TRUE(EdaAccelerators::isGpuAccelerableTool("cad_calc_print_orientation_dfm"));
+    CHECK_TRUE(EdaAccelerators::isGpuAccelerableTool("eda_calc_pcb_placement"));
+    CHECK_TRUE(EdaAccelerators::isGpuAccelerableTool("eda_calc_pcb_autoroute"));
+    CHECK_TRUE(EdaAccelerators::isGpuAccelerableTool("eda_calc_pcb_connectivity_audit"));
+
+    CHECK_FALSE(EdaAccelerators::isGpuAccelerableTool("eda_calc_schematic_layout"));
+    CHECK_FALSE(EdaAccelerators::isGpuAccelerableTool("eda_calc_schematic_erc_audit"));
+    CHECK_FALSE(EdaAccelerators::isGpuAccelerableTool("eda_calc_electrical_synth"));
+    CHECK_FALSE(EdaAccelerators::isGpuAccelerableTool("cad_calc_robot_kinematics_statics"));
+    CHECK_FALSE(EdaAccelerators::isGpuAccelerableTool("cad_calc_mechanism_synth"));
+    CHECK_FALSE(EdaAccelerators::isGpuAccelerableTool("unknown_tool"));
+
+    // 2. Execution Provenance Metadata across all 9 Accelerator Tools
+    EdaAccelerators acc;
+    std::vector<std::pair<std::string, nlohmann::json>> toolCalls = {
+        {"eda_calc_schematic_layout", {{"components", {{{"reference", "R1"}}, {{"reference", "R2"}}}}}},
+        {"eda_calc_pcb_placement", {{"components", {{{"reference", "U1"}}, {{"reference", "U2"}}}}}},
+        {"eda_calc_pcb_autoroute", {{"nets", nlohmann::json::array()}}},
+        {"eda_calc_electrical_synth", {{"mode", "voltage_divider"}, {"vin", 5.0}, {"vout", 3.3}}},
+        {"cad_calc_robot_kinematics_statics", {{"links", {{{"length_m", 0.1}, {"mass_kg", 0.1}}}}}},
+        {"cad_calc_mechanism_synth", {{"type", "spur_gear"}, {"module_mm", 1.0}}},
+        {"cad_calc_print_orientation_dfm", nlohmann::json::object()},
+        {"eda_calc_pcb_connectivity_audit", nlohmann::json::object()},
+        {"eda_calc_schematic_erc_audit", nlohmann::json::object()}
+    };
+
+    for (const auto& tc : toolCalls) {
+        bool ok = false;
+        std::string summary;
+        nlohmann::json res = acc.executeTool(tc.first, tc.second, ok, summary);
+        CHECK_TRUE(ok);
+        CHECK_TRUE(res.value("ok", false));
+        CHECK_TRUE(res.contains("compute_backend"));
+        CHECK_TRUE(res.contains("compute_device"));
+        CHECK_TRUE(res.contains("compute_units"));
+        CHECK_TRUE(res.contains("capability_score"));
+        CHECK_TRUE(res.contains("gpu_accelerated"));
+        CHECK_TRUE(res["capability_score"].get<int64_t>() >= 100);
+        if (EdaAccelerators::isGpuAccelerableTool(tc.first) && acc.getCapabilities().gpuAvailable) {
+            CHECK_TRUE(res["gpu_accelerated"].get<bool>());
+        } else {
+            CHECK_FALSE(res["gpu_accelerated"].get<bool>());
+        }
+    }
+
+    // 3. Simulated GPU vs CPU Ranking and Provenance Injection
+    AcceleratorCapabilities cpuCaps = EdaAccelerators::probeSystemCapabilities(true);
+    AcceleratorCapabilities gpuCaps;
+    gpuCaps.enabled = true;
+    gpuCaps.gpuAvailable = true;
+    gpuCaps.backend = "opencl_gpu";
+    gpuCaps.deviceName = "Simulated Discrete GPU";
+    gpuCaps.vendor = "Simulated Vendor";
+    gpuCaps.computeUnits = 32;
+    gpuCaps.clockMhz = 2740;
+    gpuCaps.globalMemBytes = 16ULL * 1024 * 1024 * 1024;
+    gpuCaps.capabilityScore = gpuCaps.scoreForTool("");
+
+    CHECK_TRUE(gpuCaps.scoreForTool("cad_calc_print_orientation_dfm") > cpuCaps.scoreForTool("cad_calc_print_orientation_dfm"));
+    CHECK_TRUE(gpuCaps.scoreForTool("eda_calc_pcb_placement") > cpuCaps.scoreForTool("eda_calc_pcb_placement"));
+    CHECK_TRUE(gpuCaps.scoreForTool("eda_calc_pcb_autoroute") > cpuCaps.scoreForTool("eda_calc_pcb_autoroute"));
+    CHECK_TRUE(gpuCaps.scoreForTool("eda_calc_pcb_connectivity_audit") > cpuCaps.scoreForTool("eda_calc_pcb_connectivity_audit"));
+    CHECK_TRUE(gpuCaps.scoreForTool("eda_calc_schematic_layout") > cpuCaps.scoreForTool("eda_calc_schematic_layout"));
+
+    EdaAccelerators simAcc;
+    simAcc.setSimulatedCapabilitiesForTest(gpuCaps);
+    CHECK_EQUAL("opencl_gpu", simAcc.getCapabilities().backend);
+    CHECK_EQUAL("Simulated Discrete GPU", simAcc.getCapabilities().deviceName);
+
+    bool simOk = false;
+    std::string simSummary;
+    nlohmann::json dfmRes = simAcc.executeTool("cad_calc_print_orientation_dfm", nlohmann::json::object(), simOk, simSummary);
+    CHECK_TRUE(simOk);
+    CHECK_EQUAL("opencl_gpu", dfmRes.value("compute_backend", ""));
+    CHECK_EQUAL("Simulated Discrete GPU", dfmRes.value("compute_device", ""));
+    CHECK_EQUAL(32, dfmRes.value("compute_units", 0));
+    CHECK_TRUE(dfmRes.value("gpu_accelerated", false));
+    CHECK_TRUE(dfmRes.value("capability_score", (int64_t)0) > cpuCaps.capabilityScore);
+
+    // Non-GPU accelerable tool executed on simulated GPU peer still attaches device provenance
+    nlohmann::json schArgs = {{"components", {{{"reference", "R1"}}, {{"reference", "R2"}}}}};
+    nlohmann::json schRes = simAcc.executeTool("eda_calc_schematic_layout",
+                                               schArgs,
+                                               simOk, simSummary);
+    CHECK_TRUE(simOk);
+    CHECK_EQUAL("opencl_gpu", schRes.value("compute_backend", ""));
+    CHECK_EQUAL("Simulated Discrete GPU", schRes.value("compute_device", ""));
+    CHECK_FALSE(schRes.value("gpu_accelerated", true));
+
+    // 4. Boundary and Fault Injection
+    // Empty JSON
+    AcceleratorCapabilities emptyCaps = AcceleratorCapabilities::fromJson(nlohmann::json::object());
+    CHECK_TRUE(emptyCaps.enabled);
+    CHECK_TRUE(emptyCaps.capabilityScore >= 100);
+
+    // Negative / malformed numerical fields
+    nlohmann::json malformedJson = {
+        {"enabled", true},
+        {"compute_units", -8},
+        {"clock_mhz", -100},
+        {"global_mem_bytes", -999999.0},
+        {"capability_score", -500},
+        {"cpu_threads", 0}
+    };
+    AcceleratorCapabilities malformedCaps = AcceleratorCapabilities::fromJson(malformedJson);
+    CHECK_TRUE(malformedCaps.enabled);
+    CHECK_EQUAL(1, malformedCaps.computeUnits);
+    CHECK_EQUAL(1, malformedCaps.cpuThreads);
+    CHECK_TRUE(malformedCaps.capabilityScore >= 100);
+
+    // Disabled capabilities
+    nlohmann::json disabledJson = {
+        {"enabled", false},
+        {"capability_score", 999999}
+    };
+    AcceleratorCapabilities disabledCaps = AcceleratorCapabilities::fromJson(disabledJson);
+    CHECK_FALSE(disabledCaps.enabled);
+    CHECK_EQUAL(0, disabledCaps.scoreForTool("cad_calc_print_orientation_dfm"));
+    CHECK_EQUAL(0, disabledCaps.scoreForTool(""));
+
+    // Non-object input
+    AcceleratorCapabilities arrayCaps = AcceleratorCapabilities::fromJson(nlohmann::json::array());
+    CHECK_TRUE(arrayCaps.enabled);
+    CHECK_TRUE(arrayCaps.capabilityScore >= 100);
+}
+
+
+
 
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {

@@ -781,6 +781,33 @@ TEST(McpServer_EdaProfile, McpDispatchesOfflineApiIntrospectionSpecValidationVol
         {"search_api", "netFlag"}
     });
     CHECK_TRUE(searchApi.value("matched_count", 0) >= 1);
+
+    // 5. Dynamic GPU capability routing over MCP tools/call
+    AcceleratorCapabilities remoteGpuCaps;
+    remoteGpuCaps.enabled = true;
+    remoteGpuCaps.gpuAvailable = true;
+    remoteGpuCaps.backend = "opencl_gpu";
+    remoteGpuCaps.deviceName = "Simulated OpenCL GPU";
+    remoteGpuCaps.computeUnits = 32;
+    remoteGpuCaps.clockMhz = 2740;
+    remoteGpuCaps.globalMemBytes = 16ULL * 1024 * 1024 * 1024;
+    remoteGpuCaps.capabilityScore = 1089480;
+    _rpcServer->setSimulatedAcceleratorCapabilitiesForTest(remoteGpuCaps);
+
+    AcceleratorCapabilities localCpuCaps;
+    localCpuCaps.enabled = true;
+    localCpuCaps.gpuAvailable = false;
+    localCpuCaps.backend = "cpu_cpp17";
+    localCpuCaps.deviceName = "CPU C++17 Solver";
+    localCpuCaps.capabilityScore = 1000;
+    _bridge->setSimulatedLocalCapabilitiesForTest(localCpuCaps);
+
+    uint64_t callsBefore = _rpcServer->getTelemetrySnapshot().components["accelerators"].totalCalls;
+    json dfmRouted = callAndParse("cad_calc_print_orientation_dfm", json::object());
+    CHECK_EQUAL(std::string("client"), dfmRouted.value("routed_via", ""));
+    CHECK_EQUAL(1089480, dfmRouted.value("provider_capability_score", 0));
+    uint64_t callsAfter = _rpcServer->getTelemetrySnapshot().components["accelerators"].totalCalls;
+    CHECK_EQUAL(static_cast<long>(callsBefore + 1), static_cast<long>(callsAfter));
 }
 
 TEST_GROUP(WebServer_EdaApi) {

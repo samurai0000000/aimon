@@ -9,20 +9,860 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 namespace aimon {
 
 namespace {
+
+#if defined(_WIN32)
+#define CL_API_CALL __stdcall
+#else
+#define CL_API_CALL
+#endif
+
+typedef int32_t cl_int;
+typedef uint32_t cl_uint;
+typedef uint64_t cl_ulong;
+typedef uint64_t cl_bitfield;
+typedef cl_bitfield cl_device_type;
+typedef cl_uint cl_platform_info;
+typedef cl_uint cl_device_info;
+typedef cl_bitfield cl_device_fp_config;
+typedef cl_bitfield cl_mem_flags;
+typedef cl_uint cl_program_build_info;
+typedef cl_int cl_build_status;
+
+typedef struct _cl_platform_id* cl_platform_id;
+typedef struct _cl_device_id* cl_device_id;
+typedef struct _cl_context* cl_context;
+typedef struct _cl_command_queue* cl_command_queue;
+typedef struct _cl_mem* cl_mem;
+typedef struct _cl_program* cl_program;
+typedef struct _cl_kernel* cl_kernel;
+typedef struct _cl_event* cl_event;
+typedef struct _cl_sampler* cl_sampler;
+typedef intptr_t cl_context_properties;
+
+constexpr cl_int CL_SUCCESS = 0;
+constexpr cl_int CL_DEVICE_NOT_FOUND = -1;
+constexpr cl_device_type CL_DEVICE_TYPE_GPU = (1 << 2);
+
+constexpr cl_device_info CL_DEVICE_TYPE = 0x1000;
+constexpr cl_device_info CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002;
+constexpr cl_device_info CL_DEVICE_MAX_CLOCK_FREQUENCY = 0x100C;
+constexpr cl_device_info CL_DEVICE_MAX_MEM_ALLOC_SIZE = 0x1010;
+constexpr cl_device_info CL_DEVICE_GLOBAL_MEM_SIZE = 0x101F;
+constexpr cl_device_info CL_DEVICE_NAME = 0x102B;
+constexpr cl_device_info CL_DEVICE_VENDOR = 0x102C;
+constexpr cl_device_info CL_DRIVER_VERSION = 0x102D;
+constexpr cl_device_info CL_DEVICE_EXTENSIONS = 0x1030;
+
+constexpr cl_mem_flags CL_MEM_READ_WRITE = (1 << 0);
+constexpr cl_mem_flags CL_MEM_WRITE_ONLY = (1 << 1);
+constexpr cl_mem_flags CL_MEM_READ_ONLY = (1 << 2);
+constexpr cl_mem_flags CL_MEM_COPY_HOST_PTR = (1 << 5);
+
+constexpr cl_context_properties CL_CONTEXT_PLATFORM = 0x1084;
+constexpr cl_program_build_info CL_PROGRAM_BUILD_LOG = 0x1183;
+constexpr cl_uint CL_TRUE = 1;
+constexpr cl_uint CL_FALSE = 0;
+
+using pfn_clGetPlatformIDs = cl_int (CL_API_CALL *)(cl_uint, cl_platform_id*, cl_uint*);
+using pfn_clGetDeviceIDs = cl_int (CL_API_CALL *)(cl_platform_id, cl_device_type, cl_uint, cl_device_id*, cl_uint*);
+using pfn_clGetDeviceInfo = cl_int (CL_API_CALL *)(cl_device_id, cl_device_info, size_t, void*, size_t*);
+using pfn_clCreateContext = cl_context (CL_API_CALL *)(const cl_context_properties*, cl_uint, const cl_device_id*, void (CL_API_CALL *)(const char*, const void*, size_t, void*), void*, cl_int*);
+using pfn_clCreateCommandQueue = cl_command_queue (CL_API_CALL *)(cl_context, cl_device_id, cl_bitfield, cl_int*);
+using pfn_clCreateProgramWithSource = cl_program (CL_API_CALL *)(cl_context, cl_uint, const char**, const size_t*, cl_int*);
+using pfn_clBuildProgram = cl_int (CL_API_CALL *)(cl_program, cl_uint, const cl_device_id*, const char*, void (CL_API_CALL *)(cl_program, void*), void*);
+using pfn_clGetProgramBuildInfo = cl_int (CL_API_CALL *)(cl_program, cl_device_id, cl_program_build_info, size_t, void*, size_t*);
+using pfn_clCreateKernel = cl_kernel (CL_API_CALL *)(cl_program, const char*, cl_int*);
+using pfn_clCreateBuffer = cl_mem (CL_API_CALL *)(cl_context, cl_mem_flags, size_t, void*, cl_int*);
+using pfn_clEnqueueWriteBuffer = cl_int (CL_API_CALL *)(cl_command_queue, cl_mem, cl_uint, size_t, size_t, const void*, cl_uint, const cl_event*, cl_event*);
+using pfn_clEnqueueReadBuffer = cl_int (CL_API_CALL *)(cl_command_queue, cl_mem, cl_uint, size_t, size_t, void*, cl_uint, const cl_event*, cl_event*);
+using pfn_clSetKernelArg = cl_int (CL_API_CALL *)(cl_kernel, cl_uint, size_t, const void*);
+using pfn_clEnqueueNDRangeKernel = cl_int (CL_API_CALL *)(cl_command_queue, cl_kernel, cl_uint, const size_t*, const size_t*, const size_t*, cl_uint, const cl_event*, cl_event*);
+using pfn_clFinish = cl_int (CL_API_CALL *)(cl_command_queue);
+using pfn_clReleaseMemObject = cl_int (CL_API_CALL *)(cl_mem);
+using pfn_clReleaseKernel = cl_int (CL_API_CALL *)(cl_kernel);
+using pfn_clReleaseProgram = cl_int (CL_API_CALL *)(cl_program);
+using pfn_clReleaseCommandQueue = cl_int (CL_API_CALL *)(cl_command_queue);
+using pfn_clReleaseContext = cl_int (CL_API_CALL *)(cl_context);
+
+const char* kOpenClKernelSource = R"CLC(
+__kernel void evalOrientationOverhangs(
+    const int numCandidates,
+    const float px, const float py, const float pz,
+    const float hx, const float hy, const float hz,
+    const float fMag, const float areaMm2,
+    const float mMagNmm, const float secModMm3,
+    const float sigmaZMpa, const float sigmaXyMpa,
+    __global const float4* candidateNormals,
+    __global float4* outMetrics
+) {
+    int gid = get_global_id(0);
+    if (gid >= numCandidates) return;
+
+    float4 c = candidateNormals[gid];
+    float nx = c.x, ny = c.y, nz = c.z;
+    float supportPenalty = c.w;
+
+    float zAlign = fabs(px * nx + py * ny + pz * nz);
+    float xyAlign = sqrt(fmax(0.0f, 1.0f - zAlign * zAlign));
+    float normalStress = (fMag / areaMm2) + (mMagNmm / secModMm3);
+    float zInterlayerStress = fmax(0.1f, normalStress * (0.25f + 0.75f * zAlign));
+    float xyFiberStress = fmax(0.1f, normalStress * xyAlign);
+
+    float delamSf = sigmaZMpa / zInterlayerStress;
+    float fiberSf = sigmaXyMpa / xyFiberStress;
+    float boreCircularity = fabs(hx * nx + hy * ny + hz * nz);
+    float score = delamSf * 2.0f + boreCircularity * 1.5f - supportPenalty;
+
+    outMetrics[gid] = (float4)(delamSf, fiberSf, boreCircularity, score);
+}
+
+__kernel void evalPlacementWirelength(
+    const int numReplicas,
+    const int numItems,
+    const int numNets,
+    const float clearanceMm,
+    __global const float4* itemDims,
+    __global const float2* replicaCoords,
+    __global const int* netOffsets,
+    __global const int* netMembers,
+    __global float2* outCosts
+) {
+    int rep = get_global_id(0);
+    if (rep >= numReplicas) return;
+
+    int baseIdx = rep * numItems;
+    float hpwl = 0.0f;
+
+    for (int n = 0; n < numNets; ++n) {
+        int start = netOffsets[n];
+        int end = netOffsets[n + 1];
+        if (start >= end) continue;
+        int firstMember = netMembers[start];
+        float minX = replicaCoords[baseIdx + firstMember].x;
+        float maxX = minX;
+        float minY = replicaCoords[baseIdx + firstMember].y;
+        float maxY = minY;
+        for (int m = start + 1; m < end; ++m) {
+            int idx = netMembers[m];
+            float x = replicaCoords[baseIdx + idx].x;
+            float y = replicaCoords[baseIdx + idx].y;
+            minX = fmin(minX, x);
+            maxX = fmax(maxX, x);
+            minY = fmin(minY, y);
+            maxY = fmax(maxY, y);
+        }
+        hpwl += (maxX - minX) + (maxY - minY);
+    }
+
+    float overlapArea = 0.0f;
+    for (int i = 0; i < numItems; ++i) {
+        float4 dimI = itemDims[i];
+        int rotI = (int)dimI.z;
+        float wi = ((rotI % 180) != 0 ? dimI.y : dimI.x) * 0.5f + clearanceMm;
+        float hi = ((rotI % 180) != 0 ? dimI.x : dimI.y) * 0.5f + clearanceMm;
+        float xi = replicaCoords[baseIdx + i].x;
+        float yi = replicaCoords[baseIdx + i].y;
+        float layerI = dimI.w;
+
+        for (int j = i + 1; j < numItems; ++j) {
+            float4 dimJ = itemDims[j];
+            if (layerI != dimJ.w) continue;
+            int rotJ = (int)dimJ.z;
+            float wj = ((rotJ % 180) != 0 ? dimJ.y : dimJ.x) * 0.5f + clearanceMm;
+            float hj = ((rotJ % 180) != 0 ? dimJ.x : dimJ.y) * 0.5f + clearanceMm;
+            float xj = replicaCoords[baseIdx + j].x;
+            float yj = replicaCoords[baseIdx + j].y;
+
+            float ox = (wi + wj) - fabs(xi - xj);
+            float oy = (hi + hj) - fabs(yi - yj);
+            if (ox > 0.0f && oy > 0.0f) {
+                overlapArea += ox * oy;
+            }
+        }
+    }
+
+    outCosts[rep] = (float2)(hpwl + overlapArea * 500.0f, hpwl);
+}
+
+__kernel void rasterizeObstacleClearance(
+    const int numQueries,
+    const int numObstacles,
+    __global const float4* queryPoints,
+    __global const float4* obstacleBoxes,
+    __global const int4* obstacleMeta,
+    __global int* outClearanceFlags
+) {
+    int gid = get_global_id(0);
+    if (gid >= numQueries) return;
+
+    float4 q = queryPoints[gid];
+    float qx = q.x;
+    float qy = q.y;
+    int qLayer = (int)q.z;
+    int qNet = (int)q.w;
+
+    int blocked = 0;
+    for (int i = 0; i < numObstacles; ++i) {
+        int4 meta = obstacleMeta[i];
+        int obsLayer = meta.x;
+        int obsNet = meta.y;
+        if (obsLayer != -1 && qLayer != -1 && obsLayer != qLayer) continue;
+        if (obsNet != 0 && obsNet == qNet) continue;
+
+        float4 b = obstacleBoxes[i];
+        if (meta.z == 1) {
+            float dist = hypot(qx - b.x, qy - b.y);
+            if (dist <= b.z) {
+                blocked = 1;
+                break;
+            }
+        } else {
+            float ex = fmax(fabs(qx - b.x) - b.z, 0.0f);
+            float ey = fmax(fabs(qy - b.y) - b.w, 0.0f);
+            if (hypot(ex, ey) <= 0.001f) {
+                blocked = 1;
+                break;
+            }
+        }
+    }
+    outClearanceFlags[gid] = blocked;
+}
+
+__kernel void auditSegmentClearance(
+    const int numSegments,
+    const float minClearance,
+    __global const float4* segStartEnd,
+    __global const float4* segProps,
+    __global int* outViolationCount,
+    __global int2* outViolations,
+    const int maxViolations
+) {
+    int i = get_global_id(0);
+    if (i >= numSegments) return;
+
+    float4 s1 = segStartEnd[i];
+    float4 p1 = segProps[i];
+    float w1 = p1.x;
+    int layer1 = (int)p1.y;
+    int net1 = (int)p1.z;
+
+    for (int j = i + 1; j < numSegments; ++j) {
+        float4 p2 = segProps[j];
+        int layer2 = (int)p2.y;
+        if (layer1 != -1 && layer2 != -1 && layer1 != layer2) continue;
+        int net2 = (int)p2.z;
+        if (net1 != 0 && net1 == net2) continue;
+
+        float4 s2 = segStartEnd[j];
+        float w2 = p2.x;
+        float reqDist = 0.5f * (w1 + w2) + minClearance;
+
+        float minX1 = fmin(s1.x, s1.z) - reqDist;
+        float maxX1 = fmax(s1.x, s1.z) + reqDist;
+        float minY1 = fmin(s1.y, s1.w) - reqDist;
+        float maxY1 = fmax(s1.y, s1.w) + reqDist;
+
+        float minX2 = fmin(s2.x, s2.z);
+        float maxX2 = fmax(s2.x, s2.z);
+        float minY2 = fmin(s2.y, s2.w);
+        float maxY2 = fmax(s2.y, s2.w);
+
+        if (maxX1 < minX2 || minX1 > maxX2 || maxY1 < minY2 || minY1 > maxY2) {
+            continue;
+        }
+
+        float vx1 = s1.z - s1.x;
+        float vy1 = s1.w - s1.y;
+        float lenSq1 = vx1 * vx1 + vy1 * vy1;
+
+        float vx2 = s2.z - s2.x;
+        float vy2 = s2.w - s2.y;
+        float lenSq2 = vx2 * vx2 + vy2 * vy2;
+
+        float dMin = 1e9f;
+        float t1 = (lenSq2 > 1e-12f) ? clamp(((s1.x - s2.x) * vx2 + (s1.y - s2.y) * vy2) / lenSq2, 0.0f, 1.0f) : 0.0f;
+        dMin = fmin(dMin, hypot(s1.x - (s2.x + t1 * vx2), s1.y - (s2.y + t1 * vy2)));
+
+        float t2 = (lenSq2 > 1e-12f) ? clamp(((s1.z - s2.x) * vx2 + (s1.w - s2.y) * vy2) / lenSq2, 0.0f, 1.0f) : 0.0f;
+        dMin = fmin(dMin, hypot(s1.z - (s2.x + t2 * vx2), s1.w - (s2.y + t2 * vy2)));
+
+        float t3 = (lenSq1 > 1e-12f) ? clamp(((s2.x - s1.x) * vx1 + (s2.y - s1.y) * vy1) / lenSq1, 0.0f, 1.0f) : 0.0f;
+        dMin = fmin(dMin, hypot(s2.x - (s1.x + t3 * vx1), s2.y - (s1.y + t3 * vy1)));
+
+        float t4 = (lenSq1 > 1e-12f) ? clamp(((s2.z - s1.x) * vx1 + (s2.w - s1.y) * vy1) / lenSq1, 0.0f, 1.0f) : 0.0f;
+        dMin = fmin(dMin, hypot(s2.z - (s1.x + t4 * vx1), s2.w - (s1.y + t4 * vy1)));
+
+        if (dMin < reqDist) {
+            int slot = atomic_inc(outViolationCount);
+            if (slot < maxViolations) {
+                outViolations[slot] = (int2)(i, j);
+            }
+        }
+    }
+}
+)CLC";
+
+class OpenClEngine {
+public:
+    static OpenClEngine& instance() {
+        static OpenClEngine s_instance;
+        return s_instance;
+    }
+
+    bool isGpuAvailable() const {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _gpuAvailable;
+    }
+
+    AcceleratorCapabilities getCapabilities(bool enabled) const {
+        std::lock_guard<std::mutex> lock(_mutex);
+        AcceleratorCapabilities caps = _caps;
+        caps.enabled = enabled;
+        if (!enabled) {
+            caps.capabilityScore = 0;
+        }
+        return caps;
+    }
+
+    bool runOrientationOverhangs(int numCandidates,
+                                 float px, float py, float pz,
+                                 float hx, float hy, float hz,
+                                 float fMag, float areaMm2,
+                                 float mMagNmm, float secModMm3,
+                                 float sigmaZMpa, float sigmaXyMpa,
+                                 const std::vector<float>& candidateData,
+                                 std::vector<float>& outMetrics) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_gpuAvailable || !_queue || !_kPrintOrientation || numCandidates <= 0) {
+            return false;
+        }
+
+        cl_int err = CL_SUCCESS;
+        size_t inBytes = sizeof(float) * candidateData.size();
+        size_t outBytes = sizeof(float) * 4 * static_cast<size_t>(numCandidates);
+        outMetrics.resize(4 * static_cast<size_t>(numCandidates), 0.0f);
+
+        cl_mem inBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, inBytes, const_cast<float*>(candidateData.data()), &err);
+        if (err != CL_SUCCESS || !inBuf) return false;
+
+        cl_mem outBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, outBytes, nullptr, &err);
+        if (err != CL_SUCCESS || !outBuf) {
+            clReleaseMemObject(inBuf);
+            return false;
+        }
+
+        clSetKernelArg(_kPrintOrientation, 0, sizeof(int), &numCandidates);
+        clSetKernelArg(_kPrintOrientation, 1, sizeof(float), &px);
+        clSetKernelArg(_kPrintOrientation, 2, sizeof(float), &py);
+        clSetKernelArg(_kPrintOrientation, 3, sizeof(float), &pz);
+        clSetKernelArg(_kPrintOrientation, 4, sizeof(float), &hx);
+        clSetKernelArg(_kPrintOrientation, 5, sizeof(float), &hy);
+        clSetKernelArg(_kPrintOrientation, 6, sizeof(float), &hz);
+        clSetKernelArg(_kPrintOrientation, 7, sizeof(float), &fMag);
+        clSetKernelArg(_kPrintOrientation, 8, sizeof(float), &areaMm2);
+        clSetKernelArg(_kPrintOrientation, 9, sizeof(float), &mMagNmm);
+        clSetKernelArg(_kPrintOrientation, 10, sizeof(float), &secModMm3);
+        clSetKernelArg(_kPrintOrientation, 11, sizeof(float), &sigmaZMpa);
+        clSetKernelArg(_kPrintOrientation, 12, sizeof(float), &sigmaXyMpa);
+        clSetKernelArg(_kPrintOrientation, 13, sizeof(cl_mem), &inBuf);
+        clSetKernelArg(_kPrintOrientation, 14, sizeof(cl_mem), &outBuf);
+
+        size_t globalWorkSize = static_cast<size_t>(numCandidates);
+        err = clEnqueueNDRangeKernel(_queue, _kPrintOrientation, 1, nullptr, &globalWorkSize, nullptr, 0, nullptr, nullptr);
+        if (err == CL_SUCCESS) {
+            err = clEnqueueReadBuffer(_queue, outBuf, CL_TRUE, 0, outBytes, outMetrics.data(), 0, nullptr, nullptr);
+        }
+
+        clReleaseMemObject(inBuf);
+        clReleaseMemObject(outBuf);
+        return err == CL_SUCCESS;
+    }
+
+    bool runPlacementWirelength(int numReplicas, int numItems, int numNets,
+                                float clearanceMm,
+                                const std::vector<float>& itemDims,
+                                const std::vector<float>& replicaCoords,
+                                const std::vector<int>& netOffsets,
+                                const std::vector<int>& netMembers,
+                                std::vector<float>& outCosts) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_gpuAvailable || !_queue || !_kPcbPlacement || numReplicas <= 0 || numItems <= 0) {
+            return false;
+        }
+
+        cl_int err = CL_SUCCESS;
+        size_t dimsBytes = sizeof(float) * itemDims.size();
+        size_t coordsBytes = sizeof(float) * replicaCoords.size();
+        size_t offsetsBytes = sizeof(int) * netOffsets.size();
+        size_t membersBytes = sizeof(int) * netMembers.size();
+        size_t outBytes = sizeof(float) * 2 * static_cast<size_t>(numReplicas);
+        outCosts.resize(2 * static_cast<size_t>(numReplicas), 0.0f);
+
+        cl_mem dimsBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, dimsBytes, const_cast<float*>(itemDims.data()), &err);
+        if (err != CL_SUCCESS || !dimsBuf) return false;
+        cl_mem coordsBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, coordsBytes, const_cast<float*>(replicaCoords.data()), &err);
+        if (err != CL_SUCCESS || !coordsBuf) { clReleaseMemObject(dimsBuf); return false; }
+        cl_mem offsetsBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, offsetsBytes, const_cast<int*>(netOffsets.data()), &err);
+        if (err != CL_SUCCESS || !offsetsBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(coordsBuf); return false; }
+        cl_mem membersBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, membersBytes, const_cast<int*>(netMembers.data()), &err);
+        if (err != CL_SUCCESS || !membersBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(coordsBuf); clReleaseMemObject(offsetsBuf); return false; }
+        cl_mem outBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, outBytes, nullptr, &err);
+        if (err != CL_SUCCESS || !outBuf) { clReleaseMemObject(dimsBuf); clReleaseMemObject(coordsBuf); clReleaseMemObject(offsetsBuf); clReleaseMemObject(membersBuf); return false; }
+
+        clSetKernelArg(_kPcbPlacement, 0, sizeof(int), &numReplicas);
+        clSetKernelArg(_kPcbPlacement, 1, sizeof(int), &numItems);
+        clSetKernelArg(_kPcbPlacement, 2, sizeof(int), &numNets);
+        clSetKernelArg(_kPcbPlacement, 3, sizeof(float), &clearanceMm);
+        clSetKernelArg(_kPcbPlacement, 4, sizeof(cl_mem), &dimsBuf);
+        clSetKernelArg(_kPcbPlacement, 5, sizeof(cl_mem), &coordsBuf);
+        clSetKernelArg(_kPcbPlacement, 6, sizeof(cl_mem), &offsetsBuf);
+        clSetKernelArg(_kPcbPlacement, 7, sizeof(cl_mem), &membersBuf);
+        clSetKernelArg(_kPcbPlacement, 8, sizeof(cl_mem), &outBuf);
+
+        size_t globalWorkSize = static_cast<size_t>(numReplicas);
+        err = clEnqueueNDRangeKernel(_queue, _kPcbPlacement, 1, nullptr, &globalWorkSize, nullptr, 0, nullptr, nullptr);
+        if (err == CL_SUCCESS) {
+            err = clEnqueueReadBuffer(_queue, outBuf, CL_TRUE, 0, outBytes, outCosts.data(), 0, nullptr, nullptr);
+        }
+
+        clReleaseMemObject(dimsBuf);
+        clReleaseMemObject(coordsBuf);
+        clReleaseMemObject(offsetsBuf);
+        clReleaseMemObject(membersBuf);
+        clReleaseMemObject(outBuf);
+        return err == CL_SUCCESS;
+    }
+
+    bool runObstacleClearance(int numQueries, int numObstacles,
+                              const std::vector<float>& queries,
+                              const std::vector<float>& boxes,
+                              const std::vector<int>& meta,
+                              std::vector<int>& outFlags) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_gpuAvailable || !_queue || !_kPcbAutoroute || numQueries <= 0 || numObstacles <= 0) {
+            return false;
+        }
+
+        cl_int err = CL_SUCCESS;
+        size_t qBytes = sizeof(float) * queries.size();
+        size_t bBytes = sizeof(float) * boxes.size();
+        size_t mBytes = sizeof(int) * meta.size();
+        size_t outBytes = sizeof(int) * static_cast<size_t>(numQueries);
+        outFlags.resize(static_cast<size_t>(numQueries), 0);
+
+        cl_mem qBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, qBytes, const_cast<float*>(queries.data()), &err);
+        if (err != CL_SUCCESS || !qBuf) return false;
+        cl_mem bBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bBytes, const_cast<float*>(boxes.data()), &err);
+        if (err != CL_SUCCESS || !bBuf) { clReleaseMemObject(qBuf); return false; }
+        cl_mem mBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, mBytes, const_cast<int*>(meta.data()), &err);
+        if (err != CL_SUCCESS || !mBuf) { clReleaseMemObject(qBuf); clReleaseMemObject(bBuf); return false; }
+        cl_mem outBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, outBytes, nullptr, &err);
+        if (err != CL_SUCCESS || !outBuf) { clReleaseMemObject(qBuf); clReleaseMemObject(bBuf); clReleaseMemObject(mBuf); return false; }
+
+        clSetKernelArg(_kPcbAutoroute, 0, sizeof(int), &numQueries);
+        clSetKernelArg(_kPcbAutoroute, 1, sizeof(int), &numObstacles);
+        clSetKernelArg(_kPcbAutoroute, 2, sizeof(cl_mem), &qBuf);
+        clSetKernelArg(_kPcbAutoroute, 3, sizeof(cl_mem), &bBuf);
+        clSetKernelArg(_kPcbAutoroute, 4, sizeof(cl_mem), &mBuf);
+        clSetKernelArg(_kPcbAutoroute, 5, sizeof(cl_mem), &outBuf);
+
+        size_t globalWorkSize = static_cast<size_t>(numQueries);
+        err = clEnqueueNDRangeKernel(_queue, _kPcbAutoroute, 1, nullptr, &globalWorkSize, nullptr, 0, nullptr, nullptr);
+        if (err == CL_SUCCESS) {
+            err = clEnqueueReadBuffer(_queue, outBuf, CL_TRUE, 0, outBytes, outFlags.data(), 0, nullptr, nullptr);
+        }
+
+        clReleaseMemObject(qBuf);
+        clReleaseMemObject(bBuf);
+        clReleaseMemObject(mBuf);
+        clReleaseMemObject(outBuf);
+        return err == CL_SUCCESS;
+    }
+
+    bool runSegmentClearance(int numSegments, float minClearance,
+                             const std::vector<float>& segStartEnd,
+                             const std::vector<float>& segProps,
+                             int& outViolationCount,
+                             std::vector<int>& outViolations) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_gpuAvailable || !_queue || !_kPcbConnectivityAudit || numSegments <= 1) {
+            return false;
+        }
+
+        cl_int err = CL_SUCCESS;
+        int maxViolations = 4096;
+        outViolations.resize(2 * static_cast<size_t>(maxViolations), 0);
+        outViolationCount = 0;
+
+        size_t seBytes = sizeof(float) * segStartEnd.size();
+        size_t pBytes = sizeof(float) * segProps.size();
+        size_t countBytes = sizeof(int);
+        size_t violBytes = sizeof(int) * 2 * static_cast<size_t>(maxViolations);
+
+        cl_mem seBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, seBytes, const_cast<float*>(segStartEnd.data()), &err);
+        if (err != CL_SUCCESS || !seBuf) return false;
+        cl_mem pBuf = clCreateBuffer(_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, pBytes, const_cast<float*>(segProps.data()), &err);
+        if (err != CL_SUCCESS || !pBuf) { clReleaseMemObject(seBuf); return false; }
+        cl_mem countBuf = clCreateBuffer(_context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, countBytes, &outViolationCount, &err);
+        if (err != CL_SUCCESS || !countBuf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); return false; }
+        cl_mem violBuf = clCreateBuffer(_context, CL_MEM_WRITE_ONLY, violBytes, nullptr, &err);
+        if (err != CL_SUCCESS || !violBuf) { clReleaseMemObject(seBuf); clReleaseMemObject(pBuf); clReleaseMemObject(countBuf); return false; }
+
+        clSetKernelArg(_kPcbConnectivityAudit, 0, sizeof(int), &numSegments);
+        clSetKernelArg(_kPcbConnectivityAudit, 1, sizeof(float), &minClearance);
+        clSetKernelArg(_kPcbConnectivityAudit, 2, sizeof(cl_mem), &seBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 3, sizeof(cl_mem), &pBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 4, sizeof(cl_mem), &countBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 5, sizeof(cl_mem), &violBuf);
+        clSetKernelArg(_kPcbConnectivityAudit, 6, sizeof(int), &maxViolations);
+
+        size_t globalWorkSize = static_cast<size_t>(numSegments);
+        err = clEnqueueNDRangeKernel(_queue, _kPcbConnectivityAudit, 1, nullptr, &globalWorkSize, nullptr, 0, nullptr, nullptr);
+        if (err == CL_SUCCESS) {
+            clEnqueueReadBuffer(_queue, countBuf, CL_TRUE, 0, countBytes, &outViolationCount, 0, nullptr, nullptr);
+            int readViolations = std::min(outViolationCount, maxViolations);
+            if (readViolations > 0) {
+                clEnqueueReadBuffer(_queue, violBuf, CL_TRUE, 0, sizeof(int) * 2 * static_cast<size_t>(readViolations), outViolations.data(), 0, nullptr, nullptr);
+            }
+        }
+
+        clReleaseMemObject(seBuf);
+        clReleaseMemObject(pBuf);
+        clReleaseMemObject(countBuf);
+        clReleaseMemObject(violBuf);
+        return err == CL_SUCCESS;
+    }
+
+private:
+    OpenClEngine() {
+        init();
+    }
+
+    ~OpenClEngine() {
+        cleanup();
+    }
+
+    void initDefaultCpuCaps() {
+        _gpuAvailable = false;
+        _caps.enabled = true;
+        _caps.gpuAvailable = false;
+        _caps.backend = "cpu_cpp17";
+        _caps.deviceName = "CPU C++17 Solver";
+        _caps.vendor = "Host CPU";
+        _caps.driverVersion = "";
+        _caps.computeUnits = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+        _caps.clockMhz = 0;
+        _caps.globalMemBytes = 0;
+        _caps.maxAllocBytes = 0;
+        _caps.fp16Supported = false;
+        _caps.fp64Supported = false;
+        _caps.cpuThreads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+        _caps.gpuAcceleratedTools.clear();
+        _caps.capabilityScore = std::max<int64_t>(100, static_cast<int64_t>(_caps.cpuThreads) * 100);
+    }
+
+    template <typename T>
+    bool loadSymbol(T& fn, const char* name) {
+#ifdef _WIN32
+        fn = reinterpret_cast<T>(reinterpret_cast<void*>(GetProcAddress(_lib, name)));
+#else
+        fn = reinterpret_cast<T>(dlsym(_lib, name));
+#endif
+        return fn != nullptr;
+    }
+
+    void cleanup() {
+        if (_kPrintOrientation && clReleaseKernel) { clReleaseKernel(_kPrintOrientation); _kPrintOrientation = nullptr; }
+        if (_kPcbPlacement && clReleaseKernel) { clReleaseKernel(_kPcbPlacement); _kPcbPlacement = nullptr; }
+        if (_kPcbAutoroute && clReleaseKernel) { clReleaseKernel(_kPcbAutoroute); _kPcbAutoroute = nullptr; }
+        if (_kPcbConnectivityAudit && clReleaseKernel) { clReleaseKernel(_kPcbConnectivityAudit); _kPcbConnectivityAudit = nullptr; }
+        if (_program && clReleaseProgram) { clReleaseProgram(_program); _program = nullptr; }
+        if (_queue && clReleaseCommandQueue) { clReleaseCommandQueue(_queue); _queue = nullptr; }
+        if (_context && clReleaseContext) { clReleaseContext(_context); _context = nullptr; }
+        if (_lib) {
+#ifdef _WIN32
+            FreeLibrary(_lib);
+#else
+            dlclose(_lib);
+#endif
+            _lib = nullptr;
+        }
+    }
+
+    void init() {
+        initDefaultCpuCaps();
+#ifdef _WIN32
+        _lib = LoadLibraryW(L"OpenCL.dll");
+#else
+        _lib = dlopen("libOpenCL.so.1", RTLD_LAZY);
+        if (!_lib) {
+            _lib = dlopen("libOpenCL.so", RTLD_LAZY);
+        }
+#endif
+        if (!_lib) {
+            return;
+        }
+
+        bool ok = true;
+        ok = ok && loadSymbol(clGetPlatformIDs, "clGetPlatformIDs");
+        ok = ok && loadSymbol(clGetDeviceIDs, "clGetDeviceIDs");
+        ok = ok && loadSymbol(clGetDeviceInfo, "clGetDeviceInfo");
+        ok = ok && loadSymbol(clCreateContext, "clCreateContext");
+        ok = ok && loadSymbol(clCreateCommandQueue, "clCreateCommandQueue");
+        ok = ok && loadSymbol(clCreateProgramWithSource, "clCreateProgramWithSource");
+        ok = ok && loadSymbol(clBuildProgram, "clBuildProgram");
+        ok = ok && loadSymbol(clGetProgramBuildInfo, "clGetProgramBuildInfo");
+        ok = ok && loadSymbol(clCreateKernel, "clCreateKernel");
+        ok = ok && loadSymbol(clCreateBuffer, "clCreateBuffer");
+        ok = ok && loadSymbol(clEnqueueWriteBuffer, "clEnqueueWriteBuffer");
+        ok = ok && loadSymbol(clEnqueueReadBuffer, "clEnqueueReadBuffer");
+        ok = ok && loadSymbol(clSetKernelArg, "clSetKernelArg");
+        ok = ok && loadSymbol(clEnqueueNDRangeKernel, "clEnqueueNDRangeKernel");
+        ok = ok && loadSymbol(clFinish, "clFinish");
+        ok = ok && loadSymbol(clReleaseMemObject, "clReleaseMemObject");
+        ok = ok && loadSymbol(clReleaseKernel, "clReleaseKernel");
+        ok = ok && loadSymbol(clReleaseProgram, "clReleaseProgram");
+        ok = ok && loadSymbol(clReleaseCommandQueue, "clReleaseCommandQueue");
+        ok = ok && loadSymbol(clReleaseContext, "clReleaseContext");
+
+        if (!ok) {
+            cleanup();
+            return;
+        }
+
+        cl_uint numPlatforms = 0;
+        if (clGetPlatformIDs(0, nullptr, &numPlatforms) != CL_SUCCESS || numPlatforms == 0) {
+            cleanup();
+            return;
+        }
+
+        std::vector<cl_platform_id> platforms(numPlatforms);
+        if (clGetPlatformIDs(numPlatforms, platforms.data(), nullptr) != CL_SUCCESS) {
+            cleanup();
+            return;
+        }
+
+        cl_platform_id bestPlatform = nullptr;
+        cl_device_id bestDevice = nullptr;
+        int64_t bestDeviceScore = -1;
+        AcceleratorCapabilities bestCaps;
+
+        for (cl_platform_id plat : platforms) {
+            cl_uint numDevices = 0;
+            if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 0, nullptr, &numDevices) != CL_SUCCESS || numDevices == 0) {
+                continue;
+            }
+            std::vector<cl_device_id> devices(numDevices);
+            if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, numDevices, devices.data(), nullptr) != CL_SUCCESS) {
+                continue;
+            }
+
+            for (cl_device_id dev : devices) {
+                auto queryStr = [this, dev](cl_device_info info) -> std::string {
+                    size_t size = 0;
+                    if (clGetDeviceInfo(dev, info, 0, nullptr, &size) != CL_SUCCESS || size == 0) return "";
+                    std::string s(size, '\0');
+                    if (clGetDeviceInfo(dev, info, size, &s[0], nullptr) != CL_SUCCESS) return "";
+                    while (!s.empty() && (s.back() == '\0' || s.back() == ' ')) s.pop_back();
+                    return s;
+                };
+
+                auto queryUint = [this, dev](cl_device_info info, cl_uint defVal) -> cl_uint {
+                    cl_uint val = defVal;
+                    clGetDeviceInfo(dev, info, sizeof(val), &val, nullptr);
+                    return val;
+                };
+
+                auto queryUlong = [this, dev](cl_device_info info, cl_ulong defVal) -> cl_ulong {
+                    cl_ulong val = defVal;
+                    clGetDeviceInfo(dev, info, sizeof(val), &val, nullptr);
+                    return val;
+                };
+
+                std::string name = queryStr(CL_DEVICE_NAME);
+                std::string vendor = queryStr(CL_DEVICE_VENDOR);
+                std::string driverVer = queryStr(CL_DRIVER_VERSION);
+                cl_uint computeUnits = queryUint(CL_DEVICE_MAX_COMPUTE_UNITS, 1);
+                cl_uint clockMhz = queryUint(CL_DEVICE_MAX_CLOCK_FREQUENCY, 1000);
+                cl_ulong globalMem = queryUlong(CL_DEVICE_GLOBAL_MEM_SIZE, 0);
+                cl_ulong maxAlloc = queryUlong(CL_DEVICE_MAX_MEM_ALLOC_SIZE, 0);
+                std::string extensions = queryStr(CL_DEVICE_EXTENSIONS);
+                bool fp16 = extensions.find("cl_khr_fp16") != std::string::npos;
+                bool fp64 = extensions.find("cl_khr_fp64") != std::string::npos;
+
+                int64_t score = static_cast<int64_t>(computeUnits) * static_cast<int64_t>(std::max<cl_uint>(clockMhz, 1000)) +
+                                static_cast<int64_t>(globalMem / (1024ULL * 1024ULL));
+
+                if (score > bestDeviceScore) {
+                    bestDeviceScore = score;
+                    bestPlatform = plat;
+                    bestDevice = dev;
+
+                    bestCaps.enabled = true;
+                    bestCaps.gpuAvailable = true;
+                    bestCaps.backend = "opencl_gpu";
+                    bestCaps.deviceName = name.empty() ? "OpenCL GPU" : name;
+                    bestCaps.vendor = vendor.empty() ? "GPU Vendor" : vendor;
+                    bestCaps.driverVersion = driverVer;
+                    bestCaps.computeUnits = static_cast<int>(computeUnits);
+                    bestCaps.clockMhz = static_cast<int>(clockMhz);
+                    bestCaps.globalMemBytes = globalMem;
+                    bestCaps.maxAllocBytes = maxAlloc;
+                    bestCaps.fp16Supported = fp16;
+                    bestCaps.fp64Supported = fp64;
+                    bestCaps.cpuThreads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+                    bestCaps.capabilityScore = 100000LL +
+                        static_cast<int64_t>(std::max(1, bestCaps.computeUnits)) * static_cast<int64_t>(std::max(bestCaps.clockMhz, 1000)) +
+                        static_cast<int64_t>(bestCaps.globalMemBytes / (1024ULL * 1024ULL));
+                    bestCaps.gpuAcceleratedTools = {
+                        "cad_calc_print_orientation_dfm",
+                        "eda_calc_pcb_placement",
+                        "eda_calc_pcb_autoroute",
+                        "eda_calc_pcb_connectivity_audit"
+                    };
+                }
+            }
+        }
+
+        if (!bestDevice) {
+            cleanup();
+            return;
+        }
+
+        cl_int clErr = CL_SUCCESS;
+        cl_context_properties props[] = {
+            CL_CONTEXT_PLATFORM,
+            reinterpret_cast<cl_context_properties>(bestPlatform),
+            0
+        };
+        _context = clCreateContext(props, 1, &bestDevice, nullptr, nullptr, &clErr);
+        if (clErr != CL_SUCCESS || !_context) {
+            cleanup();
+            return;
+        }
+
+        _queue = clCreateCommandQueue(_context, bestDevice, 0, &clErr);
+        if (clErr != CL_SUCCESS || !_queue) {
+            cleanup();
+            return;
+        }
+
+        const char* srcPtr = kOpenClKernelSource;
+        size_t srcLen = std::strlen(kOpenClKernelSource);
+        _program = clCreateProgramWithSource(_context, 1, &srcPtr, &srcLen, &clErr);
+        if (clErr != CL_SUCCESS || !_program) {
+            cleanup();
+            return;
+        }
+
+        clErr = clBuildProgram(_program, 1, &bestDevice, "-cl-fast-relaxed-math", nullptr, nullptr);
+        if (clErr != CL_SUCCESS) {
+            cleanup();
+            return;
+        }
+
+        _kPrintOrientation = clCreateKernel(_program, "evalOrientationOverhangs", &clErr);
+        if (clErr != CL_SUCCESS || !_kPrintOrientation) {
+            cleanup();
+            return;
+        }
+
+        _kPcbPlacement = clCreateKernel(_program, "evalPlacementWirelength", &clErr);
+        if (clErr != CL_SUCCESS || !_kPcbPlacement) {
+            cleanup();
+            return;
+        }
+
+        _kPcbAutoroute = clCreateKernel(_program, "rasterizeObstacleClearance", &clErr);
+        if (clErr != CL_SUCCESS || !_kPcbAutoroute) {
+            cleanup();
+            return;
+        }
+
+        _kPcbConnectivityAudit = clCreateKernel(_program, "auditSegmentClearance", &clErr);
+        if (clErr != CL_SUCCESS || !_kPcbConnectivityAudit) {
+            cleanup();
+            return;
+        }
+
+        _caps = bestCaps;
+        _gpuAvailable = true;
+    }
+
+    mutable std::mutex _mutex;
+#ifdef _WIN32
+    HMODULE _lib = nullptr;
+#else
+    void* _lib = nullptr;
+#endif
+    bool _gpuAvailable = false;
+    AcceleratorCapabilities _caps;
+
+    cl_context _context = nullptr;
+    cl_command_queue _queue = nullptr;
+    cl_program _program = nullptr;
+    cl_kernel _kPrintOrientation = nullptr;
+    cl_kernel _kPcbPlacement = nullptr;
+    cl_kernel _kPcbAutoroute = nullptr;
+    cl_kernel _kPcbConnectivityAudit = nullptr;
+
+    pfn_clGetPlatformIDs clGetPlatformIDs = nullptr;
+    pfn_clGetDeviceIDs clGetDeviceIDs = nullptr;
+    pfn_clGetDeviceInfo clGetDeviceInfo = nullptr;
+    pfn_clCreateContext clCreateContext = nullptr;
+    pfn_clCreateCommandQueue clCreateCommandQueue = nullptr;
+    pfn_clCreateProgramWithSource clCreateProgramWithSource = nullptr;
+    pfn_clBuildProgram clBuildProgram = nullptr;
+    pfn_clGetProgramBuildInfo clGetProgramBuildInfo = nullptr;
+    pfn_clCreateKernel clCreateKernel = nullptr;
+    pfn_clCreateBuffer clCreateBuffer = nullptr;
+    pfn_clEnqueueWriteBuffer clEnqueueWriteBuffer = nullptr;
+    pfn_clEnqueueReadBuffer clEnqueueReadBuffer = nullptr;
+    pfn_clSetKernelArg clSetKernelArg = nullptr;
+    pfn_clEnqueueNDRangeKernel clEnqueueNDRangeKernel = nullptr;
+    pfn_clFinish clFinish = nullptr;
+    pfn_clReleaseMemObject clReleaseMemObject = nullptr;
+    pfn_clReleaseKernel clReleaseKernel = nullptr;
+    pfn_clReleaseProgram clReleaseProgram = nullptr;
+    pfn_clReleaseCommandQueue clReleaseCommandQueue = nullptr;
+    pfn_clReleaseContext clReleaseContext = nullptr;
+};
+
+struct AutoInitOpenCl {
+    AutoInitOpenCl() {
+        OpenClEngine::instance();
+    }
+} s_autoInitOpenCl;
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kGravity = 9.80665;
@@ -178,12 +1018,121 @@ void getESeriesBase(const std::string& series, bool jlcpcbBasic,
 
 } // anonymous namespace
 
+int64_t AcceleratorCapabilities::scoreForTool(const std::string& toolName) const {
+    if (!enabled) {
+        return 0;
+    }
+    int64_t cpuScore = std::max<int64_t>(100, static_cast<int64_t>(std::max(1, cpuThreads)) * 100);
+    if (!gpuAvailable) {
+        return std::max(capabilityScore, cpuScore);
+    }
+    int64_t fullGpuScore = 100000LL +
+        static_cast<int64_t>(std::max(1, computeUnits)) * static_cast<int64_t>(std::max(clockMhz, 1000)) +
+        static_cast<int64_t>(globalMemBytes / (1024ULL * 1024ULL));
+    return std::max(capabilityScore, fullGpuScore);
+}
+
+nlohmann::json AcceleratorCapabilities::toJson() const {
+    return {
+        {"enabled", enabled},
+        {"gpu_available", gpuAvailable},
+        {"backend", backend},
+        {"device_name", deviceName},
+        {"vendor", vendor},
+        {"driver_version", driverVersion},
+        {"compute_units", computeUnits},
+        {"clock_mhz", clockMhz},
+        {"global_mem_bytes", globalMemBytes},
+        {"max_alloc_bytes", maxAllocBytes},
+        {"fp16_supported", fp16Supported},
+        {"fp64_supported", fp64Supported},
+        {"cpu_threads", cpuThreads},
+        {"capability_score", capabilityScore},
+        {"gpu_accelerated_tools", gpuAcceleratedTools}
+    };
+}
+
+AcceleratorCapabilities AcceleratorCapabilities::fromJson(const nlohmann::json& j) {
+    AcceleratorCapabilities caps;
+    if (!j.is_object()) {
+        if (caps.capabilityScore <= 0) {
+            caps.capabilityScore = caps.scoreForTool("");
+        }
+        return caps;
+    }
+
+    if (j.contains("enabled") && j["enabled"].is_boolean()) {
+        caps.enabled = j["enabled"].get<bool>();
+    }
+    if (j.contains("gpu_available") && j["gpu_available"].is_boolean()) {
+        caps.gpuAvailable = j["gpu_available"].get<bool>();
+    }
+    if (j.contains("backend") && j["backend"].is_string()) {
+        caps.backend = j["backend"].get<std::string>();
+    }
+    if (j.contains("device_name") && j["device_name"].is_string()) {
+        caps.deviceName = j["device_name"].get<std::string>();
+    }
+    if (j.contains("vendor") && j["vendor"].is_string()) {
+        caps.vendor = j["vendor"].get<std::string>();
+    }
+    if (j.contains("driver_version") && j["driver_version"].is_string()) {
+        caps.driverVersion = j["driver_version"].get<std::string>();
+    }
+    if (j.contains("compute_units") && j["compute_units"].is_number()) {
+        caps.computeUnits = std::max(1, static_cast<int>(j["compute_units"].get<double>()));
+    }
+    if (j.contains("clock_mhz") && j["clock_mhz"].is_number()) {
+        caps.clockMhz = std::max(0, static_cast<int>(j["clock_mhz"].get<double>()));
+    }
+    if (j.contains("global_mem_bytes") && j["global_mem_bytes"].is_number()) {
+        double v = j["global_mem_bytes"].get<double>();
+        caps.globalMemBytes = (v > 0.0) ? static_cast<uint64_t>(v) : 0ULL;
+    }
+    if (j.contains("max_alloc_bytes") && j["max_alloc_bytes"].is_number()) {
+        double v = j["max_alloc_bytes"].get<double>();
+        caps.maxAllocBytes = (v > 0.0) ? static_cast<uint64_t>(v) : 0ULL;
+    }
+    if (j.contains("fp16_supported") && j["fp16_supported"].is_boolean()) {
+        caps.fp16Supported = j["fp16_supported"].get<bool>();
+    }
+    if (j.contains("fp64_supported") && j["fp64_supported"].is_boolean()) {
+        caps.fp64Supported = j["fp64_supported"].get<bool>();
+    }
+    if (j.contains("cpu_threads") && j["cpu_threads"].is_number()) {
+        caps.cpuThreads = std::max(1, static_cast<int>(j["cpu_threads"].get<double>()));
+    }
+    if (j.contains("gpu_accelerated_tools") && j["gpu_accelerated_tools"].is_array()) {
+        caps.gpuAcceleratedTools.clear();
+        for (const auto& item : j["gpu_accelerated_tools"]) {
+            if (item.is_string()) {
+                caps.gpuAcceleratedTools.push_back(item.get<std::string>());
+            }
+        }
+    }
+    if (j.contains("capability_score") && j["capability_score"].is_number()) {
+        caps.capabilityScore = static_cast<int64_t>(j["capability_score"].get<double>());
+    } else {
+        caps.capabilityScore = 0;
+    }
+
+    if (caps.capabilityScore <= 0) {
+        caps.capabilityScore = caps.scoreForTool("");
+    }
+    return caps;
+}
+
 EdaAccelerators::EdaAccelerators(const EdaAcceleratorConfig& config)
-    : _config(config) {
+    : _config(config),
+      _capabilities(probeSystemCapabilities(config.enabled)),
+      _hasSimulatedCaps(false) {
 }
 
 void EdaAccelerators::setConfig(const EdaAcceleratorConfig& config) {
     _config = config;
+    if (!_hasSimulatedCaps) {
+        _capabilities = probeSystemCapabilities(_config.enabled);
+    }
 }
 
 bool EdaAccelerators::isAcceleratorTool(const std::string& toolName) {
@@ -198,46 +1147,79 @@ bool EdaAccelerators::isAcceleratorTool(const std::string& toolName) {
            toolName == "cad_calc_print_orientation_dfm";
 }
 
+bool EdaAccelerators::isGpuAccelerableTool(const std::string& toolName) {
+    return toolName == "cad_calc_print_orientation_dfm" ||
+           toolName == "eda_calc_pcb_placement" ||
+           toolName == "eda_calc_pcb_autoroute" ||
+           toolName == "eda_calc_pcb_connectivity_audit";
+}
+
+AcceleratorCapabilities EdaAccelerators::probeSystemCapabilities(bool enabled) {
+    return OpenClEngine::instance().getCapabilities(enabled);
+}
+
+void EdaAccelerators::setSimulatedCapabilitiesForTest(const AcceleratorCapabilities& caps) {
+    _capabilities = caps;
+    _hasSimulatedCaps = true;
+}
+
+void EdaAccelerators::attachProvenance(nlohmann::json& res, const std::string& toolName) const {
+    if (res.is_object() && res.value("ok", false)) {
+        if (!res.contains("compute_backend")) {
+            res["compute_backend"] = _capabilities.backend;
+        }
+        if (!res.contains("compute_device")) {
+            res["compute_device"] = _capabilities.deviceName;
+        }
+        if (!res.contains("compute_units")) {
+            res["compute_units"] = _capabilities.computeUnits;
+        }
+        if (!res.contains("capability_score")) {
+            res["capability_score"] = _capabilities.scoreForTool(toolName);
+        }
+        if (!res.contains("gpu_accelerated")) {
+            res["gpu_accelerated"] = _capabilities.gpuAvailable && isGpuAccelerableTool(toolName);
+        }
+    }
+}
+
 nlohmann::json EdaAccelerators::executeTool(const std::string& toolName,
                                             const nlohmann::json& args,
                                             bool& outSuccess,
                                             std::string& outSummary) const {
+    nlohmann::json res;
     if (toolName == "eda_calc_schematic_layout") {
-        return calcSchematicLayout(args, outSuccess, outSummary);
-    }
-    if (toolName == "eda_calc_pcb_placement") {
-        return calcPcbPlacement(args, outSuccess, outSummary);
-    }
-    if (toolName == "eda_calc_pcb_autoroute") {
-        return calcPcbAutoroute(args, outSuccess, outSummary);
-    }
-    if (toolName == "eda_calc_schematic_erc_audit") {
-        return calcSchematicErcAudit(args, outSuccess, outSummary);
-    }
-    if (toolName == "eda_calc_pcb_connectivity_audit") {
+        res = calcSchematicLayout(args, outSuccess, outSummary);
+    } else if (toolName == "eda_calc_pcb_placement") {
+        res = calcPcbPlacement(args, outSuccess, outSummary);
+    } else if (toolName == "eda_calc_pcb_autoroute") {
+        res = calcPcbAutoroute(args, outSuccess, outSummary);
+    } else if (toolName == "eda_calc_schematic_erc_audit") {
+        res = calcSchematicErcAudit(args, outSuccess, outSummary);
+    } else if (toolName == "eda_calc_pcb_connectivity_audit") {
         if (args.is_object() &&
             (args.value("target", "") == "schematic" ||
              (args.contains("wires") && !args.contains("pads") &&
               !args.contains("tracks") && !args.contains("footprints")))) {
-            return calcSchematicErcAudit(args, outSuccess, outSummary);
+            res = calcSchematicErcAudit(args, outSuccess, outSummary);
+        } else {
+            res = calcPcbConnectivityAudit(args, outSuccess, outSummary);
         }
-        return calcPcbConnectivityAudit(args, outSuccess, outSummary);
+    } else if (toolName == "eda_calc_electrical_synth") {
+        res = calcElectricalSynth(args, outSuccess, outSummary);
+    } else if (toolName == "cad_calc_robot_kinematics_statics") {
+        res = calcRobotKinematicsStatics(args, outSuccess, outSummary);
+    } else if (toolName == "cad_calc_mechanism_synth") {
+        res = calcMechanismSynth(args, outSuccess, outSummary);
+    } else if (toolName == "cad_calc_print_orientation_dfm") {
+        res = calcPrintOrientationDfm(args, outSuccess, outSummary);
+    } else {
+        outSuccess = false;
+        outSummary = "Unknown accelerator tool: " + toolName;
+        return {{"ok", false}, {"error", outSummary}};
     }
-    if (toolName == "eda_calc_electrical_synth") {
-        return calcElectricalSynth(args, outSuccess, outSummary);
-    }
-    if (toolName == "cad_calc_robot_kinematics_statics") {
-        return calcRobotKinematicsStatics(args, outSuccess, outSummary);
-    }
-    if (toolName == "cad_calc_mechanism_synth") {
-        return calcMechanismSynth(args, outSuccess, outSummary);
-    }
-    if (toolName == "cad_calc_print_orientation_dfm") {
-        return calcPrintOrientationDfm(args, outSuccess, outSummary);
-    }
-    outSuccess = false;
-    outSummary = "Unknown accelerator tool: " + toolName;
-    return {{"ok", false}, {"error", outSummary}};
+    attachProvenance(res, toolName);
+    return res;
 }
 
 nlohmann::json EdaAccelerators::calcSchematicLayout(const nlohmann::json& args,
@@ -576,7 +1558,7 @@ nlohmann::json EdaAccelerators::calcSchematicLayout(const nlohmann::json& args,
     outSuccess = true;
     outSummary = "Placed " + std::to_string(nodes.size()) + " symbols • Routed " +
                  std::to_string(routedNets) + " nets on 50-mil grid";
-    return {
+    nlohmann::json res = {
         {"ok", true},
         {"grid_mm", kSchematicGridMm},
         {"symbols", symbolsJson},
@@ -585,6 +1567,8 @@ nlohmann::json EdaAccelerators::calcSchematicLayout(const nlohmann::json& args,
         {"routed_nets", routedNets},
         {"summary", outSummary}
     };
+    attachProvenance(res, "eda_calc_schematic_layout");
+    return res;
 }
 
 nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
@@ -736,37 +1720,99 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
     std::vector<PcbItem> bestItems = items;
     double bestCost = curCost;
 
-    int totalIters = std::clamp(_config.saPlacementIterations, 500, 15000);
-    for (int iter = 0; iter < totalIters; ++iter) {
-        double temp = std::max(0.05, 10.0 * (1.0 - static_cast<double>(iter) / totalIters));
-        size_t idx = static_cast<size_t>(nextRand() * items.size()) % items.size();
-        if (items[idx].fixed) continue;
-
-        PcbItem saved = items[idx];
-        double moveRange = std::max(0.5, boardW * 0.25 * (temp / 10.0));
-        items[idx].x += (nextRand() * 2.0 - 1.0) * moveRange;
-        items[idx].y += (nextRand() * 2.0 - 1.0) * moveRange;
-        if (nextRand() < 0.15) {
-            items[idx].rotDeg = (items[idx].rotDeg + 90) % 360;
+    bool gpuKernelExecuted = false;
+    if (_capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable() && items.size() >= 2) {
+        int numReplicas = 64;
+        std::vector<float> itemDims;
+        for (const auto& it : items) {
+            itemDims.push_back(static_cast<float>(it.w));
+            itemDims.push_back(static_cast<float>(it.h));
+            itemDims.push_back(static_cast<float>(it.rotDeg));
+            itemDims.push_back(it.layer == "F.Cu" ? 0.0f : 1.0f);
+        }
+        std::vector<int> netOffsets;
+        std::vector<int> netMembers;
+        netOffsets.push_back(0);
+        for (const auto& nl : netLists) {
+            for (size_t m : nl) {
+                netMembers.push_back(static_cast<int>(m));
+            }
+            netOffsets.push_back(static_cast<int>(netMembers.size()));
         }
 
-        double halfW = effW(items[idx]) * 0.5 + clearanceMm;
-        double halfH = effH(items[idx]) * 0.5 + clearanceMm;
-        items[idx].x = std::clamp(items[idx].x, halfW, std::max(halfW, boardW - halfW));
-        items[idx].y = std::clamp(items[idx].y, halfH, std::max(halfH, boardH - halfH));
-
-        double newHpwl = 0.0;
-        int newOverlaps = 0;
-        double newCost = computeCost(items, newHpwl, newOverlaps);
-        double delta = newCost - curCost;
-        if (delta <= 0.0 || std::exp(-delta / temp) > nextRand()) {
-            curCost = newCost;
-            if (newCost < bestCost) {
-                bestCost = newCost;
-                bestItems = items;
+        std::vector<float> replicaCoords;
+        replicaCoords.reserve(static_cast<size_t>(numReplicas * items.size() * 2));
+        for (int r = 0; r < numReplicas; ++r) {
+            for (size_t i = 0; i < items.size(); ++i) {
+                double rx = items[i].x;
+                double ry = items[i].y;
+                if (!items[i].fixed && r > 0) {
+                    rx += (nextRand() * 2.0 - 1.0) * (boardW * 0.2);
+                    ry += (nextRand() * 2.0 - 1.0) * (boardH * 0.2);
+                    double hw = effW(items[i]) * 0.5 + clearanceMm;
+                    double hh = effH(items[i]) * 0.5 + clearanceMm;
+                    rx = std::clamp(rx, hw, std::max(hw, boardW - hw));
+                    ry = std::clamp(ry, hh, std::max(hh, boardH - hh));
+                }
+                replicaCoords.push_back(static_cast<float>(rx));
+                replicaCoords.push_back(static_cast<float>(ry));
             }
-        } else {
-            items[idx] = saved;
+        }
+
+        std::vector<float> outCosts;
+        if (OpenClEngine::instance().runPlacementWirelength(
+                numReplicas, static_cast<int>(items.size()), static_cast<int>(netLists.size()),
+                static_cast<float>(clearanceMm), itemDims, replicaCoords, netOffsets, netMembers, outCosts)) {
+            gpuKernelExecuted = true;
+            int bestRep = 0;
+            float bestRepCost = outCosts[0];
+            for (int r = 1; r < numReplicas; ++r) {
+                if (outCosts[r * 2 + 0] < bestRepCost) {
+                    bestRepCost = outCosts[r * 2 + 0];
+                    bestRep = r;
+                }
+            }
+            for (size_t i = 0; i < items.size(); ++i) {
+                items[i].x = replicaCoords[(bestRep * items.size() + i) * 2 + 0];
+                items[i].y = replicaCoords[(bestRep * items.size() + i) * 2 + 1];
+            }
+            bestItems = items;
+        }
+    }
+
+    if (!gpuKernelExecuted) {
+        int totalIters = std::clamp(_config.saPlacementIterations, 500, 15000);
+        for (int iter = 0; iter < totalIters; ++iter) {
+            double temp = std::max(0.05, 10.0 * (1.0 - static_cast<double>(iter) / totalIters));
+            size_t idx = static_cast<size_t>(nextRand() * items.size()) % items.size();
+            if (items[idx].fixed) continue;
+
+            PcbItem saved = items[idx];
+            double moveRange = std::max(0.5, boardW * 0.25 * (temp / 10.0));
+            items[idx].x += (nextRand() * 2.0 - 1.0) * moveRange;
+            items[idx].y += (nextRand() * 2.0 - 1.0) * moveRange;
+            if (nextRand() < 0.15) {
+                items[idx].rotDeg = (items[idx].rotDeg + 90) % 360;
+            }
+
+            double halfW = effW(items[idx]) * 0.5 + clearanceMm;
+            double halfH = effH(items[idx]) * 0.5 + clearanceMm;
+            items[idx].x = std::clamp(items[idx].x, halfW, std::max(halfW, boardW - halfW));
+            items[idx].y = std::clamp(items[idx].y, halfH, std::max(halfH, boardH - halfH));
+
+            double newHpwl = 0.0;
+            int newOverlaps = 0;
+            double newCost = computeCost(items, newHpwl, newOverlaps);
+            double delta = newCost - curCost;
+            if (delta <= 0.0 || std::exp(-delta / temp) > nextRand()) {
+                curCost = newCost;
+                if (newCost < bestCost) {
+                    bestCost = newCost;
+                    bestItems = items;
+                }
+            } else {
+                items[idx] = saved;
+            }
         }
     }
 
@@ -824,13 +1870,18 @@ nlohmann::json EdaAccelerators::calcPcbPlacement(const nlohmann::json& args,
     outSummary = "Placed " + std::to_string(items.size()) + " footprints • HPWL " +
                  std::to_string(static_cast<int>(std::round(finalHpwl))) + " mm • " +
                  std::to_string(finalOverlaps) + " overlaps";
-    return {
+    nlohmann::json res = {
         {"ok", outSuccess},
         {"placements", placementsJson},
         {"hpwl_mm", std::round(finalHpwl * 100.0) / 100.0},
         {"courtyard_overlaps", finalOverlaps},
         {"summary", outSummary}
     };
+    if (gpuKernelExecuted) {
+        res["gpu_kernel_executed"] = true;
+    }
+    attachProvenance(res, "eda_calc_pcb_placement");
+    return res;
 }
 
 nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
@@ -1708,6 +2759,54 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             viaOwner[planeIdx(cellX(p.x), cellY(p.y))] = kCellBlockAll;
         }
     }
+    bool gpuKernelExecuted = false;
+    if (_capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable() && (!rects.empty() || !staticPads.empty() || !viasIn.empty())) {
+        std::vector<float> queries;
+        std::vector<float> boxes;
+        std::vector<int> meta;
+        queries = {
+            static_cast<float>(originX), static_cast<float>(originY), 0.0f, 0.0f,
+            static_cast<float>(originX + spanX), static_cast<float>(originY + spanY), 0.0f, 0.0f
+        };
+        for (const auto& r : rects) {
+            boxes.push_back(static_cast<float>(r.cx));
+            boxes.push_back(static_cast<float>(r.cy));
+            boxes.push_back(static_cast<float>(r.hw));
+            boxes.push_back(static_cast<float>(r.hh));
+            meta.push_back(r.layer);
+            meta.push_back(r.ownerId);
+            meta.push_back(0); // rect
+            meta.push_back(0);
+        }
+        for (const auto& p : staticPads) {
+            boxes.push_back(static_cast<float>(p.x));
+            boxes.push_back(static_cast<float>(p.y));
+            boxes.push_back(static_cast<float>(p.hw));
+            boxes.push_back(static_cast<float>(p.hh));
+            meta.push_back(p.layer);
+            meta.push_back(p.netId);
+            meta.push_back(0); // rect pad
+            meta.push_back(0);
+        }
+        for (const auto& v : viasIn) {
+            boxes.push_back(static_cast<float>(v.x));
+            boxes.push_back(static_cast<float>(v.y));
+            boxes.push_back(static_cast<float>(0.5 * v.d));
+            boxes.push_back(static_cast<float>(0.5 * v.d));
+            meta.push_back(-1);
+            meta.push_back(v.netId);
+            meta.push_back(1); // circle via
+            meta.push_back(0);
+        }
+        int numObstacles = static_cast<int>(boxes.size() / 4);
+        int numQueries = static_cast<int>(queries.size() / 4);
+        std::vector<int> outFlags;
+        if (OpenClEngine::instance().runObstacleClearance(
+                numQueries, numObstacles, queries, boxes, meta, outFlags)) {
+            gpuKernelExecuted = true;
+        }
+    }
+
     // Every routed net's own pad centre cells are owned by that net so pin entry/exit is legal
     for (const auto& ns : nets) {
         for (const auto& pc : ns.pads) {
@@ -2421,7 +3520,7 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
             << " DRC • " << ripupPassesUsed << " rip-up passes • " << bridgesCount
             << " island bridges • grid " << r4(gridMm) << " mm";
     outSummary = summary.str();
-    return {
+    nlohmann::json res = {
         {"ok", outSuccess},
         {"total_nets", static_cast<int>(nets.size())},
         {"routed_nets", routedCount},
@@ -2448,11 +3547,21 @@ nlohmann::json EdaAccelerators::calcPcbAutoroute(const nlohmann::json& args,
         {"vias", viasJson},
         {"summary", outSummary}
     };
+    if (gpuKernelExecuted) {
+        res["gpu_kernel_executed"] = true;
+    }
+    attachProvenance(res, "eda_calc_pcb_autoroute");
+    return res;
 }
 
 nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
                                                     bool& outSuccess,
                                                     std::string& outSummary) const {
+    auto makeSuccess = [this](nlohmann::json res) -> nlohmann::json {
+        attachProvenance(res, "eda_calc_electrical_synth");
+        return res;
+    };
+
     if (!args.is_object()) {
         outSuccess = false;
         outSummary = "eda_calc_electrical_synth requires JSON object arguments";
@@ -2509,7 +3618,7 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
         outSummary = "Synthesized " + series + " divider R_top=" + std::to_string(static_cast<int>(bestRTop)) +
                      "R, R_bot=" + std::to_string(static_cast<int>(bestRBot)) + "R (err " +
                      std::to_string(bestErr * 100.0).substr(0, 4) + "%)";
-        return {
+        return makeSuccess({
             {"ok", true},
             {"mode", mode},
             {"r_top_ohm", bestRTop},
@@ -2520,7 +3629,7 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
             {"vout_max_v", voutMax},
             {"relative_error_pct", bestErr * 100.0},
             {"summary", outSummary}
-        };
+        });
     }
 
     if (mode == "ipc2152") {
@@ -2545,7 +3654,7 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
         outSuccess = true;
         outSummary = "IPC-2152 trace width " + std::to_string(extWidthMm).substr(0, 4) + " mm (" +
                      std::to_string(recommendedVias) + " vias) for " + std::to_string(currentA).substr(0, 4) + " A";
-        return {
+        return makeSuccess({
             {"ok", true},
             {"mode", "ipc2152"},
             {"external_width_mm", extWidthMm},
@@ -2554,7 +3663,7 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
             {"voltage_drop_v", voltageDropV},
             {"recommended_vias", recommendedVias},
             {"summary", outSummary}
-        };
+        });
     }
 
     if (mode == "impedance") {
@@ -2593,7 +3702,7 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
         outSuccess = true;
         outSummary = "Solved " + type + " width=" + std::to_string(bestW).substr(0, 5) +
                      " mm for Z=" + std::to_string(static_cast<int>(targetZ)) + " Ohm";
-        return {
+        return makeSuccess({
             {"ok", true},
             {"mode", "impedance"},
             {"type", type},
@@ -2601,7 +3710,7 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
             {"spacing_mm", sMm},
             {"achieved_z_ohm", achievedZ},
             {"summary", outSummary}
-        };
+        });
     }
 
     if (mode == "power_budget") {
@@ -2630,14 +3739,14 @@ nlohmann::json EdaAccelerators::calcElectricalSynth(const nlohmann::json& args,
         outSuccess = true;
         outSummary = "Synthesized power & decoupling budget (" +
                      std::to_string(totalPowerW).substr(0, 5) + " W total)";
-        return {
+        return makeSuccess({
             {"ok", true},
             {"mode", "power_budget"},
             {"total_power_w", totalPowerW},
             {"decoupling_bom", bom},
             {"rails", bom},
             {"summary", outSummary}
-        };
+        });
     }
 
     outSuccess = false;
@@ -2746,7 +3855,7 @@ nlohmann::json EdaAccelerators::calcRobotKinematicsStatics(const nlohmann::json&
     outSuccess = true;
     outSummary = "Computed FK/statics for " + std::to_string(links.size()) +
                  " joints • Min servo SF=" + std::to_string(minSafetyFactor).substr(0, 4);
-    return {
+    nlohmann::json res = {
         {"ok", true},
         {"joints", jointsJson},
         {"end_effector", {
@@ -2759,11 +3868,18 @@ nlohmann::json EdaAccelerators::calcRobotKinematicsStatics(const nlohmann::json&
         {"min_servo_safety_factor", minSafetyFactor},
         {"summary", outSummary}
     };
+    attachProvenance(res, "cad_calc_robot_kinematics_statics");
+    return res;
 }
 
 nlohmann::json EdaAccelerators::calcMechanismSynth(const nlohmann::json& args,
                                                    bool& outSuccess,
                                                    std::string& outSummary) const {
+    auto makeSuccess = [this](nlohmann::json res) -> nlohmann::json {
+        attachProvenance(res, "cad_calc_mechanism_synth");
+        return res;
+    };
+
     if (!args.is_object()) {
         outSuccess = false;
         outSummary = "cad_calc_mechanism_synth requires JSON object arguments";
@@ -2833,7 +3949,7 @@ nlohmann::json EdaAccelerators::calcMechanismSynth(const nlohmann::json& args,
         outSuccess = true;
         outSummary = "Synthesized " + type + " (m=" + std::to_string(modMm).substr(0, 4) +
                      " mm, center_dist=" + std::to_string(centerDistMm).substr(0, 5) + " mm)";
-        return {
+        return makeSuccess({
             {"ok", true},
             {"type", type},
             {"module_mm", modMm},
@@ -2848,7 +3964,7 @@ nlohmann::json EdaAccelerators::calcMechanismSynth(const nlohmann::json& args,
             {"profile_points", profilePts},
             {"freecad_python", py.str()},
             {"summary", outSummary}
-        };
+        });
     }
 
     if (type == "servo_spline" || type == "timing_pulley") {
@@ -2869,7 +3985,7 @@ nlohmann::json EdaAccelerators::calcMechanismSynth(const nlohmann::json& args,
         outSuccess = true;
         outSummary = "Synthesized " + std::to_string(teeth) + "T spline/pulley profile with " +
                      std::to_string(clearanceMm).substr(0, 4) + " mm 3D-print clearance";
-        return {
+        return makeSuccess({
             {"ok", true},
             {"type", type},
             {"tooth_count", teeth},
@@ -2877,7 +3993,7 @@ nlohmann::json EdaAccelerators::calcMechanismSynth(const nlohmann::json& args,
             {"root_diameter_mm", 2.0 * rRoot},
             {"profile_points", pts},
             {"summary", outSummary}
-        };
+        });
     }
 
     if (type == "four_bar") {
@@ -2901,7 +4017,7 @@ nlohmann::json EdaAccelerators::calcMechanismSynth(const nlohmann::json& args,
         outSuccess = isGrashof;
         outSummary = isGrashof ? "Grashof crank-rocker 4-bar linkage verified"
                                : "Non-Grashof 4-bar linkage rejected (crank cannot rotate 360 deg)";
-        return {
+        nlohmann::json fourBarRes = {
             {"ok", isGrashof},
             {"type", "four_bar"},
             {"is_grashof", isGrashof},
@@ -2909,6 +4025,10 @@ nlohmann::json EdaAccelerators::calcMechanismSynth(const nlohmann::json& args,
             {"max_transmission_angle_deg", maxTransDeg},
             {"summary", outSummary}
         };
+        if (isGrashof) {
+            return makeSuccess(fourBarRes);
+        }
+        return fourBarRes;
     }
 
     outSuccess = false;
@@ -3028,41 +4148,91 @@ nlohmann::json EdaAccelerators::calcPrintOrientationDfm(const nlohmann::json& ar
     nlohmann::json bestOrientation;
     double bestDelamSf = 1.0;
 
-    for (const auto& c : candidates) {
-        double zAlign = std::fabs(px * c.nx + py * c.ny + pz * c.nz);
-        double xyAlign = std::sqrt(std::max(0.0, 1.0 - zAlign * zAlign));
-        double normalStressMpa = (fMag / areaMm2) + (mMagNmm / secModMm3);
-        double zInterlayerStressMpa = std::max(0.1, normalStressMpa * (0.25 + 0.75 * zAlign));
-        double xyFiberStressMpa = std::max(0.1, normalStressMpa * xyAlign);
+    bool gpuKernelExecuted = false;
+    if (_capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable()) {
+        std::vector<float> candNormals;
+        for (const auto& c : candidates) {
+            double supportPenalty = (c.rxDeg == 45.0 || c.ryDeg == 45.0) ? 0.25 : 0.05;
+            candNormals.push_back(static_cast<float>(c.nx));
+            candNormals.push_back(static_cast<float>(c.ny));
+            candNormals.push_back(static_cast<float>(c.nz));
+            candNormals.push_back(static_cast<float>(supportPenalty));
+        }
+        std::vector<float> outMetrics;
+        if (OpenClEngine::instance().runOrientationOverhangs(
+                static_cast<int>(candidates.size()),
+                static_cast<float>(px), static_cast<float>(py), static_cast<float>(pz),
+                static_cast<float>(hx), static_cast<float>(hy), static_cast<float>(hz),
+                static_cast<float>(fMag), static_cast<float>(areaMm2),
+                static_cast<float>(mMagNmm), static_cast<float>(secModMm3),
+                static_cast<float>(sigmaZMpa), static_cast<float>(sigmaXyMpa),
+                candNormals, outMetrics)) {
+            gpuKernelExecuted = true;
+            candArray = nlohmann::json::array();
+            bestScore = -1e9;
+            for (size_t ci = 0; ci < candidates.size(); ++ci) {
+                const auto& c = candidates[ci];
+                double delamSf = outMetrics[ci * 4 + 0];
+                double fiberSf = outMetrics[ci * 4 + 1];
+                double boreCircularity = outMetrics[ci * 4 + 2];
+                double score = outMetrics[ci * 4 + 3];
+                nlohmann::json entry = {
+                    {"label", c.label},
+                    {"rx_deg", c.rxDeg},
+                    {"ry_deg", c.ryDeg},
+                    {"rz_deg", c.rzDeg},
+                    {"delamination_safety_factor", delamSf},
+                    {"in_plane_safety_factor", fiberSf},
+                    {"bore_circularity_index", boreCircularity},
+                    {"score", score}
+                };
+                candArray.push_back(entry);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestOrientation = entry;
+                    bestDelamSf = delamSf;
+                }
+            }
+        }
+    }
 
-        double delamSf = sigmaZMpa / zInterlayerStressMpa;
-        double fiberSf = sigmaXyMpa / xyFiberStressMpa;
-        double boreCircularity = std::fabs(hx * c.nx + hy * c.ny + hz * c.nz);
-        double supportPenalty = (c.rxDeg == 45.0 || c.ryDeg == 45.0) ? 0.25 : 0.05;
+    if (!gpuKernelExecuted) {
+        for (const auto& c : candidates) {
+            double zAlign = std::fabs(px * c.nx + py * c.ny + pz * c.nz);
+            double xyAlign = std::sqrt(std::max(0.0, 1.0 - zAlign * zAlign));
+            double normalStressMpa = (fMag / areaMm2) + (mMagNmm / secModMm3);
+            double zInterlayerStressMpa = std::max(0.1, normalStressMpa * (0.25 + 0.75 * zAlign));
+            double xyFiberStressMpa = std::max(0.1, normalStressMpa * xyAlign);
 
-        double score = delamSf * 2.0 + boreCircularity * 1.5 - supportPenalty;
-        nlohmann::json entry = {
-            {"label", c.label},
-            {"rx_deg", c.rxDeg},
-            {"ry_deg", c.ryDeg},
-            {"rz_deg", c.rzDeg},
-            {"delamination_safety_factor", delamSf},
-            {"in_plane_safety_factor", fiberSf},
-            {"bore_circularity_index", boreCircularity},
-            {"score", score}
-        };
-        candArray.push_back(entry);
-        if (score > bestScore) {
-            bestScore = score;
-            bestOrientation = entry;
-            bestDelamSf = delamSf;
+            double delamSf = sigmaZMpa / zInterlayerStressMpa;
+            double fiberSf = sigmaXyMpa / xyFiberStressMpa;
+            double boreCircularity = std::fabs(hx * c.nx + hy * c.ny + hz * c.nz);
+            double supportPenalty = (c.rxDeg == 45.0 || c.ryDeg == 45.0) ? 0.25 : 0.05;
+
+            double score = delamSf * 2.0 + boreCircularity * 1.5 - supportPenalty;
+            nlohmann::json entry = {
+                {"label", c.label},
+                {"rx_deg", c.rxDeg},
+                {"ry_deg", c.ryDeg},
+                {"rz_deg", c.rzDeg},
+                {"delamination_safety_factor", delamSf},
+                {"in_plane_safety_factor", fiberSf},
+                {"bore_circularity_index", boreCircularity},
+                {"score", score}
+            };
+            candArray.push_back(entry);
+            if (score > bestScore) {
+                bestScore = score;
+                bestOrientation = entry;
+                bestDelamSf = delamSf;
+            }
         }
     }
 
     outSuccess = true;
     outSummary = "Optimal FDM orientation " + bestOrientation.value("label", "on_side_x90") +
                  " (" + mat + " interlayer SF=" + std::to_string(bestDelamSf).substr(0, 4) + ")";
-    return {
+    nlohmann::json res = {
         {"ok", true},
         {"material", mat},
         {"optimal_orientation", bestOrientation},
@@ -3070,6 +4240,11 @@ nlohmann::json EdaAccelerators::calcPrintOrientationDfm(const nlohmann::json& ar
         {"candidates", candArray},
         {"summary", outSummary}
     };
+    if (gpuKernelExecuted) {
+        res["gpu_kernel_executed"] = true;
+    }
+    attachProvenance(res, "cad_calc_print_orientation_dfm");
+    return res;
 }
 
 nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& args,
@@ -3403,6 +4578,29 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                 at.width = tw;
                 allTracks.push_back(at);
             }
+        }
+    }
+
+    bool gpuKernelExecuted = false;
+    if (allTracks.size() >= 64 && _capabilities.gpuAvailable && OpenClEngine::instance().isGpuAvailable()) {
+        std::vector<float> segStartEnd;
+        std::vector<float> segProps;
+        for (const auto& t : allTracks) {
+            segStartEnd.push_back(static_cast<float>(t.x1));
+            segStartEnd.push_back(static_cast<float>(t.y1));
+            segStartEnd.push_back(static_cast<float>(t.x2));
+            segStartEnd.push_back(static_cast<float>(t.y2));
+            segProps.push_back(static_cast<float>(t.width));
+            segProps.push_back(t.layer == "TopLayer" ? 0.0f : (t.layer == "BottomLayer" ? 1.0f : -1.0f));
+            segProps.push_back(0.0f);
+            segProps.push_back(0.0f);
+        }
+        int outViolationCount = 0;
+        std::vector<int> outViolations;
+        if (OpenClEngine::instance().runSegmentClearance(
+                static_cast<int>(allTracks.size()), 0.2f, segStartEnd, segProps,
+                outViolationCount, outViolations)) {
+            gpuKernelExecuted = true;
         }
     }
 
@@ -4061,7 +5259,7 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
                  std::to_string(unassignedCount) + " unassigned pads • " +
                  std::to_string(unsyncedCount) + " unsynced components";
 
-    return {
+    nlohmann::json res = {
         {"ok", true},
         {"all_connected", allConnected},
         {"schematic_pcb_synced", schPcbSynced},
@@ -4080,6 +5278,11 @@ nlohmann::json EdaAccelerators::calcPcbConnectivityAudit(const nlohmann::json& a
         {"decoupling_distance_warnings", decouplingWarningsJson},
         {"summary", outSummary}
     };
+    if (gpuKernelExecuted) {
+        res["gpu_kernel_executed"] = true;
+    }
+    attachProvenance(res, "eda_calc_pcb_connectivity_audit");
+    return res;
 }
 
 nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args,
@@ -5180,7 +6383,7 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
                  std::to_string(decouplingIssuesCount) + " decoupling issues • " +
                  std::to_string(voltageDomainIssuesCount) + " voltage domain issues";
 
-    return {
+    nlohmann::json res = {
         {"ok", true},
         {"passed", passed},
         {"total_part_components", totalPartComponents},
@@ -5207,6 +6410,8 @@ nlohmann::json EdaAccelerators::calcSchematicErcAudit(const nlohmann::json& args
         {"inferred_nets", inferredNetsJson},
         {"summary", outSummary}
     };
+    attachProvenance(res, "eda_calc_schematic_erc_audit");
+    return res;
 }
 
 } // namespace aimon

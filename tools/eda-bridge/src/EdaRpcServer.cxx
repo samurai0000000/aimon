@@ -1797,7 +1797,16 @@ std::vector<nlohmann::json> EdaRpcServer::remoteToolDescriptors() {
         {"easyeda_run_drc", "Run live Schematic ERC or PCB DRC inside EasyEDA Pro"},
         {"easyeda_export_jlcpcb", "Export turnkey JLCPCB Gerber ZIP, BOM CSV, CPL CSV, and Specctra .dsn"},
         {"easyeda_invoke_api", "Invoke whitelisted eda.* API call in EasyEDA Pro"},
-        {"easyeda_convert", "Convert EasyEDA JSON schematic or PCB to KiCad 8 S-expression"}
+        {"easyeda_convert", "Convert EasyEDA JSON schematic or PCB to KiCad 8 S-expression"},
+        {"eda_calc_schematic_layout", "Calculate 50-mil grid schematic symbol placement and orthogonal wire routing"},
+        {"eda_calc_pcb_placement", "Calculate courtyard-legal PCB component placement via analytical + simulated annealing"},
+        {"eda_calc_pcb_autoroute", "Route PCB nets across copper layers with obstacle & clearance grid solver"},
+        {"eda_calc_pcb_connectivity_audit", "Run 3D layer-aware PCB connectivity, dangling track, and clearance audit"},
+        {"eda_calc_schematic_erc_audit", "Run schematic pin/wire/netlist ERC and semantic electrical validation"},
+        {"eda_calc_electrical_synth", "Synthesize resistor dividers, RC filters, LED resistors, and regulator networks"},
+        {"cad_calc_robot_kinematics_statics", "Compute serial chain forward kinematics, CoM, joint torques, and tip-over margin"},
+        {"cad_calc_mechanism_synth", "Synthesize involute spur gears, 4-bar linkages, and servo horn geometry"},
+        {"cad_calc_print_orientation_dfm", "Evaluate 3D print orientation overhang area, support volume, and DFM score"}
     };
 
     constexpr size_t kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -1859,6 +1868,15 @@ bool EdaRpcServer::isDisallowExports() const {
     return _disallowExports.load();
 }
 
+void EdaRpcServer::setSimulatedAcceleratorCapabilitiesForTest(const AcceleratorCapabilities& caps) {
+    _accelerators.setSimulatedCapabilitiesForTest(caps);
+    const auto& accCaps = _accelerators.getCapabilities();
+    std::lock_guard<std::mutex> lock(_telemetryMutex);
+    _componentStats["accelerators"].activeDocument = accCaps.gpuAvailable
+        ? (accCaps.deviceName + " (" + std::to_string(accCaps.computeUnits) + " CUs)")
+        : ("CPU C++17 (" + std::to_string(accCaps.cpuThreads) + " threads)");
+}
+
 std::vector<nlohmann::json> EdaRpcServer::enabledRemoteToolDescriptors() const {
     const auto allTools = remoteToolDescriptors();
     std::vector<nlohmann::json> filtered;
@@ -1867,9 +1885,16 @@ std::vector<nlohmann::json> EdaRpcServer::enabledRemoteToolDescriptors() const {
     bool kc = _enableKiCad.load();
     bool fc = _enableFreeCad.load();
 
-    for (const auto& td : allTools) {
+    for (auto td : allTools) {
         std::string name = td.value("name", "");
-        if (name.rfind("easyeda_", 0) == 0) {
+        if (EdaAccelerators::isAcceleratorTool(name)) {
+            const auto& caps = _accelerators.getCapabilities();
+            td["capability_score"] = caps.scoreForTool(name);
+            td["gpu_accelerated"] = caps.gpuAvailable && EdaAccelerators::isGpuAccelerableTool(name);
+            td["compute_device"] = caps.deviceName;
+            td["compute_backend"] = caps.backend;
+            filtered.push_back(td);
+        } else if (name.rfind("easyeda_", 0) == 0) {
             if (ee) filtered.push_back(td);
         } else if (name.rfind("kicad_", 0) == 0) {
             if (kc) filtered.push_back(td);
@@ -2579,6 +2604,11 @@ bool EdaRpcServer::connectToGateway(const std::string& host, int port) {
             {"short_name", "EDA"},
             {"priority", 40},
             {"web_port", 0},
+            {"rpc_port", _boundPort.load()},
+            {"capabilities", {
+                {"accelerators", _accelerators.getCapabilities().toJson()},
+                {"capability_score", _accelerators.getCapabilities().capabilityScore}
+            }},
             {"tools", enabledRemoteToolDescriptors()}
         }}
     };
@@ -2710,6 +2740,8 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
     const EdaBridgeComponentStat eeStat = getCompStat("easyeda");
     const EdaBridgeComponentStat kcStat = getCompStat("kicad");
     const EdaBridgeComponentStat fcStat = getCompStat("freecad");
+    const EdaBridgeComponentStat accStat = getCompStat("accelerators");
+    const AcceleratorCapabilities& accCaps = _accelerators.getCapabilities();
 
 #ifdef _WIN32
     std::string platform = "windows-x64";
@@ -2768,6 +2800,32 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
             {"avg_call_duration_ms", fcStat.avgDurationMs},
             {"last_tool_called", fcStat.lastFunctionCalled},
             {"last_call_epoch", fcStat.lastCallEpoch}
+        },
+        {
+            {"name", "accelerators"},
+            {"enabled", accCaps.enabled},
+            {"available", accCaps.enabled},
+            {"plugin_connected", accCaps.gpuAvailable},
+            {"binary_path", accCaps.backend + ": " + accCaps.deviceName},
+            {"version", AIMON_VERSION_STRING},
+            {"bridge_version", AIMON_VERSION_STRING},
+            {"active_document", accCaps.gpuAvailable
+                ? (accCaps.deviceName + " (" + std::to_string(accCaps.computeUnits) + " CUs)")
+                : ("CPU C++17 (" + std::to_string(accCaps.cpuThreads) + " threads)")},
+            {"gpu_available", accCaps.gpuAvailable},
+            {"compute_backend", accCaps.backend},
+            {"compute_device", accCaps.deviceName},
+            {"compute_units", accCaps.computeUnits},
+            {"clock_mhz", accCaps.clockMhz},
+            {"global_mem_bytes", accCaps.globalMemBytes},
+            {"capability_score", accCaps.capabilityScore},
+            {"total_calls", accStat.totalCalls},
+            {"success_calls", accStat.successCalls},
+            {"failed_calls", accStat.failedCalls},
+            {"last_call_duration_ms", accStat.lastDurationMs},
+            {"avg_call_duration_ms", accStat.avgDurationMs},
+            {"last_tool_called", accStat.lastFunctionCalled},
+            {"last_call_epoch", accStat.lastCallEpoch}
         }
     });
 
@@ -2812,6 +2870,7 @@ nlohmann::json EdaRpcServer::buildStatusPayload() const {
         {"plugin_port", _boundPluginPort.load()},
         {"disallow_exports", _disallowExports.load()},
         {"tools", tools},
+        {"accelerator_capabilities", accCaps.toJson()},
         {"function_stats", funcArr},
         {"recent_calls", recentArr}
     };
@@ -2850,9 +2909,15 @@ void EdaRpcServer::clearTelemetry() {
     _recentCalls.clear();
     _componentStats.clear();
 
+    const auto& accCaps = _accelerators.getCapabilities();
     for (const char* comp : {"easyeda", "kicad", "freecad", "accelerators"}) {
         EdaBridgeComponentStat st;
         st.component = comp;
+        if (std::string(comp) == "accelerators") {
+            st.activeDocument = accCaps.gpuAvailable
+                ? (accCaps.deviceName + " (" + std::to_string(accCaps.computeUnits) + " CUs)")
+                : ("CPU C++17 (" + std::to_string(accCaps.cpuThreads) + " threads)");
+        }
         _componentStats[comp] = st;
     }
 }
@@ -3203,10 +3268,9 @@ nlohmann::json EdaRpcServer::dispatchToolCallInternal(const std::string& toolNam
         return buildStatusPayload();
     }
     if (EdaAccelerators::isAcceleratorTool(toolName)) {
-        EdaAccelerators acc;
         bool ok = false;
         std::string summary;
-        return acc.executeTool(toolName, arguments, ok, summary);
+        return _accelerators.executeTool(toolName, arguments, ok, summary);
     }
     if (_disallowExports.load()) {
         if (toolName == "easyeda_export_jlcpcb" ||
@@ -4358,10 +4422,9 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
     if (toolName == "easyeda_inspect_schematic" && plugRes.is_object() &&
         plugRes.value("ok", true)) {
         if (!plugRes.contains("erc_audit")) {
-            EdaAccelerators acc;
             bool ercOk = false;
             std::string ercSummary;
-            plugRes["erc_audit"] = acc.calcSchematicErcAudit(plugRes, ercOk, ercSummary);
+            plugRes["erc_audit"] = _accelerators.calcSchematicErcAudit(plugRes, ercOk, ercSummary);
         }
         if (args.value("summary_only", false)) {
             if (!plugRes.contains("components_count") && plugRes.contains("components") && plugRes["components"].is_array()) {
@@ -4404,10 +4467,9 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
                     schSource = schSnap;
                 }
             }
-            EdaAccelerators acc;
             bool ercOk = false;
             std::string ercSummary;
-            plugRes["erc_audit"] = acc.calcSchematicErcAudit(schSource, ercOk, ercSummary);
+            plugRes["erc_audit"] = _accelerators.calcSchematicErcAudit(schSource, ercOk, ercSummary);
         }
         const auto &ercAudit = plugRes["erc_audit"];
         if (ercAudit.is_object() &&
@@ -4441,10 +4503,9 @@ nlohmann::json EdaRpcServer::handleEasyEdaTool(const std::string& toolName,
     } else if ((toolName == "easyeda_inspect_pcb" || toolName == "easyeda_run_drc") &&
                plugRes.is_object() && plugRes.value("ok", true)) {
         if (!plugRes.contains("connectivity_audit")) {
-            EdaAccelerators acc;
             bool auditOk = false;
             std::string auditSummary;
-            plugRes["connectivity_audit"] = acc.calcPcbConnectivityAudit(plugRes, auditOk, auditSummary);
+            plugRes["connectivity_audit"] = _accelerators.calcPcbConnectivityAudit(plugRes, auditOk, auditSummary);
         }
         bool includeRawPrimitives = args.value("include_raw_primitives", args.value("include_primitives", false));
         bool summaryOnly = args.value("summary_only", false);

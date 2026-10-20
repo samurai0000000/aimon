@@ -422,6 +422,252 @@ static void testMonitorDeduplicationUnregisterAndTtl() {
     gateway.stop();
 }
 
+static void testCapabilityRankedMultiClientRouting() {
+    std::cout << "[TEST] 4. Capability-ranked multi-client tool routing and dynamic failover..." << std::endl;
+
+    // Part A: DynamicToolRegistry ranking in both registration orders
+    {
+        nlohmann::json cpuTools = nlohmann::json::array({
+            {
+                {"name", "cad_calc_print_orientation_dfm"},
+                {"description", "DFM Solver"},
+                {"inputSchema", {{"type", "object"}}},
+                {"capability_score", 1200}
+            }
+        });
+        nlohmann::json gpuTools = nlohmann::json::array({
+            {
+                {"name", "cad_calc_print_orientation_dfm"},
+                {"description", "DFM Solver"},
+                {"inputSchema", {{"type", "object"}}},
+                {"capability_score", 1089480}
+            }
+        });
+
+        // 4a-1: Order 1 (CPU) then 2 (GPU)
+        {
+            DynamicToolRegistry reg;
+            std::vector<std::string> added;
+            assert(reg.registerTools(1, "eda", cpuTools, added));
+            assert(reg.getToolClientId("cad_calc_print_orientation_dfm") == 1);
+
+            assert(reg.registerTools(2, "eda", gpuTools, added));
+            assert(reg.getToolClientId("cad_calc_print_orientation_dfm") == 2);
+
+            DynamicTool best;
+            assert(reg.getTool("cad_calc_print_orientation_dfm", best));
+            assert(best.clientId == 2);
+            assert(best.capabilityScore == 1089480);
+
+            auto cands = reg.getToolCandidates("cad_calc_print_orientation_dfm");
+            assert(cands.size() == 2);
+            assert(cands[0].clientId == 2 && cands[0].capabilityScore == 1089480);
+            assert(cands[1].clientId == 1 && cands[1].capabilityScore == 1200);
+        }
+
+        // 4a-2: Order 2 (GPU) then 1 (CPU) - CPU must not demote GPU!
+        {
+            DynamicToolRegistry reg;
+            std::vector<std::string> added;
+            assert(reg.registerTools(2, "eda", gpuTools, added));
+            assert(reg.getToolClientId("cad_calc_print_orientation_dfm") == 2);
+
+            assert(reg.registerTools(1, "eda", cpuTools, added));
+            assert(reg.getToolClientId("cad_calc_print_orientation_dfm") == 2);
+
+            DynamicTool best;
+            assert(reg.getTool("cad_calc_print_orientation_dfm", best));
+            assert(best.clientId == 2);
+            assert(best.capabilityScore == 1089480);
+
+            auto cands = reg.getToolCandidates("cad_calc_print_orientation_dfm");
+            assert(cands.size() == 2);
+            assert(cands[0].clientId == 2 && cands[0].capabilityScore == 1089480);
+            assert(cands[1].clientId == 1 && cands[1].capabilityScore == 1200);
+        }
+        std::cout << "  [PASS] 4a. DynamicToolRegistry capability ranking invariant verified across both registration orders." << std::endl;
+    }
+
+    // Part B: End-to-end TcpGateway routing and failover across live sockets
+    {
+        const int testPort = 29887;
+        DynamicToolRegistry registry;
+        TcpGateway gateway(registry);
+        assert(gateway.start("127.0.0.1", testPort));
+
+        auto connectClient = [testPort]() -> int {
+            int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            assert(fd >= 0);
+            struct sockaddr_in saddr;
+            std::memset(&saddr, 0, sizeof(saddr));
+            saddr.sin_family = AF_INET;
+            saddr.sin_port = htons(testPort);
+            ::inet_pton(AF_INET, "127.0.0.1", &saddr.sin_addr);
+            bool ok = false;
+            for (int i = 0; i < 20; ++i) {
+                if (::connect(fd, (struct sockaddr*)&saddr, sizeof(saddr)) == 0) {
+                    ok = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            assert(ok);
+            return fd;
+        };
+
+        int fdCpu = connectClient();
+        int fdGpu = connectClient();
+
+        std::atomic<bool> cpuRunning{true};
+        std::thread cpuThread([fdCpu, &cpuRunning]() {
+            std::string buffer;
+            char buf[1024];
+            while (cpuRunning.load()) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(fdCpu, &rfds);
+                struct timeval tv{0, 20000};
+                int ret = ::select(fdCpu + 1, &rfds, nullptr, nullptr, &tv);
+                if (ret <= 0) continue;
+                ssize_t n = ::read(fdCpu, buf, sizeof(buf));
+                if (n <= 0) break;
+                buffer.append(buf, n);
+                size_t pos;
+                while ((pos = buffer.find('\n')) != std::string::npos) {
+                    std::string line = buffer.substr(0, pos);
+                    buffer.erase(0, pos + 1);
+                    if (line.empty()) continue;
+                    auto j = nlohmann::json::parse(line, nullptr, false);
+                    if (j.is_discarded()) continue;
+                    if (j.value("method", "") == "tools/call") {
+                        auto reqId = j["id"];
+                        nlohmann::json resp = {
+                            {"jsonrpc", "2.0"},
+                            {"id", reqId},
+                            {"result", {{"status", "ok"}, {"provider", "cpu"}, {"capability_score", 1200}}}
+                        };
+                        std::string respStr = resp.dump() + "\n";
+                        ssize_t w = ::write(fdCpu, respStr.data(), respStr.size());
+                        (void)w;
+                    }
+                }
+            }
+        });
+
+        std::atomic<bool> gpuRunning{true};
+        std::thread gpuThread([fdGpu, &gpuRunning]() {
+            std::string buffer;
+            char buf[1024];
+            while (gpuRunning.load()) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(fdGpu, &rfds);
+                struct timeval tv{0, 20000};
+                int ret = ::select(fdGpu + 1, &rfds, nullptr, nullptr, &tv);
+                if (ret <= 0) continue;
+                ssize_t n = ::read(fdGpu, buf, sizeof(buf));
+                if (n <= 0) break;
+                buffer.append(buf, n);
+                size_t pos;
+                while ((pos = buffer.find('\n')) != std::string::npos) {
+                    std::string line = buffer.substr(0, pos);
+                    buffer.erase(0, pos + 1);
+                    if (line.empty()) continue;
+                    auto j = nlohmann::json::parse(line, nullptr, false);
+                    if (j.is_discarded()) continue;
+                    if (j.value("method", "") == "tools/call") {
+                        auto reqId = j["id"];
+                        nlohmann::json resp = {
+                            {"jsonrpc", "2.0"},
+                            {"id", reqId},
+                            {"result", {{"status", "ok"}, {"provider", "gpu"}, {"capability_score", 1089480}}}
+                        };
+                        std::string respStr = resp.dump() + "\n";
+                        ssize_t w = ::write(fdGpu, respStr.data(), respStr.size());
+                        (void)w;
+                    }
+                }
+            }
+        });
+
+        // Register CPU client first
+        nlohmann::json regCpu = {
+            {"jsonrpc", "2.0"},
+            {"id", 1},
+            {"method", "gateway/register"},
+            {"params", {
+                {"subsystem", "eda"},
+                {"capabilities", {{"capability_score", 1200}}},
+                {"tools", {
+                    {
+                        {"name", "eda_calc_pcb_placement"},
+                        {"description", "Placement"},
+                        {"inputSchema", {{"type", "object"}}}
+                    }
+                }}
+            }}
+        };
+        std::string regCpuStr = regCpu.dump() + "\n";
+        assert(::write(fdCpu, regCpuStr.data(), regCpuStr.size()) == (ssize_t)regCpuStr.size());
+
+        // Register GPU client second
+        nlohmann::json regGpu = {
+            {"jsonrpc", "2.0"},
+            {"id", 2},
+            {"method", "gateway/register"},
+            {"params", {
+                {"subsystem", "eda"},
+                {"capabilities", {{"capability_score", 1089480}}},
+                {"tools", {
+                    {
+                        {"name", "eda_calc_pcb_placement"},
+                        {"description", "Placement"},
+                        {"inputSchema", {{"type", "object"}}}
+                    }
+                }}
+            }}
+        };
+        std::string regGpuStr = regGpu.dump() + "\n";
+        assert(::write(fdGpu, regGpuStr.data(), regGpuStr.size()) == (ssize_t)regGpuStr.size());
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        DynamicTool bestTool;
+        std::string bestRemoteAddr;
+        nlohmann::json bestCaps;
+        assert(gateway.getBestToolProvider("eda_calc_pcb_placement", bestTool, bestRemoteAddr, &bestCaps));
+        assert(bestTool.capabilityScore == 1089480);
+        assert(bestCaps.value("capability_score", 0) == 1089480);
+
+        // Call tool -> must route to GPU client!
+        nlohmann::json res;
+        std::string err;
+        assert(gateway.callTool("eda_calc_pcb_placement", nlohmann::json::object(), res, err, 3000));
+        assert(res.value("provider", "") == "gpu");
+        assert(res.value("capability_score", 0) == 1089480);
+
+        // Disconnect GPU client socket
+        gpuRunning.store(false);
+        ::close(fdGpu);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // Call tool again -> must automatically fail over to CPU client!
+        res.clear();
+        err.clear();
+        assert(gateway.callTool("eda_calc_pcb_placement", nlohmann::json::object(), res, err, 3000));
+        assert(res.value("provider", "") == "cpu");
+        assert(res.value("capability_score", 0) == 1200);
+
+        // Cleanup
+        cpuRunning.store(false);
+        ::close(fdCpu);
+        if (cpuThread.joinable()) cpuThread.join();
+        if (gpuThread.joinable()) gpuThread.join();
+        gateway.stop();
+        std::cout << "  [PASS] 4b. End-to-end capability routing and dynamic CPU fallback on GPU disconnect verified." << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "Running aimon TcpGateway Timeout Tests" << std::endl;
@@ -430,6 +676,7 @@ int main() {
     testTimeoutCalculation();
     testTcpGatewayTimeoutExecution();
     testMonitorDeduplicationUnregisterAndTtl();
+    testCapabilityRankedMultiClientRouting();
 
     std::cout << "\nALL VERIFICATION TESTS PASSED SUCCESSFULLY." << std::endl;
     return 0;

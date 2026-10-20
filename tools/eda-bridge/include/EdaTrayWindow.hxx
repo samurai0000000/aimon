@@ -160,6 +160,7 @@ private:
     QLabel* _lblEasyEdaStatus = nullptr;
     QLabel* _lblKiCadStatus = nullptr;
     QLabel* _lblFreeCadStatus = nullptr;
+    QLabel* _lblAcceleratorStatus = nullptr;
 
     QLabel* _lblTelemetryStatusPill = nullptr;
     QPushButton* _btnResetTelemetry = nullptr;
