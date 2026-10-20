@@ -21,87 +21,67 @@
 using namespace aimon;
 
 TEST_GROUP(EdaBridge_PathMapping) {
-    EdaBridgeConfig _cfg;
-
-    void setup() override {
-        _cfg.enabled = true;
-        _cfg.host = "eda.local";
-        _cfg.port = 3892;
-        _cfg.pluginPort = 3893;
-        _cfg.linuxPathPrefix = "~/work";
-        _cfg.windowsPathPrefix = "Z:\\";
-    }
 };
 
-TEST(EdaBridge_PathMapping, NominalRoundTrip) {
-    EdaBridge bridge(_cfg);
-    std::string winPath;
+TEST(EdaBridge_PathMapping, NominalPassThroughAndHomeExpansion) {
     std::string err;
-    CHECK_TRUE(bridge.translateLinuxToWindows("~/work/pcb/main.kicad_pcb", winPath, err));
-    CHECK_EQUAL("Z:\\pcb\\main.kicad_pcb", winPath);
+    CHECK_TRUE(EdaBridge::validatePathSafety("C:\\pcb\\main.kicad_pcb", err));
+    CHECK_EQUAL("", err);
 
-    std::string linuxPath;
-    CHECK_TRUE(bridge.translateWindowsToLinux(winPath, linuxPath));
-    std::string expectedLinux = PathUtils::expandHome("~/work") + "/pcb/main.kicad_pcb";
-    CHECK_EQUAL(expectedLinux, linuxPath);
+    CHECK_TRUE(EdaBridge::validatePathSafety("~/work/pcb/main.kicad_pcb", err));
+    CHECK_EQUAL("", err);
+
+    nlohmann::json payload = {
+        {"project_path", "~/work/pcb/main.kicad_pcb"},
+        {"windows_path", "C:\\pcb\\main.kicad_pcb"}
+    };
+    CHECK_TRUE(EdaBridge::validateJsonPaths(payload, err));
+    std::string expectedHome = PathUtils::expandHome("~/work/pcb/main.kicad_pcb");
+    CHECK_EQUAL(expectedHome, payload["project_path"].get<std::string>());
+    CHECK_EQUAL("C:\\pcb\\main.kicad_pcb", payload["windows_path"].get<std::string>());
 }
 
-TEST(EdaBridge_PathMapping, ExactPrefixRootAndCaseInsensitiveDrive) {
-    EdaBridge bridge(_cfg);
-    std::string winPath;
+TEST(EdaBridge_PathMapping, RejectsTraversalNullByteEmptyAndOversized) {
     std::string err;
-    CHECK_TRUE(bridge.translateLinuxToWindows("~/work", winPath, err));
-    CHECK_EQUAL("Z:\\", winPath);
-
-    std::string linuxPath;
-    CHECK_TRUE(bridge.translateWindowsToLinux("z:\\board\\top.kicad_sch", linuxPath));
-    CHECK_EQUAL(PathUtils::expandHome("~/work") + "/board/top.kicad_sch", linuxPath);
-}
-
-TEST(EdaBridge_PathMapping, RejectsSiblingCollisionTraversalAndNullByte) {
-    EdaBridge bridge(_cfg);
-    std::string winPath;
-    std::string err;
-
-    CHECK_FALSE(bridge.translateLinuxToWindows("~/work-other/file.kicad_pcb", winPath, err));
-    CHECK_FALSE(bridge.translateLinuxToWindows("~/work/../../etc/passwd", winPath, err));
-    CHECK_FALSE(bridge.translateLinuxToWindows("", winPath, err));
+    CHECK_FALSE(EdaBridge::validatePathSafety("", err));
+    CHECK_FALSE(EdaBridge::validatePathSafety("~/work/../../etc/passwd", err));
+    CHECK_FALSE(EdaBridge::validatePathSafety("C:\\..\\Windows\\System32\\cmd.exe", err));
 
     std::string withNull = "~/work/pcb/a";
     withNull.push_back('\0');
     withNull += "b.kicad_pcb";
-    CHECK_FALSE(bridge.translateLinuxToWindows(withNull, winPath, err));
-
-    std::string linuxPath;
-    CHECK_FALSE(bridge.translateWindowsToLinux("Z:\\..\\Windows\\System32\\cmd.exe", linuxPath));
-    CHECK_FALSE(bridge.translateWindowsToLinux("C:\\Users\\other\\file.txt", linuxPath));
+    CHECK_FALSE(EdaBridge::validatePathSafety(withNull, err));
 
     std::string overLimit(4100, 'a');
-    CHECK_FALSE(bridge.translateLinuxToWindows("~/work/" + overLimit, winPath, err));
+    CHECK_FALSE(EdaBridge::validatePathSafety(overLimit, err));
 }
 
-TEST(EdaBridge_PathMapping, RewriteNestedJsonPayloadPaths) {
-    EdaBridge bridge(_cfg);
+TEST(EdaBridge_PathMapping, ValidateNestedJsonPayloadPaths) {
     nlohmann::json payload = {
         {"project_path", "~/work/pcb/controller.kicad_pro"},
         {"nested", {
-            {"schematic_path", "~/work/pcb/controller.kicad_sch"},
+            {"schematic_path", "D:\\projects\\controller.kicad_sch"},
             {"output_dir", "~/work/pcb/fab"},
             {"count", 4}
         }},
-        {"files", nlohmann::json::array({"~/work/pcb/a.step", "~/work/pcb/b.stl"})}
+        {"files", nlohmann::json::array({"~/work/pcb/a.step", "E:\\cad\\b.stl"})}
     };
     std::string err;
-    CHECK_TRUE(bridge.rewriteJsonPaths(payload, true, err));
-    CHECK_EQUAL("Z:\\pcb\\controller.kicad_pro", payload["project_path"].get<std::string>());
-    CHECK_EQUAL("Z:\\pcb\\controller.kicad_sch", payload["nested"]["schematic_path"].get<std::string>());
-    CHECK_EQUAL("Z:\\pcb\\fab", payload["nested"]["output_dir"].get<std::string>());
-    CHECK_EQUAL("Z:\\pcb\\a.step", payload["files"][0].get<std::string>());
+    CHECK_TRUE(EdaBridge::validateJsonPaths(payload, err));
+    std::string expectedPro = PathUtils::expandHome("~/work/pcb/controller.kicad_pro");
+    std::string expectedFab = PathUtils::expandHome("~/work/pcb/fab");
+    std::string expectedStep = PathUtils::expandHome("~/work/pcb/a.step");
 
-    CHECK_TRUE(bridge.rewriteJsonPaths(payload, false, err));
-    std::string root = PathUtils::expandHome("~/work");
-    CHECK_EQUAL(root + "/pcb/controller.kicad_pro", payload["project_path"].get<std::string>());
-    CHECK_EQUAL(root + "/pcb/a.step", payload["files"][0].get<std::string>());
+    CHECK_EQUAL(expectedPro, payload["project_path"].get<std::string>());
+    CHECK_EQUAL("D:\\projects\\controller.kicad_sch", payload["nested"]["schematic_path"].get<std::string>());
+    CHECK_EQUAL(expectedFab, payload["nested"]["output_dir"].get<std::string>());
+    CHECK_EQUAL(expectedStep, payload["files"][0].get<std::string>());
+    CHECK_EQUAL("E:\\cad\\b.stl", payload["files"][1].get<std::string>());
+
+    nlohmann::json badPayload = {
+        {"project_path", "~/work/../../escape.kicad_pro"}
+    };
+    CHECK_FALSE(EdaBridge::validateJsonPaths(badPayload, err));
 }
 
 TEST_GROUP(EdaBridge_ScriptGuard) {
@@ -3046,13 +3026,8 @@ TEST(EdaBridge, EasyEdaBridgeV1_1_12PerformanceAndSyncUpgrades) {
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {
         if (std::strcmp(av[i], "--negative-control") == 0) {
-            EdaBridgeConfig cfg;
-            cfg.linuxPathPrefix = "~/work";
-            cfg.windowsPathPrefix = "Z:\\";
-            EdaBridge bridge(cfg);
-            std::string winPath;
             std::string err;
-            bool allowed = bridge.translateLinuxToWindows("~/work/../../etc/passwd", winPath, err);
+            bool allowed = EdaBridge::validatePathSafety("~/work/../../etc/passwd", err);
             if (!allowed) {
                 std::cerr << "[NegativeControl] Path traversal correctly rejected: " << err << std::endl;
                 return 1;

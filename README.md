@@ -287,13 +287,10 @@ eda = {
     mode = "bidirectional";
     host = "workstation.local";
     port = 3892;
-    plugin_port = 3893;
-    linux_path_prefix = "~/work";
-    windows_path_prefix = "Z:\\";
-    accelerators = { enabled = true; sa_placement_iterations = 50000; autoroute_max_ripup_passes = 25; };
-    easyeda      = { enabled = true; execution_mode = "auto"; prefer_jlcpcb_basic_parts = true; };
-    kicad        = { enabled = true; execution_mode = "auto"; schematic_grid_mils = 50; };
-    freecad      = { enabled = true; execution_mode = "auto"; enforce_tnp_guard = true; };
+    accelerators = { enabled = true; };
+    easyeda      = { enabled = true; };
+    kicad        = { enabled = true; };
+    freecad      = { enabled = true; };
 };
 ```
 

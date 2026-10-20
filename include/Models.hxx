@@ -463,8 +463,6 @@ struct EdaToolRuntimeInfo {
     bool enabled = true;
     std::string resolvedHost;
     int resolvedPort = 3892;
-    int resolvedPluginPort = 3893;
-    std::string executionMode = "auto";
     bool available = false;
     bool pluginConnected = false;
     std::string binaryPath;
@@ -487,8 +485,6 @@ struct EdaToolRuntimeInfo {
             {"enabled", enabled},
             {"resolved_host", resolvedHost},
             {"resolved_port", resolvedPort},
-            {"resolved_plugin_port", resolvedPluginPort},
-            {"execution_mode", executionMode},
             {"available", available},
             {"plugin_connected", pluginConnected},
             {"binary_path", binaryPath},
@@ -515,12 +511,8 @@ struct EdaBridgeStatus {
     std::string activeTransport = "none";
     std::string host;
     int port = 3892;
-    int pluginPort = 3893;
     bool authConfigured = false;
     int healthPollIntervalSec = 30;
-    bool requireApprovalForExports = false;
-    std::string linuxPathPrefix;
-    std::string windowsPathPrefix;
     int64_t lastProbeEpoch = 0;
     int lastLatencyMs = -1;
     std::string remotePlatform;
@@ -545,12 +537,8 @@ struct EdaBridgeStatus {
             {"active_transport", activeTransport},
             {"host", host},
             {"port", port},
-            {"plugin_port", pluginPort},
             {"auth_configured", authConfigured},
             {"health_poll_interval_sec", healthPollIntervalSec},
-            {"require_approval_for_exports", requireApprovalForExports},
-            {"linux_path_prefix", linuxPathPrefix},
-            {"windows_path_prefix", windowsPathPrefix},
             {"last_probe_epoch", lastProbeEpoch},
             {"last_latency_ms", lastLatencyMs},
             {"remote_platform", remotePlatform},

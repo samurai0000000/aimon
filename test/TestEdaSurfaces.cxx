@@ -331,10 +331,7 @@ TEST_GROUP(McpServer_EdaProfile) {
         _cfg.mode = "client";
         _cfg.host = "127.0.0.1";
         _cfg.port = _rpcServer->boundPort();
-        _cfg.pluginPort = _rpcServer->boundPluginPort();
         _cfg.authSecret = "mcp-surface-secret-2026";
-        _cfg.linuxPathPrefix = _ws;
-        _cfg.windowsPathPrefix = _ws;
 
         _bridge = std::make_unique<EdaBridge>(_cfg);
         _mcp = std::make_unique<McpServer>(StateStore::getInstance());
@@ -824,10 +821,7 @@ TEST_GROUP(WebServer_EdaApi) {
         edaCfg.mode = "client";
         edaCfg.host = "127.0.0.1";
         edaCfg.port = _rpcServer->boundPort();
-        edaCfg.pluginPort = _rpcServer->boundPluginPort();
         edaCfg.authSecret = "super-secret-eda-key-999";
-        edaCfg.linuxPathPrefix = _ws;
-        edaCfg.windowsPathPrefix = _ws;
 
         _bridge = std::make_unique<EdaBridge>(edaCfg);
         _hstore = std::make_unique<HistoryStore>();
@@ -926,23 +920,20 @@ TEST(WebServer_EdaApi, AuthGateSecretRedactionPersistenceAndLiveProbe) {
         {"mode", "client"},
         {"host", "127.0.0.1"},
         {"port", _rpcServer->boundPort()},
-        {"plugin_port", _rpcServer->boundPluginPort()},
         {"auth_secret", "***"},
-        {"linux_path_prefix", _ws},
-        {"windows_path_prefix", _ws},
         {"accelerators", {
             {"enabled", true},
             {"sa_placement_iterations", 42000},
             {"default_filament_material", "ASA"}
         }},
+        {"easyeda", {
+            {"enabled", true}
+        }},
         {"kicad", {
-            {"enabled", true},
-            {"schematic_grid_mils", 50},
-            {"fab_target_house", "jlcpcb"}
+            {"enabled", true}
         }},
         {"freecad", {
-            {"enabled", true},
-            {"default_print_tolerance_mm", 0.25}
+            {"enabled", true}
         }}
     };
     auto cfgRes = cli.Post("/api/eda/config", uiHeaders, updatePayload.dump(), "application/json");
@@ -968,16 +959,16 @@ TEST(WebServer_EdaApi, AuthGateSecretRedactionPersistenceAndLiveProbe) {
     CHECK_EQUAL("super-secret-eda-key-999", reloadLibCfgMgr.getConfig().eda.authSecret);
     LONGS_EQUAL(42000, reloadLibCfgMgr.getConfig().eda.accelerators.saPlacementIterations);
 
-    // 5. Fault injection: invalid port or '..' traversal in POST /api/eda/config returns HTTP 400
+    // 5. Fault injection: invalid port or invalid mode in POST /api/eda/config returns HTTP 400
     json badPortPayload = {{"port", 70000}};
     auto badPortRes = cli.Post("/api/eda/config", uiHeaders, badPortPayload.dump(), "application/json");
     CHECK_TRUE(badPortRes != nullptr);
     LONGS_EQUAL(400, badPortRes->status);
 
-    json badPathPayload = {{"linux_path_prefix", _ws + "/../etc"}};
-    auto badPathRes = cli.Post("/api/eda/config", uiHeaders, badPathPayload.dump(), "application/json");
-    CHECK_TRUE(badPathRes != nullptr);
-    LONGS_EQUAL(400, badPathRes->status);
+    json badModePayload = {{"mode", "invalid_mode"}};
+    auto badModeRes = cli.Post("/api/eda/config", uiHeaders, badModePayload.dump(), "application/json");
+    CHECK_TRUE(badModeRes != nullptr);
+    LONGS_EQUAL(400, badModeRes->status);
 
     // 6. Authenticated POST /api/eda/probe measures live latency and plugin attachment
     auto probeRes = cli.Post("/api/eda/probe", uiHeaders, "{}", "application/json");
@@ -1061,30 +1052,31 @@ TEST(WebServer_EdaApi, ServesToolBridgesSubpanelAndWebAssetsMatchDiskByteForByte
     static constexpr const char* kRequiredDomIds[] = {
         "id=\"eda-status-pill\"",
         "id=\"eda-latency-pill\"",
-        "id=\"eda-cfg-enabled\"",
-        "id=\"eda-cfg-mode\"",
-        "id=\"eda-cfg-host\"",
-        "id=\"eda-cfg-port\"",
-        "id=\"eda-cfg-plugin-port\"",
-        "id=\"eda-cfg-linux-prefix\"",
-        "id=\"eda-cfg-win-prefix\"",
-        "id=\"eda-cfg-auth-secret\"",
-        "id=\"eda-cfg-poll-interval\"",
-        "id=\"eda-cfg-require-approval\"",
         "id=\"btn-eda-probe\"",
-        "id=\"btn-eda-save\"",
         "id=\"eda-card-accelerators\"",
         "id=\"eda-card-easyeda\"",
         "id=\"eda-card-kicad\"",
         "id=\"eda-card-freecad\"",
-        "id=\"eda-acc-enabled\"",
-        "id=\"eda-easyeda-enabled\"",
-        "id=\"eda-kicad-enabled\"",
-        "id=\"eda-freecad-enabled\"",
         "id=\"eda-recent-calls-body\""
     };
     for (const char* domId : kRequiredDomIds) {
         CHECK_TRUE_TEXT(html.find(domId) != std::string::npos, domId);
+    }
+
+    static constexpr const char* kStrippedDomIds[] = {
+        "id=\"eda-cfg-enabled\"",
+        "id=\"eda-cfg-host\"",
+        "id=\"eda-cfg-plugin-port\"",
+        "id=\"eda-cfg-linux-prefix\"",
+        "id=\"eda-cfg-win-prefix\"",
+        "id=\"eda-acc-enabled\"",
+        "id=\"eda-easyeda-enabled\"",
+        "id=\"eda-kicad-enabled\"",
+        "id=\"eda-freecad-enabled\"",
+        "id=\"btn-eda-save\""
+    };
+    for (const char* strippedId : kStrippedDomIds) {
+        CHECK_TRUE_TEXT(html.find(strippedId) == std::string::npos, strippedId);
     }
 
     // 2. Verify GET /style.css serves #subpanel-bridges styling
@@ -1094,14 +1086,12 @@ TEST(WebServer_EdaApi, ServesToolBridgesSubpanelAndWebAssetsMatchDiskByteForByte
     CHECK_TRUE_TEXT(cssRes->body.find("#subpanel-bridges") != std::string::npos,
                     "Missing #subpanel-bridges in style.css");
 
-    // 3. Verify GET /app.js serves renderToolBridges, saveToolBridgesConfig, and probeToolBridges
+    // 3. Verify GET /app.js serves renderToolBridges and probeToolBridges
     auto jsRes = cli.Get("/app.js");
     CHECK_TRUE(jsRes != nullptr);
     LONGS_EQUAL(200, jsRes->status);
     CHECK_TRUE_TEXT(jsRes->body.find("renderToolBridges") != std::string::npos,
                     "Missing renderToolBridges in app.js");
-    CHECK_TRUE_TEXT(jsRes->body.find("saveToolBridgesConfig") != std::string::npos,
-                    "Missing saveToolBridgesConfig in app.js");
     CHECK_TRUE_TEXT(jsRes->body.find("probeToolBridges") != std::string::npos,
                     "Missing probeToolBridges in app.js");
 

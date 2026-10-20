@@ -8,6 +8,7 @@
 #include "EasyEdaConverter.hxx"
 #include "TcpGateway.hxx"
 #include "PathUtils.hxx"
+#include "Version.hxx"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -47,14 +48,6 @@ bool hasNullOrDotDotSegment(const std::string& p) {
         }
         if (next == std::string::npos) break;
         pos = next + 1;
-    }
-    return false;
-}
-
-bool isWindowsStylePrefix(const std::string& prefix) {
-    if (prefix.find('\\') != std::string::npos) return true;
-    if (prefix.size() >= 2 && std::isalpha(static_cast<unsigned char>(prefix[0])) && prefix[1] == ':') {
-        return true;
     }
     return false;
 }
@@ -127,13 +120,11 @@ void EdaBridge::initRuntimeToolsLocked() {
     acc.enabled = _config.accelerators.enabled;
     acc.resolvedHost = "local (aimon)";
     acc.resolvedPort = 0;
-    acc.resolvedPluginPort = 0;
-    acc.executionMode = "in_process_cxx17";
     acc.available = _config.accelerators.enabled;
     acc.pluginConnected = _config.accelerators.enabled;
     acc.binaryPath = "aimon::EdaAccelerators (C++17)";
-    acc.version = "1.0";
-    acc.activeDocument = "7 local solvers ready";
+    acc.version = AIMON_VERSION_STRING;
+    acc.activeDocument = "9 C++17 Solvers";
     acc.lastProbeLatencyMs = 0;
     preserveStats("accelerators", acc);
     updated.push_back(acc);
@@ -141,33 +132,24 @@ void EdaBridge::initRuntimeToolsLocked() {
     EdaToolRuntimeInfo ee;
     ee.name = "easyeda";
     ee.enabled = _config.easyeda.enabled;
-    ee.resolvedHost = _config.resolvedHostFor(_config.easyeda.host);
-    ee.resolvedPort = _config.resolvedPortFor(_config.easyeda.port);
-    ee.resolvedPluginPort = _config.resolvedPluginPortFor(_config.easyeda.pluginPort);
-    ee.executionMode = _config.easyeda.executionMode;
-    ee.binaryPath = _config.easyeda.customBinaryPath;
+    ee.resolvedHost = _config.host;
+    ee.resolvedPort = _config.port;
     preserveStats("easyeda", ee);
     updated.push_back(ee);
 
     EdaToolRuntimeInfo kc;
     kc.name = "kicad";
     kc.enabled = _config.kicad.enabled;
-    kc.resolvedHost = _config.resolvedHostFor(_config.kicad.host);
-    kc.resolvedPort = _config.resolvedPortFor(_config.kicad.port);
-    kc.resolvedPluginPort = _config.resolvedPluginPortFor(_config.kicad.pluginPort);
-    kc.executionMode = _config.kicad.executionMode;
-    kc.binaryPath = _config.kicad.customBinaryPath;
+    kc.resolvedHost = _config.host;
+    kc.resolvedPort = _config.port;
     preserveStats("kicad", kc);
     updated.push_back(kc);
 
     EdaToolRuntimeInfo fc;
     fc.name = "freecad";
     fc.enabled = _config.freecad.enabled;
-    fc.resolvedHost = _config.resolvedHostFor(_config.freecad.host);
-    fc.resolvedPort = _config.resolvedPortFor(_config.freecad.port);
-    fc.resolvedPluginPort = _config.resolvedPluginPortFor(_config.freecad.pluginPort);
-    fc.executionMode = _config.freecad.executionMode;
-    fc.binaryPath = _config.freecad.customBinaryPath;
+    fc.resolvedHost = _config.host;
+    fc.resolvedPort = _config.port;
     preserveStats("freecad", fc);
     updated.push_back(fc);
 
@@ -183,163 +165,18 @@ EdaToolRuntimeInfo* EdaBridge::findToolInfoLocked(const std::string& component) 
     return nullptr;
 }
 
-bool EdaBridge::translateLinuxToWindows(const std::string& linuxPath,
-                                        std::string& outWinPath,
-                                        std::string& outError) const {
-    outWinPath.clear();
+bool EdaBridge::validatePathSafety(const std::string& pathStr,
+                                   std::string& outError) {
     outError.clear();
-
-    if (hasNullOrDotDotSegment(linuxPath)) {
-        outError = "Invalid or traversal-containing Linux path";
+    if (hasNullOrDotDotSegment(pathStr)) {
+        outError = "Invalid, empty, or traversal-containing path: " + pathStr;
         return false;
-    }
-
-    std::string linuxPrefixCfg;
-    std::string winPrefixCfg;
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        linuxPrefixCfg = _config.linuxPathPrefix;
-        winPrefixCfg = _config.windowsPathPrefix;
-    }
-
-    if (hasNullOrDotDotSegment(linuxPrefixCfg) || winPrefixCfg.empty()) {
-        outError = "Invalid path mapping configuration";
-        return false;
-    }
-
-    std::string expandedPrefix = fs::path(PathUtils::expandHome(linuxPrefixCfg)).lexically_normal().string();
-    while (expandedPrefix.size() > 1 && expandedPrefix.back() == '/') {
-        expandedPrefix.pop_back();
-    }
-
-    std::string expandedInput = fs::path(PathUtils::expandHome(linuxPath)).lexically_normal().string();
-    while (expandedInput.size() > 1 && expandedInput.back() == '/') {
-        expandedInput.pop_back();
-    }
-
-    if (expandedInput.find("..") != std::string::npos) {
-        outError = "Normalized path escapes workspace";
-        return false;
-    }
-
-    if (expandedInput.rfind(expandedPrefix, 0) != 0) {
-        outError = "Path is outside configured linux_path_prefix (" + linuxPrefixCfg + ")";
-        return false;
-    }
-
-    std::string relSuffix;
-    if (expandedInput.size() > expandedPrefix.size()) {
-        if (expandedInput[expandedPrefix.size()] != '/') {
-            outError = "Sibling path does not match linux_path_prefix boundary";
-            return false;
-        }
-        relSuffix = expandedInput.substr(expandedPrefix.size() + 1);
-    }
-
-    bool winTarget = isWindowsStylePrefix(winPrefixCfg);
-    char sep = winTarget ? '\\' : '/';
-    std::string base = winPrefixCfg;
-    while (base.size() > 1 && (base.back() == '\\' || base.back() == '/')) {
-        // Keep trailing slash only for bare drive root like "Z:\"
-        if (winTarget && base.size() == 3 && base[1] == ':') {
-            break;
-        }
-        base.pop_back();
-    }
-
-    if (relSuffix.empty()) {
-        outWinPath = base;
-        return true;
-    }
-
-    for (char& ch : relSuffix) {
-        if (ch == '/' || ch == '\\') {
-            ch = sep;
-        }
-    }
-
-    if (base.back() == sep) {
-        outWinPath = base + relSuffix;
-    } else {
-        outWinPath = base + sep + relSuffix;
     }
     return true;
 }
 
-bool EdaBridge::translateWindowsToLinux(const std::string& winPath,
-                                        std::string& outLinuxPath) const {
-    outLinuxPath.clear();
-    if (hasNullOrDotDotSegment(winPath)) {
-        return false;
-    }
-
-    std::string linuxPrefixCfg;
-    std::string winPrefixCfg;
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        linuxPrefixCfg = _config.linuxPathPrefix;
-        winPrefixCfg = _config.windowsPathPrefix;
-    }
-
-    if (linuxPrefixCfg.empty() || winPrefixCfg.empty()) {
-        return false;
-    }
-
-    std::string expandedLinuxPrefix = fs::path(PathUtils::expandHome(linuxPrefixCfg)).lexically_normal().string();
-    while (expandedLinuxPrefix.size() > 1 && expandedLinuxPrefix.back() == '/') {
-        expandedLinuxPrefix.pop_back();
-    }
-
-    std::string normWinPrefix = winPrefixCfg;
-    std::replace(normWinPrefix.begin(), normWinPrefix.end(), '\\', '/');
-    while (normWinPrefix.size() > 1 && normWinPrefix.back() == '/') {
-        normWinPrefix.pop_back();
-    }
-
-    std::string normWinInput = winPath;
-    std::replace(normWinInput.begin(), normWinInput.end(), '\\', '/');
-    while (normWinInput.size() > 1 && normWinInput.back() == '/') {
-        normWinInput.pop_back();
-    }
-
-    auto caseInsensitiveDriveMatch = [](const std::string& input, const std::string& prefix) -> bool {
-        if (input.size() < prefix.size()) return false;
-        for (size_t i = 0; i < prefix.size(); ++i) {
-            if (i == 0 && prefix.size() >= 2 && prefix[1] == ':') {
-                if (std::tolower(static_cast<unsigned char>(input[i])) !=
-                    std::tolower(static_cast<unsigned char>(prefix[i]))) {
-                    return false;
-                }
-            } else if (input[i] != prefix[i]) {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    if (!caseInsensitiveDriveMatch(normWinInput, normWinPrefix)) {
-        return false;
-    }
-
-    std::string rel;
-    if (normWinInput.size() > normWinPrefix.size()) {
-        if (normWinInput[normWinPrefix.size()] != '/') {
-            return false;
-        }
-        rel = normWinInput.substr(normWinPrefix.size() + 1);
-    }
-
-    if (rel.empty()) {
-        outLinuxPath = expandedLinuxPrefix;
-    } else {
-        outLinuxPath = expandedLinuxPrefix + "/" + rel;
-    }
-    return true;
-}
-
-bool EdaBridge::rewriteJsonPaths(nlohmann::json& payload,
-                                 bool linuxToWindows,
-                                 std::string& outError) const {
+bool EdaBridge::validateJsonPaths(nlohmann::json& payload,
+                                  std::string& outError) {
     outError.clear();
     if (payload.is_object()) {
         for (auto it = payload.begin(); it != payload.end(); ++it) {
@@ -347,46 +184,30 @@ bool EdaBridge::rewriteJsonPaths(nlohmann::json& payload,
             nlohmann::json& val = it.value();
             if (val.is_string() && isPathFieldKey(key)) {
                 std::string s = val.get<std::string>();
-                if (linuxToWindows) {
-                    std::string mapped;
-                    if (!translateLinuxToWindows(s, mapped, outError)) {
-                        return false;
-                    }
-                    val = mapped;
-                } else {
-                    std::string mapped;
-                    if (!translateWindowsToLinux(s, mapped)) {
-                        outError = "Windows path outside mapped prefix: " + s;
-                        return false;
-                    }
-                    val = mapped;
+                if (!validatePathSafety(s, outError)) {
+                    return false;
+                }
+                if (s == "~" || s.rfind("~/", 0) == 0) {
+                    val = PathUtils::expandHome(s);
                 }
             } else if (val.is_array() && isPathFieldKey(key)) {
                 for (auto& elem : val) {
                     if (elem.is_string()) {
                         std::string s = elem.get<std::string>();
-                        if (linuxToWindows) {
-                            std::string mapped;
-                            if (!translateLinuxToWindows(s, mapped, outError)) {
-                                return false;
-                            }
-                            elem = mapped;
-                        } else {
-                            std::string mapped;
-                            if (!translateWindowsToLinux(s, mapped)) {
-                                outError = "Windows path outside mapped prefix: " + s;
-                                return false;
-                            }
-                            elem = mapped;
+                        if (!validatePathSafety(s, outError)) {
+                            return false;
+                        }
+                        if (s == "~" || s.rfind("~/", 0) == 0) {
+                            elem = PathUtils::expandHome(s);
                         }
                     } else if (elem.is_object() || elem.is_array()) {
-                        if (!rewriteJsonPaths(elem, linuxToWindows, outError)) {
+                        if (!validateJsonPaths(elem, outError)) {
                             return false;
                         }
                     }
                 }
             } else if (val.is_object() || val.is_array()) {
-                if (!rewriteJsonPaths(val, linuxToWindows, outError)) {
+                if (!validateJsonPaths(val, outError)) {
                     return false;
                 }
             }
@@ -394,7 +215,7 @@ bool EdaBridge::rewriteJsonPaths(nlohmann::json& payload,
     } else if (payload.is_array()) {
         for (auto& elem : payload) {
             if (elem.is_object() || elem.is_array()) {
-                if (!rewriteJsonPaths(elem, linuxToWindows, outError)) {
+                if (!validateJsonPaths(elem, outError)) {
                     return false;
                 }
             }
@@ -650,12 +471,8 @@ EdaBridgeStatus EdaBridge::getStatus() const {
     st.activeTransport = _activeTransport;
     st.host = _config.host;
     st.port = _config.port;
-    st.pluginPort = _config.pluginPort;
     st.authConfigured = !_config.authSecret.empty();
     st.healthPollIntervalSec = _config.healthPollIntervalSec;
-    st.requireApprovalForExports = _config.requireApprovalForExports;
-    st.linuxPathPrefix = _config.linuxPathPrefix;
-    st.windowsPathPrefix = _config.windowsPathPrefix;
     st.lastProbeEpoch = _lastProbeEpoch;
     st.lastLatencyMs = _lastLatencyMs;
     st.remotePlatform = _remotePlatform;
@@ -2222,7 +2039,7 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
     }
 
     // Client-side pre-flight security & TNP guards
-    if (toolName == "freecad_generate_cad" && cfg.freecad.enforceTnpGuard &&
+    if (toolName == "freecad_generate_cad" &&
         arguments.is_object() && arguments.contains("script") && arguments["script"].is_string()) {
         std::string reason;
         if (!guardFreecadScript(arguments["script"].get<std::string>(), reason)) {
@@ -2244,10 +2061,10 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
         easyedaSerialLock.lock();
     }
 
-    // Rewrite Linux paths in arguments to Windows/remote paths
+    // Validate path safety and expand ~ home paths in arguments
     nlohmann::json remoteArgs = arguments.is_object() ? arguments : nlohmann::json::object();
     std::string pathErr;
-    if (!rewriteJsonPaths(remoteArgs, true, pathErr)) {
+    if (!validateJsonPaths(remoteArgs, pathErr)) {
         recordToolCall(comp, toolName, "", 0, false, "", pathErr);
         return {{"ok", false}, {"error", pathErr}, {"code", -32602}};
     }
@@ -2463,23 +2280,10 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
     std::string targetHost = cfg.host;
     int targetPort = cfg.port;
     int timeoutMs = cfg.timeoutMs;
-    if (comp == "easyeda") {
-        targetHost = cfg.resolvedHostFor(cfg.easyeda.host);
-        targetPort = cfg.resolvedPortFor(cfg.easyeda.port);
-        timeoutMs = cfg.easyeda.timeoutMs;
-        // The native auto-router blocks the plugin until routing settles; give the RPC the
-        // caller's routing budget plus margin for the DOM / Win32 UI Automation trigger.
-        if (toolName == "easyeda_native_autoroute") {
-            timeoutMs = std::max(timeoutMs, jsonInt(remoteArgs, "timeout_ms", 120000) + 30000);
-        }
-    } else if (comp == "kicad") {
-        targetHost = cfg.resolvedHostFor(cfg.kicad.host);
-        targetPort = cfg.resolvedPortFor(cfg.kicad.port);
-        timeoutMs = cfg.kicad.timeoutMs;
+    if (comp == "easyeda" && toolName == "easyeda_native_autoroute") {
+        timeoutMs = std::max(timeoutMs, jsonInt(remoteArgs, "timeout_ms", 120000) + 30000);
     } else if (comp == "freecad") {
-        targetHost = cfg.resolvedHostFor(cfg.freecad.host);
-        targetPort = cfg.resolvedPortFor(cfg.freecad.port);
-        timeoutMs = cfg.freecad.timeoutMs;
+        timeoutMs = std::max(timeoutMs, 120000);
     }
 
     auto dispatchRemoteRpc = [&](const std::string& rTool,
@@ -2681,10 +2485,6 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
         }
         return errObj;
     }
-
-    // Rewrite any Windows paths in result back to Linux paths where applicable
-    std::string ignoreReverseErr;
-    rewriteJsonPaths(rpcResult, false, ignoreReverseErr);
 
     auto invokeEasyEdaApi = [&](const std::string& apiPath,
                                 const nlohmann::json& apiArgs,
@@ -2900,7 +2700,6 @@ nlohmann::json EdaBridge::callTool(const std::string& toolName,
                     nlohmann::json retryRes;
                     if (dispatchRemoteRpc(toolName, remoteArgs, retryRes, retryErr, retryCode) &&
                         retryRes.is_object()) {
-                        rewriteJsonPaths(retryRes, false, ignoreReverseErr);
                         rpcResult = std::move(retryRes);
                     }
                 }

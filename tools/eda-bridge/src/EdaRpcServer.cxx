@@ -149,10 +149,23 @@ HWND findEasyEdaProWindow() {
     return search.hwnd;
 }
 
+bool isWindowChromeAutomationId(IUIAutomationElement* el) {
+    if (el == nullptr) return false;
+    BSTR aidBstr = nullptr;
+    if (FAILED(el->get_CurrentAutomationId(&aidBstr)) || aidBstr == nullptr) {
+        return false;
+    }
+    std::wstring aid(aidBstr, ::SysStringLen(aidBstr));
+    ::SysFreeString(aidBstr);
+    return aid == L"Close" || aid == L"Minimize" || aid == L"Maximize" || aid == L"Restore";
+}
+
 // Returns an AddRef'd element whose Name equals one of names (and whose ControlType equals
 // controlType when controlType != 0), searching all descendants of root; nullptr if none.
+// When expectedPid != 0, restricts search and result to elements owned by expectedPid.
 IUIAutomationElement* findUiaElementByName(IUIAutomation* uia, IUIAutomationElement* root,
-                                           const std::vector<std::wstring>& names, int controlType) {
+                                           const std::vector<std::wstring>& names, int controlType,
+                                           DWORD expectedPid = 0) {
     for (const auto& name : names) {
         VARIANT nameVar;
         ::VariantInit(&nameVar);
@@ -162,6 +175,8 @@ IUIAutomationElement* findUiaElementByName(IUIAutomation* uia, IUIAutomationElem
         ComRelease<IUIAutomationCondition> nameCond;
         ComRelease<IUIAutomationCondition> typeCond;
         ComRelease<IUIAutomationCondition> andCond;
+        ComRelease<IUIAutomationCondition> pidCond;
+        ComRelease<IUIAutomationCondition> andPidCond;
         IUIAutomationElement* found = nullptr;
         if (SUCCEEDED(uia->CreatePropertyCondition(UIA_NamePropertyId, nameVar, &nameCond.p)) &&
             nameCond.p != nullptr) {
@@ -178,40 +193,82 @@ IUIAutomationElement* findUiaElementByName(IUIAutomation* uia, IUIAutomationElem
                     cond = andCond.p;
                 }
             }
-            root->FindFirst(TreeScope_Descendants, cond, &found);
+            bool condOk = true;
+            if (expectedPid != 0) {
+                VARIANT pidVar;
+                ::VariantInit(&pidVar);
+                pidVar.vt = VT_I4;
+                pidVar.lVal = static_cast<LONG>(expectedPid);
+                if (SUCCEEDED(uia->CreatePropertyCondition(UIA_ProcessIdPropertyId, pidVar, &pidCond.p)) &&
+                    pidCond.p != nullptr &&
+                    SUCCEEDED(uia->CreateAndCondition(cond, pidCond.p, &andPidCond.p)) &&
+                    andPidCond.p != nullptr) {
+                    cond = andPidCond.p;
+                } else {
+                    condOk = false;
+                }
+            }
+            if (condOk) {
+                root->FindFirst(TreeScope_Descendants, cond, &found);
+            }
         }
         ::VariantClear(&nameVar);
-        if (found != nullptr) return found;
+        if (found != nullptr) {
+            if (expectedPid != 0) {
+                int elPid = 0;
+                if (FAILED(found->get_CurrentProcessId(&elPid)) ||
+                    static_cast<DWORD>(elPid) != expectedPid) {
+                    found->Release();
+                    found = nullptr;
+                }
+            }
+            if (found != nullptr && isWindowChromeAutomationId(found)) {
+                found->Release();
+                found = nullptr;
+            }
+            if (found != nullptr) return found;
+        }
     }
     return nullptr;
 }
 
 IUIAutomationElement* pollUiaElementByName(IUIAutomation* uia, IUIAutomationElement* root,
                                            const std::vector<std::wstring>& names, int controlType,
-                                           int timeoutMs) {
+                                           int timeoutMs, DWORD expectedPid = 0) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     for (;;) {
-        IUIAutomationElement* el = findUiaElementByName(uia, root, names, controlType);
+        IUIAutomationElement* el = findUiaElementByName(uia, root, names, controlType, expectedPid);
         if (el != nullptr) return el;
         if (std::chrono::steady_clock::now() >= deadline) return nullptr;
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
 }
 
-// Scans descendants of root using TrueCondition, performing case-insensitive substring matching on CurrentName
-// against substrings. If controlType != 0, requires matching CurrentControlType. If controlType == 0, accepts
-// common clickable control types (MenuItem, Text, Button, Custom). Optionally collects visible names into outCandidates.
+// Scans descendants of root (scoped to expectedPid when non-zero), performing case-insensitive substring
+// matching on CurrentName against substrings. If controlType != 0, requires matching CurrentControlType.
+// If controlType == 0, accepts common clickable control types (MenuItem, Text, Button, Custom).
+// Optionally collects visible names into outCandidates.
 IUIAutomationElement* findUiaElementBySubstring(IUIAutomation* uia, IUIAutomationElement* root,
                                                const std::vector<std::wstring>& substrings,
                                                int controlType,
-                                               std::vector<std::string>* outCandidates = nullptr) {
+                                               std::vector<std::string>* outCandidates = nullptr,
+                                               DWORD expectedPid = 0) {
     if (uia == nullptr || root == nullptr) return nullptr;
-    ComRelease<IUIAutomationCondition> trueCond;
-    if (FAILED(uia->CreateTrueCondition(&trueCond.p)) || trueCond.p == nullptr) {
-        return nullptr;
+    ComRelease<IUIAutomationCondition> searchCond;
+    if (expectedPid != 0) {
+        VARIANT pidVar;
+        ::VariantInit(&pidVar);
+        pidVar.vt = VT_I4;
+        pidVar.lVal = static_cast<LONG>(expectedPid);
+        uia->CreatePropertyCondition(UIA_ProcessIdPropertyId, pidVar, &searchCond.p);
+    }
+    if (searchCond.p == nullptr) {
+        if (FAILED(uia->CreateTrueCondition(&searchCond.p)) || searchCond.p == nullptr) {
+            return nullptr;
+        }
     }
     ComRelease<IUIAutomationElementArray> arr;
-    if (FAILED(root->FindAll(TreeScope_Descendants, trueCond.p, &arr.p)) || arr.p == nullptr) {
+    if (FAILED(root->FindAll(TreeScope_Descendants, searchCond.p, &arr.p)) || arr.p == nullptr) {
         return nullptr;
     }
     int len = 0;
@@ -229,6 +286,17 @@ IUIAutomationElement* findUiaElementBySubstring(IUIAutomation* uia, IUIAutomatio
     for (int i = 0; i < len; ++i) {
         ComRelease<IUIAutomationElement> el;
         if (FAILED(arr.p->GetElement(i, &el.p)) || el.p == nullptr) continue;
+
+        if (expectedPid != 0) {
+            int elPid = 0;
+            if (FAILED(el.p->get_CurrentProcessId(&elPid)) ||
+                static_cast<DWORD>(elPid) != expectedPid) {
+                continue;
+            }
+        }
+        if (isWindowChromeAutomationId(el.p)) {
+            continue;
+        }
 
         CONTROLTYPEID ct = 0;
         el.p->get_CurrentControlType(&ct);
@@ -337,6 +405,13 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
         outDiag["error"] = "EasyEDA Pro window not found (no visible easyeda-pro.exe / EasyEDA top-level window)";
         return false;
     }
+    DWORD easyEdaPid = 0;
+    ::GetWindowThreadProcessId(hwnd, &easyEdaPid);
+    if (easyEdaPid == 0) {
+        outDiag["error"] = "Failed to query EasyEDA Pro process ID from window handle";
+        return false;
+    }
+    outDiag["easyeda_pid"] = static_cast<uint64_t>(easyEdaPid);
     if (::IsIconic(hwnd)) ::ShowWindow(hwnd, SW_RESTORE);
     ::SetForegroundWindow(hwnd);
 
@@ -371,9 +446,9 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
     };
 
     ComRelease<IUIAutomationElement> routeMenu;
-    routeMenu.p = pollUiaElementByName(uia.p, root.p, routeNames, 0, 3000);
+    routeMenu.p = pollUiaElementByName(uia.p, root.p, routeNames, 0, 3000, easyEdaPid);
     if (routeMenu.p == nullptr) {
-        routeMenu.p = findUiaElementBySubstring(uia.p, root.p, routeSubstrings, 0);
+        routeMenu.p = findUiaElementBySubstring(uia.p, root.p, routeSubstrings, 0, nullptr, easyEdaPid);
     }
     if (routeMenu.p == nullptr) {
         outDiag["stage"] = "route_menu_not_found";
@@ -385,9 +460,9 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
 
     std::vector<std::string> visibleCandidates;
     ComRelease<IUIAutomationElement> autoItem;
-    autoItem.p = pollUiaElementByName(uia.p, root.p, autoItemNames, 0, 1000);
+    autoItem.p = pollUiaElementByName(uia.p, root.p, autoItemNames, 0, 1000, easyEdaPid);
     if (autoItem.p == nullptr) {
-        autoItem.p = findUiaElementBySubstring(uia.p, root.p, autoSubstrings, 0, &visibleCandidates);
+        autoItem.p = findUiaElementBySubstring(uia.p, root.p, autoSubstrings, 0, &visibleCandidates, easyEdaPid);
     }
     if (autoItem.p == nullptr) {
         // Explicitly click center of routeMenu's bounding rectangle if not found within 1000 ms
@@ -396,19 +471,19 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
             rcMenu.right > rcMenu.left && rcMenu.bottom > rcMenu.top) {
             sendMouseClickAt((rcMenu.left + rcMenu.right) / 2, (rcMenu.top + rcMenu.bottom) / 2);
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            autoItem.p = pollUiaElementByName(uia.p, root.p, autoItemNames, 0, 1000);
+            autoItem.p = pollUiaElementByName(uia.p, root.p, autoItemNames, 0, 1000, easyEdaPid);
             if (autoItem.p == nullptr) {
-                autoItem.p = findUiaElementBySubstring(uia.p, root.p, autoSubstrings, 0, &visibleCandidates);
+                autoItem.p = findUiaElementBySubstring(uia.p, root.p, autoSubstrings, 0, &visibleCandidates, easyEdaPid);
             }
         }
     }
     if (autoItem.p == nullptr) {
-        // Native popup menus are separate top-level windows: search desktop
+        // Native popup menus are separate top-level windows: search desktop scoped to easyEdaPid
         ComRelease<IUIAutomationElement> desktop;
         if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
-            autoItem.p = findUiaElementByName(uia.p, desktop.p, autoItemNames, UIA_MenuItemControlTypeId);
+            autoItem.p = findUiaElementByName(uia.p, desktop.p, autoItemNames, UIA_MenuItemControlTypeId, easyEdaPid);
             if (autoItem.p == nullptr) {
-                autoItem.p = findUiaElementBySubstring(uia.p, desktop.p, autoSubstrings, 0, &visibleCandidates);
+                autoItem.p = findUiaElementBySubstring(uia.p, desktop.p, autoSubstrings, 0, &visibleCandidates, easyEdaPid);
             }
         }
     }
@@ -419,23 +494,25 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
         if (!visibleCandidates.empty()) {
             outDiag["visible_menu_candidates"] = visibleCandidates;
         }
-        sendVirtualKey(VK_DOWN);
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        sendVirtualKey(VK_RETURN);
-        outDiag["auto_route_item_method"] = "keyboard_down_enter";
+        if (::GetForegroundWindow() == hwnd) {
+            sendVirtualKey(VK_DOWN);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            sendVirtualKey(VK_RETURN);
+            outDiag["auto_route_item_method"] = "keyboard_down_enter";
+        }
     }
 
     ComRelease<IUIAutomationElement> runBtn;
-    runBtn.p = pollUiaElementByName(uia.p, root.p, runNames, UIA_ButtonControlTypeId, dialogTimeoutMs);
+    runBtn.p = pollUiaElementByName(uia.p, root.p, runNames, UIA_ButtonControlTypeId, dialogTimeoutMs, easyEdaPid);
     if (runBtn.p == nullptr) {
-        runBtn.p = findUiaElementBySubstring(uia.p, root.p, runSubstrings, UIA_ButtonControlTypeId);
+        runBtn.p = findUiaElementBySubstring(uia.p, root.p, runSubstrings, UIA_ButtonControlTypeId, nullptr, easyEdaPid);
     }
     if (runBtn.p == nullptr) {
         ComRelease<IUIAutomationElement> desktop;
         if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
-            runBtn.p = findUiaElementByName(uia.p, desktop.p, runNames, UIA_ButtonControlTypeId);
+            runBtn.p = findUiaElementByName(uia.p, desktop.p, runNames, UIA_ButtonControlTypeId, easyEdaPid);
             if (runBtn.p == nullptr) {
-                runBtn.p = findUiaElementBySubstring(uia.p, desktop.p, runSubstrings, UIA_ButtonControlTypeId);
+                runBtn.p = findUiaElementBySubstring(uia.p, desktop.p, runSubstrings, UIA_ButtonControlTypeId, nullptr, easyEdaPid);
             }
         }
     }
@@ -450,7 +527,9 @@ bool triggerEasyEdaNativeAutoRouteWin32(int dialogTimeoutMs, nlohmann::json& out
         outDiag["error"] = (autoItem.p == nullptr)
             ? "UI Automation could not find the Auto Route menu item and keyboard fallback did not open dialog"
             : "Auto Route dialog Run button not found and EasyEDA Pro is not the foreground window";
-        sendVirtualKey(VK_ESCAPE);
+        if (::GetForegroundWindow() == hwnd) {
+            sendVirtualKey(VK_ESCAPE);
+        }
         return false;
     }
     outDiag["stage"] = "triggered";
@@ -468,6 +547,13 @@ bool triggerEasyEdaImportChangesWin32(int dialogTimeoutMs, nlohmann::json& outDi
         outDiag["error"] = "EasyEDA Pro window not found (no visible easyeda-pro.exe / EasyEDA top-level window)";
         return false;
     }
+    DWORD easyEdaPid = 0;
+    ::GetWindowThreadProcessId(hwnd, &easyEdaPid);
+    if (easyEdaPid == 0) {
+        outDiag["error"] = "Failed to query EasyEDA Pro process ID from window handle";
+        return false;
+    }
+    outDiag["easyeda_pid"] = static_cast<uint64_t>(easyEdaPid);
     if (::IsIconic(hwnd)) ::ShowWindow(hwnd, SW_RESTORE);
     ::SetForegroundWindow(hwnd);
 
@@ -502,14 +588,11 @@ bool triggerEasyEdaImportChangesWin32(int dialogTimeoutMs, nlohmann::json& outDi
     const std::vector<std::wstring> applySubstrings = {
         L"apply changes", L"apply", L"confirm", L"\u5e94\u7528\u4fee\u6539", L"\u5e94\u7528", L"\u786e\u8ba4", L"\u786e\u5b9a"
     };
-    const std::vector<std::wstring> closeNames = {
-        L"Close", L"\u5173\u95ed"
-    };
 
     ComRelease<IUIAutomationElement> designMenu;
-    designMenu.p = pollUiaElementByName(uia.p, root.p, designNames, 0, 3000);
+    designMenu.p = pollUiaElementByName(uia.p, root.p, designNames, 0, 3000, easyEdaPid);
     if (designMenu.p == nullptr) {
-        designMenu.p = findUiaElementBySubstring(uia.p, root.p, designSubstrings, 0);
+        designMenu.p = findUiaElementBySubstring(uia.p, root.p, designSubstrings, 0, nullptr, easyEdaPid);
     }
     if (designMenu.p == nullptr) {
         outDiag["stage"] = "design_menu_not_found";
@@ -521,9 +604,9 @@ bool triggerEasyEdaImportChangesWin32(int dialogTimeoutMs, nlohmann::json& outDi
 
     std::vector<std::string> visibleCandidates;
     ComRelease<IUIAutomationElement> importItem;
-    importItem.p = pollUiaElementByName(uia.p, root.p, importItemNames, 0, 1000);
+    importItem.p = pollUiaElementByName(uia.p, root.p, importItemNames, 0, 1000, easyEdaPid);
     if (importItem.p == nullptr) {
-        importItem.p = findUiaElementBySubstring(uia.p, root.p, importSubstrings, 0, &visibleCandidates);
+        importItem.p = findUiaElementBySubstring(uia.p, root.p, importSubstrings, 0, &visibleCandidates, easyEdaPid);
     }
     if (importItem.p == nullptr) {
         RECT rcMenu = {};
@@ -531,18 +614,18 @@ bool triggerEasyEdaImportChangesWin32(int dialogTimeoutMs, nlohmann::json& outDi
             rcMenu.right > rcMenu.left && rcMenu.bottom > rcMenu.top) {
             sendMouseClickAt((rcMenu.left + rcMenu.right) / 2, (rcMenu.top + rcMenu.bottom) / 2);
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            importItem.p = pollUiaElementByName(uia.p, root.p, importItemNames, 0, 1000);
+            importItem.p = pollUiaElementByName(uia.p, root.p, importItemNames, 0, 1000, easyEdaPid);
             if (importItem.p == nullptr) {
-                importItem.p = findUiaElementBySubstring(uia.p, root.p, importSubstrings, 0, &visibleCandidates);
+                importItem.p = findUiaElementBySubstring(uia.p, root.p, importSubstrings, 0, &visibleCandidates, easyEdaPid);
             }
         }
     }
     if (importItem.p == nullptr) {
         ComRelease<IUIAutomationElement> desktop;
         if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
-            importItem.p = findUiaElementByName(uia.p, desktop.p, importItemNames, UIA_MenuItemControlTypeId);
+            importItem.p = findUiaElementByName(uia.p, desktop.p, importItemNames, UIA_MenuItemControlTypeId, easyEdaPid);
             if (importItem.p == nullptr) {
-                importItem.p = findUiaElementBySubstring(uia.p, desktop.p, importSubstrings, 0, &visibleCandidates);
+                importItem.p = findUiaElementBySubstring(uia.p, desktop.p, importSubstrings, 0, &visibleCandidates, easyEdaPid);
             }
         }
     }
@@ -555,22 +638,24 @@ bool triggerEasyEdaImportChangesWin32(int dialogTimeoutMs, nlohmann::json& outDi
         }
         outDiag["stage"] = "import_item_not_found";
         outDiag["error"] = "UI Automation could not find Import Changes menu item";
-        sendVirtualKey(VK_ESCAPE);
+        if (::GetForegroundWindow() == hwnd) {
+            sendVirtualKey(VK_ESCAPE);
+        }
         return false;
     }
 
     // Poll for the confirmation dialog button (Apply Changes, Confirm, etc.)
     ComRelease<IUIAutomationElement> applyBtn;
-    applyBtn.p = pollUiaElementByName(uia.p, root.p, applyNames, UIA_ButtonControlTypeId, dialogTimeoutMs);
+    applyBtn.p = pollUiaElementByName(uia.p, root.p, applyNames, UIA_ButtonControlTypeId, dialogTimeoutMs, easyEdaPid);
     if (applyBtn.p == nullptr) {
-        applyBtn.p = findUiaElementBySubstring(uia.p, root.p, applySubstrings, UIA_ButtonControlTypeId);
+        applyBtn.p = findUiaElementBySubstring(uia.p, root.p, applySubstrings, UIA_ButtonControlTypeId, nullptr, easyEdaPid);
     }
     if (applyBtn.p == nullptr) {
         ComRelease<IUIAutomationElement> desktop;
         if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
-            applyBtn.p = findUiaElementByName(uia.p, desktop.p, applyNames, UIA_ButtonControlTypeId);
+            applyBtn.p = findUiaElementByName(uia.p, desktop.p, applyNames, UIA_ButtonControlTypeId, easyEdaPid);
             if (applyBtn.p == nullptr) {
-                applyBtn.p = findUiaElementBySubstring(uia.p, desktop.p, applySubstrings, UIA_ButtonControlTypeId);
+                applyBtn.p = findUiaElementBySubstring(uia.p, desktop.p, applySubstrings, UIA_ButtonControlTypeId, nullptr, easyEdaPid);
             }
         }
     }
@@ -583,17 +668,9 @@ bool triggerEasyEdaImportChangesWin32(int dialogTimeoutMs, nlohmann::json& outDi
 
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
-    // Check if a Close button is visible on a modal dialog
-    ComRelease<IUIAutomationElement> closeBtn;
-    closeBtn.p = findUiaElementByName(uia.p, root.p, closeNames, UIA_ButtonControlTypeId);
-    if (closeBtn.p == nullptr) {
-        ComRelease<IUIAutomationElement> desktop;
-        if (SUCCEEDED(uia.p->GetRootElement(&desktop.p)) && desktop.p != nullptr) {
-            closeBtn.p = findUiaElementByName(uia.p, desktop.p, closeNames, UIA_ButtonControlTypeId);
-        }
-    }
-    if (closeBtn.p != nullptr) {
-        outDiag["close_method"] = activateUiaElement(closeBtn.p);
+    if (::GetForegroundWindow() == hwnd) {
+        sendVirtualKey(VK_ESCAPE);
+        outDiag["dismiss_method"] = "escape_key";
     }
 
     outDiag["stage"] = "triggered";
@@ -625,6 +702,10 @@ static bool triggerEasyEdaRebuildPoursWin32(nlohmann::json& outDiag) {
     }
     ::SetForegroundWindow(hwnd);
     ::Sleep(150);
+    if (::GetForegroundWindow() != hwnd) {
+        outDiag["error"] = "EasyEDA Pro window did not become foreground window";
+        return false;
+    }
 
     INPUT inputs[4] = {};
     inputs[0].type = INPUT_KEYBOARD;

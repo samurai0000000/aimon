@@ -4412,14 +4412,28 @@ var edaEsbuildExportName = (function () {
         const toolArgs = msg.params.arguments || {};
 
         toolDispatchQueue = toolDispatchQueue.then(async function () {
+            let timeoutHandle = null;
             try {
-                const res = await dispatchTool(toolName, toolArgs);
+                const timeoutPromise = new Promise(function (_, reject) {
+                    timeoutHandle = setTimeout(function () {
+                        reject(new Error("EasyEDA extension dispatchTool timed out after 25000ms for " + toolName));
+                    }, 25000);
+                });
+                const res = await Promise.race([dispatchTool(toolName, toolArgs), timeoutPromise]);
+                if (timeoutHandle) {
+                    clearTimeout(timeoutHandle);
+                    timeoutHandle = null;
+                }
                 sendRawJson({
                     jsonrpc: "2.0",
                     id: reqId,
                     result: res
                 });
             } catch (err) {
+                if (timeoutHandle) {
+                    clearTimeout(timeoutHandle);
+                    timeoutHandle = null;
+                }
                 sendRawJson({
                     jsonrpc: "2.0",
                     id: reqId,

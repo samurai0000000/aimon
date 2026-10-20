@@ -32,16 +32,11 @@ public:
     void attachGateway(TcpGateway* gateway);
     void attachTcpGateway(TcpGateway* gateway) { attachGateway(gateway); }
 
-    bool translateLinuxToWindows(const std::string& linuxPath,
-                                 std::string& outWinPath,
-                                 std::string& outError) const;
+    static bool validatePathSafety(const std::string& pathStr,
+                                   std::string& outError);
 
-    bool translateWindowsToLinux(const std::string& winPath,
-                                 std::string& outLinuxPath) const;
-
-    bool rewriteJsonPaths(nlohmann::json& payload,
-                          bool linuxToWindows,
-                          std::string& outError) const;
+    static bool validateJsonPaths(nlohmann::json& payload,
+                                  std::string& outError);
 
     static bool guardFreecadScript(const std::string& scriptCode,
                                    std::string& outReason);

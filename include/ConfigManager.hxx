@@ -116,54 +116,14 @@ struct EdaAcceleratorConfig {
 
 struct EasyEdaToolConfig {
     bool enabled = true;
-    std::string host;
-    int port = 0;
-    int pluginPort = 0;
-    std::string executionMode = "auto";
-    std::string customBinaryPath;
-    std::string projectsDir = "~/work/pcb/easyeda";
-    bool preferJlcpcbBasicParts = true;
-    int minLcscStock = 100;
-    bool autoDrcAfterEdit = true;
-    int jlcpcbLayerCount = 2;
-    int timeoutMs = 60000;
 };
 
 struct KiCadToolConfig {
     bool enabled = true;
-    std::string host;
-    int port = 0;
-    int pluginPort = 0;
-    std::string executionMode = "auto";
-    std::string customBinaryPath;
-    std::string symbolLibDir;
-    std::string footprintLibDir;
-    std::string projectsDir = "~/work/pcb/kicad";
-    int schematicGridMils = 50;
-    bool autoErcAfterEdit = true;
-    bool drcSchematicParity = true;
-    std::string fabTargetHouse = "jlcpcb";
-    int timeoutMs = 60000;
 };
 
 struct FreeCadToolConfig {
     bool enabled = true;
-    std::string host;
-    int port = 0;
-    int pluginPort = 0;
-    std::string executionMode = "auto";
-    std::string customBinaryPath;
-    std::string projectsDir = "~/work/robot/cad";
-    bool enforceTnpGuard = true;
-    double defaultPrintToleranceMm = 0.20;
-    double minWallThicknessMm = 1.20;
-    double maxOverhangDeg = 45.0;
-    double meshLinearDeflectionMm = 0.05;
-    double meshAngularDeflectionDeg = 5.0;
-    double jointSweepStepDeg = 5.0;
-    int renderWidth = 1280;
-    int renderHeight = 960;
-    int timeoutMs = 120000;
 };
 
 struct EdaBridgeConfig {
@@ -171,32 +131,15 @@ struct EdaBridgeConfig {
     std::string mode = "bidirectional";
     std::string host;
     int port = 3892;
-    int pluginPort = 3893;
     std::string authSecret;
     int healthPollIntervalSec = 30;
     int timeoutMs = 60000;
     int maxOutputBytes = 4194304;
-    bool requireApprovalForExports = false;
-
-    std::string linuxPathPrefix = "~/work";
-    std::string windowsPathPrefix = "Z:\\";
 
     EdaAcceleratorConfig accelerators;
     EasyEdaToolConfig easyeda;
     KiCadToolConfig kicad;
     FreeCadToolConfig freecad;
-
-    std::string resolvedHostFor(const std::string& toolHost) const {
-        return toolHost.empty() ? host : toolHost;
-    }
-
-    int resolvedPortFor(int toolPort) const {
-        return toolPort > 0 ? toolPort : port;
-    }
-
-    int resolvedPluginPortFor(int toolPluginPort) const {
-        return toolPluginPort > 0 ? toolPluginPort : pluginPort;
-    }
 
     nlohmann::json toJson(bool redactSecret = false) const;
     void fromJson(const nlohmann::json& j);

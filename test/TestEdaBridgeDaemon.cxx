@@ -811,10 +811,7 @@ TEST_GROUP(EdaBridge_LoopbackRpc) {
         _cfg.mode = "client";
         _cfg.host = "127.0.0.1";
         _cfg.port = _server->boundPort();
-        _cfg.pluginPort = _server->boundPluginPort();
         _cfg.authSecret = "test-secret-token-2026";
-        _cfg.linuxPathPrefix = _ws;
-        _cfg.windowsPathPrefix = _ws;
     }
 
     void teardown() override {
@@ -1761,8 +1758,6 @@ TEST(EdaBridge_GatewayReverse, ReverseConnectRegisters29RemoteToolsAndExecutesVi
     cfg.enabled = true;
     cfg.mode = "gateway";
     cfg.authSecret = "gw-secret-2026";
-    cfg.linuxPathPrefix = _ws;
-    cfg.windowsPathPrefix = _ws;
 
     EdaBridge bridge(cfg);
     bridge.attachTcpGateway(_gateway.get());
@@ -2997,10 +2992,7 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, AgentCadSpecValidationVolumetricDiffF
     cfg.mode = "client";
     cfg.host = "127.0.0.1";
     cfg.port = srv.boundPort();
-    cfg.pluginPort = srv.boundPluginPort();
     cfg.authSecret = "env3-secret";
-    cfg.linuxPathPrefix = _ws;
-    cfg.windowsPathPrefix = _ws;
 
     EdaBridge bridge(cfg);
 
@@ -3115,7 +3107,6 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, AgentCadSpecValidationVolumetricDiffF
     // 7. Populate >25 tool calls and verify recent_calls ring buffer in easyeda_live_status
     CHECK_TRUE(srv.start());
     cfg.port = srv.boundPort();
-    cfg.pluginPort = srv.boundPluginPort();
     bridge.setConfig(cfg);
     CHECK_TRUE(eePlugin.start(srv.boundPluginPort()));
     for (int i = 0; i < 30 && !srv.isPluginConnected("easyeda"); ++i) {
@@ -3183,6 +3174,40 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, AgentCadSpecValidationVolumetricDiffF
     srv.stop();
 }
 
+TEST(EdaBridge_UnifiedAppConfigAndToggles, Win32UiaProcessIdScopingAndNoCloseButtonClick) {
+    fs::path repoRoot = fs::path(__FILE__).parent_path().parent_path();
+    fs::path rpcSrcPath = repoRoot / "tools" / "eda-bridge" / "src" / "EdaRpcServer.cxx";
+    CHECK_TRUE(fs::exists(rpcSrcPath));
+
+    std::ifstream ifs(rpcSrcPath);
+    std::string src((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    CHECK_FALSE(src.empty());
+
+    // 1. Verify UIA_ProcessIdPropertyId and get_CurrentProcessId scoping in Win32 UIA helpers
+    CHECK_TRUE(src.find("UIA_ProcessIdPropertyId") != std::string::npos);
+    CHECK_TRUE(src.find("get_CurrentProcessId") != std::string::npos);
+    CHECK_TRUE(src.find("isWindowChromeAutomationId") != std::string::npos);
+    CHECK_TRUE(src.find("GetWindowThreadProcessId(hwnd, &easyEdaPid)") != std::string::npos);
+
+    // 2. Verify triggerEasyEdaImportChangesWin32 does NOT contain closeNames or click Close buttons
+    size_t importStart = src.find("bool triggerEasyEdaImportChangesWin32(");
+    size_t rebuildStart = src.find("static bool triggerEasyEdaRebuildPoursWin32(");
+    CHECK_TRUE(importStart != std::string::npos);
+    CHECK_TRUE(rebuildStart != std::string::npos && rebuildStart > importStart);
+    std::string importFn = src.substr(importStart, rebuildStart - importStart);
+
+    CHECK_TRUE(importFn.find("closeNames") == std::string::npos);
+    CHECK_TRUE(importFn.find("closeBtn") == std::string::npos);
+    CHECK_TRUE(importFn.find("L\"Close\"") == std::string::npos);
+    CHECK_TRUE(importFn.find("easyEdaPid") != std::string::npos);
+
+    // 3. Verify sendVirtualKey calls in Win32 triggers are guarded by ::GetForegroundWindow() == hwnd
+    size_t autoRouteStart = src.find("bool triggerEasyEdaNativeAutoRouteWin32(");
+    CHECK_TRUE(autoRouteStart != std::string::npos && autoRouteStart < importStart);
+    std::string win32Triggers = src.substr(autoRouteStart, rebuildStart - autoRouteStart);
+    CHECK_TRUE(win32Triggers.find("::GetForegroundWindow() == hwnd") != std::string::npos);
+}
+
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {
         if (std::strcmp(av[i], "--negative-control") == 0) {
@@ -3205,8 +3230,6 @@ int main(int ac, char** av) {
             cfg.host = "127.0.0.1";
             cfg.port = srv.boundPort();
             cfg.authSecret = "wrong-secret";
-            cfg.linuxPathPrefix = ws;
-            cfg.windowsPathPrefix = ws;
 
             EdaBridge bridge(cfg);
             nlohmann::json unauthRes = bridge.callTool("kicad_search_library", {{"query", "R"}});

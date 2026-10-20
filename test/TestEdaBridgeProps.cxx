@@ -27,26 +27,25 @@ int main() {
     setenv("RC_PARAMS", "max_success=250", 0);
     bool ok = true;
 
-    ok &= rc::check("valid relative subpath round-trips Linux <-> Windows", []() {
+    ok &= rc::check("valid relative subpath passes validatePathSafety and validateJsonPaths", []() {
         const auto seg1 = *rc::gen::nonEmpty(rc::gen::container<std::string>(
             rc::gen::elementOf(std::string("abcdefghijklmnopqrstuvwxyz0123456789_-"))));
         const auto seg2 = *rc::gen::nonEmpty(rc::gen::container<std::string>(
             rc::gen::elementOf(std::string("abcdefghijklmnopqrstuvwxyz0123456789_-"))));
-        EdaBridgeConfig cfg;
-        cfg.linuxPathPrefix = "~/work";
-        cfg.windowsPathPrefix = "Z:\\";
-        EdaBridge bridge(cfg);
 
         std::string rel = seg1 + "/" + seg2 + ".kicad_pcb";
         std::string inLinux = "~/work/" + rel;
-        std::string winOut;
         std::string err;
-        RC_ASSERT(bridge.translateLinuxToWindows(inLinux, winOut, err));
-        RC_ASSERT(winOut == ("Z:\\" + seg1 + "\\" + seg2 + ".kicad_pcb"));
+        RC_ASSERT(EdaBridge::validatePathSafety(inLinux, err));
+        RC_ASSERT(EdaBridge::validatePathSafety("C:\\pcb\\" + seg1 + "\\" + seg2 + ".kicad_pcb", err));
 
-        std::string backLinux;
-        RC_ASSERT(bridge.translateWindowsToLinux(winOut, backLinux));
-        RC_ASSERT(backLinux == (PathUtils::expandHome("~/work") + "/" + rel));
+        nlohmann::json payload = {
+            {"project_path", inLinux},
+            {"windows_path", "C:\\pcb\\" + seg1 + "\\" + seg2 + ".kicad_pcb"}
+        };
+        RC_ASSERT(EdaBridge::validateJsonPaths(payload, err));
+        RC_ASSERT(payload["project_path"].get<std::string>() == (PathUtils::expandHome("~/work") + "/" + rel));
+        RC_ASSERT(payload["windows_path"].get<std::string>() == ("C:\\pcb\\" + seg1 + "\\" + seg2 + ".kicad_pcb"));
     });
 
     ok &= rc::check("any path containing .. segment is rejected", []() {
@@ -54,15 +53,15 @@ int main() {
             rc::gen::elementOf(std::string("abcdef0123")));
         const auto suffix = *rc::gen::container<std::string>(
             rc::gen::elementOf(std::string("abcdef0123")));
-        EdaBridgeConfig cfg;
-        cfg.linuxPathPrefix = "~/work";
-        cfg.windowsPathPrefix = "Z:\\";
-        EdaBridge bridge(cfg);
 
         std::string candidate = "~/work/" + prefix + "/../../" + suffix;
-        std::string winOut;
         std::string err;
-        RC_ASSERT(!bridge.translateLinuxToWindows(candidate, winOut, err));
+        RC_ASSERT(!EdaBridge::validatePathSafety(candidate, err));
+
+        nlohmann::json payload = {
+            {"project_path", candidate}
+        };
+        RC_ASSERT(!EdaBridge::validateJsonPaths(payload, err));
     });
 
     ok &= rc::check("FreeCAD TNP guard rejects any FaceN, EdgeN, or VertexN reference", []() {
