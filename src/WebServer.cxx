@@ -40,6 +40,7 @@
 #include <sqlite3.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <signal.h>
 
 namespace fs = std::filesystem;
@@ -48,6 +49,7 @@ namespace aimon {
 
 static std::mutex s_cachedCliTokensMutex;
 static std::map<int, std::string> s_cachedCliTokens;
+static std::atomic<int64_t> s_lastProcHarvestSec{0};
 
 struct AgyProcessInfo {
     pid_t pid = 0;
@@ -59,8 +61,122 @@ struct AgyProcessInfo {
     int httpsPort = 0;
 };
 
+static std::string getAgyEndpointsStatePath() {
+    const char* envEp = std::getenv("AIMON_AGY_ENDPOINTS_FILE");
+    if (envEp && *envEp) {
+        return std::string(envEp);
+    }
+    return PathUtils::expandHome("~/.cursor/hooks/state/agy_ls_endpoints.json");
+}
+
+static std::set<int> scanListeningTcpPorts() {
+    std::set<int> ports;
+    auto scanNetFile = [&](const std::string& netPath) {
+        std::ifstream nf(netPath);
+        if (!nf.is_open()) return;
+        std::string line;
+        std::getline(nf, line);
+        while (std::getline(nf, line)) {
+            std::istringstream ss(line);
+            std::string sl, localAddr, remAddr, state;
+            if (ss >> sl >> localAddr >> remAddr >> state) {
+                if (state == "0A") {
+                    auto colon = localAddr.find(':');
+                    if (colon != std::string::npos) {
+                        try {
+                            int p = std::stoi(localAddr.substr(colon + 1), nullptr, 16);
+                            if (p > 0 && p <= 65535) {
+                                ports.insert(p);
+                            }
+                        } catch (...) {}
+                    }
+                }
+            }
+        }
+    };
+    scanNetFile("/proc/net/tcp");
+    scanNetFile("/proc/net/tcp6");
+    return ports;
+}
+
+static bool writeJsonFileAtomically(const std::string& targetPath, const nlohmann::json& j) {
+    try {
+        std::error_code ec;
+        fs::path tp(targetPath);
+        if (tp.has_parent_path()) {
+            fs::create_directories(tp.parent_path(), ec);
+        }
+        std::string tmpPath = targetPath + ".tmp." + std::to_string(getpid());
+        {
+            std::ofstream of(tmpPath, std::ios::trunc | std::ios::binary);
+            if (!of.is_open()) {
+                return false;
+            }
+            of << j.dump(2);
+            of.flush();
+            if (!of.good()) {
+                of.close();
+                fs::remove(tmpPath, ec);
+                return false;
+            }
+        }
+        chmod(tmpPath.c_str(), 0600);
+        fs::rename(tmpPath, targetPath, ec);
+        if (ec) {
+            fs::remove(tmpPath, ec);
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
     std::vector<AgyProcessInfo> result;
+    const char* envProcsFile = std::getenv("AIMON_AGY_PROCESSES_FILE");
+    if (envProcsFile && *envProcsFile) {
+        try {
+            std::ifstream pf(envProcsFile);
+            if (pf.is_open()) {
+                auto pj = nlohmann::json::parse(pf, nullptr, false);
+                const nlohmann::json* arr = nullptr;
+                if (!pj.is_discarded()) {
+                    if (pj.is_array()) {
+                        arr = &pj;
+                    } else if (pj.is_object() && pj.contains("processes") && pj["processes"].is_array()) {
+                        arr = &pj["processes"];
+                    }
+                }
+                if (arr) {
+                    for (const auto& item : *arr) {
+                        if (!item.is_object()) continue;
+                        AgyProcessInfo info;
+                        if (item.contains("pid")) {
+                            if (item["pid"].is_number_integer()) {
+                                info.pid = item["pid"].get<int>();
+                                info.pidStr = std::to_string(info.pid);
+                            } else if (item["pid"].is_string()) {
+                                info.pidStr = item["pid"].get<std::string>();
+                                try { info.pid = std::stoi(info.pidStr); } catch (...) {}
+                            }
+                        }
+                        if (item.contains("pidStr") && item["pidStr"].is_string()) {
+                            info.pidStr = item["pidStr"].get<std::string>();
+                        }
+                        info.cwd = item.value("cwd", "");
+                        info.lockedConversationId = item.value("lockedConversationId", "");
+                        info.terminalPts = item.value("terminalPts", "");
+                        info.httpPort = item.value("httpPort", 0);
+                        info.httpsPort = item.value("httpsPort", 0);
+                        result.push_back(std::move(info));
+                    }
+                }
+            }
+        } catch (...) {}
+        return result;
+    }
+
     std::error_code ec;
     if (!fs::exists("/proc", ec)) {
         return result;
@@ -137,7 +253,7 @@ static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
             std::ifstream lf(cliLogPath);
             std::string lline;
             int scanned = 0;
-            while (std::getline(lf, lline) && scanned < 40) {
+            while (std::getline(lf, lline) && scanned < 200) {
                 ++scanned;
                 auto portPos = lline.find("port at ");
                 if (portPos != std::string::npos) {
@@ -159,6 +275,9 @@ static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
                         }
                     }
                 }
+                if (info.httpPort > 0 && info.httpsPort > 0) {
+                    break;
+                }
             }
         }
 
@@ -166,6 +285,210 @@ static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
     }
 
     return result;
+}
+
+static std::map<int, std::pair<std::string, std::string>> syncAndPruneCliEndpointsState(
+    const std::vector<AgyProcessInfo>& agyProcs,
+    bool scanProcEnv) {
+    std::map<int, std::pair<std::string, std::string>> outLiveEnvEndpoints;
+    const char* envProcsFile = std::getenv("AIMON_AGY_PROCESSES_FILE");
+    const char* envEpFile = std::getenv("AIMON_AGY_ENDPOINTS_FILE");
+    bool hasProcsOverride = (envProcsFile && *envProcsFile);
+    bool hermeticTestMode = hasProcsOverride || (envEpFile && *envEpFile);
+
+    std::string epStatePath = getAgyEndpointsStatePath();
+    std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+
+    if (hermeticTestMode) {
+        s_cachedCliTokens.clear();
+    }
+
+    nlohmann::json ej = {{"endpoints", nlohmann::json::object()}};
+    std::map<int, int64_t> fileUpdatedAt;
+    if (fs::exists(epStatePath)) {
+        try {
+            std::ifstream ef(epStatePath);
+            auto parsed = nlohmann::json::parse(ef, nullptr, false);
+            if (!parsed.is_discarded() && parsed.is_object()) {
+                ej = std::move(parsed);
+            }
+        } catch (...) {}
+    }
+    if (!ej.contains("endpoints") || !ej["endpoints"].is_object()) {
+        ej["endpoints"] = nlohmann::json::object();
+    }
+
+    for (auto it = ej["endpoints"].begin(); it != ej["endpoints"].end(); ++it) {
+        if (!it.value().is_object()) continue;
+        int p = it.value().value("port", 0);
+        if (p <= 0) {
+            try { p = std::stoi(it.key()); } catch (...) { p = 0; }
+        }
+        std::string tok = it.value().value("csrf_token", "");
+        int64_t upd = it.value().value("updated_at", static_cast<int64_t>(0));
+        if (p > 0 && p <= 65535 && !tok.empty()) {
+            s_cachedCliTokens[p] = tok;
+            fileUpdatedAt[p] = upd;
+        }
+    }
+
+    bool stateChanged = false;
+    if (scanProcEnv && !hasProcsOverride && fs::exists("/proc")) {
+        std::vector<pid_t> procPids;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator("/proc", ec)) {
+            if (ec || !entry.is_directory()) continue;
+            std::string dname = entry.path().filename().string();
+            if (!dname.empty() && std::all_of(dname.begin(), dname.end(), ::isdigit)) {
+                try { procPids.push_back(std::stoi(dname)); } catch (...) {}
+            }
+        }
+        std::sort(procPids.begin(), procPids.end(), std::greater<pid_t>());
+
+        for (pid_t pid : procPids) {
+            std::ifstream envFile("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
+            if (!envFile.is_open()) continue;
+            std::string envContent((std::istreambuf_iterator<char>(envFile)),
+                                   std::istreambuf_iterator<char>());
+            if (envContent.find("ANTIGRAVITY_LS_ADDRESS=") == std::string::npos) continue;
+            std::string lsAddr;
+            std::string lsCsrf;
+            size_t pos = 0;
+            while (pos < envContent.size()) {
+                std::string item = envContent.c_str() + pos;
+                if (item.rfind("ANTIGRAVITY_LS_ADDRESS=", 0) == 0) {
+                    lsAddr = item.substr(23);
+                } else if (item.rfind("ANTIGRAVITY_CSRF_TOKEN=", 0) == 0) {
+                    lsCsrf = item.substr(23);
+                }
+                pos += item.length() + 1;
+            }
+            if (!lsAddr.empty() && !lsCsrf.empty()) {
+                auto colon = lsAddr.rfind(':');
+                if (colon != std::string::npos) {
+                    std::string cwdStr;
+                    std::error_code cwdEc;
+                    auto cwdPath = fs::read_symlink("/proc/" + std::to_string(pid) + "/cwd", cwdEc);
+                    if (!cwdEc) {
+                        cwdStr = cwdPath.string();
+                    }
+                    try {
+                        int p = std::stoi(lsAddr.substr(colon + 1));
+                        if (p > 0 && p <= 65535) {
+                            if (s_cachedCliTokens[p] != lsCsrf) {
+                                s_cachedCliTokens[p] = lsCsrf;
+                                stateChanged = true;
+                            }
+                            outLiveEnvEndpoints[p] = {lsCsrf, cwdStr};
+                        }
+                    } catch (...) {}
+                }
+            }
+        }
+    }
+
+    std::set<int> livePorts;
+    for (const auto& proc : agyProcs) {
+        if (proc.httpPort > 0) livePorts.insert(proc.httpPort);
+        if (proc.httpsPort > 0) livePorts.insert(proc.httpsPort);
+    }
+    for (const auto& kv : outLiveEnvEndpoints) {
+        if (kv.first > 0) livePorts.insert(kv.first);
+    }
+    std::set<int> tcpListening = scanListeningTcpPorts();
+    if (!hasProcsOverride) {
+        for (int p : tcpListening) {
+            livePorts.insert(p);
+        }
+    }
+
+    int64_t nowSec = static_cast<int64_t>(std::time(nullptr));
+    if (!livePorts.empty() || hasProcsOverride) {
+        for (auto it = s_cachedCliTokens.begin(); it != s_cachedCliTokens.end(); ) {
+            int p = it->first;
+            bool isAlive = (livePorts.count(p) > 0);
+            if (!isAlive && !hasProcsOverride) {
+                auto updIt = fileUpdatedAt.find(p);
+                if (updIt != fileUpdatedAt.end() && updIt->second > 0 && (nowSec - updIt->second) < 15) {
+                    isAlive = true;
+                }
+            }
+            if (!isAlive) {
+                it = s_cachedCliTokens.erase(it);
+                stateChanged = true;
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = ej["endpoints"].begin(); it != ej["endpoints"].end(); ) {
+            int p = 0;
+            if (it.value().is_object()) {
+                p = it.value().value("port", 0);
+            }
+            if (p <= 0) {
+                try { p = std::stoi(it.key()); } catch (...) { p = 0; }
+            }
+            if (p <= 0 || s_cachedCliTokens.find(p) == s_cachedCliTokens.end()) {
+                it = ej["endpoints"].erase(it);
+                stateChanged = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::map<int, const AgyProcessInfo*> agyByPort;
+    for (const auto& proc : agyProcs) {
+        if (proc.httpPort > 0) {
+            agyByPort[proc.httpPort] = &proc;
+        }
+    }
+
+    for (const auto& tkv : s_cachedCliTokens) {
+        std::string key = std::to_string(tkv.first);
+        if (!ej["endpoints"].contains(key) || !ej["endpoints"][key].is_object()) {
+            ej["endpoints"][key] = {
+                {"port", tkv.first},
+                {"ls_address", "localhost:" + key},
+                {"csrf_token", tkv.second},
+                {"updated_at", static_cast<long long>(nowSec)}
+            };
+            stateChanged = true;
+        } else {
+            auto& entryObj = ej["endpoints"][key];
+            if (entryObj.value("port", 0) != tkv.first ||
+                entryObj.value("csrf_token", "") != tkv.second) {
+                entryObj["port"] = tkv.first;
+                entryObj["csrf_token"] = tkv.second;
+                entryObj["updated_at"] = static_cast<long long>(nowSec);
+                stateChanged = true;
+            }
+        }
+        auto& entryObj = ej["endpoints"][key];
+        auto pIt = agyByPort.find(tkv.first);
+        if (pIt != agyByPort.end()) {
+            if (!pIt->second->lockedConversationId.empty() &&
+                entryObj.value("conversation_id", "") != pIt->second->lockedConversationId) {
+                entryObj["conversation_id"] = pIt->second->lockedConversationId;
+                stateChanged = true;
+            }
+            if (!pIt->second->cwd.empty() && entryObj.value("workspace", "").empty()) {
+                entryObj["workspace"] = pIt->second->cwd;
+                stateChanged = true;
+            }
+        }
+        auto envIt = outLiveEnvEndpoints.find(tkv.first);
+        if (envIt != outLiveEnvEndpoints.end() && !envIt->second.second.empty() &&
+            entryObj.value("workspace", "").empty()) {
+            entryObj["workspace"] = envIt->second.second;
+            stateChanged = true;
+        }
+    }
+
+    if (stateChanged) {
+        writeJsonFileAtomically(epStatePath, ej);
+    }
+    return outLiveEnvEndpoints;
 }
 
 static std::string getPrimaryLanIp() {
@@ -686,6 +1009,7 @@ void WebServer::setupRoutes() {
             std::string agentType = body.value("agent_type", "antigravity");
             int64_t ts = body.value("timestamp", static_cast<int64_t>(time(nullptr)));
 
+            bool recordedEndpointFromDetails = false;
             if (body.contains("details") && body["details"].is_object()) {
                 const auto& det = body["details"];
                 std::string lsAddr = det.value("ls_address", "");
@@ -696,10 +1020,43 @@ void WebServer::setupRoutes() {
                     try {
                         int p = std::stoi(portPart);
                         if (p > 0 && p <= 65535) {
-                            std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
-                            s_cachedCliTokens[p] = csrfTok;
+                            {
+                                std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                                s_cachedCliTokens[p] = csrfTok;
+                            }
+                            recordedEndpointFromDetails = true;
+                            std::string epStatePath = getAgyEndpointsStatePath();
+                            nlohmann::json ej = {{"endpoints", nlohmann::json::object()}};
+                            if (fs::exists(epStatePath)) {
+                                std::ifstream ef(epStatePath);
+                                auto parsed = nlohmann::json::parse(ef, nullptr, false);
+                                if (!parsed.is_discarded() && parsed.is_object()) {
+                                    ej = std::move(parsed);
+                                }
+                            }
+                            if (!ej.contains("endpoints") || !ej["endpoints"].is_object()) {
+                                ej["endpoints"] = nlohmann::json::object();
+                            }
+                            std::string key = std::to_string(p);
+                            ej["endpoints"][key] = {
+                                {"port", p},
+                                {"csrf_token", csrfTok},
+                                {"workspace", body.value("workspace", "")},
+                                {"conversation_id", body.value("conversation_id", sessionId)},
+                                {"updated_at", static_cast<long long>(std::time(nullptr))}
+                            };
+                            writeJsonFileAtomically(epStatePath, ej);
                         }
                     } catch (...) {}
+                }
+            }
+            if (!recordedEndpointFromDetails && agentType == "antigravity") {
+                static std::atomic<int64_t> s_lastHookProcScanEpoch{0};
+                int64_t nowEpoch = static_cast<int64_t>(std::time(nullptr));
+                int64_t prevEpoch = s_lastHookProcScanEpoch.load();
+                if (nowEpoch - prevEpoch >= 3 &&
+                    s_lastHookProcScanEpoch.compare_exchange_strong(prevEpoch, nowEpoch)) {
+                    syncAndPruneCliEndpointsState(discoverRunningAgyProcesses(), true);
                 }
             }
 
@@ -1172,6 +1529,10 @@ void WebServer::setupRoutes() {
         const char* envLsCsrf = std::getenv("AGY_LS_CSRF_TOKEN");
         const char* envAgAddr = std::getenv("ANTIGRAVITY_LS_ADDRESS");
         const char* envAgCsrf = std::getenv("ANTIGRAVITY_CSRF_TOKEN");
+        const char* envEpFileOverride = std::getenv("AIMON_AGY_ENDPOINTS_FILE");
+        const char* envProcsFileOverride = std::getenv("AIMON_AGY_PROCESSES_FILE");
+        bool hasHermeticTestOverrides = (envEpFileOverride && *envEpFileOverride) ||
+                                        (envProcsFileOverride && *envProcsFileOverride);
         std::string fallbackCsrf = (envLsCsrf && *envLsCsrf) ? envLsCsrf :
                                    ((envAgCsrf && *envAgCsrf) ? envAgCsrf : "");
         if (envLsPort && *envLsPort) {
@@ -1179,91 +1540,27 @@ void WebServer::setupRoutes() {
                 addEndpoint(std::stoi(envLsPort), fallbackCsrf, true, true);
             } catch (...) {}
         }
-        if (envAgAddr && *envAgAddr) {
+        if (!hasHermeticTestOverrides && envAgAddr && *envAgAddr) {
             std::string addr(envAgAddr);
             auto colon = addr.rfind(':');
             if (colon != std::string::npos) {
                 try {
-                    addEndpoint(std::stoi(addr.substr(colon + 1)), fallbackCsrf, true, true);
+                    int p = std::stoi(addr.substr(colon + 1));
+                    if (p > 0 && p <= 65535 && !fallbackCsrf.empty()) {
+                        {
+                            std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                            s_cachedCliTokens[p] = fallbackCsrf;
+                        }
+                        addEndpoint(p, fallbackCsrf, true, true);
+                    }
                 } catch (...) {}
             }
         }
 
-        if (endpoints.empty() && fs::exists("/proc")) {
-            std::string epStatePath = PathUtils::expandHome("~/.cursor/hooks/state/agy_ls_endpoints.json");
-            if (fs::exists(epStatePath)) {
-                try {
-                    std::ifstream ef(epStatePath);
-                    auto ej = nlohmann::json::parse(ef, nullptr, false);
-                    if (!ej.is_discarded() && ej.is_object() &&
-                        ej.contains("endpoints") && ej["endpoints"].is_object()) {
-                        std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
-                        for (auto it = ej["endpoints"].begin(); it != ej["endpoints"].end(); ++it) {
-                            if (!it.value().is_object()) continue;
-                            int p = it.value().value("port", 0);
-                            std::string tok = it.value().value("csrf_token", "");
-                            if (p > 0 && p <= 65535 && !tok.empty()) {
-                                s_cachedCliTokens[p] = tok;
-                            }
-                        }
-                    }
-                } catch (...) {}
-            }
-
-            std::vector<pid_t> pids;
-            std::error_code ec;
-            for (const auto& entry : fs::directory_iterator("/proc", ec)) {
-                if (ec || !entry.is_directory()) continue;
-                std::string dname = entry.path().filename().string();
-                if (!dname.empty() && std::all_of(dname.begin(), dname.end(), ::isdigit)) {
-                    try { pids.push_back(std::stoi(dname)); } catch (...) {}
-                }
-            }
-            std::sort(pids.begin(), pids.end(), std::greater<pid_t>());
-
-            std::map<int, std::pair<std::string, std::string>> liveEnvEndpoints;
-            for (pid_t pid : pids) {
-                std::ifstream envFile("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
-                if (!envFile.is_open()) continue;
-                std::string envContent((std::istreambuf_iterator<char>(envFile)),
-                                       std::istreambuf_iterator<char>());
-                if (envContent.find("ANTIGRAVITY_LS_ADDRESS=") == std::string::npos) continue;
-                std::string lsAddr;
-                std::string lsCsrf;
-                size_t pos = 0;
-                while (pos < envContent.size()) {
-                    std::string item = envContent.c_str() + pos;
-                    if (item.rfind("ANTIGRAVITY_LS_ADDRESS=", 0) == 0) {
-                        lsAddr = item.substr(23);
-                    } else if (item.rfind("ANTIGRAVITY_CSRF_TOKEN=", 0) == 0) {
-                        lsCsrf = item.substr(23);
-                    }
-                    pos += item.length() + 1;
-                }
-                if (!lsAddr.empty() && !lsCsrf.empty()) {
-                    auto colon = lsAddr.rfind(':');
-                    if (colon != std::string::npos) {
-                        std::string cwdStr;
-                        std::error_code cwdEc;
-                        auto cwdPath = fs::read_symlink("/proc/" + std::to_string(pid) + "/cwd", cwdEc);
-                        if (!cwdEc) {
-                            cwdStr = cwdPath.string();
-                        }
-                        try {
-                            int p = std::stoi(lsAddr.substr(colon + 1));
-                            if (p > 0 && p <= 65535) {
-                                {
-                                    std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
-                                    s_cachedCliTokens[p] = lsCsrf;
-                                }
-                                liveEnvEndpoints[p] = {lsCsrf, cwdStr};
-                            }
-                        } catch (...) {}
-                    }
-                }
-            }
-
+        if (!(envLsPort && *envLsPort) && (fs::exists("/proc") || hasHermeticTestOverrides)) {
             auto agyProcs = discoverRunningAgyProcesses();
+            auto liveEnvEndpoints = syncAndPruneCliEndpointsState(agyProcs, !hasHermeticTestOverrides);
+
             for (const auto& agyProc : agyProcs) {
                 if (agyProc.httpPort <= 0) continue;
                 std::string tok;
@@ -1286,74 +1583,94 @@ void WebServer::setupRoutes() {
                 addEndpoint(kv.first, kv.second.first, preferred, true, "", kv.second.second, "", "");
             }
 
-            auto findPortsForPid = [](pid_t pid) -> std::vector<int> {
-                std::vector<int> ports;
-                std::set<std::string> inodes;
-                std::string fdDir = "/proc/" + std::to_string(pid) + "/fd";
-                std::error_code fdEc;
-                if (!fs::exists(fdDir, fdEc)) return ports;
-                for (const auto& fdEntry : fs::directory_iterator(fdDir, fdEc)) {
-                    if (fdEc) break;
-                    std::error_code symEc;
-                    if (fs::is_symlink(fdEntry.path(), symEc)) {
-                        std::string target = fs::read_symlink(fdEntry.path(), symEc).string();
-                        if (!symEc && target.rfind("socket:[", 0) == 0 && target.size() > 9) {
-                            inodes.insert(target.substr(8, target.size() - 9));
-                        }
+            {
+                std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                for (const auto& tkv : s_cachedCliTokens) {
+                    addEndpoint(tkv.first, tkv.second, false, true, "", "", "", "");
+                }
+            }
+
+            if (!hasHermeticTestOverrides && fs::exists("/proc")) {
+                std::vector<pid_t> pids;
+                std::error_code ec;
+                for (const auto& entry : fs::directory_iterator("/proc", ec)) {
+                    if (ec || !entry.is_directory()) continue;
+                    std::string dname = entry.path().filename().string();
+                    if (!dname.empty() && std::all_of(dname.begin(), dname.end(), ::isdigit)) {
+                        try { pids.push_back(std::stoi(dname)); } catch (...) {}
                     }
                 }
-                if (inodes.empty()) return ports;
+                std::sort(pids.begin(), pids.end(), std::greater<pid_t>());
 
-                auto scanNetFile = [&](const std::string& netPath) {
-                    std::ifstream nf(netPath);
-                    std::string line;
-                    std::getline(nf, line);
-                    while (std::getline(nf, line)) {
-                        std::istringstream ss(line);
-                        std::string sl, localAddr, remAddr, state, txRx, trTm, retrnsmt, uid, timeout, inode;
-                        if (ss >> sl >> localAddr >> remAddr >> state >> txRx >> trTm >> retrnsmt >> uid >> timeout >> inode) {
-                            if (state == "0A" && inodes.count(inode)) {
-                                auto colon = localAddr.find(':');
-                                if (colon != std::string::npos) {
-                                    try {
-                                        int p = std::stoi(localAddr.substr(colon + 1), nullptr, 16);
-                                        if (p > 0) ports.push_back(p);
-                                    } catch (...) {}
-                                }
+                auto findPortsForPid = [](pid_t pid) -> std::vector<int> {
+                    std::vector<int> ports;
+                    std::set<std::string> inodes;
+                    std::string fdDir = "/proc/" + std::to_string(pid) + "/fd";
+                    std::error_code fdEc;
+                    if (!fs::exists(fdDir, fdEc)) return ports;
+                    for (const auto& fdEntry : fs::directory_iterator(fdDir, fdEc)) {
+                        if (fdEc) break;
+                        std::error_code symEc;
+                        if (fs::is_symlink(fdEntry.path(), symEc)) {
+                            std::string target = fs::read_symlink(fdEntry.path(), symEc).string();
+                            if (!symEc && target.rfind("socket:[", 0) == 0 && target.size() > 9) {
+                                inodes.insert(target.substr(8, target.size() - 9));
                             }
                         }
                     }
+                    if (inodes.empty()) return ports;
+
+                    auto scanNetFile = [&](const std::string& netPath) {
+                        std::ifstream nf(netPath);
+                        std::string line;
+                        std::getline(nf, line);
+                        while (std::getline(nf, line)) {
+                            std::istringstream ss(line);
+                            std::string sl, localAddr, remAddr, state, txRx, trTm, retrnsmt, uid, timeout, inode;
+                            if (ss >> sl >> localAddr >> remAddr >> state >> txRx >> trTm >> retrnsmt >> uid >> timeout >> inode) {
+                                if (state == "0A" && inodes.count(inode)) {
+                                    auto colon = localAddr.find(':');
+                                    if (colon != std::string::npos) {
+                                        try {
+                                            int p = std::stoi(localAddr.substr(colon + 1), nullptr, 16);
+                                            if (p > 0) ports.push_back(p);
+                                        } catch (...) {}
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    scanNetFile("/proc/net/tcp");
+                    scanNetFile("/proc/net/tcp6");
+                    return ports;
                 };
-                scanNetFile("/proc/net/tcp");
-                scanNetFile("/proc/net/tcp6");
-                return ports;
-            };
 
-            for (pid_t pid : pids) {
-                std::ifstream cmdFile("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
-                if (!cmdFile.is_open()) continue;
-                std::string cmdContent((std::istreambuf_iterator<char>(cmdFile)),
-                                       std::istreambuf_iterator<char>());
-                if (cmdContent.find("language_server") == std::string::npos) continue;
+                for (pid_t pid : pids) {
+                    std::ifstream cmdFile("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
+                    if (!cmdFile.is_open()) continue;
+                    std::string cmdContent((std::istreambuf_iterator<char>(cmdFile)),
+                                           std::istreambuf_iterator<char>());
+                    if (cmdContent.find("language_server") == std::string::npos) continue;
 
-                std::string csrf;
-                std::string workspaceId;
-                size_t pos = 0;
-                while (pos < cmdContent.size()) {
-                    std::string arg = cmdContent.c_str() + pos;
-                    if (arg == "--csrf_token" && (pos + arg.length() + 1) < cmdContent.size()) {
-                        csrf = cmdContent.c_str() + pos + arg.length() + 1;
-                    } else if (arg == "--workspace_id" && (pos + arg.length() + 1) < cmdContent.size()) {
-                        workspaceId = cmdContent.c_str() + pos + arg.length() + 1;
+                    std::string csrf;
+                    std::string workspaceId;
+                    size_t pos = 0;
+                    while (pos < cmdContent.size()) {
+                        std::string arg = cmdContent.c_str() + pos;
+                        if (arg == "--csrf_token" && (pos + arg.length() + 1) < cmdContent.size()) {
+                            csrf = cmdContent.c_str() + pos + arg.length() + 1;
+                        } else if (arg == "--workspace_id" && (pos + arg.length() + 1) < cmdContent.size()) {
+                            workspaceId = cmdContent.c_str() + pos + arg.length() + 1;
+                        }
+                        pos += arg.length() + 1;
                     }
-                    pos += arg.length() + 1;
-                }
-                if (csrf.empty()) csrf = fallbackCsrf;
-                if (csrf.empty()) continue;
+                    if (csrf.empty()) csrf = fallbackCsrf;
+                    if (csrf.empty()) continue;
 
-                bool preferred = (workspaceId.find("aimon") != std::string::npos);
-                for (int p : findPortsForPid(pid)) {
-                    addEndpoint(p, csrf, preferred, false, std::to_string(pid), workspaceId, "", "");
+                    bool preferred = (workspaceId.find("aimon") != std::string::npos);
+                    for (int p : findPortsForPid(pid)) {
+                        addEndpoint(p, csrf, preferred, false, std::to_string(pid), workspaceId, "", "");
+                    }
                 }
             }
         }
@@ -2138,7 +2455,9 @@ void WebServer::setupRoutes() {
 
         std::map<std::string, AgyProcessInfo> runningAgyByConvId;
         const char* envCliBrainOverride = std::getenv("AIMON_CLI_BRAIN_DIR");
-        bool isDefaultBrain = (!envCliBrainOverride || !*envCliBrainOverride);
+        const char* envAgyProcsOverride = std::getenv("AIMON_AGY_PROCESSES_FILE");
+        bool isDefaultBrain = (!envCliBrainOverride || !*envCliBrainOverride) ||
+                              (envAgyProcsOverride && *envAgyProcsOverride);
         if (isDefaultBrain) {
             for (const auto& proc : discoverRunningAgyProcesses()) {
                 if (!proc.lockedConversationId.empty()) {
@@ -2543,6 +2862,18 @@ void WebServer::setupRoutes() {
         bool isCliConv = fs::exists(cliPath) ||
                          fs::exists(fs::path(getCliBrainDir()) / id) ||
                          fs::exists(cliRootDir / "conversations" / (id + ".db"));
+        bool isLockedByRunningAgy = false;
+        int lockedHttpPort = 0;
+        for (const auto& proc : discoverRunningAgyProcesses()) {
+            if (proc.lockedConversationId == id) {
+                isLockedByRunningAgy = true;
+                lockedHttpPort = proc.httpPort;
+                break;
+            }
+        }
+        if (isLockedByRunningAgy) {
+            isCliConv = true;
+        }
         fs::path transcriptPath;
         std::string source = "ide";
 
@@ -2674,12 +3005,15 @@ void WebServer::setupRoutes() {
             const char* envLsCsrf = std::getenv("AGY_LS_CSRF_TOKEN");
             if (envLsPort && *envLsPort && envLsCsrf && *envLsCsrf) {
                 try {
-                    if (tryProbeRpcTrajectory(std::stoi(envLsPort), envLsCsrf)) {
-                        foundInMemory = true;
+                    int envP = std::stoi(envLsPort);
+                    if (!isLockedByRunningAgy || (lockedHttpPort > 0 && envP == lockedHttpPort)) {
+                        if (tryProbeRpcTrajectory(envP, envLsCsrf)) {
+                            foundInMemory = true;
+                        }
                     }
                 } catch (...) {}
             }
-            if (!foundInMemory && !isCliConv) {
+            if (!foundInMemory && !isCliConv && !isLockedByRunningAgy) {
                 int cachedPort = 0;
                 std::string cachedCsrf;
                 {
@@ -2694,9 +3028,24 @@ void WebServer::setupRoutes() {
                 }
             }
             if (!foundInMemory) {
-                for (const auto& ep : discoverLsEndpoints()) {
+                auto eps = discoverLsEndpoints();
+                std::stable_sort(eps.begin(), eps.end(), [&](const LsEndpoint& a, const LsEndpoint& b) {
+                    bool aOwns = (a.lockedConversationId == id) || (lockedHttpPort > 0 && a.port == lockedHttpPort);
+                    bool bOwns = (b.lockedConversationId == id) || (lockedHttpPort > 0 && b.port == lockedHttpPort);
+                    if (aOwns != bOwns) return aOwns > bOwns;
+                    return false;
+                });
+                for (const auto& ep : eps) {
                     if (isCliConv && !ep.isCli) {
                         continue;
+                    }
+                    if (isLockedByRunningAgy) {
+                        if (lockedHttpPort > 0 && ep.port != lockedHttpPort) {
+                            continue;
+                        }
+                        if (lockedHttpPort <= 0 && ep.lockedConversationId != id) {
+                            continue;
+                        }
                     }
                     if (tryProbeRpcTrajectory(ep.port, ep.csrf)) {
                         std::lock_guard<std::mutex> lk(*lastRpcMutex);
@@ -2928,9 +3277,14 @@ void WebServer::setupRoutes() {
         std::string wsPath = getWorkspaceRoot().string();
         std::vector<AgyProcessInfo> runningAgy = discoverRunningAgyProcesses();
         bool isLockedByRunningAgy = false;
+        int lockedHttpPort = 0;
+        std::string lockedTerminalPts;
         for (const auto& proc : runningAgy) {
             if (!cid.empty() && cid != "new" && proc.lockedConversationId == cid) {
                 isLockedByRunningAgy = true;
+                isCliConv = true;
+                lockedHttpPort = proc.httpPort;
+                lockedTerminalPts = proc.terminalPts;
                 if (!proc.cwd.empty()) {
                     wsPath = proc.cwd;
                 }
@@ -3129,8 +3483,16 @@ void WebServer::setupRoutes() {
                 if (isCliConv && !ep.isCli) {
                     continue;
                 }
+                if (isLockedByRunningAgy) {
+                    if (lockedHttpPort > 0 && ep.port != lockedHttpPort) {
+                        continue;
+                    }
+                    if (lockedHttpPort <= 0 && ep.lockedConversationId != cid) {
+                        continue;
+                    }
+                }
                 bool reachable = false;
-                if (endpointOwnsConversation(ep, cid, reachable)) {
+                if (isLockedByRunningAgy || endpointOwnsConversation(ep, cid, reachable)) {
                     std::string rpcOut;
                     if (sendRpcCascadeMessage(ep, cid, rpcOut)) {
                         nlohmann::json resp;
@@ -3147,8 +3509,8 @@ void WebServer::setupRoutes() {
                 }
             }
             // If cid was an archived conversation not loaded in any live server, start a new cascade on the primary reachable server
-            // (unless this is an unlocked CLI conversation on disk that can be resumed directly via agy --conversation <cid>)
-            if (firstReachableEp != nullptr && (!hasCliDiskConversation || isLockedByRunningAgy)) {
+            // (never start a new cascade if cid is an existing CLI disk conversation or locked by a running agy TUI)
+            if (firstReachableEp != nullptr && !hasCliDiskConversation && !isLockedByRunningAgy) {
                 std::string newCid;
                 std::string rpcOut;
                 if (startRpcNewCascade(*firstReachableEp, newCid) &&
@@ -3268,9 +3630,24 @@ void WebServer::setupRoutes() {
         };
 
         std::string lastError = "Failed to dispatch prompt via agy agentapi";
+        if (isLockedByRunningAgy) {
+            std::string locDesc = !lockedTerminalPts.empty()
+                ? lockedTerminalPts
+                : (lockedHttpPort > 0 ? ("port " + std::to_string(lockedHttpPort)) : "active terminal");
+            lastError = "Conversation is open in terminal (" + locDesc +
+                        "), but its language server CSRF token is not yet registered";
+        }
         for (const auto& ep : endpoints) {
             if (isCliConv && !ep.isCli) {
                 continue;
+            }
+            if (isLockedByRunningAgy) {
+                if (lockedHttpPort > 0 && ep.port != lockedHttpPort) {
+                    continue;
+                }
+                if (lockedHttpPort <= 0 && ep.lockedConversationId != cid) {
+                    continue;
+                }
             }
             int exitCode = -1;
             std::string output;
