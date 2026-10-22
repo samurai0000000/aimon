@@ -340,8 +340,10 @@ int main(int argc, char* argv[]) {
 
     EdaBridge edaBridge(cfg.eda);
     int64_t lastEdaProbeEpoch = 0;
+    std::mutex pollMutex;
 
     auto pollOnce = [&]() {
+        std::lock_guard<std::mutex> pollLock(pollMutex);
         AntigravityStatus ag = agCollector.fetchStatus();
         CursorStatus cr = crCollector.fetchStatus();
         ClaudeStatus cl;

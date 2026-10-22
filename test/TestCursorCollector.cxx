@@ -190,12 +190,156 @@ static void testCursorCollectorEnterpriseFallback() {
     }
 }
 
+static void testTransientConnectionErrorRetryAndRetention() {
+    std::cout << "[TestCursorCollector] Running testTransientConnectionErrorRetryAndRetention..." << std::endl;
+
+    CursorConfig cfg;
+    cfg.accessToken = "test_enterprise_token";
+    CursorCollector collector(cfg);
+
+    const std::string summaryBody = R"({
+        "billingCycleStart": "2026-10-01T00:00:00.000Z",
+        "billingCycleEnd": "2026-11-01T00:00:00.000Z",
+        "membershipType": "enterprise",
+        "individualUsage": {
+            "overall": {
+                "enabled": true,
+                "used": 98134,
+                "limit": 120000,
+                "remaining": 21866
+            }
+        }
+    })";
+
+    const std::string spendBody = R"({
+        "dailySpend": [
+            {"day": 1790812800000, "spendCents": 45000.0, "category": "auto-grok-4.7-high"},
+            {"day": 1790899200000, "spendCents": 53174.0, "category": "auto-claude-opus-5-5-medium"}
+        ]
+    })";
+
+    const std::string prevSpendBody = R"({
+        "dailySpend": [
+            {"day": 1788220800000, "spendCents": 127231.0, "category": "auto-grok-4.7-high"}
+        ]
+    })";
+
+    // Case 1: Initial poll fails all retries with connection error -> reports connection error
+    int summaryCalls = 0;
+    collector.setHttpRequestFn([&](const std::string&, const std::string& path,
+                                   const std::vector<std::pair<std::string, std::string>>&,
+                                   const std::string&) -> CursorHttpResponse {
+        if (path == "/auth/usage-summary") {
+            ++summaryCalls;
+        }
+        return CursorHttpResponse{false, 0, ""};
+    });
+
+    CursorStatus initialFail = collector.fetchStatus();
+    assert(!initialFail.isAuthenticated);
+    assert(summaryCalls == 2);
+    assert(initialFail.errorMessage == "Cursor API request failed (status: connection error)");
+
+    // Case 2: First attempt fails with connection error, retry succeeds -> full status populated
+    summaryCalls = 0;
+    int spendCalls = 0;
+    collector.setHttpRequestFn([&](const std::string&, const std::string& path,
+                                   const std::vector<std::pair<std::string, std::string>>&,
+                                   const std::string&) -> CursorHttpResponse {
+        if (path == "/auth/usage-summary") {
+            ++summaryCalls;
+            if (summaryCalls == 1) {
+                return CursorHttpResponse{false, 0, ""};
+            }
+            return CursorHttpResponse{true, 200, summaryBody};
+        }
+        if (path == "/aiserver.v1.DashboardService/GetDailySpendByCategory") {
+            ++spendCalls;
+            return CursorHttpResponse{true, 200, (spendCalls == 1) ? spendBody : prevSpendBody};
+        }
+        return CursorHttpResponse{false, 0, ""};
+    });
+
+    CursorStatus okStatus = collector.fetchStatus();
+    assert(okStatus.isAuthenticated);
+    assert(summaryCalls == 2);
+    assert(okStatus.planTier == "enterprise");
+    assert(okStatus.fastRequestsUsed == 98134);
+    assert(okStatus.fastRequestsLimit == 120000);
+    assert(okStatus.usageMode == "spend");
+    assert(okStatus.totalSpendUsd > 981.73 && okStatus.totalSpendUsd < 981.75);
+    assert(okStatus.prevCycleSpendUsd > 1272.30 && okStatus.prevCycleSpendUsd < 1272.32);
+    assert(okStatus.dailySpendHistory.size() == 2);
+    assert(okStatus.categorySpendList.size() == 2);
+    assert(okStatus.errorMessage.empty());
+
+    // Case 3: Subsequent poll hits transient connection error across all retries -> retains last valid status
+    collector.setHttpRequestFn([&](const std::string&, const std::string&,
+                                   const std::vector<std::pair<std::string, std::string>>&,
+                                   const std::string&) -> CursorHttpResponse {
+        return CursorHttpResponse{false, 0, ""};
+    });
+
+    CursorStatus retainedOnConnErr = collector.fetchStatus();
+    assert(retainedOnConnErr.isAuthenticated);
+    assert(retainedOnConnErr.planTier == "enterprise");
+    assert(retainedOnConnErr.fastRequestsUsed == 98134);
+    assert(retainedOnConnErr.fastRequestsLimit == 120000);
+    assert(retainedOnConnErr.dailySpendHistory.size() == 2);
+    assert(retainedOnConnErr.errorMessage.empty());
+
+    // Case 4: Subsequent poll succeeds on /auth/usage-summary (with updated used count)
+    // but GetDailySpendByCategory fails with connection error -> retains spend breakdown
+    const std::string updatedSummaryBody = R"({
+        "billingCycleStart": "2026-10-01T00:00:00.000Z",
+        "billingCycleEnd": "2026-11-01T00:00:00.000Z",
+        "membershipType": "enterprise",
+        "individualUsage": {
+            "overall": {
+                "enabled": true,
+                "used": 98200,
+                "limit": 120000,
+                "remaining": 21800
+            }
+        }
+    })";
+    collector.setHttpRequestFn([&](const std::string&, const std::string& path,
+                                   const std::vector<std::pair<std::string, std::string>>&,
+                                   const std::string&) -> CursorHttpResponse {
+        if (path == "/auth/usage-summary") {
+            return CursorHttpResponse{true, 200, updatedSummaryBody};
+        }
+        return CursorHttpResponse{false, 0, ""};
+    });
+
+    CursorStatus partialSpendFail = collector.fetchStatus();
+    assert(partialSpendFail.isAuthenticated);
+    assert(partialSpendFail.fastRequestsUsed == 98200);
+    assert(partialSpendFail.usageMode == "spend");
+    assert(partialSpendFail.totalSpendUsd > 981.73 && partialSpendFail.totalSpendUsd < 981.75);
+    assert(partialSpendFail.prevCycleSpendUsd > 1272.30 && partialSpendFail.prevCycleSpendUsd < 1272.32);
+    assert(partialSpendFail.dailySpendHistory.size() == 2);
+    assert(partialSpendFail.categorySpendList.size() == 2);
+
+    // Case 5: Real 401 authentication failure clears cached authentication state
+    collector.setHttpRequestFn([&](const std::string&, const std::string&,
+                                   const std::vector<std::pair<std::string, std::string>>&,
+                                   const std::string&) -> CursorHttpResponse {
+        return CursorHttpResponse{true, 401, R"({"error":"unauthorized"})"};
+    });
+
+    CursorStatus authFail = collector.fetchStatus();
+    assert(!authFail.isAuthenticated);
+    assert(authFail.errorMessage == "Cursor API request failed (status: 401)");
+}
+
 int main() {
     std::cout << "=== Starting TestCursorCollector ===" << std::endl;
     testDailySpendPointSerialization();
     testHistoryDailyUsageSummary();
     testBoundaryAndEmptyCases();
     testCursorCollectorEnterpriseFallback();
+    testTransientConnectionErrorRetryAndRetention();
     std::cout << "=== TestCursorCollector: ALL TESTS PASSED ===" << std::endl;
     return 0;
 }

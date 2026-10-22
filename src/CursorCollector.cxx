@@ -13,7 +13,9 @@
 #include <ctime>
 #include <cstdio>
 #include <chrono>
+#include <fstream>
 #include <limits>
+#include <thread>
 #include "HistoryStore.hxx"
 #include <sqlite3.h>
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -50,7 +52,56 @@ CursorCollector::CursorCollector(const CursorConfig& config)
 }
 
 void CursorCollector::setHistoryStore(HistoryStore* historyStore) {
+    std::lock_guard<std::mutex> lock(_mutex);
     _historyStore = historyStore;
+}
+
+void CursorCollector::setHttpRequestFn(HttpRequestFn fn) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _httpRequestFn = std::move(fn);
+}
+
+static bool isTransientHttpFailure(const CursorHttpResponse& resp) {
+    return !resp.connected || resp.status == 408 || resp.status == 429 || resp.status >= 500;
+}
+
+CursorHttpResponse CursorCollector::performRequest(
+    const std::string& method,
+    const std::string& path,
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    const std::string& body) {
+    if (_httpRequestFn) {
+        return _httpRequestFn(method, path, headers, body);
+    }
+
+    CursorHttpResponse out;
+    try {
+        httplib::SSLClient cli("api2.cursor.sh", 443);
+        cli.set_connection_timeout(8, 0);
+        cli.set_read_timeout(10, 0);
+        cli.set_write_timeout(8, 0);
+
+        httplib::Headers reqHeaders;
+        for (const auto& kv : headers) {
+            if (method == "POST" && kv.first == "Content-Type") {
+                continue;
+            }
+            reqHeaders.emplace(kv.first, kv.second);
+        }
+
+        httplib::Result res = (method == "POST")
+            ? cli.Post(path, reqHeaders, body, "application/json")
+            : cli.Get(path, reqHeaders);
+
+        if (res) {
+            out.connected = true;
+            out.status = res->status;
+            out.body = res->body;
+        }
+    } catch (...) {
+        out.connected = false;
+    }
+    return out;
 }
 
 std::string CursorCollector::extractTokenFromDb(const std::string& dbPath, std::string& outTier) {
@@ -132,6 +183,7 @@ std::string CursorCollector::resolveAccessToken() {
 }
 
 CursorStatus CursorCollector::fetchStatus() {
+    std::lock_guard<std::mutex> lock(_mutex);
     CursorStatus status;
     std::string tier;
     std::string dbPath = _config.dbPath.empty() ?
@@ -139,6 +191,8 @@ CursorStatus CursorCollector::fetchStatus() {
 
     std::string token = resolveAccessToken();
     if (token.empty()) {
+        _hasLastValidStatus = false;
+        _lastValidStatus = CursorStatus{};
         // Check if we at least found membership tier in DB
         extractTokenFromDb(dbPath, tier);
         if (!tier.empty()) {
@@ -150,37 +204,53 @@ CursorStatus CursorCollector::fetchStatus() {
     }
 
     try {
-        httplib::SSLClient cli("api2.cursor.sh", 443);
-        cli.set_connection_timeout(3, 0);
-        cli.set_read_timeout(4, 0);
-
-        httplib::Headers headers = {
+        std::vector<std::pair<std::string, std::string>> headers = {
             {"Authorization", "Bearer " + token},
             {"Content-Type", "application/json"}
         };
 
-        // 1. Primary modern endpoint: /auth/usage-summary
-        auto res = cli.Get("/auth/usage-summary", headers);
+        // 1. Primary modern endpoint: /auth/usage-summary (retry once on transient failure)
+        CursorHttpResponse res;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            res = performRequest("GET", "/auth/usage-summary", headers);
+            if (!isTransientHttpFailure(res)) {
+                break;
+            }
+            if (!_httpRequestFn && attempt == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            }
+        }
 
-        if (!res || res->status != 200) {
+        // Only fall back to legacy endpoints when /auth/usage-summary is unsupported (e.g. 404/405),
+        // not when the server is experiencing a transient connection/5xx error or auth rejection.
+        if (res.connected && (res.status == 404 || res.status == 405)) {
             // 2. Fallback endpoint: /aiserver.v1.DashboardService/GetCurrentPeriodUsage
-            res = cli.Post("/aiserver.v1.DashboardService/GetCurrentPeriodUsage", headers, "{}", "application/json");
+            res = performRequest("POST", "/aiserver.v1.DashboardService/GetCurrentPeriodUsage", headers, "{}");
+            if (!res.connected || res.status != 200) {
+                // 3. Fallback endpoint: /auth/usage
+                res = performRequest("GET", "/auth/usage", headers);
+            }
         }
 
-        if (!res || res->status != 200) {
-            // 3. Fallback endpoint: /auth/usage
-            res = cli.Get("/auth/usage", headers);
-        }
-
-        if (!res || res->status != 200) {
+        if (!res.connected || res.status != 200) {
+            if (isTransientHttpFailure(res) && _hasLastValidStatus) {
+                return _lastValidStatus;
+            }
+            if (res.connected && (res.status == 401 || res.status == 403)) {
+                _hasLastValidStatus = false;
+                _lastValidStatus = CursorStatus{};
+            }
             status.isAuthenticated = false;
             status.errorMessage = "Cursor API request failed (status: " +
-                (res ? std::to_string(res->status) : "connection error") + ")";
+                (res.connected ? std::to_string(res.status) : "connection error") + ")";
             return status;
         }
 
-        nlohmann::json j = nlohmann::json::parse(res->body, nullptr, false);
+        nlohmann::json j = nlohmann::json::parse(res.body, nullptr, false);
         if (j.is_discarded()) {
+            if (_hasLastValidStatus) {
+                return _lastValidStatus;
+            }
             status.isAuthenticated = false;
             status.errorMessage = "Invalid JSON response received from api2.cursor.sh";
             return status;
@@ -260,9 +330,15 @@ CursorStatus CursorCollector::fetchStatus() {
         }
 
         // Fetch personal usage and cumulative spend history
-        fetchSpendData(cli, token, cycleStartIso, status.cycleResetIso, status);
+        fetchSpendData(token, cycleStartIso, status.cycleResetIso, status);
+
+        _lastValidStatus = status;
+        _hasLastValidStatus = true;
 
     } catch (const std::exception& e) {
+        if (_hasLastValidStatus) {
+            return _lastValidStatus;
+        }
         status.isAuthenticated = false;
         status.errorMessage = std::string("Exception querying Cursor API: ") + e.what();
     }
@@ -270,8 +346,7 @@ CursorStatus CursorCollector::fetchStatus() {
     return status;
 }
 
-void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
-                                     const std::string& token,
+void CursorCollector::fetchSpendData(const std::string& token,
                                      const std::string& cycleStartIso,
                                      const std::string& cycleEndIso,
                                      CursorStatus& status) {
@@ -302,10 +377,11 @@ void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
         endMs = static_cast<int64_t>(timegm(&tmEnd)) * 1000;
     }
 
-    httplib::Headers headers = {
+    std::vector<std::pair<std::string, std::string>> headers = {
         {"Authorization", "Bearer " + token},
         {"Cookie", "WorkosCursorSessionToken=" + token},
-        {"Connect-Protocol-Version", "1"}
+        {"Connect-Protocol-Version", "1"},
+        {"Content-Type", "application/json"}
     };
 
     // 1. Current billing cycle query
@@ -314,12 +390,23 @@ void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
         {"periodEndMs", std::to_string(endMs)}
     };
 
+    bool currentSpendTransientFailure = false;
     try {
-        auto res = cli.Post("/aiserver.v1.DashboardService/GetDailySpendByCategory",
-                            headers, reqBody.dump(), "application/json");
+        CursorHttpResponse res;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            res = performRequest("POST", "/aiserver.v1.DashboardService/GetDailySpendByCategory",
+                                 headers, reqBody.dump());
+            if (!isTransientHttpFailure(res)) {
+                break;
+            }
+            if (!_httpRequestFn && attempt == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            }
+        }
+        currentSpendTransientFailure = isTransientHttpFailure(res);
 
-        if (res && res->status == 200) {
-            nlohmann::json spendJson = nlohmann::json::parse(res->body, nullptr, false);
+        if (res.connected && res.status == 200) {
+            nlohmann::json spendJson = nlohmann::json::parse(res.body, nullptr, false);
             if (!spendJson.is_discarded() && spendJson.contains("dailySpend") && spendJson["dailySpend"].is_array()) {
                 std::map<int64_t, double> dailyTotals;
                 std::map<std::string, double> categoryTotals;
@@ -392,9 +479,19 @@ void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
                           });
             }
         }
-    } catch (...) {}
+    } catch (...) {
+        currentSpendTransientFailure = true;
+    }
 
-    if (status.dailySpendHistory.empty()) {
+    if (status.dailySpendHistory.empty() && currentSpendTransientFailure &&
+        _hasLastValidStatus && _lastValidStatus.usageMode == "spend" &&
+        !_lastValidStatus.dailySpendHistory.empty()) {
+        status.totalSpendUsd = _lastValidStatus.totalSpendUsd;
+        status.dailySpendHistory = _lastValidStatus.dailySpendHistory;
+        status.categorySpendList = _lastValidStatus.categorySpendList;
+        status.dailyCategorySpends = _lastValidStatus.dailyCategorySpends;
+        status.usageMode = _lastValidStatus.usageMode;
+    } else if (status.dailySpendHistory.empty()) {
         if (status.fastRequestsLimit > 0 || status.fastRequestsUsed > 0) {
             status.usageMode = "requests";
             if (_historyStore) {
@@ -458,11 +555,20 @@ void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
     };
 
     try {
-        auto prevRes = cli.Post("/aiserver.v1.DashboardService/GetDailySpendByCategory",
-                                headers, prevReqBody.dump(), "application/json");
+        CursorHttpResponse prevRes;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            prevRes = performRequest("POST", "/aiserver.v1.DashboardService/GetDailySpendByCategory",
+                                     headers, prevReqBody.dump());
+            if (!isTransientHttpFailure(prevRes)) {
+                break;
+            }
+            if (!_httpRequestFn && attempt == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            }
+        }
 
-        if (prevRes && prevRes->status == 200) {
-            nlohmann::json prevJson = nlohmann::json::parse(prevRes->body, nullptr, false);
+        if (prevRes.connected && prevRes.status == 200) {
+            nlohmann::json prevJson = nlohmann::json::parse(prevRes.body, nullptr, false);
             if (!prevJson.is_discarded() && prevJson.contains("dailySpend") && prevJson["dailySpend"].is_array()) {
                 double prevTotalCents = 0.0;
                 for (const auto& item : prevJson["dailySpend"]) {
@@ -472,8 +578,14 @@ void CursorCollector::fetchSpendData(httplib::SSLClient& cli,
                 }
                 status.prevCycleSpendUsd = prevTotalCents / 100.0;
             }
+        } else if (isTransientHttpFailure(prevRes) && _hasLastValidStatus && _lastValidStatus.prevCycleSpendUsd > 0.0) {
+            status.prevCycleSpendUsd = _lastValidStatus.prevCycleSpendUsd;
         }
-    } catch (...) {}
+    } catch (...) {
+        if (_hasLastValidStatus && _lastValidStatus.prevCycleSpendUsd > 0.0) {
+            status.prevCycleSpendUsd = _lastValidStatus.prevCycleSpendUsd;
+        }
+    }
 }
 
 } // namespace aimon
