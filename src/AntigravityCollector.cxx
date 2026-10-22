@@ -48,33 +48,61 @@ static std::chrono::system_clock::time_point parseIsoTimestamp(const std::string
     return std::chrono::system_clock::from_time_t(timegm(&tm));
 }
 
-bool AntigravityCollector::probePort(int port, const std::string& csrfToken) {
+static bool postLsJson(int port, const std::string& csrfToken, const std::string& path,
+                       std::string& outBody, int& outStatus) {
+    outStatus = 0;
     if (port <= 0 || port > 65535) {
         return false;
     }
+    httplib::Headers headers = {
+        {"Content-Type", "application/json"},
+        {"x-codeium-csrf-token", csrfToken}
+    };
+    try {
+        httplib::Client httpCli("127.0.0.1", port);
+        httpCli.set_connection_timeout(1, 0);
+        httpCli.set_read_timeout(3, 0);
+        auto res = httpCli.Post(path.c_str(), headers, "{}", "application/json");
+        if (res && res->status == 200) {
+            outStatus = res->status;
+            outBody = res->body;
+            return true;
+        }
+        if (res) {
+            outStatus = res->status;
+        }
+    } catch (...) {}
 
     try {
-        httplib::SSLClient cli("127.0.0.1", port);
-        cli.enable_server_certificate_verification(false);
-        cli.set_connection_timeout(1, 0);
-        cli.set_read_timeout(2, 0);
-
-        httplib::Headers headers = {
-            {"Content-Type", "application/json"},
-            {"x-codeium-csrf-token", csrfToken}
-        };
-
-        auto res = cli.Post("/exa.language_server_pb.LanguageServerService/GetUserStatus", headers, "{}", "application/json");
+        httplib::SSLClient sslCli("127.0.0.1", port);
+        sslCli.enable_server_certificate_verification(false);
+        sslCli.set_connection_timeout(1, 0);
+        sslCli.set_read_timeout(3, 0);
+        auto res = sslCli.Post(path.c_str(), headers, "{}", "application/json");
         if (res && res->status == 200) {
-            nlohmann::json j = nlohmann::json::parse(res->body, nullptr, false);
-            if (!j.is_discarded() && j.contains("userStatus")) {
-                return true;
-            }
+            outStatus = res->status;
+            outBody = res->body;
+            return true;
         }
-    } catch (...) {
-        return false;
-    }
+        if (res) {
+            outStatus = res->status;
+        }
+    } catch (...) {}
 
+    return false;
+}
+
+bool AntigravityCollector::probePort(int port, const std::string& csrfToken) {
+    std::string body;
+    int status = 0;
+    if (postLsJson(port, csrfToken,
+                   "/exa.language_server_pb.LanguageServerService/GetUserStatus",
+                   body, status)) {
+        nlohmann::json j = nlohmann::json::parse(body, nullptr, false);
+        if (!j.is_discarded() && j.contains("userStatus")) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -177,6 +205,49 @@ bool AntigravityCollector::discoverProcess(int& outPort, std::string& outCsrf) {
     // Sort PIDs in descending order (highest/newest PID first)
     std::sort(candidatePids.begin(), candidatePids.end(), std::greater<pid_t>());
 
+    // 1. Prefer active agy CLI LanguageServer endpoints registered in agy_ls_endpoints.json
+    const char* homeDir = std::getenv("HOME");
+    if (homeDir && *homeDir) {
+        fs::path epStatePath = fs::path(homeDir) / ".cursor" / "hooks" / "state" / "agy_ls_endpoints.json";
+        if (fs::exists(epStatePath)) {
+            try {
+                std::ifstream ef(epStatePath);
+                auto ej = nlohmann::json::parse(ef, nullptr, false);
+                if (!ej.is_discarded() && ej.is_object() &&
+                    ej.contains("endpoints") && ej["endpoints"].is_object()) {
+                    struct CliEpCandidate {
+                        int port = 0;
+                        std::string csrf;
+                        int64_t updatedAt = 0;
+                    };
+                    std::vector<CliEpCandidate> cliEps;
+                    for (auto it = ej["endpoints"].begin(); it != ej["endpoints"].end(); ++it) {
+                        if (!it.value().is_object()) continue;
+                        int p = it.value().value("port", 0);
+                        std::string tok = it.value().value("csrf_token", "");
+                        int64_t upd = it.value().value("updated_at", static_cast<int64_t>(0));
+                        if (p > 0 && p <= 65535 && !tok.empty()) {
+                            cliEps.push_back({p, tok, upd});
+                        }
+                    }
+                    std::sort(cliEps.begin(), cliEps.end(),
+                              [](const CliEpCandidate& a, const CliEpCandidate& b) {
+                                  return a.updatedAt > b.updatedAt;
+                              });
+                    for (const auto& cand : cliEps) {
+                        if (probePort(cand.port, cand.csrf)) {
+                            _cachedPort = cand.port;
+                            _cachedCsrf = cand.csrf;
+                            outPort = cand.port;
+                            outCsrf = cand.csrf;
+                            return true;
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
     for (pid_t pid : candidatePids) {
         std::string cmdlinePath = "/proc/" + std::to_string(pid) + "/cmdline";
         std::string content;
@@ -257,25 +328,18 @@ AntigravityStatus AntigravityCollector::fetchStatus() {
     }
 
     try {
-        httplib::SSLClient cli("127.0.0.1", port);
-        cli.enable_server_certificate_verification(false);
-        cli.set_connection_timeout(2, 0);
-        cli.set_read_timeout(3, 0);
-
-        httplib::Headers headers = {
-            {"Content-Type", "application/json"},
-            {"x-codeium-csrf-token", csrf}
-        };
-
-        auto res = cli.Post("/exa.language_server_pb.LanguageServerService/GetUserStatus", headers, "{}", "application/json");
-        if (!res || res->status != 200) {
+        std::string statusBody;
+        int httpStatus = 0;
+        if (!postLsJson(port, csrf,
+                        "/exa.language_server_pb.LanguageServerService/GetUserStatus",
+                        statusBody, httpStatus)) {
             status.isRunning = false;
             status.errorMessage = "RPC call GetUserStatus failed (status: " +
-                (res ? std::to_string(res->status) : "connection error") + ")";
+                (httpStatus > 0 ? std::to_string(httpStatus) : "connection error") + ")";
             return status;
         }
 
-        nlohmann::json j = nlohmann::json::parse(res->body, nullptr, false);
+        nlohmann::json j = nlohmann::json::parse(statusBody, nullptr, false);
         if (j.is_discarded() || !j.contains("userStatus")) {
             status.isRunning = false;
             status.errorMessage = "Invalid JSON response received from language server";
@@ -375,10 +439,12 @@ AntigravityStatus AntigravityCollector::fetchStatus() {
 
         // Query authoritative quota groups (Weekly & 5-Hour limits matching the IDE)
         try {
-            auto quotaRes = cli.Post("/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
-                                     headers, "{}", "application/json");
-            if (quotaRes && quotaRes->status == 200) {
-                nlohmann::json qj = nlohmann::json::parse(quotaRes->body, nullptr, false);
+            std::string quotaBody;
+            int quotaHttpStatus = 0;
+            if (postLsJson(port, csrf,
+                           "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+                           quotaBody, quotaHttpStatus)) {
+                nlohmann::json qj = nlohmann::json::parse(quotaBody, nullptr, false);
                 if (!qj.is_discarded() && qj.contains("response") && qj["response"].contains("groups")) {
                     status.quotaGroups.clear();
                     for (const auto& g : qj["response"]["groups"]) {
