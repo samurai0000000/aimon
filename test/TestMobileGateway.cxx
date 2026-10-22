@@ -1240,6 +1240,16 @@ static void testAgentPromptPreservesCascadeConfigAndModelM418() {
     assert(resCliFlashLite && resCliFlashLite->status == 200);
     assert(resCliFlashLite->body.find("--model=flash_lite") != std::string::npos);
 
+    json cliArgonHighReq = {{"text", "CLI Argon High new"}, {"conversationId", "new"}, {"model", "Gemini 4 Argon (High)"}};
+    auto resCliArgonHigh = client.Post("/api/agent/prompt", headers, cliArgonHighReq.dump(), "application/json");
+    assert(resCliArgonHigh && resCliArgonHigh->status == 200);
+    assert(resCliArgonHigh->body.find("--model=gemini-4-argon-high") != std::string::npos);
+
+    json cliArgonMedReq = {{"text", "CLI Argon Med new"}, {"conversationId", "new"}, {"model", "Gemini 4 Argon (Medium)"}};
+    auto resCliArgonMed = client.Post("/api/agent/prompt", headers, cliArgonMedReq.dump(), "application/json");
+    assert(resCliArgonMed && resCliArgonMed->status == 200);
+    assert(resCliArgonMed->body.find("--model=gemini-4-argon-medium") != std::string::npos);
+
     server.stop();
     unsetenv("AIMON_IDE_BRAIN_DIR");
     unsetenv("AIMON_CLI_BRAIN_DIR");

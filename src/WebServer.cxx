@@ -14,6 +14,7 @@
 #include "PathUtils.hxx"
 #include "InsightEngine.hxx"
 #include "EdaBridge.hxx"
+#include "Version.hxx"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -33,7 +34,10 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <algorithm>
+#include <cctype>
+#include <map>
 #include <set>
+#include <sqlite3.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -41,6 +45,128 @@
 namespace fs = std::filesystem;
 
 namespace aimon {
+
+static std::mutex s_cachedCliTokensMutex;
+static std::map<int, std::string> s_cachedCliTokens;
+
+struct AgyProcessInfo {
+    pid_t pid = 0;
+    std::string pidStr;
+    std::string cwd;
+    std::string lockedConversationId;
+    std::string terminalPts;
+    int httpPort = 0;
+    int httpsPort = 0;
+};
+
+static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
+    std::vector<AgyProcessInfo> result;
+    std::error_code ec;
+    if (!fs::exists("/proc", ec)) {
+        return result;
+    }
+
+    for (const auto& entry : fs::directory_iterator("/proc", ec)) {
+        if (ec || !entry.is_directory()) continue;
+        std::string dname = entry.path().filename().string();
+        if (dname.empty() || !std::all_of(dname.begin(), dname.end(), ::isdigit)) {
+            continue;
+        }
+        pid_t pid = 0;
+        try {
+            pid = std::stoi(dname);
+        } catch (...) {
+            continue;
+        }
+        if (pid <= 0) continue;
+
+        std::ifstream commFile("/proc/" + dname + "/comm");
+        if (!commFile.is_open()) continue;
+        std::string comm;
+        std::getline(commFile, comm);
+        while (!comm.empty() && (comm.back() == '\r' || comm.back() == '\n' || comm.back() == ' ')) {
+            comm.pop_back();
+        }
+        if (comm != "agy") continue;
+
+        AgyProcessInfo info;
+        info.pid = pid;
+        info.pidStr = dname;
+
+        std::error_code symEc;
+        auto cwdPath = fs::read_symlink("/proc/" + dname + "/cwd", symEc);
+        if (!symEc) {
+            info.cwd = cwdPath.string();
+        }
+
+        auto fd0Path = fs::read_symlink("/proc/" + dname + "/fd/0", symEc);
+        if (!symEc) {
+            std::string fd0Str = fd0Path.string();
+            auto ptsPos = fd0Str.find("pts/");
+            if (ptsPos != std::string::npos) {
+                info.terminalPts = fd0Str.substr(ptsPos);
+            }
+        }
+
+        std::string fdDir = "/proc/" + dname + "/fd";
+        std::error_code fdEc;
+        std::string cliLogPath;
+        if (fs::exists(fdDir, fdEc)) {
+            for (const auto& fdEntry : fs::directory_iterator(fdDir, fdEc)) {
+                if (fdEc) break;
+                std::error_code linkEc;
+                if (!fs::is_symlink(fdEntry.path(), linkEc) || linkEc) continue;
+                std::string target = fs::read_symlink(fdEntry.path(), linkEc).string();
+                if (linkEc || target.empty()) continue;
+
+                auto presPos = target.find("/presence/");
+                if (presPos != std::string::npos && target.size() > presPos + 15 &&
+                    target.compare(target.size() - 5, 5, ".lock") == 0) {
+                    std::string lockName = target.substr(presPos + 10);
+                    if (lockName.size() > 5) {
+                        info.lockedConversationId = lockName.substr(0, lockName.size() - 5);
+                    }
+                } else if (cliLogPath.empty() && target.find("/log/cli-") != std::string::npos &&
+                           target.size() > 4 && target.compare(target.size() - 4, 4, ".log") == 0) {
+                    cliLogPath = target;
+                }
+            }
+        }
+
+        if (!cliLogPath.empty()) {
+            std::ifstream lf(cliLogPath);
+            std::string lline;
+            int scanned = 0;
+            while (std::getline(lf, lline) && scanned < 40) {
+                ++scanned;
+                auto portPos = lline.find("port at ");
+                if (portPos != std::string::npos) {
+                    size_t numStart = portPos + 8;
+                    size_t numEnd = lline.find(' ', numStart);
+                    if (numEnd != std::string::npos && numEnd > numStart) {
+                        int parsedPort = 0;
+                        try {
+                            parsedPort = std::stoi(lline.substr(numStart, numEnd - numStart));
+                        } catch (...) {
+                            parsedPort = 0;
+                        }
+                        if (parsedPort > 0 && parsedPort <= 65535) {
+                            if (lline.find(" for HTTPS") != std::string::npos) {
+                                info.httpsPort = parsedPort;
+                            } else if (lline.find(" for HTTP") != std::string::npos) {
+                                info.httpPort = parsedPort;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        result.push_back(std::move(info));
+    }
+
+    return result;
+}
 
 static std::string getPrimaryLanIp() {
     struct ifaddrs* ifaddr = nullptr;
@@ -306,6 +432,7 @@ void WebServer::setupRoutes() {
         if (!_endpointsEnabled) {
             if (req.path == "/api/monitors" ||
                 req.path == "/api/status" ||
+                req.path == "/api/health" ||
                 req.path.rfind("/api/telemetry", 0) == 0 ||
                 req.path.rfind("/api/v1/insights", 0) == 0) {
                 return httplib::Server::HandlerResponse::Unhandled;
@@ -433,6 +560,19 @@ void WebServer::setupRoutes() {
         res.set_content(faviconSvg, "image/svg+xml");
     });
 
+    _server->Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
+        nlohmann::json j = {
+            {"status", "ok"},
+            {"version", AIMON_VERSION_STRING},
+            {"daemon", "aimon"}
+        };
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Expires", "0");
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(j.dump(2), "application/json");
+    });
+
     _server->Get("/api/status", [this](const httplib::Request&, httplib::Response& res) {
         AggregateStatus st = _stateStore.getStatus();
         if (_edaBridge) {
@@ -545,6 +685,23 @@ void WebServer::setupRoutes() {
             std::string sessionId = body.value("session_id", "default");
             std::string agentType = body.value("agent_type", "antigravity");
             int64_t ts = body.value("timestamp", static_cast<int64_t>(time(nullptr)));
+
+            if (body.contains("details") && body["details"].is_object()) {
+                const auto& det = body["details"];
+                std::string lsAddr = det.value("ls_address", "");
+                std::string csrfTok = det.value("csrf_token", "");
+                if (!lsAddr.empty() && !csrfTok.empty()) {
+                    auto colon = lsAddr.rfind(':');
+                    std::string portPart = (colon != std::string::npos) ? lsAddr.substr(colon + 1) : lsAddr;
+                    try {
+                        int p = std::stoi(portPart);
+                        if (p > 0 && p <= 65535) {
+                            std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                            s_cachedCliTokens[p] = csrfTok;
+                        }
+                    } catch (...) {}
+                }
+            }
 
             if (eventType == "SESSION_START") {
                 std::string convId = body.value("conversation_id", sessionId);
@@ -923,6 +1080,22 @@ void WebServer::setupRoutes() {
         auto endTag = text.find("</USER_REQUEST>");
         if (startTag != std::string::npos && endTag != std::string::npos && endTag >= startTag + 14) {
             text = text.substr(startTag + 14, endTag - (startTag + 14));
+        } else {
+            auto stripBlock = [&](const std::string& openT, const std::string& closeT) {
+                while (true) {
+                    auto s = text.find(openT);
+                    if (s == std::string::npos) break;
+                    auto e = text.find(closeT, s + openT.size());
+                    if (e == std::string::npos) {
+                        text.erase(s);
+                        break;
+                    }
+                    text.erase(s, (e + closeT.size()) - s);
+                }
+            };
+            stripBlock("<ADDITIONAL_METADATA>", "</ADDITIONAL_METADATA>");
+            stripBlock("<USER_SETTINGS_CHANGE>", "</USER_SETTINGS_CHANGE>");
+            stripBlock("<SYSTEM_MESSAGE>", "</SYSTEM_MESSAGE>");
         }
         auto first = text.find_first_not_of(" \n\r\t");
         if (first == std::string::npos) {
@@ -951,191 +1124,48 @@ void WebServer::setupRoutes() {
     _server->Get("/api/agent/available", handleAgentAvailable);
     _server->Get("/api/agent/agents", handleAgentAvailable);
 
-    auto handleAgentConversations = [getIdeBrainDir, getCliBrainDir, getCliPresenceDir, stripUserRequestTags](
-                                        const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        size_t limit = 50;
-        if (req.has_param("limit")) {
-            try {
-                int parsed = std::stoi(req.get_param_value("limit"));
-                if (parsed > 0) {
-                    limit = static_cast<size_t>(parsed);
-                }
-            } catch (...) {}
-        }
-
-        struct ConvEntry {
-            std::string id;
-            std::string title;
-            std::string source;
-            uint64_t timestamp = 0;
-            bool active = false;
-        };
-
-        std::vector<ConvEntry> collected;
-        std::string presenceDir = getCliPresenceDir();
-        uint64_t nowSec = static_cast<uint64_t>(std::time(nullptr));
-
-        auto scanRoot = [&](const std::string& rootPath, const std::string& sourceLabel) {
-            if (rootPath.empty() || !fs::exists(rootPath) || !fs::is_directory(rootPath)) {
-                return;
-            }
-            std::error_code ec;
-            for (const auto& entry : fs::directory_iterator(rootPath, ec)) {
-                if (ec || !entry.is_directory()) continue;
-                std::string id = entry.path().filename().string();
-                if (id.empty() || id[0] == '.' || id == "tempmediaStorage") continue;
-
-                fs::path transcriptPath = entry.path() / ".system_generated" / "logs" / "transcript.jsonl";
-                fs::path taskMdPath = entry.path() / "task.md";
-                bool hasTranscript = fs::exists(transcriptPath);
-                bool hasTaskMd = fs::exists(taskMdPath);
-                if (!hasTranscript && !hasTaskMd) continue;
-
-                uint64_t ts = 0;
-                try {
-                    auto ftime = hasTranscript ? fs::last_write_time(transcriptPath)
-                                               : fs::last_write_time(entry.path());
-                    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
-                    );
-                    auto secs = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
-                    if (secs > 0) {
-                        ts = static_cast<uint64_t>(secs);
-                    }
-                } catch (...) {}
-
-                std::string title;
-                if (hasTaskMd) {
-                    std::ifstream tf(taskMdPath);
-                    std::string tline;
-                    while (std::getline(tf, tline)) {
-                        auto first = tline.find_first_not_of(" \t\r\n");
-                        if (first == std::string::npos) continue;
-                        if (tline.compare(first, 2, "# ") == 0) {
-                            title = tline.substr(first + 2);
-                            auto last = title.find_last_not_of(" \t\r\n");
-                            if (last != std::string::npos) {
-                                title.erase(last + 1);
-                            }
-                            if (title.rfind("Task:", 0) == 0 || title.rfind("Plan:", 0) == 0) {
-                                auto afterColon = title.find_first_not_of(" \t", 5);
-                                if (afterColon != std::string::npos) {
-                                    title = title.substr(afterColon);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                bool isInternalSubagent = false;
-                if (title.empty() && hasTranscript) {
-                    std::ifstream f(transcriptPath);
-                    std::string line;
-                    int scannedLines = 0;
-                    while (std::getline(f, line) && scannedLines < 25) {
-                        ++scannedLines;
-                        if (line.empty()) continue;
-                        try {
-                            auto j = nlohmann::json::parse(line, nullptr, false);
-                            if (j.is_discarded() || !j.is_object()) continue;
-                            std::string stype = j.value("type", "");
-                            if (scannedLines == 1 && stype == "SYSTEM_MESSAGE" && !hasTaskMd) {
-                                isInternalSubagent = true;
-                                break;
-                            }
-                            if (stype == "USER_INPUT" || (scannedLines == 1 && j.contains("content"))) {
-                                std::string content = j.value("content", "");
-                                std::string clean = stripUserRequestTags(content);
-                                if (!clean.empty()) {
-                                    auto nlPos = clean.find_first_of("\r\n");
-                                    if (nlPos != std::string::npos) {
-                                        clean = clean.substr(0, nlPos);
-                                    }
-                                    title = clean;
-                                    if (stype == "USER_INPUT") {
-                                        break;
-                                    }
-                                }
-                            }
-                        } catch (...) {}
-                    }
-                }
-                if (isInternalSubagent) {
-                    continue;
-                }
-
-                if (title.empty()) {
-                    title = "Conversation " + id.substr(0, std::min<size_t>(8, id.length()));
-                } else if (title.length() > 80) {
-                    title = title.substr(0, 77) + "...";
-                }
-
-                bool isActive = false;
-                if (!presenceDir.empty() && fs::exists(fs::path(presenceDir) / (id + ".lock"))) {
-                    isActive = true;
-                } else if (ts > 0 && nowSec >= ts && (nowSec - ts) < 120) {
-                    isActive = true;
-                }
-
-                ConvEntry ce;
-                ce.id = id;
-                ce.title = title;
-                ce.source = sourceLabel;
-                ce.timestamp = ts;
-                ce.active = isActive;
-                collected.push_back(std::move(ce));
-            }
-        };
-
-        scanRoot(getIdeBrainDir(), "ide");
-        scanRoot(getCliBrainDir(), "cli");
-
-        std::sort(collected.begin(), collected.end(), [](const ConvEntry& a, const ConvEntry& b) {
-            if (a.timestamp != b.timestamp) {
-                return a.timestamp > b.timestamp;
-            }
-            return a.id > b.id;
-        });
-
-        nlohmann::json conversations = nlohmann::json::array();
-        size_t count = std::min(collected.size(), limit);
-        for (size_t i = 0; i < count; ++i) {
-            conversations.push_back({
-                {"id", collected[i].id},
-                {"title", collected[i].title},
-                {"source", collected[i].source},
-                {"timestamp", collected[i].timestamp},
-                {"active", collected[i].active}
-            });
-        }
-
-        nlohmann::json resp;
-        resp["conversations"] = conversations;
-        res.set_content(resp.dump(2), "application/json");
-    };
-    _server->Get("/api/agent/conversations", handleAgentConversations);
-    _server->Get("/api/agent/history", handleAgentConversations);
-
     struct LsEndpoint {
         int port = 0;
         std::string csrf;
+        bool isHttps = false;
+        bool isCli = false;
         bool isPreferredWorkspace = false;
+        std::string pid;
+        std::string cwd;
+        std::string lockedConversationId;
+        std::string terminalPts;
     };
 
     auto discoverLsEndpoints = []() -> std::vector<LsEndpoint> {
         std::vector<LsEndpoint> endpoints;
 
-        auto addEndpoint = [&](int port, const std::string& csrf, bool preferred = false) {
+        auto addEndpoint = [&](int port, const std::string& csrf, bool preferred = false,
+                               bool isCli = false, const std::string& pidStr = "",
+                               const std::string& cwd = "", const std::string& lockedCid = "",
+                               const std::string& pts = "") {
             if (port <= 0 || port > 65535 || csrf.empty()) return;
             for (auto& ep : endpoints) {
                 if (ep.port == port && ep.csrf == csrf) {
                     if (preferred) ep.isPreferredWorkspace = true;
+                    if (isCli) ep.isCli = true;
+                    if (ep.pid.empty() && !pidStr.empty()) ep.pid = pidStr;
+                    if (ep.cwd.empty() && !cwd.empty()) ep.cwd = cwd;
+                    if (ep.lockedConversationId.empty() && !lockedCid.empty()) ep.lockedConversationId = lockedCid;
+                    if (ep.terminalPts.empty() && !pts.empty()) ep.terminalPts = pts;
                     return;
                 }
             }
-            endpoints.push_back({port, csrf, preferred});
+            LsEndpoint ep;
+            ep.port = port;
+            ep.csrf = csrf;
+            ep.isHttps = false;
+            ep.isCli = isCli;
+            ep.isPreferredWorkspace = preferred;
+            ep.pid = pidStr;
+            ep.cwd = cwd;
+            ep.lockedConversationId = lockedCid;
+            ep.terminalPts = pts;
+            endpoints.push_back(std::move(ep));
         };
 
         const char* envLsPort = std::getenv("AGY_LS_PORT");
@@ -1146,7 +1176,7 @@ void WebServer::setupRoutes() {
                                    ((envAgCsrf && *envAgCsrf) ? envAgCsrf : "");
         if (envLsPort && *envLsPort) {
             try {
-                addEndpoint(std::stoi(envLsPort), fallbackCsrf, true);
+                addEndpoint(std::stoi(envLsPort), fallbackCsrf, true, true);
             } catch (...) {}
         }
         if (envAgAddr && *envAgAddr) {
@@ -1154,12 +1184,32 @@ void WebServer::setupRoutes() {
             auto colon = addr.rfind(':');
             if (colon != std::string::npos) {
                 try {
-                    addEndpoint(std::stoi(addr.substr(colon + 1)), fallbackCsrf, true);
+                    addEndpoint(std::stoi(addr.substr(colon + 1)), fallbackCsrf, true, true);
                 } catch (...) {}
             }
         }
 
         if (endpoints.empty() && fs::exists("/proc")) {
+            std::string epStatePath = PathUtils::expandHome("~/.cursor/hooks/state/agy_ls_endpoints.json");
+            if (fs::exists(epStatePath)) {
+                try {
+                    std::ifstream ef(epStatePath);
+                    auto ej = nlohmann::json::parse(ef, nullptr, false);
+                    if (!ej.is_discarded() && ej.is_object() &&
+                        ej.contains("endpoints") && ej["endpoints"].is_object()) {
+                        std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                        for (auto it = ej["endpoints"].begin(); it != ej["endpoints"].end(); ++it) {
+                            if (!it.value().is_object()) continue;
+                            int p = it.value().value("port", 0);
+                            std::string tok = it.value().value("csrf_token", "");
+                            if (p > 0 && p <= 65535 && !tok.empty()) {
+                                s_cachedCliTokens[p] = tok;
+                            }
+                        }
+                    }
+                } catch (...) {}
+            }
+
             std::vector<pid_t> pids;
             std::error_code ec;
             for (const auto& entry : fs::directory_iterator("/proc", ec)) {
@@ -1171,6 +1221,7 @@ void WebServer::setupRoutes() {
             }
             std::sort(pids.begin(), pids.end(), std::greater<pid_t>());
 
+            std::map<int, std::pair<std::string, std::string>> liveEnvEndpoints;
             for (pid_t pid : pids) {
                 std::ifstream envFile("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
                 if (!envFile.is_open()) continue;
@@ -1192,17 +1243,47 @@ void WebServer::setupRoutes() {
                 if (!lsAddr.empty() && !lsCsrf.empty()) {
                     auto colon = lsAddr.rfind(':');
                     if (colon != std::string::npos) {
-                        bool preferred = false;
+                        std::string cwdStr;
                         std::error_code cwdEc;
                         auto cwdPath = fs::read_symlink("/proc/" + std::to_string(pid) + "/cwd", cwdEc);
-                        if (!cwdEc && cwdPath.string().find("aimon") != std::string::npos) {
-                            preferred = true;
+                        if (!cwdEc) {
+                            cwdStr = cwdPath.string();
                         }
                         try {
-                            addEndpoint(std::stoi(lsAddr.substr(colon + 1)), lsCsrf, preferred);
+                            int p = std::stoi(lsAddr.substr(colon + 1));
+                            if (p > 0 && p <= 65535) {
+                                {
+                                    std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                                    s_cachedCliTokens[p] = lsCsrf;
+                                }
+                                liveEnvEndpoints[p] = {lsCsrf, cwdStr};
+                            }
                         } catch (...) {}
                     }
                 }
+            }
+
+            auto agyProcs = discoverRunningAgyProcesses();
+            for (const auto& agyProc : agyProcs) {
+                if (agyProc.httpPort <= 0) continue;
+                std::string tok;
+                {
+                    std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                    auto it = s_cachedCliTokens.find(agyProc.httpPort);
+                    if (it != s_cachedCliTokens.end()) {
+                        tok = it->second;
+                    }
+                }
+                if (!tok.empty()) {
+                    bool preferred = (agyProc.cwd.find("aimon") != std::string::npos);
+                    addEndpoint(agyProc.httpPort, tok, preferred, true, agyProc.pidStr,
+                                agyProc.cwd, agyProc.lockedConversationId, agyProc.terminalPts);
+                }
+            }
+
+            for (const auto& kv : liveEnvEndpoints) {
+                bool preferred = (kv.second.second.find("aimon") != std::string::npos);
+                addEndpoint(kv.first, kv.second.first, preferred, true, "", kv.second.second, "", "");
             }
 
             auto findPortsForPid = [](pid_t pid) -> std::vector<int> {
@@ -1272,12 +1353,15 @@ void WebServer::setupRoutes() {
 
                 bool preferred = (workspaceId.find("aimon") != std::string::npos);
                 for (int p : findPortsForPid(pid)) {
-                    addEndpoint(p, csrf, preferred);
+                    addEndpoint(p, csrf, preferred, false, std::to_string(pid), workspaceId, "", "");
                 }
             }
         }
 
         std::stable_sort(endpoints.begin(), endpoints.end(), [](const LsEndpoint& a, const LsEndpoint& b) {
+            if (a.isCli != b.isCli) {
+                return a.isCli > b.isCli;
+            }
             return a.isPreferredWorkspace > b.isPreferredWorkspace;
         });
         return endpoints;
@@ -1286,17 +1370,387 @@ void WebServer::setupRoutes() {
     auto lastRpcEndpoint = std::make_shared<std::pair<int, std::string>>(0, "");
     auto lastRpcMutex = std::make_shared<std::mutex>();
 
-    auto mapModelPlaceholderToName = [](const std::string& raw) -> std::string {
+    auto toLowerAscii = [](std::string s) -> std::string {
+        for (char& ch : s) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        return s;
+    };
+
+    auto mapModelEnumToModelName = [](const std::string& raw) -> std::string {
+        if (raw == "MODEL_PLACEHOLDER_M417" || raw == "gemini-4-argon-high") {
+            return "gemini-4-argon-high";
+        }
         if (raw == "MODEL_PLACEHOLDER_M418" || raw == "gemini-4-argon-medium" || raw == "pro") {
             return "gemini-4-argon-medium";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M419" || raw == "gemini-4-argon-low") {
+            return "gemini-4-argon-low";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M318" || raw == "gemini-3.8-flash-high") {
+            return "gemini-3.8-flash-high";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M319" || raw == "gemini-3.8-flash-medium") {
+            return "gemini-3.8-flash-medium";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M320" || raw == "gemini-3.8-flash-low") {
+            return "gemini-3.8-flash-low";
         }
         if (raw == "MODEL_PLACEHOLDER_M322" || raw == "gemini-3.8-flash-tiered" || raw == "flash") {
             return "gemini-3.8-flash-tiered";
         }
+        if (raw == "MODEL_PLACEHOLDER_M402" || raw == "claude-opus-5-5-high") {
+            return "claude-opus-5-5-high";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M401" || raw == "claude-opus-5-5-medium") {
+            return "claude-opus-5-5-medium";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M400" || raw == "claude-opus-5-5-low") {
+            return "claude-opus-5-5-low";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M405" || raw == "claude-sonnet-5-5-high") {
+            return "claude-sonnet-5-5-high";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M404" || raw == "claude-sonnet-5-5-medium") {
+            return "claude-sonnet-5-5-medium";
+        }
+        if (raw == "MODEL_PLACEHOLDER_M403" || raw == "claude-sonnet-5-5-low") {
+            return "claude-sonnet-5-5-low";
+        }
+        if (raw == "MODEL_OPENAI_GPT_OSS_120B_MEDIUM" || raw == "gpt-oss-120b-medium") {
+            return "gpt-oss-120b-medium";
+        }
         return raw;
     };
 
-    auto extractTrajectoryModelName = [mapModelPlaceholderToName](const nlohmann::json& tj) -> std::string {
+    auto mapModelToHumanLabel = [](const std::string& raw) -> std::string {
+        if (raw.find("gemini-4-argon-high") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M417") != std::string::npos ||
+            raw.find("Gemini 4 Argon (High)") != std::string::npos) {
+            return "Gemini 4 Argon (High)";
+        }
+        if (raw.find("gemini-4-argon-medium") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M418") != std::string::npos ||
+            raw.find("Gemini 4 Argon (Medium)") != std::string::npos) {
+            return "Gemini 4 Argon (Medium)";
+        }
+        if (raw.find("gemini-4-argon-low") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M419") != std::string::npos ||
+            raw.find("Gemini 4 Argon (Low)") != std::string::npos) {
+            return "Gemini 4 Argon (Low)";
+        }
+        if (raw.find("gemini-3.8-flash-high") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M318") != std::string::npos ||
+            raw.find("Gemini 3.8 Flash (High)") != std::string::npos) {
+            return "Gemini 3.8 Flash (High)";
+        }
+        if (raw.find("gemini-3.8-flash-medium") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M319") != std::string::npos ||
+            raw.find("Gemini 3.8 Flash (Medium)") != std::string::npos) {
+            return "Gemini 3.8 Flash (Medium)";
+        }
+        if (raw.find("gemini-3.8-flash-low") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M320") != std::string::npos ||
+            raw.find("Gemini 3.8 Flash (Low)") != std::string::npos) {
+            return "Gemini 3.8 Flash (Low)";
+        }
+        if (raw.find("claude-opus-5-5-high") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M402") != std::string::npos ||
+            raw.find("Claude Opus 5.5 (High)") != std::string::npos) {
+            return "Claude Opus 5.5 (High)";
+        }
+        if (raw.find("claude-opus-5-5-medium") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M401") != std::string::npos ||
+            raw.find("Claude Opus 5.5 (Medium)") != std::string::npos) {
+            return "Claude Opus 5.5 (Medium)";
+        }
+        if (raw.find("claude-opus-5-5-low") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M400") != std::string::npos ||
+            raw.find("Claude Opus 5.5 (Low)") != std::string::npos) {
+            return "Claude Opus 5.5 (Low)";
+        }
+        if (raw.find("claude-sonnet-5-5-high") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M405") != std::string::npos ||
+            raw.find("Claude Sonnet 5.5 (High)") != std::string::npos) {
+            return "Claude Sonnet 5.5 (High)";
+        }
+        if (raw.find("claude-sonnet-5-5-medium") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M404") != std::string::npos ||
+            raw.find("Claude Sonnet 5.5 (Medium)") != std::string::npos) {
+            return "Claude Sonnet 5.5 (Medium)";
+        }
+        if (raw.find("claude-sonnet-5-5-low") != std::string::npos ||
+            raw.find("MODEL_PLACEHOLDER_M403") != std::string::npos ||
+            raw.find("Claude Sonnet 5.5 (Low)") != std::string::npos) {
+            return "Claude Sonnet 5.5 (Low)";
+        }
+        if (raw.find("gpt-oss-120b-medium") != std::string::npos ||
+            raw.find("MODEL_OPENAI_GPT_OSS_120B_MEDIUM") != std::string::npos ||
+            raw.find("GPT-OSS 120B (Medium)") != std::string::npos) {
+            return "GPT-OSS 120B (Medium)";
+        }
+        return "";
+    };
+
+    auto mapLabelToCliModelId = [toLowerAscii](const std::string& modelLabel) -> std::string {
+        std::string lower = toLowerAscii(modelLabel);
+        if (lower.empty()) return "";
+        if (lower == "pro") return "pro";
+        if (lower == "flash") return "flash";
+        if (lower == "flash_lite") return "flash_lite";
+        if (lower.find("m417") != std::string::npos || lower == "argon" ||
+            (lower.find("argon") != std::string::npos && lower.find("high") != std::string::npos)) {
+            return "gemini-4-argon-high";
+        }
+        if (lower.find("m419") != std::string::npos ||
+            (lower.find("argon") != std::string::npos && lower.find("low") != std::string::npos)) {
+            return "gemini-4-argon-low";
+        }
+        if (lower.find("m418") != std::string::npos || lower.find("argon") != std::string::npos) {
+            return "gemini-4-argon-medium";
+        }
+        if (lower.find("m318") != std::string::npos ||
+            (lower.find("flash") != std::string::npos && lower.find("high") != std::string::npos)) {
+            return "gemini-3.8-flash-high";
+        }
+        if (lower.find("m319") != std::string::npos ||
+            (lower.find("flash") != std::string::npos && lower.find("medium") != std::string::npos)) {
+            return "gemini-3.8-flash-medium";
+        }
+        if (lower.find("m320") != std::string::npos ||
+            (lower.find("flash") != std::string::npos && lower.find("low") != std::string::npos)) {
+            return "gemini-3.8-flash-low";
+        }
+        if (lower.find("m402") != std::string::npos ||
+            (lower.find("opus") != std::string::npos && lower.find("high") != std::string::npos)) {
+            return "claude-opus-5-5-high";
+        }
+        if (lower.find("m401") != std::string::npos ||
+            (lower.find("opus") != std::string::npos && lower.find("medium") != std::string::npos)) {
+            return "claude-opus-5-5-medium";
+        }
+        if (lower.find("m400") != std::string::npos ||
+            (lower.find("opus") != std::string::npos && lower.find("low") != std::string::npos)) {
+            return "claude-opus-5-5-low";
+        }
+        if (lower.find("m405") != std::string::npos ||
+            (lower.find("sonnet") != std::string::npos && lower.find("high") != std::string::npos)) {
+            return "claude-sonnet-5-5-high";
+        }
+        if (lower.find("m404") != std::string::npos ||
+            (lower.find("sonnet") != std::string::npos && lower.find("medium") != std::string::npos)) {
+            return "claude-sonnet-5-5-medium";
+        }
+        if (lower.find("m403") != std::string::npos ||
+            (lower.find("sonnet") != std::string::npos && lower.find("low") != std::string::npos)) {
+            return "claude-sonnet-5-5-low";
+        }
+        if (lower.find("gpt-oss") != std::string::npos || lower.find("120b") != std::string::npos) {
+            return "gpt-oss-120b-medium";
+        }
+        return "";
+    };
+
+    auto extractConversationModelById = [getCliBrainDir, getIdeBrainDir, mapModelToHumanLabel](
+                                            const std::string& conversationId) -> std::string {
+        if (conversationId.empty() || conversationId == "new") {
+            return "";
+        }
+
+        // 1. Check transcript.jsonl for explicit <USER_SETTINGS_CHANGE> Model Selection lines
+        std::string lastTranscriptModel;
+        for (const std::string& rootDir : {getCliBrainDir(), getIdeBrainDir()}) {
+            if (rootDir.empty()) continue;
+            fs::path tPath = fs::path(rootDir) / conversationId / ".system_generated" / "logs" / "transcript.jsonl";
+            if (!fs::exists(tPath)) continue;
+            std::ifstream tf(tPath);
+            std::string line;
+            while (std::getline(tf, line)) {
+                if (line.find("USER_SETTINGS_CHANGE") == std::string::npos &&
+                    line.find("Model Selection") == std::string::npos) {
+                    continue;
+                }
+                std::string matched = mapModelToHumanLabel(line);
+                if (!matched.empty()) {
+                    lastTranscriptModel = matched;
+                }
+            }
+            if (!lastTranscriptModel.empty()) {
+                return lastTranscriptModel;
+            }
+        }
+
+        // 2. Check <cliRoot>/conversations/<conversationId>.db (executor_metadata and gen_metadata)
+        fs::path cliRootDir = fs::path(getCliBrainDir()).parent_path();
+        fs::path convDbPath = cliRootDir / "conversations" / (conversationId + ".db");
+        if (fs::exists(convDbPath)) {
+            sqlite3* db = nullptr;
+            if (sqlite3_open_v2(convDbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK && db) {
+                sqlite3_busy_timeout(db, 200);
+                std::string foundLabel;
+                sqlite3_stmt* stmt = nullptr;
+                if (sqlite3_prepare_v2(db, "SELECT data FROM executor_metadata ORDER BY idx DESC LIMIT 5", -1, &stmt, nullptr) == SQLITE_OK && stmt) {
+                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                        const void* blob = sqlite3_column_blob(stmt, 0);
+                        int bytes = sqlite3_column_bytes(stmt, 0);
+                        if (blob && bytes > 0) {
+                            std::string raw(static_cast<const char*>(blob), static_cast<size_t>(std::min(bytes, 4096)));
+                            std::string m = mapModelToHumanLabel(raw);
+                            if (!m.empty()) {
+                                foundLabel = m;
+                                break;
+                            }
+                        }
+                    }
+                    sqlite3_finalize(stmt);
+                }
+                if (foundLabel.empty()) {
+                    stmt = nullptr;
+                    if (sqlite3_prepare_v2(db, "SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1", -1, &stmt, nullptr) == SQLITE_OK && stmt) {
+                        if (sqlite3_step(stmt) == SQLITE_ROW) {
+                            const void* blob = sqlite3_column_blob(stmt, 0);
+                            int bytes = sqlite3_column_bytes(stmt, 0);
+                            if (blob && bytes > 0) {
+                                int tailLen = std::min(bytes, 4096);
+                                const char* startPtr = static_cast<const char*>(blob) + (bytes - tailLen);
+                                std::string raw(startPtr, static_cast<size_t>(tailLen));
+                                foundLabel = mapModelToHumanLabel(raw);
+                            }
+                        }
+                        sqlite3_finalize(stmt);
+                    }
+                }
+                sqlite3_close(db);
+                if (!foundLabel.empty()) {
+                    return foundLabel;
+                }
+            } else if (db) {
+                sqlite3_close(db);
+            }
+        }
+
+        return "";
+    };
+
+    auto mapLabelToModelEnum = [toLowerAscii](const LsEndpoint& ep, const std::string& modelLabel) -> std::string {
+        std::string lower = toLowerAscii(modelLabel);
+        std::string candidateEnum;
+        if (modelLabel.rfind("MODEL_", 0) == 0) {
+            candidateEnum = modelLabel;
+        } else if (lower.find("m417") != std::string::npos || lower == "argon" ||
+                   (lower.find("argon") != std::string::npos && lower.find("high") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M417";
+        } else if (lower.find("m419") != std::string::npos ||
+                   (lower.find("argon") != std::string::npos && lower.find("low") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M419";
+        } else if (lower.find("m418") != std::string::npos || lower.find("argon") != std::string::npos || lower == "pro") {
+            candidateEnum = "MODEL_PLACEHOLDER_M418";
+        } else if (lower == "flash" || lower == "flash_lite" || lower.find("m322") != std::string::npos ||
+                   lower.find("flash-tiered") != std::string::npos) {
+            candidateEnum = "MODEL_PLACEHOLDER_M322";
+        } else if (lower.find("m318") != std::string::npos ||
+                   (lower.find("flash") != std::string::npos && lower.find("high") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M318";
+        } else if (lower.find("m319") != std::string::npos ||
+                   (lower.find("flash") != std::string::npos && lower.find("medium") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M319";
+        } else if (lower.find("m320") != std::string::npos ||
+                   (lower.find("flash") != std::string::npos && lower.find("low") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M320";
+        } else if (lower.find("m402") != std::string::npos ||
+                   (lower.find("opus") != std::string::npos && lower.find("high") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M402";
+        } else if (lower.find("m401") != std::string::npos ||
+                   (lower.find("opus") != std::string::npos && lower.find("medium") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M401";
+        } else if (lower.find("m400") != std::string::npos ||
+                   (lower.find("opus") != std::string::npos && lower.find("low") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M400";
+        } else if (lower.find("m405") != std::string::npos ||
+                   (lower.find("sonnet") != std::string::npos && lower.find("high") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M405";
+        } else if (lower.find("m404") != std::string::npos ||
+                   (lower.find("sonnet") != std::string::npos && lower.find("medium") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M404";
+        } else if (lower.find("m403") != std::string::npos ||
+                   (lower.find("sonnet") != std::string::npos && lower.find("low") != std::string::npos)) {
+            candidateEnum = "MODEL_PLACEHOLDER_M403";
+        } else if (lower.find("gpt-oss") != std::string::npos || lower.find("120b") != std::string::npos) {
+            candidateEnum = "MODEL_OPENAI_GPT_OSS_120B_MEDIUM";
+        }
+
+        std::vector<std::pair<std::string, std::string>> supportedModels;
+        if (ep.port > 0 && ep.port <= 65535 && !ep.csrf.empty()) {
+            try {
+                httplib::Client cli("127.0.0.1", ep.port);
+                cli.set_connection_timeout(0, 400000);
+                cli.set_read_timeout(1, 0);
+                httplib::Headers hdrs = {
+                    {"Content-Type", "application/json"},
+                    {"x-codeium-csrf-token", ep.csrf}
+                };
+                auto stRes = cli.Post(
+                    "/exa.language_server_pb.LanguageServerService/GetUserStatus",
+                    hdrs,
+                    "{}",
+                    "application/json"
+                );
+                if (stRes && stRes->status == 200) {
+                    auto sj = nlohmann::json::parse(stRes->body, nullptr, false);
+                    if (!sj.is_discarded() && sj.is_object() &&
+                        sj.contains("userStatus") && sj["userStatus"].is_object()) {
+                        const auto& us = sj["userStatus"];
+                        if (us.contains("cascadeModelConfigData") && us["cascadeModelConfigData"].is_object()) {
+                            const auto& cmc = us["cascadeModelConfigData"];
+                            if (cmc.contains("clientModelConfigs") && cmc["clientModelConfigs"].is_array()) {
+                                for (const auto& item : cmc["clientModelConfigs"]) {
+                                    if (!item.is_object()) continue;
+                                    std::string lbl = item.value("label", "");
+                                    std::string enm;
+                                    if (item.contains("modelOrAlias") && item["modelOrAlias"].is_object()) {
+                                        enm = item["modelOrAlias"].value("model", "");
+                                    }
+                                    if (!enm.empty()) {
+                                        supportedModels.push_back({lbl, enm});
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+
+        if (!supportedModels.empty()) {
+            for (const auto& pair : supportedModels) {
+                if (pair.first == modelLabel || pair.second == modelLabel ||
+                    (!candidateEnum.empty() && pair.second == candidateEnum)) {
+                    return pair.second;
+                }
+            }
+            for (const auto& pair : supportedModels) {
+                std::string lblLow = toLowerAscii(pair.first);
+                if (!lower.empty() && (lblLow == lower || lblLow.find(lower) != std::string::npos ||
+                                       lower.find(lblLow) != std::string::npos)) {
+                    return pair.second;
+                }
+            }
+            // Endpoint explicitly reported its supported models and does not support the requested model
+            return "";
+        }
+
+        if (ep.isCli) {
+            return candidateEnum;
+        }
+        if (candidateEnum == "MODEL_PLACEHOLDER_M417" ||
+            candidateEnum == "MODEL_PLACEHOLDER_M418" ||
+            candidateEnum == "MODEL_PLACEHOLDER_M419") {
+            return "";
+        }
+        return candidateEnum;
+    };
+
+    auto extractTrajectoryModelName = [mapModelEnumToModelName](const nlohmann::json& tj) -> std::string {
         if (!tj.is_object() || !tj.contains("trajectory") || !tj["trajectory"].is_object()) {
             return "gemini-4-argon-medium";
         }
@@ -1317,8 +1771,8 @@ void WebServer::setupRoutes() {
                 std::string pModel = pc.value("planModel", "");
                 bool hasCustomCfg = pc.contains("customizationConfig") && !pc["customizationConfig"].is_null() &&
                                     pc["customizationConfig"].is_object() && !pc["customizationConfig"].empty();
-                std::string candidate = !mName.empty() ? mapModelPlaceholderToName(mName)
-                                                       : (!pModel.empty() ? mapModelPlaceholderToName(pModel) : "");
+                std::string candidate = !mName.empty() ? mapModelEnumToModelName(mName)
+                                                       : (!pModel.empty() ? mapModelEnumToModelName(pModel) : "");
                 if (candidate.empty()) {
                     continue;
                 }
@@ -1337,7 +1791,7 @@ void WebServer::setupRoutes() {
                 if (it->is_object() && it->contains("chatModel") && (*it)["chatModel"].is_object()) {
                     std::string gmModel = (*it)["chatModel"].value("model", "");
                     if (!gmModel.empty()) {
-                        std::string mapped = mapModelPlaceholderToName(gmModel);
+                        std::string mapped = mapModelEnumToModelName(gmModel);
                         if (!mapped.empty() && (mapped != "gemini-3.8-flash-tiered" || fallbackM322Model.empty())) {
                             return mapped;
                         }
@@ -1351,51 +1805,65 @@ void WebServer::setupRoutes() {
         return "gemini-4-argon-medium";
     };
 
-    auto resolveCascadeConfigForRpc = [](const LsEndpoint& ep,
-                                         const std::string& targetCid,
-                                         const std::string& requestedModel,
-                                         const std::string& workspacePath) -> nlohmann::json {
-        auto extractBestCascadeConfigFromTrajectory = [](const nlohmann::json& tj, nlohmann::json& outConfig) -> bool {
+    auto resolveCascadeConfigForRpc = [mapLabelToModelEnum, mapModelEnumToModelName, extractConversationModelById](
+                                          const LsEndpoint& ep,
+                                          const std::string& targetCid,
+                                          const std::string& requestedModel,
+                                          const std::string& workspacePath) -> nlohmann::json {
+        auto extractBestCascadeConfigFromTrajectory = [&](const nlohmann::json& tj, nlohmann::json& outConfig) -> bool {
             if (!tj.is_object() || !tj.contains("trajectory") || !tj["trajectory"].is_object()) {
                 return false;
             }
             const auto& traj = tj["trajectory"];
-            if (!traj.contains("executorMetadatas") || !traj["executorMetadatas"].is_array()) {
-                return false;
-            }
-            const auto& ems = traj["executorMetadatas"];
             nlohmann::json latestCascadeConfig = nlohmann::json::object();
             nlohmann::json richCascadeConfig = nlohmann::json::object();
             nlohmann::json recoveredDynamicUris = nlohmann::json::array();
 
-            for (auto it = ems.rbegin(); it != ems.rend(); ++it) {
-                if (!it->is_object() || !it->contains("cascadeConfig") || !(*it)["cascadeConfig"].is_object()) {
-                    continue;
-                }
-                const auto& cc = (*it)["cascadeConfig"];
-                if (cc.empty()) {
-                    continue;
-                }
-                if (latestCascadeConfig.empty()) {
-                    latestCascadeConfig = cc;
-                }
-                if (recoveredDynamicUris.empty() && cc.contains("dynamicWorkspaceUris") &&
-                    cc["dynamicWorkspaceUris"].is_array() && !cc["dynamicWorkspaceUris"].empty()) {
-                    recoveredDynamicUris = cc["dynamicWorkspaceUris"];
-                }
-                if (richCascadeConfig.empty() && cc.contains("plannerConfig") && cc["plannerConfig"].is_object()) {
-                    const auto& pc = cc["plannerConfig"];
-                    if (pc.contains("customizationConfig") && pc["customizationConfig"].is_object() &&
-                        !pc["customizationConfig"].empty()) {
-                        richCascadeConfig = cc;
+            if (traj.contains("executorMetadatas") && traj["executorMetadatas"].is_array()) {
+                const auto& ems = traj["executorMetadatas"];
+                for (auto it = ems.rbegin(); it != ems.rend(); ++it) {
+                    if (!it->is_object() || !it->contains("cascadeConfig") || !(*it)["cascadeConfig"].is_object()) {
+                        continue;
                     }
-                }
-                if (!latestCascadeConfig.empty() && !richCascadeConfig.empty() && !recoveredDynamicUris.empty()) {
-                    break;
+                    const auto& cc = (*it)["cascadeConfig"];
+                    if (cc.empty()) {
+                        continue;
+                    }
+                    if (latestCascadeConfig.empty()) {
+                        latestCascadeConfig = cc;
+                    }
+                    if (recoveredDynamicUris.empty() && cc.contains("dynamicWorkspaceUris") &&
+                        cc["dynamicWorkspaceUris"].is_array() && !cc["dynamicWorkspaceUris"].empty()) {
+                        recoveredDynamicUris = cc["dynamicWorkspaceUris"];
+                    }
+                    if (richCascadeConfig.empty() && cc.contains("plannerConfig") && cc["plannerConfig"].is_object()) {
+                        const auto& pc = cc["plannerConfig"];
+                        if (pc.contains("customizationConfig") && pc["customizationConfig"].is_object() &&
+                            !pc["customizationConfig"].empty()) {
+                            richCascadeConfig = cc;
+                        }
+                    }
+                    if (!latestCascadeConfig.empty() && !richCascadeConfig.empty() && !recoveredDynamicUris.empty()) {
+                        break;
+                    }
                 }
             }
 
-            if (latestCascadeConfig.empty() && richCascadeConfig.empty()) {
+            std::string gmModelEnum;
+            if (traj.contains("generatorMetadata") && traj["generatorMetadata"].is_array()) {
+                const auto& gms = traj["generatorMetadata"];
+                for (auto it = gms.rbegin(); it != gms.rend(); ++it) {
+                    if (it->is_object() && it->contains("chatModel") && (*it)["chatModel"].is_object()) {
+                        std::string m = (*it)["chatModel"].value("model", "");
+                        if (!m.empty() && m != "MODEL_PLACEHOLDER_M322") {
+                            gmModelEnum = m;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (latestCascadeConfig.empty() && richCascadeConfig.empty() && gmModelEnum.empty()) {
                 return false;
             }
 
@@ -1417,9 +1885,10 @@ void WebServer::setupRoutes() {
                                    !latestCascadeConfig["plannerConfig"]["customizationConfig"].empty();
             std::string curPlanModel = pc.value("planModel", "");
             if (curPlanModel.empty() || (curPlanModel == "MODEL_PLACEHOLDER_M322" && !latestHadCustom)) {
-                pc["planModel"] = "MODEL_PLACEHOLDER_M418";
-                if (pc.contains("modelName") && pc["modelName"].is_string()) {
-                    pc["modelName"] = "gemini-4-argon-medium";
+                std::string chosenEnum = !gmModelEnum.empty() ? gmModelEnum : (ep.isCli ? "MODEL_PLACEHOLDER_M418" : "");
+                if (!chosenEnum.empty()) {
+                    pc["planModel"] = chosenEnum;
+                    pc["modelName"] = mapModelEnumToModelName(chosenEnum);
                 }
             }
             return true;
@@ -1497,7 +1966,23 @@ void WebServer::setupRoutes() {
         }
         auto& pc = cascadeConfig["plannerConfig"];
         if (!pc.contains("planModel") || !pc["planModel"].is_string() || pc["planModel"].get<std::string>().empty()) {
-            pc["planModel"] = "MODEL_PLACEHOLDER_M418";
+            std::string dbModelLabel = extractConversationModelById(targetCid);
+            std::string resolvedEnum = !dbModelLabel.empty() ? mapLabelToModelEnum(ep, dbModelLabel) : "";
+            if (resolvedEnum.empty()) {
+                if (ep.isCli) {
+                    resolvedEnum = mapLabelToModelEnum(ep, "Gemini 4 Argon (Medium)");
+                    if (resolvedEnum.empty()) resolvedEnum = "MODEL_PLACEHOLDER_M418";
+                } else {
+                    resolvedEnum = mapLabelToModelEnum(ep, "Claude Sonnet 5.5 (High)");
+                    if (resolvedEnum.empty()) {
+                        resolvedEnum = mapLabelToModelEnum(ep, "Gemini 3.8 Flash (High)");
+                    }
+                }
+            }
+            pc["planModel"] = resolvedEnum;
+            if (!resolvedEnum.empty()) {
+                pc["modelName"] = mapModelEnumToModelName(resolvedEnum);
+            }
         }
         if ((!cascadeConfig.contains("dynamicWorkspaceUris") || !cascadeConfig["dynamicWorkspaceUris"].is_array() ||
              cascadeConfig["dynamicWorkspaceUris"].empty()) && !workspacePath.empty()) {
@@ -1505,27 +1990,535 @@ void WebServer::setupRoutes() {
         }
 
         if (!requestedModel.empty()) {
-            if (requestedModel == "MODEL_PLACEHOLDER_M418" || requestedModel == "gemini-4-argon-medium" ||
-                requestedModel == "pro") {
-                pc["planModel"] = "MODEL_PLACEHOLDER_M418";
-                if (pc.contains("modelName")) {
-                    pc["modelName"] = "gemini-4-argon-medium";
-                }
-            } else if (requestedModel == "MODEL_PLACEHOLDER_M322" || requestedModel == "gemini-3.8-flash-tiered" ||
-                       requestedModel == "flash" || requestedModel == "flash_lite") {
+            if (requestedModel == "MODEL_PLACEHOLDER_M322" || requestedModel == "gemini-3.8-flash-tiered" ||
+                requestedModel == "flash" || requestedModel == "flash_lite") {
                 pc["planModel"] = "MODEL_PLACEHOLDER_M322";
-                if (pc.contains("modelName")) {
-                    pc["modelName"] = "gemini-3.8-flash-tiered";
-                }
-            } else if (requestedModel.rfind("MODEL_", 0) == 0) {
+                pc["modelName"] = "gemini-3.8-flash-tiered";
+            } else if (requestedModel.rfind("MODEL_CUSTOM_", 0) == 0) {
                 pc["planModel"] = requestedModel;
+            } else {
+                std::string mappedEnum = mapLabelToModelEnum(ep, requestedModel);
+                if (!mappedEnum.empty()) {
+                    pc["planModel"] = mappedEnum;
+                    pc["modelName"] = mapModelEnumToModelName(mappedEnum);
+                } else if (!ep.isCli) {
+                    pc["planModel"] = "";
+                }
+            }
+        }
+
+        std::string finalEnum = pc.value("planModel", "");
+        if (!finalEnum.empty() && finalEnum != "MODEL_PLACEHOLDER_M322" && finalEnum.rfind("MODEL_CUSTOM_", 0) != 0) {
+            std::string verified = mapLabelToModelEnum(ep, finalEnum);
+            if (verified.empty()) {
+                pc["planModel"] = "";
+            } else {
+                pc["planModel"] = verified;
+                pc["modelName"] = mapModelEnumToModelName(verified);
             }
         }
 
         return cascadeConfig;
     };
 
-    _server->Get("/api/agent/transcript", [getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName](
+    auto handleAgentConversations = [getIdeBrainDir, getCliBrainDir, getCliPresenceDir, stripUserRequestTags,
+                                     toLowerAscii, extractConversationModelById, discoverLsEndpoints](
+                                        const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        size_t limit = 50;
+        if (req.has_param("limit")) {
+            try {
+                int parsed = std::stoi(req.get_param_value("limit"));
+                if (parsed > 0) {
+                    limit = static_cast<size_t>(parsed);
+                }
+            } catch (...) {}
+        }
+        std::string query = req.has_param("q") ? req.get_param_value("q") : "";
+        std::string queryLower = toLowerAscii(query);
+        bool includeSubagents = (req.has_param("include_subagents") &&
+                                 req.get_param_value("include_subagents") == "true");
+
+        struct DbConvSummary {
+            std::string id;
+            std::string title;
+            std::string preview;
+            int stepCount = 0;
+            uint64_t lastModifiedSec = 0;
+            std::string workspacePath;
+            std::string workspaceShort;
+            std::string status;
+            std::string parentConversationId;
+            int nestingDepth = 0;
+        };
+
+        std::map<std::string, DbConvSummary> summariesMap;
+        std::set<std::string> subagentIds;
+        std::set<std::string> phantomIds = {
+            "74e1eba3-a305-4cf7-8ada-b6979fe09fd4",
+            "7b329a4c-496a-4459-ac49-a55c176bfea1",
+            "b8b5d7d4-eed2-442f-ba15-f070f3dc5c62"
+        };
+
+        fs::path cliRootDir = fs::path(getCliBrainDir()).parent_path();
+        fs::path summariesDbPath = cliRootDir / "conversation_summaries.db";
+        if (fs::exists(summariesDbPath)) {
+            sqlite3* db = nullptr;
+            if (sqlite3_open_v2(summariesDbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK && db) {
+                sqlite3_busy_timeout(db, 300);
+                sqlite3_stmt* stmt = nullptr;
+                const char* sql =
+                    "SELECT conversation_id, title, preview, step_count, "
+                    "CAST(strftime('%s', substr(last_modified_time, 1, 19)) AS INTEGER), "
+                    "workspace_uris, status, parent_conversation_id, nesting_depth "
+                    "FROM conversation_summaries";
+                if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK && stmt) {
+                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                        const char* cId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                        if (!cId || !*cId) continue;
+                        DbConvSummary ds;
+                        ds.id = cId;
+                        const char* cTitle = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                        if (cTitle) ds.title = cTitle;
+                        const char* cPrev = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+                        if (cPrev) ds.preview = cPrev;
+                        ds.stepCount = sqlite3_column_int(stmt, 3);
+                        int64_t mSec = sqlite3_column_int64(stmt, 4);
+                        if (mSec > 0) ds.lastModifiedSec = static_cast<uint64_t>(mSec);
+                        const char* cWs = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+                        if (cWs && *cWs) {
+                            auto wj = nlohmann::json::parse(cWs, nullptr, false);
+                            if (!wj.is_discarded() && wj.is_array() && !wj.empty() && wj[0].is_string()) {
+                                std::string uri = wj[0].get<std::string>();
+                                if (uri.rfind("file://", 0) == 0) {
+                                    uri = uri.substr(7);
+                                }
+                                ds.workspacePath = uri;
+                                ds.workspaceShort = fs::path(uri).filename().string();
+                            }
+                        }
+                        const char* cSt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+                        if (cSt) ds.status = cSt;
+                        const char* cPar = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+                        if (cPar) ds.parentConversationId = cPar;
+                        ds.nestingDepth = sqlite3_column_int(stmt, 8);
+
+                        if (ds.nestingDepth > 0 || !ds.parentConversationId.empty()) {
+                            subagentIds.insert(ds.id);
+                        }
+                        summariesMap[ds.id] = std::move(ds);
+                    }
+                    sqlite3_finalize(stmt);
+                }
+                sqlite3_close(db);
+            } else if (db) {
+                sqlite3_close(db);
+            }
+        }
+
+        fs::path metaCachePath = cliRootDir / "cache" / "conversation_metadata.json";
+        if (fs::exists(metaCachePath)) {
+            try {
+                std::ifstream mf(metaCachePath);
+                auto mj = nlohmann::json::parse(mf, nullptr, false);
+                if (!mj.is_discarded() && mj.is_object() &&
+                    mj.contains("conversations") && mj["conversations"].is_object()) {
+                    for (auto it = mj["conversations"].begin(); it != mj["conversations"].end(); ++it) {
+                        if (it.value().is_object() && it.value().value("is_internal", false)) {
+                            auto sumIt = summariesMap.find(it.key());
+                            if (sumIt == summariesMap.end() || sumIt->second.nestingDepth > 0 ||
+                                !sumIt->second.parentConversationId.empty()) {
+                                subagentIds.insert(it.key());
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+
+        std::map<std::string, AgyProcessInfo> runningAgyByConvId;
+        const char* envCliBrainOverride = std::getenv("AIMON_CLI_BRAIN_DIR");
+        bool isDefaultBrain = (!envCliBrainOverride || !*envCliBrainOverride);
+        if (isDefaultBrain) {
+            for (const auto& proc : discoverRunningAgyProcesses()) {
+                if (!proc.lockedConversationId.empty()) {
+                    runningAgyByConvId[proc.lockedConversationId] = proc;
+                }
+            }
+        }
+
+        struct ConvEntry {
+            std::string id;
+            std::string title;
+            std::string source;
+            uint64_t timestamp = 0;
+            bool active = false;
+            bool openInTerminal = false;
+            std::string terminalPts;
+            std::string workspace;
+            std::string workspacePath;
+            std::string model;
+            int stepCount = 0;
+            std::string firstPrompt;
+            std::string lastPrompt;
+            int lastPromptStepIndex = -1;
+            nlohmann::json userPrompts = nlohmann::json::array();
+            std::string matchedPrompt;
+            int matchedStepIndex = -1;
+        };
+
+        struct CandidateConv {
+            std::string id;
+            fs::path cdir;
+            std::string sourceLabel;
+            uint64_t ts = 0;
+            bool hasTranscript = false;
+            bool hasTaskMd = false;
+            bool hasDbSummary = false;
+        };
+
+        std::vector<CandidateConv> candidates;
+        std::set<std::string> seenIds;
+        std::string presenceDir = getCliPresenceDir();
+        uint64_t nowSec = static_cast<uint64_t>(std::time(nullptr));
+
+        auto addCandidate = [&](const std::string& id, const fs::path& cdir, const std::string& sourceLabel) {
+            if (id.empty() || id[0] == '.' || id == "tempmediaStorage") return;
+            if (seenIds.count(id)) return;
+            if (phantomIds.count(id)) return;
+            if (!includeSubagents && subagentIds.count(id)) return;
+
+            fs::path transcriptPath = cdir.empty() ? fs::path() : (cdir / ".system_generated" / "logs" / "transcript.jsonl");
+            fs::path taskMdPath = cdir.empty() ? fs::path() : (cdir / "task.md");
+            bool hasTranscript = !transcriptPath.empty() && fs::exists(transcriptPath);
+            bool hasTaskMd = !taskMdPath.empty() && fs::exists(taskMdPath);
+            auto sumIt = summariesMap.find(id);
+            bool hasDbSummary = (sumIt != summariesMap.end());
+            if (!hasTranscript && !hasTaskMd && !hasDbSummary) return;
+
+            uint64_t ts = hasDbSummary ? sumIt->second.lastModifiedSec : 0;
+            if (!cdir.empty() && fs::exists(cdir)) {
+                try {
+                    auto ftime = hasTranscript ? fs::last_write_time(transcriptPath)
+                                               : fs::last_write_time(cdir);
+                    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+                    );
+                    auto secs = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
+                    if (secs > 0 && static_cast<uint64_t>(secs) > ts) {
+                        ts = static_cast<uint64_t>(secs);
+                    }
+                } catch (...) {}
+            }
+
+            seenIds.insert(id);
+            candidates.push_back({id, cdir, sourceLabel, ts, hasTranscript, hasTaskMd, hasDbSummary});
+        };
+
+        auto scanRoot = [&](const std::string& rootPath, const std::string& sourceLabel) {
+            if (rootPath.empty() || !fs::exists(rootPath) || !fs::is_directory(rootPath)) {
+                return;
+            }
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator(rootPath, ec)) {
+                if (ec || !entry.is_directory()) continue;
+                std::string id = entry.path().filename().string();
+                addCandidate(id, entry.path(), sourceLabel);
+            }
+        };
+
+        scanRoot(getIdeBrainDir(), "ide");
+        scanRoot(getCliBrainDir(), "cli");
+
+        for (const auto& kv : summariesMap) {
+            if (seenIds.count(kv.first)) continue;
+            if (!includeSubagents && subagentIds.count(kv.first)) continue;
+            fs::path cdir = fs::path(getCliBrainDir()) / kv.first;
+            addCandidate(kv.first, fs::exists(cdir) ? cdir : fs::path(), "cli");
+        }
+
+        std::sort(candidates.begin(), candidates.end(), [](const CandidateConv& a, const CandidateConv& b) {
+            if (a.ts != b.ts) {
+                return a.ts > b.ts;
+            }
+            return a.id > b.id;
+        });
+
+        std::vector<ConvEntry> collected;
+
+        auto buildConvEntry = [&](const CandidateConv& cand) -> bool {
+            const std::string& id = cand.id;
+            const fs::path& cdir = cand.cdir;
+            const std::string& sourceLabel = cand.sourceLabel;
+            uint64_t ts = cand.ts;
+            bool hasTranscript = cand.hasTranscript;
+            bool hasTaskMd = cand.hasTaskMd;
+            bool hasDbSummary = cand.hasDbSummary;
+
+            fs::path transcriptPath = cdir.empty() ? fs::path() : (cdir / ".system_generated" / "logs" / "transcript.jsonl");
+            fs::path taskMdPath = cdir.empty() ? fs::path() : (cdir / "task.md");
+            fs::path planMdPath = cdir.empty() ? fs::path() : (cdir / "implementation_plan.md");
+            auto sumIt = summariesMap.find(id);
+
+            std::string mdTitle;
+            for (const fs::path& mdPath : {taskMdPath, planMdPath}) {
+                if (mdPath.empty() || !fs::exists(mdPath)) continue;
+                std::ifstream tf(mdPath);
+                std::string tline;
+                while (std::getline(tf, tline)) {
+                    auto first = tline.find_first_not_of(" \t\r\n");
+                    if (first == std::string::npos) continue;
+                    if (tline.compare(first, 2, "# ") == 0) {
+                        mdTitle = tline.substr(first + 2);
+                        auto last = mdTitle.find_last_not_of(" \t\r\n");
+                        if (last != std::string::npos) {
+                            mdTitle.erase(last + 1);
+                        }
+                        if (mdTitle.rfind("Task:", 0) == 0 || mdTitle.rfind("Plan:", 0) == 0) {
+                            auto afterColon = mdTitle.find_first_not_of(" \t", 5);
+                            if (afterColon != std::string::npos) {
+                                mdTitle = mdTitle.substr(afterColon);
+                            }
+                        }
+                        break;
+                    }
+                }
+                if (!mdTitle.empty()) break;
+            }
+
+            struct PromptRecord {
+                int stepIdx = 0;
+                int filteredStepIdx = 0;
+                std::string text;
+                std::string timestamp;
+            };
+            std::vector<PromptRecord> allUserPrompts;
+            std::string firstPrompt;
+            std::string lastPrompt;
+            int lastPromptStepIndex = -1;
+            std::string matchedPrompt;
+            int matchedStepIndex = -1;
+            std::string assistantMatchedSnippet;
+            int assistantMatchedStepIndex = -1;
+            int totalStepsInTranscript = 0;
+            bool isInternalSubagent = false;
+
+            if (hasTranscript) {
+                std::ifstream f(transcriptPath);
+                std::string line;
+                int lineNum = 0;
+                int filteredIdx = 0;
+                while (std::getline(f, line)) {
+                    if (line.empty()) continue;
+                    try {
+                        auto j = nlohmann::json::parse(line, nullptr, false);
+                        if (j.is_discarded() || !j.is_object()) continue;
+                        int stepIdx = j.value("step_index", lineNum);
+                        ++lineNum;
+                        totalStepsInTranscript = std::max(totalStepsInTranscript, stepIdx + 1);
+                        std::string stype = j.value("type", "");
+                        if (lineNum == 1 && stype == "SYSTEM_MESSAGE" && !hasTaskMd && !hasDbSummary && !includeSubagents) {
+                            isInternalSubagent = true;
+                            break;
+                        }
+                        std::string content = j.value("content", "");
+                        std::string thinking = j.value("thinking", "");
+                        std::string createdAt = j.value("created_at", "");
+                        bool hasToolCalls = j.contains("tool_calls") && j["tool_calls"].is_array() && !j["tool_calls"].empty();
+
+                        if (stype == "USER_INPUT" || (lineNum == 1 && !hasDbSummary && j.contains("content") && stype != "PLANNER_RESPONSE")) {
+                            std::string clean = stripUserRequestTags(content);
+                            if (!clean.empty()) {
+                                std::string truncated = (clean.size() > 240) ? (clean.substr(0, 237) + "...") : clean;
+                                if (firstPrompt.empty()) {
+                                    firstPrompt = truncated;
+                                }
+                                if (stype == "USER_INPUT") {
+                                    lastPrompt = truncated;
+                                    lastPromptStepIndex = stepIdx;
+                                    allUserPrompts.push_back({stepIdx, filteredIdx, truncated, createdAt});
+                                    if (!queryLower.empty() && toLowerAscii(clean).find(queryLower) != std::string::npos) {
+                                        matchedPrompt = truncated;
+                                        matchedStepIndex = stepIdx;
+                                    }
+                                    ++filteredIdx;
+                                }
+                            }
+                        } else if (stype == "PLANNER_RESPONSE") {
+                            if (!queryLower.empty() && matchedPrompt.empty() && assistantMatchedSnippet.empty()) {
+                                std::string hay = !content.empty() ? content : thinking;
+                                std::string hayLow = toLowerAscii(hay);
+                                auto mPos = hayLow.find(queryLower);
+                                if (mPos != std::string::npos) {
+                                    size_t start = (mPos > 40) ? (mPos - 40) : 0;
+                                    std::string snip = hay.substr(start, std::min<size_t>(200, hay.size() - start));
+                                    for (char& ch : snip) {
+                                        if (ch == '\r' || ch == '\n') ch = ' ';
+                                    }
+                                    assistantMatchedSnippet = snip;
+                                    assistantMatchedStepIndex = stepIdx;
+                                }
+                            }
+                            ++filteredIdx;
+                        } else if (stype == "ERROR_MESSAGE" || hasToolCalls) {
+                            ++filteredIdx;
+                        }
+                    } catch (...) {}
+                }
+            }
+            if (isInternalSubagent) {
+                return false;
+            }
+
+            if (firstPrompt.empty() && hasDbSummary && !sumIt->second.preview.empty()) {
+                std::string cleanPrev = stripUserRequestTags(sumIt->second.preview);
+                if (!cleanPrev.empty()) {
+                    firstPrompt = (cleanPrev.size() > 240) ? (cleanPrev.substr(0, 237) + "...") : cleanPrev;
+                    if (lastPrompt.empty()) {
+                        lastPrompt = firstPrompt;
+                    }
+                }
+            }
+
+            std::string title;
+            if (hasDbSummary && !sumIt->second.title.empty()) {
+                title = sumIt->second.title;
+            } else if (!mdTitle.empty()) {
+                title = mdTitle;
+            } else if (!firstPrompt.empty()) {
+                title = firstPrompt;
+                auto nlPos = title.find_first_of("\r\n");
+                if (nlPos != std::string::npos) {
+                    title = title.substr(0, nlPos);
+                }
+            }
+            if (title.empty()) {
+                title = "Conversation " + id.substr(0, std::min<size_t>(8, id.length()));
+            } else if (title.length() > 80) {
+                title = title.substr(0, 77) + "...";
+            }
+
+            bool openInTerminal = false;
+            std::string terminalPts;
+            std::string workspacePath = hasDbSummary ? sumIt->second.workspacePath : "";
+            std::string workspaceShort = hasDbSummary ? sumIt->second.workspaceShort : "";
+
+            auto agyIt = runningAgyByConvId.find(id);
+            if (agyIt != runningAgyByConvId.end()) {
+                openInTerminal = true;
+                terminalPts = agyIt->second.terminalPts;
+                if (workspacePath.empty() && !agyIt->second.cwd.empty()) {
+                    workspacePath = agyIt->second.cwd;
+                    workspaceShort = fs::path(workspacePath).filename().string();
+                }
+            }
+
+            bool isActive = openInTerminal;
+            if (!presenceDir.empty() && fs::exists(fs::path(presenceDir) / (id + ".lock"))) {
+                isActive = true;
+            } else if (hasDbSummary && sumIt->second.status == "CASCADE_RUN_STATUS_RUNNING") {
+                isActive = true;
+            } else if (ts > 0 && nowSec >= ts && (nowSec - ts) < 120) {
+                isActive = true;
+            }
+
+            std::string modelLabel = extractConversationModelById(id);
+            if (modelLabel.empty()) {
+                modelLabel = (sourceLabel == "cli") ? "Gemini 4 Argon (High)" : "Claude Sonnet 5.5 (High)";
+            }
+
+            if (matchedPrompt.empty() && !assistantMatchedSnippet.empty()) {
+                matchedPrompt = assistantMatchedSnippet;
+                matchedStepIndex = assistantMatchedStepIndex;
+            }
+
+            if (!queryLower.empty()) {
+                bool matchesMeta = (toLowerAscii(title).find(queryLower) != std::string::npos) ||
+                                   (toLowerAscii(workspaceShort).find(queryLower) != std::string::npos) ||
+                                   (toLowerAscii(workspacePath).find(queryLower) != std::string::npos) ||
+                                   (toLowerAscii(modelLabel).find(queryLower) != std::string::npos) ||
+                                   (toLowerAscii(id).find(queryLower) != std::string::npos) ||
+                                   (toLowerAscii(firstPrompt).find(queryLower) != std::string::npos) ||
+                                   (toLowerAscii(lastPrompt).find(queryLower) != std::string::npos) ||
+                                   !matchedPrompt.empty();
+                if (!matchesMeta) {
+                    return false;
+                }
+            }
+
+            nlohmann::json userPromptsJson = nlohmann::json::array();
+            size_t startIdx = (allUserPrompts.size() > 30) ? (allUserPrompts.size() - 30) : 0;
+            for (size_t i = startIdx; i < allUserPrompts.size(); ++i) {
+                userPromptsJson.push_back({
+                    {"stepIndex", allUserPrompts[i].stepIdx},
+                    {"filteredStepIndex", allUserPrompts[i].filteredStepIdx},
+                    {"text", allUserPrompts[i].text},
+                    {"timestamp", allUserPrompts[i].timestamp}
+                });
+            }
+
+            ConvEntry ce;
+            ce.id = id;
+            ce.title = title;
+            ce.source = sourceLabel;
+            ce.timestamp = ts;
+            ce.active = isActive;
+            ce.openInTerminal = openInTerminal;
+            ce.terminalPts = terminalPts;
+            ce.workspace = workspaceShort;
+            ce.workspacePath = workspacePath;
+            ce.model = modelLabel;
+            ce.stepCount = std::max(totalStepsInTranscript, hasDbSummary ? sumIt->second.stepCount : 0);
+            ce.firstPrompt = firstPrompt;
+            ce.lastPrompt = lastPrompt;
+            ce.lastPromptStepIndex = lastPromptStepIndex;
+            ce.userPrompts = std::move(userPromptsJson);
+            ce.matchedPrompt = matchedPrompt;
+            ce.matchedStepIndex = matchedStepIndex;
+
+            collected.push_back(std::move(ce));
+            return true;
+        };
+
+        for (const auto& cand : candidates) {
+            if (collected.size() >= limit) {
+                break;
+            }
+            buildConvEntry(cand);
+        }
+
+        nlohmann::json conversations = nlohmann::json::array();
+        size_t count = std::min(collected.size(), limit);
+        for (size_t i = 0; i < count; ++i) {
+            conversations.push_back({
+                {"id", collected[i].id},
+                {"title", collected[i].title},
+                {"source", collected[i].source},
+                {"timestamp", collected[i].timestamp},
+                {"active", collected[i].active},
+                {"openInTerminal", collected[i].openInTerminal},
+                {"terminalPts", collected[i].terminalPts},
+                {"workspace", collected[i].workspace},
+                {"workspacePath", collected[i].workspacePath},
+                {"model", collected[i].model},
+                {"stepCount", collected[i].stepCount},
+                {"firstPrompt", collected[i].firstPrompt},
+                {"lastPrompt", collected[i].lastPrompt},
+                {"lastPromptStepIndex", collected[i].lastPromptStepIndex},
+                {"userPrompts", collected[i].userPrompts},
+                {"matchedPrompt", collected[i].matchedPrompt},
+                {"matchedStepIndex", collected[i].matchedStepIndex}
+            });
+        }
+
+        nlohmann::json resp;
+        resp["conversations"] = conversations;
+        res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+    };
+    _server->Get("/api/agent/conversations", handleAgentConversations);
+    _server->Get("/api/agent/history", handleAgentConversations);
+
+    _server->Get("/api/agent/transcript", [getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName, extractConversationModelById, mapLabelToCliModelId](
                                               const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string id = req.get_param_value("id");
@@ -1546,6 +2539,10 @@ void WebServer::setupRoutes() {
 
         fs::path idePath = fs::path(getIdeBrainDir()) / id / ".system_generated" / "logs" / "transcript.jsonl";
         fs::path cliPath = fs::path(getCliBrainDir()) / id / ".system_generated" / "logs" / "transcript.jsonl";
+        fs::path cliRootDir = fs::path(getCliBrainDir()).parent_path();
+        bool isCliConv = fs::exists(cliPath) ||
+                         fs::exists(fs::path(getCliBrainDir()) / id) ||
+                         fs::exists(cliRootDir / "conversations" / (id + ".db"));
         fs::path transcriptPath;
         std::string source = "ide";
 
@@ -1596,18 +2593,34 @@ void WebServer::setupRoutes() {
                         if (!tj.is_discarded() && tj.contains("trajectory") && tj["trajectory"].is_object()) {
                             liveModel = extractTrajectoryModelName(tj);
                             const auto& rawSteps = tj["trajectory"].value("steps", nlohmann::json::array());
+                            nlohmann::json parsedLiveSteps = nlohmann::json::array();
+                            int parsedTotalSteps = 0;
+                            bool hasUnknownModelError = false;
                             int idx = 0;
                             for (const auto& rs : rawSteps) {
                                 int stepIdx = idx++;
-                                liveTotalSteps = std::max(liveTotalSteps, stepIdx + 1);
-                                if (sinceIndex >= 0 && stepIdx <= sinceIndex) continue;
+                                parsedTotalSteps = std::max(parsedTotalSteps, stepIdx + 1);
                                 std::string stType = rs.value("type", "");
+                                if (stType == "CORTEX_STEP_TYPE_ERROR_MESSAGE" && rs.contains("errorMessage")) {
+                                    std::string errCheck;
+                                    if (rs["errorMessage"].contains("error") && rs["errorMessage"]["error"].is_object()) {
+                                        const auto& errObj = rs["errorMessage"]["error"];
+                                        errCheck = errObj.value("modelErrorMessage",
+                                                   errObj.value("shortError",
+                                                   errObj.value("userErrorMessage", "")));
+                                    }
+                                    if (errCheck.find("unknown model key") != std::string::npos ||
+                                        errCheck.find("failed to construct executor") != std::string::npos) {
+                                        hasUnknownModelError = true;
+                                    }
+                                }
+                                if (sinceIndex >= 0 && stepIdx <= sinceIndex) continue;
                                 if (stType == "CORTEX_STEP_TYPE_USER_INPUT" && rs.contains("userInput")) {
                                     std::string uText = rs["userInput"].value("userResponse", "");
                                     if (uText.empty() && rs["userInput"].contains("items") && rs["userInput"]["items"].is_array() && !rs["userInput"]["items"].empty()) {
                                         uText = rs["userInput"]["items"][0].value("text", "");
                                     }
-                                    liveSteps.push_back({
+                                    parsedLiveSteps.push_back({
                                         {"index", stepIdx},
                                         {"stepIndex", stepIdx},
                                         {"type", "USER_INPUT"},
@@ -1618,7 +2631,7 @@ void WebServer::setupRoutes() {
                                 } else if (stType == "CORTEX_STEP_TYPE_PLANNER_RESPONSE" && rs.contains("plannerResponse")) {
                                     std::string pText = rs["plannerResponse"].value("modifiedResponse", rs["plannerResponse"].value("response", ""));
                                     std::string pThink = rs["plannerResponse"].value("thinking", "");
-                                    liveSteps.push_back({
+                                    parsedLiveSteps.push_back({
                                         {"index", stepIdx},
                                         {"stepIndex", stepIdx},
                                         {"type", "PLANNER_RESPONSE"},
@@ -1631,10 +2644,12 @@ void WebServer::setupRoutes() {
                                 } else if (stType == "CORTEX_STEP_TYPE_ERROR_MESSAGE" && rs.contains("errorMessage")) {
                                     std::string errText = "Agent execution error";
                                     if (rs["errorMessage"].contains("error") && rs["errorMessage"]["error"].is_object()) {
-                                        errText = rs["errorMessage"]["error"].value("shortError",
-                                                  rs["errorMessage"]["error"].value("userErrorMessage", errText));
+                                        const auto& errObj = rs["errorMessage"]["error"];
+                                        errText = errObj.value("modelErrorMessage",
+                                                  errObj.value("shortError",
+                                                  errObj.value("userErrorMessage", errText)));
                                     }
-                                    liveSteps.push_back({
+                                    parsedLiveSteps.push_back({
                                         {"index", stepIdx},
                                         {"stepIndex", stepIdx},
                                         {"type", "ERROR_MESSAGE"},
@@ -1643,6 +2658,11 @@ void WebServer::setupRoutes() {
                                     });
                                 }
                             }
+                            if (hasUnknownModelError && parsedTotalSteps <= 2) {
+                                return false;
+                            }
+                            liveSteps = std::move(parsedLiveSteps);
+                            liveTotalSteps = parsedTotalSteps;
                             return true;
                         }
                     }
@@ -1659,7 +2679,7 @@ void WebServer::setupRoutes() {
                     }
                 } catch (...) {}
             }
-            if (!foundInMemory) {
+            if (!foundInMemory && !isCliConv) {
                 int cachedPort = 0;
                 std::string cachedCsrf;
                 {
@@ -1675,6 +2695,9 @@ void WebServer::setupRoutes() {
             }
             if (!foundInMemory) {
                 for (const auto& ep : discoverLsEndpoints()) {
+                    if (isCliConv && !ep.isCli) {
+                        continue;
+                    }
                     if (tryProbeRpcTrajectory(ep.port, ep.csrf)) {
                         std::lock_guard<std::mutex> lk(*lastRpcMutex);
                         *lastRpcEndpoint = {ep.port, ep.csrf};
@@ -1691,7 +2714,7 @@ void WebServer::setupRoutes() {
                 resp["model"] = liveModel;
                 resp["stepCount"] = liveTotalSteps;
                 resp["steps"] = liveSteps;
-                res.set_content(resp.dump(2), "application/json");
+                res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
             }
 
@@ -1831,16 +2854,24 @@ void WebServer::setupRoutes() {
             } catch (...) {}
         }
 
+        std::string resolvedModel = "gemini-4-argon-medium";
+        std::string extractedLabel = extractConversationModelById(id);
+        if (!extractedLabel.empty()) {
+            resolvedModel = extractedLabel;
+        }
+
         nlohmann::json resp;
         resp["conversationId"] = id;
         resp["source"] = source;
-        resp["model"] = "gemini-4-argon-medium";
+        resp["model"] = resolvedModel;
+        resp["modelId"] = !extractedLabel.empty() ? mapLabelToCliModelId(extractedLabel) : resolvedModel;
         resp["stepCount"] = totalStepCount;
         resp["steps"] = steps;
-        res.set_content(resp.dump(2), "application/json");
+        res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
     });
 
-    _server->Post("/api/agent/prompt", [getWorkspaceRoot, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc](const httplib::Request& req, httplib::Response& res) {
+    _server->Post("/api/agent/prompt", [getWorkspaceRoot, getCliBrainDir, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc, extractConversationModelById, mapLabelToCliModelId, toLowerAscii](
+                                           const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         nlohmann::json j;
         try {
@@ -1855,6 +2886,7 @@ void WebServer::setupRoutes() {
         std::string agentId = j.value("agentId", "antigravity");
         std::string cid = j.value("conversationId", "");
         std::string requestedModel = j.value("model", "");
+        std::string requestedSource = toLowerAscii(j.value("source", ""));
         if (text.empty()) {
             res.status = 400;
             res.set_content("{\"status\":\"error\",\"error\":\"Prompt text cannot be empty\"}", "application/json");
@@ -1875,9 +2907,79 @@ void WebServer::setupRoutes() {
             return;
         }
 
-        std::vector<LsEndpoint> endpoints = discoverLsEndpoints();
+        fs::path cliBrainDir = fs::path(getCliBrainDir());
+        fs::path cliRootDir = cliBrainDir.parent_path();
+        bool hasCliDiskConversation = false;
+        if (!cid.empty() && cid != "new") {
+            hasCliDiskConversation = fs::exists(cliBrainDir / cid) ||
+                                     fs::exists(cliRootDir / "conversations" / (cid + ".db"));
+        }
 
-        if (endpoints.empty()) {
+        std::string desiredModel = !requestedModel.empty()
+                                       ? requestedModel
+                                       : ((!cid.empty() && cid != "new") ? extractConversationModelById(cid) : "");
+        std::string desiredLower = toLowerAscii(desiredModel);
+        bool requiresCliModel = desiredLower.find("argon") != std::string::npos ||
+                                desiredLower.find("m417") != std::string::npos ||
+                                desiredLower.find("m418") != std::string::npos ||
+                                desiredLower.find("m419") != std::string::npos;
+        bool isCliConv = hasCliDiskConversation || requestedSource == "cli" || requiresCliModel;
+
+        std::string wsPath = getWorkspaceRoot().string();
+        std::vector<AgyProcessInfo> runningAgy = discoverRunningAgyProcesses();
+        bool isLockedByRunningAgy = false;
+        for (const auto& proc : runningAgy) {
+            if (!cid.empty() && cid != "new" && proc.lockedConversationId == cid) {
+                isLockedByRunningAgy = true;
+                if (!proc.cwd.empty()) {
+                    wsPath = proc.cwd;
+                }
+                break;
+            }
+        }
+        if (!cid.empty() && cid != "new" && wsPath == getWorkspaceRoot().string()) {
+            fs::path sumDbPath = cliRootDir / "conversation_summaries.db";
+            if (fs::exists(sumDbPath)) {
+                sqlite3* db = nullptr;
+                if (sqlite3_open_v2(sumDbPath.string().c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
+                    sqlite3_stmt* stmt = nullptr;
+                    const char* sql = "SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ? LIMIT 1";
+                    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+                        sqlite3_bind_text(stmt, 1, cid.c_str(), -1, SQLITE_STATIC);
+                        if (sqlite3_step(stmt) == SQLITE_ROW) {
+                            const unsigned char* wuTxt = sqlite3_column_text(stmt, 0);
+                            std::string wsUris = wuTxt ? reinterpret_cast<const char*>(wuTxt) : "";
+                            try {
+                                auto wj = nlohmann::json::parse(wsUris, nullptr, false);
+                                if (!wj.is_discarded() && wj.is_array() && !wj.empty() && wj[0].is_string()) {
+                                    std::string u = wj[0].get<std::string>();
+                                    if (u.rfind("file://", 0) == 0) u = u.substr(7);
+                                    if (!u.empty() && fs::exists(u)) {
+                                        wsPath = u;
+                                    }
+                                }
+                            } catch (...) {}
+                        }
+                        sqlite3_finalize(stmt);
+                    }
+                    sqlite3_close(db);
+                }
+            }
+        }
+
+        std::vector<LsEndpoint> endpoints = discoverLsEndpoints();
+        std::stable_sort(endpoints.begin(), endpoints.end(), [&](const LsEndpoint& a, const LsEndpoint& b) {
+            bool aOwns = (!cid.empty() && cid != "new" && a.lockedConversationId == cid);
+            bool bOwns = (!cid.empty() && cid != "new" && b.lockedConversationId == cid);
+            if (aOwns != bOwns) return aOwns > bOwns;
+            bool aWs = (!wsPath.empty() && a.cwd == wsPath);
+            bool bWs = (!wsPath.empty() && b.cwd == wsPath);
+            if (aWs != bWs) return aWs > bWs;
+            if (a.isCli != b.isCli) return a.isCli > b.isCli;
+            return a.isPreferredWorkspace > b.isPreferredWorkspace;
+        });
+
+        if (endpoints.empty() && (!hasCliDiskConversation || isLockedByRunningAgy)) {
             res.status = 503;
             res.set_content(nlohmann::json({
                 {"status", "error"},
@@ -1886,12 +2988,14 @@ void WebServer::setupRoutes() {
             return;
         }
 
-        std::string wsPath = getWorkspaceRoot().string();
-
-        // 3. Attempt direct ConnectRPC dispatch with conversation ownership verification
+        // 3. Attempt direct ConnectRPC dispatch with conversation ownership & model verification
         auto sendRpcCascadeMessage = [&](const LsEndpoint& ep, const std::string& targetCid, std::string& outBody) -> bool {
             try {
                 nlohmann::json cascadeCfg = resolveCascadeConfigForRpc(ep, targetCid, requestedModel, wsPath);
+                if (!cascadeCfg.contains("plannerConfig") || !cascadeCfg["plannerConfig"].is_object() ||
+                    cascadeCfg["plannerConfig"].value("planModel", "").empty()) {
+                    return false;
+                }
                 httplib::Client cli("127.0.0.1", ep.port);
                 cli.set_connection_timeout(1, 0);
                 cli.set_read_timeout(5, 0);
@@ -1911,6 +3015,34 @@ void WebServer::setupRoutes() {
                     "application/json"
                 );
                 if (rpcRes && rpcRes->status == 200) {
+                    // Verify that the language server did not immediately reject the model with CORTEX_STEP_TYPE_ERROR_MESSAGE
+                    auto checkRes = cli.Post(
+                        "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory",
+                        hdrs,
+                        nlohmann::json({{"cascadeId", targetCid}}).dump(),
+                        "application/json"
+                    );
+                    if (checkRes && checkRes->status == 200) {
+                        auto tj = nlohmann::json::parse(checkRes->body, nullptr, false);
+                        if (!tj.is_discarded() && tj.is_object() && tj.contains("trajectory") && tj["trajectory"].is_object()) {
+                            const auto& steps = tj["trajectory"].value("steps", nlohmann::json::array());
+                            if (!steps.empty() && steps.back().is_object() &&
+                                steps.back().value("type", "") == "CORTEX_STEP_TYPE_ERROR_MESSAGE") {
+                                std::string errCheck;
+                                if (steps.back().contains("errorMessage") && steps.back()["errorMessage"].is_object() &&
+                                    steps.back()["errorMessage"].contains("error") && steps.back()["errorMessage"]["error"].is_object()) {
+                                    const auto& errObj = steps.back()["errorMessage"]["error"];
+                                    errCheck = errObj.value("modelErrorMessage",
+                                               errObj.value("shortError",
+                                               errObj.value("userErrorMessage", "")));
+                                }
+                                if (errCheck.find("unknown model key") != std::string::npos ||
+                                    errCheck.find("failed to construct executor") != std::string::npos) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                     outBody = rpcRes->body;
                     std::lock_guard<std::mutex> lk(*lastRpcMutex);
                     *lastRpcEndpoint = {ep.port, ep.csrf};
@@ -1994,6 +3126,9 @@ void WebServer::setupRoutes() {
         if (!cid.empty() && cid != "new") {
             const LsEndpoint* firstReachableEp = nullptr;
             for (const auto& ep : endpoints) {
+                if (isCliConv && !ep.isCli) {
+                    continue;
+                }
                 bool reachable = false;
                 if (endpointOwnsConversation(ep, cid, reachable)) {
                     std::string rpcOut;
@@ -2012,7 +3147,8 @@ void WebServer::setupRoutes() {
                 }
             }
             // If cid was an archived conversation not loaded in any live server, start a new cascade on the primary reachable server
-            if (firstReachableEp != nullptr) {
+            // (unless this is an unlocked CLI conversation on disk that can be resumed directly via agy --conversation <cid>)
+            if (firstReachableEp != nullptr && (!hasCliDiskConversation || isLockedByRunningAgy)) {
                 std::string newCid;
                 std::string rpcOut;
                 if (startRpcNewCascade(*firstReachableEp, newCid) &&
@@ -2028,6 +3164,9 @@ void WebServer::setupRoutes() {
             }
         } else {
             for (const auto& ep : endpoints) {
+                if (isCliConv && !ep.isCli) {
+                    continue;
+                }
                 std::string newCid;
                 std::string rpcOut;
                 if (startRpcNewCascade(ep, newCid) && sendRpcCascadeMessage(ep, newCid, rpcOut)) {
@@ -2075,6 +3214,13 @@ void WebServer::setupRoutes() {
                     cliModelFlag = "--model=flash";
                 } else if (requestedModel == "flash_lite") {
                     cliModelFlag = "--model=flash_lite";
+                } else if (requestedModel == "pro") {
+                    cliModelFlag = "--model=pro";
+                } else if (!requestedModel.empty()) {
+                    std::string mappedCliId = mapLabelToCliModelId(requestedModel);
+                    if (!mappedCliId.empty()) {
+                        cliModelFlag = "--model=" + mappedCliId;
+                    }
                 }
 
                 std::vector<char*> argv;
@@ -2123,6 +3269,9 @@ void WebServer::setupRoutes() {
 
         std::string lastError = "Failed to dispatch prompt via agy agentapi";
         for (const auto& ep : endpoints) {
+            if (isCliConv && !ep.isCli) {
+                continue;
+            }
             int exitCode = -1;
             std::string output;
             if (!runAgyCommand(ep, exitCode, output)) {
@@ -2171,6 +3320,57 @@ void WebServer::setupRoutes() {
             } else {
                 lastError = "agy exited with code " + std::to_string(exitCode);
             }
+        }
+
+        // 5. Fallback for unlocked CLI conversations on disk: resume directly via detached `agy --conversation <cid> -p <prompt>`
+        if (hasCliDiskConversation && !isLockedByRunningAgy && !cid.empty() && cid != "new") {
+            std::string cliModelId = mapLabelToCliModelId(desiredModel);
+            std::thread([agyBin, cid, text, wsPath, cliModelId]() {
+                pid_t child = fork();
+                if (child == 0) {
+                    setsid();
+                    if (!wsPath.empty()) {
+                        if (chdir(wsPath.c_str()) != 0) {}
+                    }
+                    int devNull = open("/dev/null", O_RDWR);
+                    if (devNull >= 0) {
+                        dup2(devNull, STDIN_FILENO);
+                        dup2(devNull, STDOUT_FILENO);
+                        dup2(devNull, STDERR_FILENO);
+                        if (devNull > 2) close(devNull);
+                    }
+                    unsetenv("ANTIGRAVITY_CONVERSATION_ID");
+                    unsetenv("AGY_LS_PORT");
+                    unsetenv("AGY_LS_CSRF_TOKEN");
+                    unsetenv("ANTIGRAVITY_LS_ADDRESS");
+                    unsetenv("ANTIGRAVITY_CSRF_TOKEN");
+                    std::string modelArg = "--model=" + cliModelId;
+                    std::vector<char*> argv;
+                    argv.push_back(const_cast<char*>(agyBin.c_str()));
+                    argv.push_back(const_cast<char*>("--conversation"));
+                    argv.push_back(const_cast<char*>(cid.c_str()));
+                    argv.push_back(const_cast<char*>("--dangerously-skip-permissions"));
+                    if (!cliModelId.empty()) {
+                        argv.push_back(const_cast<char*>(modelArg.c_str()));
+                    }
+                    argv.push_back(const_cast<char*>("-p"));
+                    argv.push_back(const_cast<char*>(text.c_str()));
+                    argv.push_back(nullptr);
+                    execv(agyBin.c_str(), argv.data());
+                    _exit(127);
+                } else if (child > 0) {
+                    int status = 0;
+                    waitpid(child, &status, 0);
+                }
+            }).detach();
+
+            nlohmann::json resp;
+            resp["status"] = "dispatched";
+            resp["agentId"] = agentId;
+            resp["conversationId"] = cid;
+            resp["output"] = "{\"status\":\"resumed_cli_conversation\"}";
+            res.set_content(resp.dump(2), "application/json");
+            return;
         }
 
         res.status = 503;
