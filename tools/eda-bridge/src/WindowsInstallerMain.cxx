@@ -133,7 +133,7 @@ void cleanStaleInstallFiles(const fs::path& destDir) {
                 c = static_cast<wchar_t>(c - L'A' + L'a');
             }
         }
-        if (ext == L".dll" || ext == L".exe" || ext == L".eext") {
+        if (ext == L".dll" || ext == L".exe" || ext == L".eext" || ext == L".old") {
             SetFileAttributesW(entry.path().wstring().c_str(), FILE_ATTRIBUTE_NORMAL);
             DeleteFileW(entry.path().wstring().c_str());
         }

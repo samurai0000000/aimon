@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.2.5 LANGUAGES CXX)
+project(aimon VERSION 1.2.6 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -470,16 +470,41 @@ if(CPPUTEST_LIBRARY_DIRS)
     target_link_directories(test_insight_surfaces PRIVATE ${CPPUTEST_LIBRARY_DIRS})
 endif()
 
+set(AIMON_SELFUPDATE_CMAKE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../selfupdate/windows/selfupdate.cmake"
+    CACHE FILEPATH "Path to selfupdate/windows/selfupdate.cmake"
+)
+if(NOT EXISTS "${AIMON_SELFUPDATE_CMAKE}")
+    message(FATAL_ERROR "selfupdate CMake module not found at ${AIMON_SELFUPDATE_CMAKE}")
+endif()
+include("${AIMON_SELFUPDATE_CMAKE}")
+
+find_package(Qt6 QUIET COMPONENTS Core Gui Widgets)
+if(NOT Qt6_FOUND)
+    find_package(Qt5 QUIET COMPONENTS Core Gui Widgets)
+endif()
+
 add_executable(aimon-eda-bridge
     tools/eda-bridge/src/Main.cxx
     tools/eda-bridge/src/ProcessLauncher.cxx
     tools/eda-bridge/src/ToolDiscovery.cxx
     tools/eda-bridge/src/EdaRpcServer.cxx
     tools/eda-bridge/src/EdaBridgeAppConfig.cxx
+    tools/eda-bridge/src/EdaTrayWindow.cxx
     src/EdaAccelerators.cxx
     src/EasyEdaConverter.cxx
     src/KiCadSchematicEditor.cxx
 )
+
+selfupdate_target_sources(aimon-eda-bridge)
+
+if(Qt6_FOUND)
+    target_compile_definitions(aimon-eda-bridge PRIVATE AIMON_EDA_BRIDGE_WITH_QT=1)
+    target_link_libraries(aimon-eda-bridge PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
+elseif(Qt5_FOUND)
+    target_compile_definitions(aimon-eda-bridge PRIVATE AIMON_EDA_BRIDGE_WITH_QT=1)
+    target_link_libraries(aimon-eda-bridge PRIVATE Qt5::Core Qt5::Gui Qt5::Widgets)
+endif()
 
 target_include_directories(aimon-eda-bridge PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
@@ -513,8 +538,20 @@ aimon_add_claude_test(test_eda_bridge_daemon LIBCONFIG
             tools/eda-bridge/src/ToolDiscovery.cxx
             tools/eda-bridge/src/EdaRpcServer.cxx
             tools/eda-bridge/src/EdaBridgeAppConfig.cxx
+            tools/eda-bridge/src/EdaTrayWindow.cxx
             src/DynamicToolRegistry.cxx src/TcpGateway.cxx
             src/ConfigManager.cxx src/PathUtils.cxx)
+
+selfupdate_target_sources(test_eda_bridge_daemon)
+target_link_libraries(test_eda_bridge_daemon PRIVATE ${RAPIDCHECK_LIBRARY})
+
+if(Qt6_FOUND)
+    target_compile_definitions(test_eda_bridge_daemon PRIVATE AIMON_EDA_BRIDGE_WITH_QT=1)
+    target_link_libraries(test_eda_bridge_daemon PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
+elseif(Qt5_FOUND)
+    target_compile_definitions(test_eda_bridge_daemon PRIVATE AIMON_EDA_BRIDGE_WITH_QT=1)
+    target_link_libraries(test_eda_bridge_daemon PRIVATE Qt5::Core Qt5::Gui Qt5::Widgets)
+endif()
 
 target_include_directories(test_eda_bridge_daemon PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/eda-bridge/include

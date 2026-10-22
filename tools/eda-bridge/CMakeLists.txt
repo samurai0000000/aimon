@@ -29,6 +29,15 @@ endif()
 
 find_package(Threads REQUIRED)
 
+set(AIMON_SELFUPDATE_CMAKE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../selfupdate/windows/selfupdate.cmake"
+    CACHE FILEPATH "Path to selfupdate/windows/selfupdate.cmake"
+)
+if(NOT EXISTS "${AIMON_SELFUPDATE_CMAKE}")
+    message(FATAL_ERROR "selfupdate CMake module not found at ${AIMON_SELFUPDATE_CMAKE}")
+endif()
+include("${AIMON_SELFUPDATE_CMAKE}")
+
 set(AIMON_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
 set(WHOAMI_OUTPUT)
@@ -91,6 +100,8 @@ if(WIN32)
 endif()
 
 add_executable(aimon-eda-bridge ${EDA_BRIDGE_SOURCES})
+
+selfupdate_target_sources(aimon-eda-bridge)
 
 target_include_directories(aimon-eda-bridge PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}

@@ -75,8 +75,9 @@ ifeq ($(SANITIZE_CANARY),1)
 endif
 
 mobile:
-	@if [ -d mobile/android ] && command -v ./mobile/android/gradlew >/dev/null 2>&1; then \
-		cd mobile/android && ./gradlew assembleDebug; \
+	@if [ -d third_party/antimatter/android ] && [ -x third_party/antimatter/android/gradlew ]; then \
+		if [ -d "$$HOME/.jdks/jdk-21.0.4+7" ]; then export JAVA_HOME="$$HOME/.jdks/jdk-21.0.4+7"; fi; \
+		cd third_party/antimatter/android && ./gradlew assembleDebug testDebugUnitTest; \
 	fi
 
 windows-eda-bridge:

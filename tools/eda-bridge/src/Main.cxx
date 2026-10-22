@@ -13,6 +13,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <selfupdate/UpdateInstaller.hxx>
 #include "EdaBridgeAppConfig.hxx"
 #include "EdaRpcServer.hxx"
 
@@ -57,6 +58,8 @@ void printUsage(const char* prog) {
 } // anonymous namespace
 
 int main(int argc, char** argv) {
+    selfupdate::UpdateInstaller::cleanupStaleBackup();
+
     std::string configPath = aimon::EdaBridgeAppConfig::defaultConfigFilePath();
     std::string exportEextPath;
     std::string deployPluginsDir;

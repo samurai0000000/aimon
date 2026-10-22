@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 #include <QApplication>
@@ -36,8 +37,10 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QPixmap>
+#include <QPlainTextEdit>
 #include <QScrollArea>
 #include <QUrl>
+#include <selfupdate/QtSelfUpdateBridge.hxx>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -255,6 +258,390 @@ QString secondaryGhostButtonStyle() {
 
 } // anonymous namespace
 
+class AimonSelfUpdateDialog : public QDialog {
+public:
+    AimonSelfUpdateDialog(selfupdate::SelfUpdateController* controller,
+                          const std::string& installedVersion,
+                          const selfupdate::UpdateStatus& initialState,
+                          std::function<void()> onManualCheckRequested,
+                          QWidget* parent = nullptr)
+        : QDialog(parent),
+          _controller(controller),
+          _installedVersion(installedVersion),
+          _onManualCheckRequested(std::move(onManualCheckRequested)) {
+        setObjectName("aimonSelfUpdateDialog");
+        setWindowTitle("aimon — Software Update");
+        setModal(true);
+        setMinimumSize(520, 420);
+        resize(540, 450);
+
+        setStyleSheet(
+            "QDialog { background-color: #0a0e17; color: #e2e8f0; "
+            "font-family: 'Segoe UI', -apple-system, sans-serif; } "
+            "QLabel { color: #e2e8f0; background: transparent; } "
+            "QPlainTextEdit { background-color: #090d16; color: #cbd5e1; "
+            "border: 1px solid #1e293b; border-radius: 8px; padding: 8px; "
+            "font-family: 'Consolas', 'JetBrains Mono', monospace; font-size: 11px; }"
+        );
+
+        QVBoxLayout* rootLayout = new QVBoxLayout(this);
+        rootLayout->setContentsMargins(16, 14, 16, 14);
+        rootLayout->setSpacing(10);
+
+        QHBoxLayout* headerRow = new QHBoxLayout();
+        headerRow->setSpacing(10);
+        QLabel* iconLbl = new QLabel(this);
+        iconLbl->setPixmap(renderConceptBBrandPixmap(26, false, QColor()));
+        iconLbl->setFixedSize(26, 26);
+
+        QLabel* titleLbl = new QLabel("aimon Desktop Self-Update", this);
+        titleLbl->setStyleSheet("color: #f8fafc; font-size: 16px; font-weight: 800;");
+
+        _lblPhaseBadge = new QLabel("IDLE", this);
+        _lblPhaseBadge->setObjectName("lblUpdatePhaseBadge");
+
+        headerRow->addWidget(iconLbl);
+        headerRow->addWidget(titleLbl);
+        headerRow->addStretch(1);
+        headerRow->addWidget(_lblPhaseBadge);
+        rootLayout->addLayout(headerRow);
+
+        QFrame* summaryCard = new QFrame(this);
+        summaryCard->setObjectName("updateSummaryCard");
+        summaryCard->setStyleSheet(
+            "#updateSummaryCard { background-color: #0b1120; border: 1px solid #1e293b; border-radius: 10px; }"
+        );
+        QVBoxLayout* cardLayout = new QVBoxLayout(summaryCard);
+        cardLayout->setContentsMargins(12, 10, 12, 10);
+        cardLayout->setSpacing(6);
+
+        QHBoxLayout* verRow = new QHBoxLayout();
+        _lblInstalledVer = new QLabel(
+            QString("Installed: v%1").arg(QString::fromStdString(_installedVersion)), summaryCard
+        );
+        _lblInstalledVer->setStyleSheet(
+            "color: #94a3b8; font-family: 'Consolas', monospace; font-size: 12px; font-weight: 700;"
+        );
+        _lblLatestVer = new QLabel("Latest: --", summaryCard);
+        _lblLatestVer->setObjectName("lblUpdateLatestVer");
+        _lblLatestVer->setStyleSheet(
+            "color: #00f2fe; font-family: 'Consolas', monospace; font-size: 12px; font-weight: 800;"
+        );
+        verRow->addWidget(_lblInstalledVer);
+        verRow->addStretch(1);
+        verRow->addWidget(_lblLatestVer);
+        cardLayout->addLayout(verRow);
+
+        _lblStatusMsg = new QLabel("Ready to check for updates.", summaryCard);
+        _lblStatusMsg->setObjectName("lblUpdateStatusMsg");
+        _lblStatusMsg->setWordWrap(true);
+        _lblStatusMsg->setStyleSheet("color: #f8fafc; font-size: 12px; font-weight: 600;");
+        cardLayout->addWidget(_lblStatusMsg);
+
+        _lblPkgDetails = new QLabel("Package: aimon-setup.exe  ·  Mode: installer (--silent)", summaryCard);
+        _lblPkgDetails->setObjectName("lblUpdatePkgDetails");
+        _lblPkgDetails->setWordWrap(true);
+        _lblPkgDetails->setStyleSheet(
+            "color: #64748b; font-family: 'Consolas', monospace; font-size: 11px;"
+        );
+        cardLayout->addWidget(_lblPkgDetails);
+
+        _prgDownload = new QProgressBar(summaryCard);
+        _prgDownload->setObjectName("prgUpdateDialogDownload");
+        _prgDownload->setRange(0, 100);
+        _prgDownload->setValue(0);
+        _prgDownload->setTextVisible(false);
+        _prgDownload->setFixedHeight(8);
+        _prgDownload->setStyleSheet(
+            "QProgressBar { border: 1px solid #1e293b; border-radius: 4px; "
+            "background-color: #090d16; min-height: 8px; max-height: 8px; } "
+            "QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+            "stop:0 #0284c7, stop:1 #00f2fe); border-radius: 3px; }"
+        );
+        _prgDownload->setVisible(false);
+        cardLayout->addWidget(_prgDownload);
+
+        _lblProgressBytes = new QLabel("", summaryCard);
+        _lblProgressBytes->setStyleSheet(
+            "color: #38bdf8; font-family: 'Consolas', monospace; font-size: 11px;"
+        );
+        _lblProgressBytes->setVisible(false);
+        cardLayout->addWidget(_lblProgressBytes);
+
+        rootLayout->addWidget(summaryCard);
+
+        QLabel* notesHdr = new QLabel("RELEASE NOTES", this);
+        notesHdr->setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;");
+        rootLayout->addWidget(notesHdr);
+
+        _txtReleaseNotes = new QPlainTextEdit(this);
+        _txtReleaseNotes->setObjectName("txtUpdateReleaseNotes");
+        _txtReleaseNotes->setReadOnly(true);
+        rootLayout->addWidget(_txtReleaseNotes, 1);
+
+        QHBoxLayout* btnRow = new QHBoxLayout();
+        btnRow->setSpacing(8);
+
+        _btnCheck = new QPushButton("Check for Updates", this);
+        _btnCheck->setObjectName("btnDialogCheckUpdates");
+        _btnCheck->setStyleSheet(secondaryGhostButtonStyle());
+
+        _btnInstall = new QPushButton("Download & Install Update", this);
+        _btnInstall->setObjectName("btnDialogInstallUpdate");
+        _btnInstall->setStyleSheet(primaryGradientButtonStyle());
+
+        _btnCancel = new QPushButton("Cancel Download", this);
+        _btnCancel->setObjectName("btnDialogCancelUpdate");
+        _btnCancel->setStyleSheet(secondaryGhostButtonStyle());
+
+        _btnClose = new QPushButton("Close", this);
+        _btnClose->setObjectName("btnDialogCloseUpdate");
+        _btnClose->setStyleSheet(secondaryGhostButtonStyle());
+
+        QObject::connect(_btnCheck, &QPushButton::clicked, [this]() {
+            if (_onManualCheckRequested) {
+                _onManualCheckRequested();
+            }
+        });
+        QObject::connect(_btnInstall, &QPushButton::clicked, [this]() {
+            if (_controller) {
+                _controller->downloadAndInstall();
+            }
+        });
+        QObject::connect(_btnCancel, &QPushButton::clicked, [this]() {
+            if (_controller) {
+                _controller->cancel();
+            }
+        });
+        QObject::connect(_btnClose, &QPushButton::clicked, [this]() {
+            hide();
+        });
+
+        btnRow->addWidget(_btnCheck);
+        btnRow->addWidget(_btnInstall);
+        btnRow->addWidget(_btnCancel);
+        btnRow->addStretch(1);
+        btnRow->addWidget(_btnClose);
+        rootLayout->addLayout(btnRow);
+
+        applyState(initialState);
+    }
+
+    void setController(selfupdate::SelfUpdateController* controller) {
+        _controller = controller;
+    }
+
+    void applyState(const selfupdate::UpdateStatus& st) {
+        const auto ph = st.phase;
+        QString badgeText = "IDLE";
+        QString badgeStyle =
+            "background-color: rgba(148, 163, 184, 0.12); color: #94a3b8; "
+            "border: 1px solid #334155; border-radius: 6px; padding: 2px 8px; "
+            "font-size: 11px; font-weight: 700;";
+
+        if (ph == selfupdate::UpdatePhase::Checking) {
+            badgeText = "CHECKING";
+            badgeStyle =
+                "background-color: rgba(56, 189, 248, 0.14); color: #38bdf8; "
+                "border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 6px; "
+                "padding: 2px 8px; font-size: 11px; font-weight: 700;";
+        } else if (ph == selfupdate::UpdatePhase::UpToDate) {
+            badgeText = "UP TO DATE";
+            badgeStyle =
+                "background-color: rgba(16, 185, 129, 0.14); color: #10b981; "
+                "border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 6px; "
+                "padding: 2px 8px; font-size: 11px; font-weight: 700;";
+        } else if (ph == selfupdate::UpdatePhase::Available) {
+            badgeText = "UPDATE AVAILABLE";
+            badgeStyle =
+                "background-color: rgba(0, 242, 254, 0.14); color: #00f2fe; "
+                "border: 1px solid rgba(0, 242, 254, 0.40); border-radius: 6px; "
+                "padding: 2px 8px; font-size: 11px; font-weight: 700;";
+        } else if (ph == selfupdate::UpdatePhase::Downloading) {
+            badgeText = "DOWNLOADING";
+            badgeStyle =
+                "background-color: rgba(56, 189, 248, 0.14); color: #38bdf8; "
+                "border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 6px; "
+                "padding: 2px 8px; font-size: 11px; font-weight: 700;";
+        } else if (ph == selfupdate::UpdatePhase::ReadyToInstall) {
+            badgeText = "READY TO INSTALL";
+            badgeStyle =
+                "background-color: rgba(16, 185, 129, 0.14); color: #10b981; "
+                "border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 6px; "
+                "padding: 2px 8px; font-size: 11px; font-weight: 700;";
+        } else if (ph == selfupdate::UpdatePhase::Installing ||
+                   ph == selfupdate::UpdatePhase::Relaunching) {
+            badgeText = (ph == selfupdate::UpdatePhase::Relaunching) ? "RELAUNCHING" : "INSTALLING";
+            badgeStyle =
+                "background-color: rgba(245, 158, 11, 0.14); color: #fbbf24; "
+                "border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 6px; "
+                "padding: 2px 8px; font-size: 11px; font-weight: 700;";
+        } else if (ph == selfupdate::UpdatePhase::Error) {
+            badgeText = "ERROR";
+            badgeStyle =
+                "background-color: rgba(239, 68, 68, 0.14); color: #f87171; "
+                "border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 6px; "
+                "padding: 2px 8px; font-size: 11px; font-weight: 700;";
+        }
+        _lblPhaseBadge->setText(badgeText);
+        _lblPhaseBadge->setStyleSheet(badgeStyle);
+
+        if (!st.manifest.versionName.empty()) {
+            _lblLatestVer->setText(
+                QString("Latest: v%1 (build %2)")
+                    .arg(QString::fromStdString(st.manifest.versionName))
+                    .arg(st.manifest.versionCode)
+            );
+        } else if (ph == selfupdate::UpdatePhase::UpToDate) {
+            _lblLatestVer->setText(
+                QString("Latest: v%1").arg(QString::fromStdString(_installedVersion))
+            );
+        } else {
+            _lblLatestVer->setText("Latest: --");
+        }
+
+        if (ph == selfupdate::UpdatePhase::Error) {
+            _lblStatusMsg->setText(
+                QString::fromStdString(
+                    st.errorMessage.empty() ? "Update check or download failed." : st.errorMessage
+                )
+            );
+            _lblStatusMsg->setStyleSheet("color: #f87171; font-size: 12px; font-weight: 600;");
+        } else if (ph == selfupdate::UpdatePhase::Checking) {
+            _lblStatusMsg->setText("Checking https://www.selfso.com/software/windows/ for updates...");
+            _lblStatusMsg->setStyleSheet("color: #38bdf8; font-size: 12px; font-weight: 600;");
+        } else if (ph == selfupdate::UpdatePhase::UpToDate) {
+            _lblStatusMsg->setText(
+                QString("aimon v%1 is up to date.").arg(QString::fromStdString(_installedVersion))
+            );
+            _lblStatusMsg->setStyleSheet("color: #10b981; font-size: 12px; font-weight: 600;");
+        } else if (ph == selfupdate::UpdatePhase::Available) {
+            _lblStatusMsg->setText(
+                QString("A newer release (v%1) is ready to download and install.")
+                    .arg(QString::fromStdString(st.manifest.versionName))
+            );
+            _lblStatusMsg->setStyleSheet("color: #00f2fe; font-size: 12px; font-weight: 600;");
+        } else if (ph == selfupdate::UpdatePhase::Downloading) {
+            _lblStatusMsg->setText(
+                QString("Downloading aimon v%1 installer package...")
+                    .arg(QString::fromStdString(st.manifest.versionName))
+            );
+            _lblStatusMsg->setStyleSheet("color: #38bdf8; font-size: 12px; font-weight: 600;");
+        } else if (ph == selfupdate::UpdatePhase::ReadyToInstall) {
+            _lblStatusMsg->setText(
+                QString("Verified SHA-256 for aimon v%1. Ready to install.")
+                    .arg(QString::fromStdString(st.manifest.versionName))
+            );
+            _lblStatusMsg->setStyleSheet("color: #10b981; font-size: 12px; font-weight: 600;");
+        } else if (ph == selfupdate::UpdatePhase::Installing ||
+                   ph == selfupdate::UpdatePhase::Relaunching) {
+            _lblStatusMsg->setText("Launching silent installer and restarting aimon...");
+            _lblStatusMsg->setStyleSheet("color: #fbbf24; font-size: 12px; font-weight: 600;");
+        } else {
+            _lblStatusMsg->setText("Click 'Check for Updates' to check for new releases.");
+            _lblStatusMsg->setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 600;");
+        }
+
+        if (!st.manifest.packageUrl.empty() || st.manifest.sizeBytes > 0) {
+            const double sizeMb = static_cast<double>(st.manifest.sizeBytes) / (1024.0 * 1024.0);
+            const std::string shaPrefix = (st.manifest.sha256.size() >= 16)
+                ? (st.manifest.sha256.substr(0, 16) + "...")
+                : st.manifest.sha256;
+            const std::string modeStr =
+                (st.manifest.installMode == selfupdate::InstallMode::BinaryCopy)
+                    ? "binary"
+                    : "installer";
+            _lblPkgDetails->setText(
+                QString("Size: %1 MB  ·  SHA-256: %2  ·  Mode: %3 %4")
+                    .arg(sizeMb, 0, 'f', 2)
+                    .arg(QString::fromStdString(shaPrefix.empty() ? "--" : shaPrefix))
+                    .arg(QString::fromStdString(modeStr))
+                    .arg(QString::fromStdString(st.manifest.installerArgs))
+            );
+        } else {
+            _lblPkgDetails->setText("Package: aimon-setup.exe  ·  Mode: installer (--silent)");
+        }
+
+        if (!st.manifest.releaseNotes.empty()) {
+            _txtReleaseNotes->setPlainText(QString::fromStdString(st.manifest.releaseNotes));
+        } else if (ph == selfupdate::UpdatePhase::UpToDate) {
+            _txtReleaseNotes->setPlainText(
+                QString("You are running the latest version of aimon (v%1).")
+                    .arg(QString::fromStdString(_installedVersion))
+            );
+        } else {
+            _txtReleaseNotes->setPlainText(
+                "Release notes will appear here when a software update is discovered."
+            );
+        }
+
+        const bool showProgress = (ph == selfupdate::UpdatePhase::Downloading ||
+                                   ph == selfupdate::UpdatePhase::ReadyToInstall ||
+                                   ph == selfupdate::UpdatePhase::Installing ||
+                                   ph == selfupdate::UpdatePhase::Relaunching);
+        _prgDownload->setVisible(showProgress);
+        _lblProgressBytes->setVisible(showProgress);
+        if (showProgress) {
+            int pct = 0;
+            if (st.totalBytes > 0) {
+                pct = static_cast<int>((st.bytesRead * 100) / st.totalBytes);
+            } else if (ph != selfupdate::UpdatePhase::Downloading) {
+                pct = 100;
+            }
+            pct = std::clamp(pct, 0, 100);
+            _prgDownload->setValue(pct);
+            const double dlMb = static_cast<double>(st.bytesRead) / (1024.0 * 1024.0);
+            const double totMb = static_cast<double>(st.totalBytes) / (1024.0 * 1024.0);
+            if (st.totalBytes > 0) {
+                _lblProgressBytes->setText(
+                    QString("%1 MB / %2 MB (%3%)")
+                        .arg(dlMb, 0, 'f', 2)
+                        .arg(totMb, 0, 'f', 2)
+                        .arg(pct)
+                );
+            } else {
+                _lblProgressBytes->setText(QString("%1 MB downloaded (%2%)").arg(dlMb, 0, 'f', 2).arg(pct));
+            }
+        }
+
+        const bool busy = (ph == selfupdate::UpdatePhase::Checking ||
+                           ph == selfupdate::UpdatePhase::Downloading ||
+                           ph == selfupdate::UpdatePhase::Installing ||
+                           ph == selfupdate::UpdatePhase::Relaunching);
+        _btnCheck->setEnabled(!busy);
+        _btnInstall->setVisible(ph == selfupdate::UpdatePhase::Available ||
+                                ph == selfupdate::UpdatePhase::ReadyToInstall);
+        _btnInstall->setEnabled(ph == selfupdate::UpdatePhase::Available ||
+                                ph == selfupdate::UpdatePhase::ReadyToInstall);
+        if (!st.manifest.versionName.empty()) {
+            _btnInstall->setText(
+                QString("Download & Install v%1").arg(QString::fromStdString(st.manifest.versionName))
+            );
+        } else {
+            _btnInstall->setText("Download & Install Update");
+        }
+        _btnCancel->setVisible(ph == selfupdate::UpdatePhase::Checking ||
+                               ph == selfupdate::UpdatePhase::Downloading);
+    }
+
+private:
+    selfupdate::SelfUpdateController* _controller = nullptr;
+    std::string _installedVersion;
+    std::function<void()> _onManualCheckRequested;
+    QLabel* _lblPhaseBadge = nullptr;
+    QLabel* _lblInstalledVer = nullptr;
+    QLabel* _lblLatestVer = nullptr;
+    QLabel* _lblStatusMsg = nullptr;
+    QLabel* _lblPkgDetails = nullptr;
+    QProgressBar* _prgDownload = nullptr;
+    QLabel* _lblProgressBytes = nullptr;
+    QPlainTextEdit* _txtReleaseNotes = nullptr;
+    QPushButton* _btnCheck = nullptr;
+    QPushButton* _btnInstall = nullptr;
+    QPushButton* _btnCancel = nullptr;
+    QPushButton* _btnClose = nullptr;
+};
+
 EdaTrayWindow::EdaTrayWindow(EdaRpcServer& server,
                              const EdaBridgeAppSettings& initialSettings,
                              const std::string& configFilePath,
@@ -313,6 +700,7 @@ EdaTrayWindow::EdaTrayWindow(EdaRpcServer& server,
     buildTrayIcon();
     syncControlsFromSettings();
     applyRuntimeToggles();
+    initSelfUpdateController();
 
     _statusTimer = new QTimer(this);
     QObject::connect(_statusTimer, &QTimer::timeout, [this]() {
@@ -333,6 +721,8 @@ EdaTrayWindow::EdaTrayWindow(EdaRpcServer& server,
 EdaTrayWindow::~EdaTrayWindow() {
     if (_statusTimer) _statusTimer->stop();
     if (_quotaTimer) _quotaTimer->stop();
+    if (_updateCheckTimer) _updateCheckTimer->stop();
+    if (_updateController) _updateController->cancel();
 }
 
 void EdaTrayWindow::showQuotasTab() {
@@ -424,13 +814,92 @@ void EdaTrayWindow::buildUi() {
         "padding: 3px 10px; font-size: 11px; font-weight: 700;"
     );
 
+    _btnCheckUpdates = new QPushButton("Check for Updates", this);
+    _btnCheckUpdates->setObjectName("btnCheckUpdates");
+    _btnCheckUpdates->setStyleSheet(
+        "QPushButton { background-color: rgba(148, 163, 184, 0.10); color: #cbd5e1; "
+        "border: 1px solid #334155; border-radius: 10px; padding: 3px 10px; "
+        "font-size: 11px; font-weight: 700; } "
+        "QPushButton:hover { background-color: rgba(56, 189, 248, 0.16); "
+        "border-color: #38bdf8; color: #f8fafc; }"
+    );
+    QObject::connect(_btnCheckUpdates, &QPushButton::clicked, [this]() {
+        const auto ph = _currentUpdateState.phase;
+        const bool shouldCheck = (ph == selfupdate::UpdatePhase::Idle ||
+                                  ph == selfupdate::UpdatePhase::UpToDate ||
+                                  ph == selfupdate::UpdatePhase::Error);
+        openSelfUpdateDialog(shouldCheck);
+    });
+
     headerLayout->addWidget(brandIconLbl);
     headerLayout->addWidget(titleLbl);
     headerLayout->addWidget(subtitleLbl);
     headerLayout->addStretch(1);
     headerLayout->addWidget(_quotaConnectionBanner);
     headerLayout->addWidget(verLbl);
+    headerLayout->addWidget(_btnCheckUpdates);
     rootLayout->addLayout(headerLayout);
+
+    // Inline Self-Update Notification Banner (hidden until update available or manual check)
+    _updateBannerFrame = new QFrame(this);
+    _updateBannerFrame->setObjectName("updateBannerFrame");
+    _updateBannerFrame->setStyleSheet(
+        "#updateBannerFrame { background-color: rgba(0, 242, 254, 0.08); "
+        "border: 1px solid rgba(0, 242, 254, 0.35); border-radius: 9px; }"
+    );
+    QHBoxLayout* bannerLayout = new QHBoxLayout(_updateBannerFrame);
+    bannerLayout->setContentsMargins(12, 7, 12, 7);
+    bannerLayout->setSpacing(10);
+
+    _lblUpdateBannerText = new QLabel("Update available", _updateBannerFrame);
+    _lblUpdateBannerText->setObjectName("lblUpdateBannerText");
+    _lblUpdateBannerText->setStyleSheet("color: #f8fafc; font-size: 12px; font-weight: 700;");
+
+    _prgUpdateBanner = new QProgressBar(_updateBannerFrame);
+    _prgUpdateBanner->setObjectName("prgUpdateBanner");
+    _prgUpdateBanner->setRange(0, 100);
+    _prgUpdateBanner->setValue(0);
+    _prgUpdateBanner->setTextVisible(false);
+    _prgUpdateBanner->setFixedWidth(130);
+    _prgUpdateBanner->setFixedHeight(7);
+    _prgUpdateBanner->setStyleSheet(
+        "QProgressBar { border: 1px solid #1e293b; border-radius: 3px; "
+        "background-color: #090d16; min-height: 7px; max-height: 7px; } "
+        "QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+        "stop:0 #0284c7, stop:1 #00f2fe); border-radius: 3px; }"
+    );
+    _prgUpdateBanner->setVisible(false);
+
+    _btnUpdateBannerAction = new QPushButton("Update Now", _updateBannerFrame);
+    _btnUpdateBannerAction->setObjectName("btnUpdateBannerAction");
+    _btnUpdateBannerAction->setStyleSheet(
+        "QPushButton { background-color: #0284c7; color: #ffffff; "
+        "border: 1px solid #38bdf8; border-radius: 6px; padding: 4px 12px; "
+        "font-size: 11px; font-weight: 700; } "
+        "QPushButton:hover { background-color: #0ea5e9; }"
+    );
+    QObject::connect(_btnUpdateBannerAction, &QPushButton::clicked, [this]() {
+        openSelfUpdateDialog(false);
+    });
+
+    _btnUpdateBannerDismiss = new QPushButton("Dismiss", _updateBannerFrame);
+    _btnUpdateBannerDismiss->setObjectName("btnUpdateBannerDismiss");
+    _btnUpdateBannerDismiss->setStyleSheet(
+        "QPushButton { background: transparent; color: #94a3b8; border: 1px solid #334155; "
+        "border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 600; } "
+        "QPushButton:hover { color: #f8fafc; border-color: #64748b; }"
+    );
+    QObject::connect(_btnUpdateBannerDismiss, &QPushButton::clicked, [this]() {
+        _updateBannerDismissed = true;
+        _updateBannerFrame->setVisible(false);
+    });
+
+    bannerLayout->addWidget(_lblUpdateBannerText, 1);
+    bannerLayout->addWidget(_prgUpdateBanner);
+    bannerLayout->addWidget(_btnUpdateBannerAction);
+    bannerLayout->addWidget(_btnUpdateBannerDismiss);
+    _updateBannerFrame->setVisible(false);
+    rootLayout->addWidget(_updateBannerFrame);
 
     _tabWidget = new QTabWidget(this);
     rootLayout->addWidget(_tabWidget, 1);
@@ -1076,6 +1545,8 @@ void EdaTrayWindow::buildUi() {
     _chkAutoDeployPlugins = new QCheckBox("Auto-deploy companion plugins on startup", togglesCard);
     _chkStartMinimized = new QCheckBox("Start minimized to Windows System Tray", togglesCard);
     _chkLaunchAtLogin = new QCheckBox("Launch automatically at Windows login", togglesCard);
+    _chkAutoCheckUpdates = new QCheckBox("Auto-check for app updates (every 6h)", togglesCard);
+    _chkAutoCheckUpdates->setObjectName("chkAutoCheckUpdates");
 
     togglesGrid->addWidget(_chkEnableEasyEda, 0, 0);
     togglesGrid->addWidget(_chkEnableKiCad, 0, 1);
@@ -1083,6 +1554,7 @@ void EdaTrayWindow::buildUi() {
     togglesGrid->addWidget(_chkAutoDeployPlugins, 1, 1);
     togglesGrid->addWidget(_chkStartMinimized, 2, 0);
     togglesGrid->addWidget(_chkLaunchAtLogin, 2, 1);
+    togglesGrid->addWidget(_chkAutoCheckUpdates, 3, 0, 1, 2);
     togglesCardLayout->addLayout(togglesGrid);
     settingsVBox->addWidget(togglesCard);
 
@@ -1097,6 +1569,7 @@ void EdaTrayWindow::buildUi() {
     QObject::connect(_chkEnableEasyEda, &QCheckBox::toggled, onInstantToggleChanged);
     QObject::connect(_chkEnableKiCad, &QCheckBox::toggled, onInstantToggleChanged);
     QObject::connect(_chkEnableFreeCad, &QCheckBox::toggled, onInstantToggleChanged);
+    QObject::connect(_chkAutoCheckUpdates, &QCheckBox::toggled, onInstantToggleChanged);
 
     // Connection & Paths Card
     QFrame* connCard = new QFrame(settingsContent);
@@ -1153,6 +1626,9 @@ void EdaTrayWindow::buildUi() {
     btnDeploy->setStyleSheet(secondaryGhostButtonStyle());
     QPushButton* btnExportEext = new QPushButton("Export EasyEDA .eext Extension...", bridgesTab);
     btnExportEext->setStyleSheet(secondaryGhostButtonStyle());
+    _btnSettingsCheckUpdates = new QPushButton("Check for Updates...", bridgesTab);
+    _btnSettingsCheckUpdates->setObjectName("btnSettingsCheckUpdates");
+    _btnSettingsCheckUpdates->setStyleSheet(secondaryGhostButtonStyle());
 
     QObject::connect(btnSave, &QPushButton::clicked, [this]() {
         applyAndSaveSettings();
@@ -1163,10 +1639,14 @@ void EdaTrayWindow::buildUi() {
     QObject::connect(btnExportEext, &QPushButton::clicked, [this]() {
         onExportEasyEdaExtensionClicked();
     });
+    QObject::connect(_btnSettingsCheckUpdates, &QPushButton::clicked, [this]() {
+        openSelfUpdateDialog(true);
+    });
 
     bridgeButtons->addWidget(btnSave);
     bridgeButtons->addWidget(btnDeploy);
     bridgeButtons->addWidget(btnExportEext);
+    bridgeButtons->addWidget(_btnSettingsCheckUpdates);
     bridgesLayout->addLayout(bridgeButtons);
 
     _tabWidget->addTab(bridgesTab, "EDA/CAD");
@@ -1253,6 +1733,14 @@ void EdaTrayWindow::buildTrayIcon() {
         onExportEasyEdaExtensionClicked();
     });
 
+    _actCheckUpdates = _trayMenu->addAction("Check for Updates...");
+    QObject::connect(_actCheckUpdates, &QAction::triggered, [this]() {
+        showNormal();
+        raise();
+        activateWindow();
+        openSelfUpdateDialog(true);
+    });
+
     _trayMenu->addSeparator();
 
     QAction* actQuit = _trayMenu->addAction("Quit aimon");
@@ -1273,6 +1761,306 @@ void EdaTrayWindow::buildTrayIcon() {
     _trayIcon->show();
 }
 
+void EdaTrayWindow::initSelfUpdateController() {
+    selfupdate::SelfUpdateConfig cfg = EdaBridgeAppConfig::toSelfUpdateConfig(_settings);
+    selfupdate::InstallOptions installOpts;
+    auto ctrl = std::make_unique<selfupdate::SelfUpdateController>(cfg, installOpts);
+    setSelfUpdateController(std::move(ctrl));
+
+    if (!_updateCheckTimer) {
+        _updateCheckTimer = new QTimer(this);
+        QObject::connect(_updateCheckTimer, &QTimer::timeout, [this]() {
+            if (!_settings.autoCheckUpdates) {
+                return;
+            }
+            const auto ph = _currentUpdateState.phase;
+            if (ph == selfupdate::UpdatePhase::Checking ||
+                ph == selfupdate::UpdatePhase::Downloading ||
+                ph == selfupdate::UpdatePhase::ReadyToInstall ||
+                ph == selfupdate::UpdatePhase::Installing ||
+                ph == selfupdate::UpdatePhase::Relaunching) {
+                return;
+            }
+            checkForAppUpdates(false);
+        });
+    }
+    const int intervalMin = std::clamp(_settings.updateCheckIntervalMinutes, 15, 10080);
+    _updateCheckTimer->setInterval(intervalMin * 60 * 1000);
+    if (_settings.autoCheckUpdates) {
+        _updateCheckTimer->start();
+    } else {
+        _updateCheckTimer->stop();
+    }
+
+    QTimer::singleShot(1500, this, [this]() {
+        if (_settings.autoCheckUpdates &&
+            _currentUpdateState.phase == selfupdate::UpdatePhase::Idle) {
+            checkForAppUpdates(false);
+        }
+    });
+}
+
+void EdaTrayWindow::setSelfUpdateController(
+    std::unique_ptr<selfupdate::SelfUpdateController> controller) {
+    if (_updateController) {
+        _updateController->cancel();
+    }
+    _updateController = std::move(controller);
+    if (_updateDialog) {
+        _updateDialog->setController(_updateController.get());
+    }
+    if (_updateController) {
+        selfupdate::bindQtController(
+            *_updateController,
+            this,
+            [this](const selfupdate::UpdateStatus& st) {
+                onSelfUpdateStatusChanged(st);
+            },
+            [this]() {
+                quitApplication();
+            }
+        );
+        onSelfUpdateStatusChanged(_updateController->state());
+    }
+}
+
+void EdaTrayWindow::checkForAppUpdates(bool manual) {
+    _lastUpdateCheckManual = manual;
+    if (manual) {
+        _updateBannerDismissed = false;
+    }
+    if (_updateController) {
+        _updateController->checkForUpdates();
+    }
+}
+
+void EdaTrayWindow::openSelfUpdateDialog(bool triggerCheck) {
+    if (!_updateDialog && _updateController) {
+        _updateDialog = new AimonSelfUpdateDialog(
+            _updateController.get(),
+            _settings.version,
+            _currentUpdateState,
+            [this]() { checkForAppUpdates(true); },
+            this
+        );
+    }
+    if (_updateDialog) {
+        _updateDialog->applyState(_currentUpdateState);
+        _updateDialog->show();
+        _updateDialog->raise();
+        _updateDialog->activateWindow();
+    }
+    if (triggerCheck) {
+        const auto ph = _currentUpdateState.phase;
+        if (ph == selfupdate::UpdatePhase::Idle ||
+            ph == selfupdate::UpdatePhase::UpToDate ||
+            ph == selfupdate::UpdatePhase::Error) {
+            checkForAppUpdates(true);
+        }
+    }
+}
+
+bool EdaTrayWindow::isSelfUpdateBannerVisible() const {
+    return _updateBannerFrame != nullptr && !_updateBannerFrame->isHidden();
+}
+
+std::string EdaTrayWindow::checkUpdatesButtonText() const {
+    return _btnCheckUpdates ? _btnCheckUpdates->text().toStdString() : std::string();
+}
+
+std::string EdaTrayWindow::trayCheckUpdatesActionText() const {
+    return _actCheckUpdates ? _actCheckUpdates->text().toStdString() : std::string();
+}
+
+void EdaTrayWindow::onSelfUpdateStatusChanged(const selfupdate::UpdateStatus& st) {
+    _currentUpdateState = st;
+    if (_updateDialog) {
+        _updateDialog->applyState(st);
+    }
+
+    const auto ph = st.phase;
+    int pct = 0;
+    if (st.totalBytes > 0) {
+        pct = static_cast<int>((st.bytesRead * 100) / st.totalBytes);
+    }
+    pct = std::clamp(pct, 0, 100);
+
+    if (_btnCheckUpdates) {
+        if (ph == selfupdate::UpdatePhase::Checking) {
+            _btnCheckUpdates->setText("Checking...");
+            _btnCheckUpdates->setStyleSheet(
+                "QPushButton { background-color: rgba(56, 189, 248, 0.14); color: #38bdf8; "
+                "border: 1px solid rgba(56, 189, 248, 0.40); border-radius: 10px; "
+                "padding: 3px 10px; font-size: 11px; font-weight: 700; }"
+            );
+        } else if (ph == selfupdate::UpdatePhase::Available ||
+                   ph == selfupdate::UpdatePhase::ReadyToInstall) {
+            _btnCheckUpdates->setText(
+                QString::fromUtf8("⬆ Update v%1").arg(QString::fromStdString(st.manifest.versionName))
+            );
+            _btnCheckUpdates->setStyleSheet(
+                "QPushButton { background-color: rgba(0, 242, 254, 0.16); color: #00f2fe; "
+                "border: 1px solid rgba(0, 242, 254, 0.45); border-radius: 10px; "
+                "padding: 3px 10px; font-size: 11px; font-weight: 800; } "
+                "QPushButton:hover { background-color: rgba(0, 242, 254, 0.25); color: #ffffff; }"
+            );
+        } else if (ph == selfupdate::UpdatePhase::Downloading) {
+            _btnCheckUpdates->setText(QString("Downloading %1%").arg(pct));
+            _btnCheckUpdates->setStyleSheet(
+                "QPushButton { background-color: rgba(56, 189, 248, 0.14); color: #38bdf8; "
+                "border: 1px solid rgba(56, 189, 248, 0.40); border-radius: 10px; "
+                "padding: 3px 10px; font-size: 11px; font-weight: 700; }"
+            );
+        } else if (ph == selfupdate::UpdatePhase::Installing ||
+                   ph == selfupdate::UpdatePhase::Relaunching) {
+            _btnCheckUpdates->setText("Installing...");
+            _btnCheckUpdates->setStyleSheet(
+                "QPushButton { background-color: rgba(245, 158, 11, 0.14); color: #fbbf24; "
+                "border: 1px solid rgba(245, 158, 11, 0.40); border-radius: 10px; "
+                "padding: 3px 10px; font-size: 11px; font-weight: 700; }"
+            );
+        } else {
+            _btnCheckUpdates->setText("Check for Updates");
+            _btnCheckUpdates->setStyleSheet(
+                "QPushButton { background-color: rgba(148, 163, 184, 0.10); color: #cbd5e1; "
+                "border: 1px solid #334155; border-radius: 10px; padding: 3px 10px; "
+                "font-size: 11px; font-weight: 700; } "
+                "QPushButton:hover { background-color: rgba(56, 189, 248, 0.16); "
+                "border-color: #38bdf8; color: #f8fafc; }"
+            );
+        }
+    }
+
+    if (_actCheckUpdates) {
+        if (ph == selfupdate::UpdatePhase::Available ||
+            ph == selfupdate::UpdatePhase::ReadyToInstall) {
+            _actCheckUpdates->setText(
+                QString::fromUtf8("⬆ Update Available (v%1)...")
+                    .arg(QString::fromStdString(st.manifest.versionName))
+            );
+        } else {
+            _actCheckUpdates->setText("Check for Updates...");
+        }
+    }
+
+    if (_updateBannerFrame) {
+        if (ph == selfupdate::UpdatePhase::Available) {
+            if (st.manifest.versionCode > _lastNotifiedUpdateVersionCode) {
+                _lastNotifiedUpdateVersionCode = st.manifest.versionCode;
+                _updateBannerDismissed = false;
+                if (_trayIcon && _trayIcon->isVisible()) {
+                    _trayIcon->showMessage(
+                        "aimon Update Available",
+                        QString("aimon v%1 is available to download and install.")
+                            .arg(QString::fromStdString(st.manifest.versionName)),
+                        QSystemTrayIcon::Information,
+                        5000
+                    );
+                }
+            }
+            _lblUpdateBannerText->setText(
+                QString::fromUtf8("⬆  aimon v%1 is available (installed: v%2)")
+                    .arg(QString::fromStdString(st.manifest.versionName))
+                    .arg(QString::fromStdString(_settings.version))
+            );
+            _prgUpdateBanner->setVisible(false);
+            _btnUpdateBannerAction->setText("Update Now");
+            _btnUpdateBannerAction->setVisible(true);
+            _btnUpdateBannerDismiss->setVisible(true);
+            _updateBannerFrame->setVisible(!_updateBannerDismissed);
+        } else if (ph == selfupdate::UpdatePhase::Downloading) {
+            _lblUpdateBannerText->setText(
+                QString("Downloading aimon v%1 update (%2%)...")
+                    .arg(QString::fromStdString(st.manifest.versionName))
+                    .arg(pct)
+            );
+            _prgUpdateBanner->setRange(0, 100);
+            _prgUpdateBanner->setValue(pct);
+            _prgUpdateBanner->setVisible(true);
+            _btnUpdateBannerAction->setText("Details...");
+            _btnUpdateBannerAction->setVisible(true);
+            _btnUpdateBannerDismiss->setVisible(false);
+            _updateBannerFrame->setVisible(true);
+        } else if (ph == selfupdate::UpdatePhase::ReadyToInstall ||
+                   ph == selfupdate::UpdatePhase::Installing ||
+                   ph == selfupdate::UpdatePhase::Relaunching) {
+            _lblUpdateBannerText->setText(
+                QString("Ready to install aimon v%1")
+                    .arg(QString::fromStdString(st.manifest.versionName))
+            );
+            _prgUpdateBanner->setRange(0, 100);
+            _prgUpdateBanner->setValue(100);
+            _prgUpdateBanner->setVisible(ph == selfupdate::UpdatePhase::ReadyToInstall);
+            _btnUpdateBannerAction->setText("Details...");
+            _btnUpdateBannerAction->setVisible(true);
+            _btnUpdateBannerDismiss->setVisible(false);
+            _updateBannerFrame->setVisible(true);
+        } else if (ph == selfupdate::UpdatePhase::Checking) {
+            if (_lastUpdateCheckManual) {
+                _lblUpdateBannerText->setText("Checking for aimon updates...");
+                _prgUpdateBanner->setVisible(false);
+                _btnUpdateBannerAction->setVisible(false);
+                _btnUpdateBannerDismiss->setVisible(true);
+                _updateBannerFrame->setVisible(!_updateBannerDismissed);
+            } else {
+                _updateBannerFrame->setVisible(false);
+            }
+        } else if (ph == selfupdate::UpdatePhase::UpToDate) {
+            if (_lastUpdateCheckManual) {
+                _lblUpdateBannerText->setText(
+                    QString::fromUtf8("✓  aimon v%1 is up to date.")
+                        .arg(QString::fromStdString(_settings.version))
+                );
+                _prgUpdateBanner->setVisible(false);
+                _btnUpdateBannerAction->setText("Details...");
+                _btnUpdateBannerAction->setVisible(true);
+                _btnUpdateBannerDismiss->setVisible(true);
+                _updateBannerFrame->setVisible(!_updateBannerDismissed);
+            } else {
+                _updateBannerFrame->setVisible(false);
+            }
+        } else if (ph == selfupdate::UpdatePhase::Error) {
+            if (_lastUpdateCheckManual) {
+                _lblUpdateBannerText->setText(
+                    QString::fromUtf8("⚠  Update check failed: %1")
+                        .arg(QString::fromStdString(st.errorMessage))
+                );
+                _prgUpdateBanner->setVisible(false);
+                _btnUpdateBannerAction->setText("Details...");
+                _btnUpdateBannerAction->setVisible(true);
+                _btnUpdateBannerDismiss->setVisible(true);
+                _updateBannerFrame->setVisible(!_updateBannerDismissed);
+            } else {
+                _updateBannerFrame->setVisible(false);
+            }
+        } else {
+            _updateBannerFrame->setVisible(false);
+        }
+    }
+
+    if (_lastUpdateCheckManual && _lblSettingsStatus) {
+        if (ph == selfupdate::UpdatePhase::Checking) {
+            _lblSettingsStatus->setText("Checking for app updates...");
+            _lblSettingsStatus->setStyleSheet("color: #38bdf8; font-size: 11px;");
+        } else if (ph == selfupdate::UpdatePhase::UpToDate) {
+            _lblSettingsStatus->setText(
+                QString("aimon v%1 is up to date").arg(QString::fromStdString(_settings.version))
+            );
+            _lblSettingsStatus->setStyleSheet("color: #10b981; font-size: 11px;");
+        } else if (ph == selfupdate::UpdatePhase::Available) {
+            _lblSettingsStatus->setText(
+                QString("Update v%1 available").arg(QString::fromStdString(st.manifest.versionName))
+            );
+            _lblSettingsStatus->setStyleSheet("color: #00f2fe; font-size: 11px;");
+        } else if (ph == selfupdate::UpdatePhase::Error) {
+            _lblSettingsStatus->setText(
+                QString("Update check failed: %1").arg(QString::fromStdString(st.errorMessage))
+            );
+            _lblSettingsStatus->setStyleSheet("color: #f87171; font-size: 11px;");
+        }
+    }
+}
+
 void EdaTrayWindow::syncControlsFromSettings() {
     _syncingUi = true;
     _chkEnableEasyEda->setChecked(_settings.enableEasyEda);
@@ -1281,6 +2069,9 @@ void EdaTrayWindow::syncControlsFromSettings() {
     _chkAutoDeployPlugins->setChecked(_settings.autoDeployPlugins);
     _chkStartMinimized->setChecked(_settings.startMinimizedToTray);
     _chkLaunchAtLogin->setChecked(_settings.launchAtLogin);
+    if (_chkAutoCheckUpdates) {
+        _chkAutoCheckUpdates->setChecked(_settings.autoCheckUpdates);
+    }
 
     if (_actTrayEasyEda) _actTrayEasyEda->setChecked(_settings.enableEasyEda);
     if (_actTrayKiCad) _actTrayKiCad->setChecked(_settings.enableKiCad);
@@ -1300,6 +2091,9 @@ void EdaTrayWindow::collectSettingsFromControls() {
     _settings.autoDeployPlugins = _chkAutoDeployPlugins->isChecked();
     _settings.startMinimizedToTray = _chkStartMinimized->isChecked();
     _settings.launchAtLogin = _chkLaunchAtLogin->isChecked();
+    if (_chkAutoCheckUpdates) {
+        _settings.autoCheckUpdates = _chkAutoCheckUpdates->isChecked();
+    }
     _settings.disallowExports = false;
 
     _settings.aimonHost = _edtAimonHost->text().trimmed().toStdString();
@@ -1322,6 +2116,18 @@ void EdaTrayWindow::applyRuntimeToggles() {
     _server.setBridgeEnabled("freecad", _settings.enableFreeCad);
     _server.setDisallowExports(_settings.disallowExports);
     _server.setAllowedRoot(_settings.allowedRoot);
+
+    if (_updateCheckTimer) {
+        const int intervalMin = std::clamp(_settings.updateCheckIntervalMinutes, 15, 10080);
+        _updateCheckTimer->setInterval(intervalMin * 60 * 1000);
+        if (_settings.autoCheckUpdates) {
+            if (!_updateCheckTimer->isActive()) {
+                _updateCheckTimer->start();
+            }
+        } else {
+            _updateCheckTimer->stop();
+        }
+    }
 
     _syncingUi = true;
     if (_actTrayEasyEda) _actTrayEasyEda->setChecked(_settings.enableEasyEda);

@@ -32,6 +32,16 @@
 #include "EdaRpcServer.hxx"
 #include "EdaBridgeAppConfig.hxx"
 #include "PathUtils.hxx"
+#include <rapidcheck.h>
+#include <selfupdate/SelfUpdateController.hxx>
+#include <selfupdate/Sha256.hxx>
+#include <selfupdate/UpdateInstaller.hxx>
+#include <selfupdate/UpdateManifest.hxx>
+#ifdef AIMON_EDA_BRIDGE_WITH_QT
+#include <QApplication>
+#include <QPlainTextEdit>
+#include "EdaTrayWindow.hxx"
+#endif
 
 #include <CppUTest/TestHarness.h>
 #include <CppUTest/CommandLineTestRunner.h>
@@ -1812,6 +1822,9 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     orig.freecadBinaryPath = "/usr/bin/freecadcmd";
     orig.kicadPluginDir = _ws + "/custom_kicad_plugins";
     orig.freecadModDir = _ws + "/custom_freecad_mod";
+    orig.autoCheckUpdates = false;
+    orig.updateCheckIntervalMinutes = 720;
+    orig.updateManifestUrl = "https://www.selfso.com/software/windows/";
 
     std::string cfgFile = _ws + "/sub/aimon-settings.json";
     std::string err;
@@ -1843,6 +1856,9 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, RoundTripSettingsSaveLoadAndServerOpt
     CHECK_EQUAL(orig.freecadBinaryPath, loaded.freecadBinaryPath);
     CHECK_EQUAL(orig.kicadPluginDir, loaded.kicadPluginDir);
     CHECK_EQUAL(orig.freecadModDir, loaded.freecadModDir);
+    CHECK_EQUAL(orig.autoCheckUpdates, loaded.autoCheckUpdates);
+    CHECK_EQUAL(orig.updateCheckIntervalMinutes, loaded.updateCheckIntervalMinutes);
+    CHECK_EQUAL(orig.updateManifestUrl, loaded.updateManifestUrl);
 
     EdaRpcServerOptions srvOpts = EdaBridgeAppConfig::toServerOptions(loaded);
     CHECK_EQUAL(loaded.listenHost, srvOpts.listenHost);
@@ -3321,6 +3337,450 @@ TEST(EdaBridge_UnifiedAppConfigAndToggles, BridgeFunctionTelemetryRecordingAndSn
     CHECK_EQUAL(0, static_cast<int>(srv.getTelemetrySnapshot().totalCalls));
 }
 
+TEST(EdaBridge_UnifiedAppConfigAndToggles, SelfUpdateConfigPersistenceAndLoopbackControllerFlow) {
+    // 1. Default settings -> toSelfUpdateConfig
+    EdaBridgeAppSettings defaults;
+    CHECK_TRUE(defaults.autoCheckUpdates);
+    CHECK_EQUAL(360, defaults.updateCheckIntervalMinutes);
+    STRCMP_EQUAL("https://www.selfso.com/software/windows/", defaults.updateManifestUrl.c_str());
+
+    selfupdate::SelfUpdateConfig suCfg = EdaBridgeAppConfig::toSelfUpdateConfig(defaults);
+    STRCMP_EQUAL("com.selfso.aimon", suCfg.applicationId.c_str());
+    STRCMP_EQUAL(AIMON_VERSION_STRING, suCfg.installedVersionName.c_str());
+    CHECK_EQUAL(selfupdate::UpdateManifest::parseVersionCode(AIMON_VERSION_STRING),
+                suCfg.installedVersionCode);
+    STRCMP_EQUAL(selfupdate::UpdateManifest::DEFAULT_MANIFEST_URL, suCfg.manifestUrl.c_str());
+
+    // 2. Empty manifest URL fallback and interval clamping on save/load
+    EdaBridgeAppSettings clampedIn;
+    clampedIn.autoCheckUpdates = false;
+    clampedIn.updateCheckIntervalMinutes = 3; // below min 15
+    clampedIn.updateManifestUrl = "";
+    std::string cfgPath = _ws + "/selfupdate_clamp.json";
+    std::string err;
+    CHECK_TRUE(EdaBridgeAppConfig::saveToFile(cfgPath, clampedIn, err));
+
+    EdaBridgeAppSettings clampedOut;
+    CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgPath, clampedOut, err));
+    CHECK_FALSE(clampedOut.autoCheckUpdates);
+    CHECK_EQUAL(15, clampedOut.updateCheckIntervalMinutes);
+    STRCMP_EQUAL(selfupdate::UpdateManifest::DEFAULT_MANIFEST_URL,
+                 clampedOut.updateManifestUrl.c_str());
+
+    // Also test upper bound clamping (> 10080) via raw JSON file load
+    {
+        std::ofstream ofs(cfgPath, std::ios::binary | std::ios::trunc);
+        ofs << R"({"auto_check_updates":true,"update_check_interval_minutes":999999,"update_manifest_url":""})";
+    }
+    EdaBridgeAppSettings upperClamped;
+    CHECK_TRUE(EdaBridgeAppConfig::loadFromFile(cfgPath, upperClamped, err));
+    CHECK_TRUE(upperClamped.autoCheckUpdates);
+    CHECK_EQUAL(10080, upperClamped.updateCheckIntervalMinutes);
+    STRCMP_EQUAL(selfupdate::UpdateManifest::DEFAULT_MANIFEST_URL,
+                 upperClamped.updateManifestUrl.c_str());
+
+    // 3. RapidCheck property test for interval clamping and URL fallback
+    MemoryLeakWarningPlugin::saveAndDisableNewDeleteOverloads();
+    bool rcOk = rc::check("EdaBridgeAppConfig clamps updateCheckIntervalMinutes to [15, 10080]",
+                          [&]() {
+        int rawInterval = *rc::gen::inRange(-50000, 50000);
+        bool autoCheck = *rc::gen::arbitrary<bool>();
+        bool useCustomUrl = *rc::gen::arbitrary<bool>();
+        std::string customUrl = useCustomUrl ? "http://127.0.0.1:19999/software/windows/" : "";
+
+        EdaBridgeAppSettings in;
+        in.autoCheckUpdates = autoCheck;
+        in.updateCheckIntervalMinutes = rawInterval;
+        in.updateManifestUrl = customUrl;
+
+        std::string propFile = _ws + "/rc_settings.json";
+        std::string propErr;
+        RC_ASSERT(EdaBridgeAppConfig::saveToFile(propFile, in, propErr));
+
+        EdaBridgeAppSettings out;
+        RC_ASSERT(EdaBridgeAppConfig::loadFromFile(propFile, out, propErr));
+        RC_ASSERT(out.autoCheckUpdates == autoCheck);
+        RC_ASSERT(out.updateCheckIntervalMinutes >= 15);
+        RC_ASSERT(out.updateCheckIntervalMinutes <= 10080);
+        int expectedInterval = rawInterval < 15 ? 15 : (rawInterval > 10080 ? 10080 : rawInterval);
+        RC_ASSERT(out.updateCheckIntervalMinutes == expectedInterval);
+
+        selfupdate::SelfUpdateConfig mapped = EdaBridgeAppConfig::toSelfUpdateConfig(out);
+        RC_ASSERT(mapped.applicationId == "com.selfso.aimon");
+        RC_ASSERT(mapped.installedVersionName == std::string(AIMON_VERSION_STRING));
+        if (useCustomUrl) {
+            RC_ASSERT(mapped.manifestUrl == customUrl);
+        } else {
+            RC_ASSERT(mapped.manifestUrl == std::string(selfupdate::UpdateManifest::DEFAULT_MANIFEST_URL));
+        }
+    });
+    MemoryLeakWarningPlugin::restoreNewDeleteOverloads();
+    CHECK_TRUE(rcOk);
+
+    // 4. Verify UpdateInstaller::cleanupStaleBackup removes stale .old file
+    std::string fakeExe = _ws + "/aimon-eda-bridge.exe";
+    std::string fakeOld = fakeExe + ".old";
+    {
+        std::ofstream f1(fakeExe, std::ios::binary);
+        f1 << "current-binary";
+        std::ofstream f2(fakeOld, std::ios::binary);
+        f2 << "stale-backup";
+    }
+    CHECK_TRUE(fs::exists(fakeOld));
+    CHECK_TRUE(selfupdate::UpdateInstaller::cleanupStaleBackup(fakeExe));
+    CHECK_FALSE(fs::exists(fakeOld));
+    CHECK_TRUE(fs::exists(fakeExe));
+
+    // 5. Hermetic loopback HTTP server testing SelfUpdateController state machine
+    int listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK_TRUE(listenFd >= 0);
+    int opt = 1;
+    ::setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    CHECK_EQUAL(0, ::bind(listenFd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)));
+    CHECK_EQUAL(0, ::listen(listenFd, 16));
+
+    socklen_t addrLen = sizeof(addr);
+    CHECK_EQUAL(0, ::getsockname(listenFd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen));
+    uint16_t port = ntohs(addr.sin_port);
+
+    const std::string fakeInstallerPayload = "MZ-FAKE-AIMON-SETUP-BINARY-PAYLOAD-2026-SELFSO";
+    const std::string validSha256 = selfupdate::Sha256::hashString(fakeInstallerPayload);
+
+    std::atomic<bool> stopServer{false};
+    std::atomic<int64_t> servedVersionCode{suCfg.installedVersionCode};
+    std::atomic<bool> serveCorruptSha{false};
+
+    std::thread httpThread([&]() {
+        while (!stopServer.load()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(listenFd, &rfds);
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 50000;
+            int sel = ::select(listenFd + 1, &rfds, nullptr, nullptr, &tv);
+            if (sel <= 0) {
+                continue;
+            }
+            struct sockaddr_in cliAddr;
+            socklen_t cliLen = sizeof(cliAddr);
+            int clientFd = ::accept(listenFd, reinterpret_cast<struct sockaddr*>(&cliAddr), &cliLen);
+            if (clientFd < 0) {
+                continue;
+            }
+
+            char buf[2048];
+            ssize_t n = ::recv(clientFd, buf, sizeof(buf) - 1, 0);
+            if (n > 0) {
+                buf[n] = '\0';
+                std::string req(buf, static_cast<size_t>(n));
+                std::string body;
+                std::string contentType = "application/json";
+
+                if (req.find("GET /software/windows/aimon-setup.exe") != std::string::npos) {
+                    body = fakeInstallerPayload;
+                    contentType = "application/octet-stream";
+                } else {
+                    int64_t verCode = servedVersionCode.load();
+                    std::string verName = (verCode > suCfg.installedVersionCode) ? "99.0.0" : AIMON_VERSION_STRING;
+                    std::string sha = serveCorruptSha.load()
+                        ? std::string(64, 'f')
+                        : validSha256;
+                    std::string pkgUrl =
+                        "http://127.0.0.1:" + std::to_string(port) + "/software/windows/aimon-setup.exe";
+                    nlohmann::json appEntry = {
+                        {"applicationId", "com.selfso.aimon"},
+                        {"slug", "aimon"},
+                        {"versionName", verName},
+                        {"versionCode", verCode},
+                        {"packageUrl", pkgUrl},
+                        {"downloadUrl", pkgUrl},
+                        {"sha256", sha},
+                        {"sizeBytes", static_cast<int64_t>(fakeInstallerPayload.size())},
+                        {"installMode", "installer"},
+                        {"installType", "installer"},
+                        {"installerArgs", "--silent"},
+                        {"releaseNotes", "Automated loopback test release"}
+                    };
+                    nlohmann::json manifest = {
+                        {"apps", {
+                            {"com.selfso.aimon", appEntry}
+                        }}
+                    };
+                    body = manifest.dump();
+                }
+
+                std::string resp =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: " + contentType + "\r\n"
+                    "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                    "Connection: close\r\n\r\n" + body;
+                (void)::send(clientFd, resp.data(), resp.size(), 0);
+            }
+            ::close(clientFd);
+        }
+    });
+
+    struct ScopedHttpCleanup {
+        std::atomic<bool>& stop;
+        std::thread& thr;
+        int fd;
+        ~ScopedHttpCleanup() {
+            stop.store(true);
+            if (thr.joinable()) {
+                thr.join();
+            }
+            if (fd >= 0) {
+                ::close(fd);
+            }
+        }
+    } httpGuard{stopServer, httpThread, listenFd};
+
+    EdaBridgeAppSettings loopSettings;
+    loopSettings.updateManifestUrl =
+        "http://127.0.0.1:" + std::to_string(port) + "/software/windows/manifest.json";
+    selfupdate::SelfUpdateConfig loopCfg = EdaBridgeAppConfig::toSelfUpdateConfig(loopSettings);
+
+    selfupdate::InstallOptions instOpts;
+    instOpts.dryRun = true;
+    instOpts.currentExePath = fakeExe;
+    std::string stageDir = _ws + "/update_staging";
+
+    {
+        selfupdate::SelfUpdateController controller(loopCfg, instOpts, stageDir);
+
+        // Case A: Remote versionCode == installedVersionCode -> UpToDate
+        servedVersionCode.store(loopCfg.installedVersionCode);
+        controller.checkForUpdates(true);
+        controller.waitForIdle();
+        selfupdate::UpdateStatus stUpToDate = controller.state();
+        CHECK_EQUAL(static_cast<int>(selfupdate::UpdatePhase::UpToDate),
+                    static_cast<int>(stUpToDate.phase));
+
+        // Case B: Remote versionCode > installedVersionCode -> Available
+        servedVersionCode.store(990000);
+        controller.checkForUpdates(true);
+        controller.waitForIdle();
+        selfupdate::UpdateStatus stAvail = controller.state();
+        CHECK_EQUAL(static_cast<int>(selfupdate::UpdatePhase::Available),
+                    static_cast<int>(stAvail.phase));
+        STRCMP_EQUAL("99.0.0", stAvail.manifest.versionName.c_str());
+        CHECK_EQUAL(990000, stAvail.manifest.versionCode);
+
+        // Case C: Download valid package -> ReadyToInstall
+        serveCorruptSha.store(false);
+        controller.downloadPackage();
+        controller.waitForIdle();
+        selfupdate::UpdateStatus stReady = controller.state();
+        CHECK_EQUAL(static_cast<int>(selfupdate::UpdatePhase::ReadyToInstall),
+                    static_cast<int>(stReady.phase));
+        CHECK_FALSE(stReady.stagedPackagePath.empty());
+        CHECK_TRUE(fs::exists(stReady.stagedPackagePath));
+
+        // Case D: Corrupt SHA-256 -> Error and staged file removed
+        serveCorruptSha.store(true);
+        controller.checkForUpdates(true);
+        controller.waitForIdle();
+        CHECK_EQUAL(static_cast<int>(selfupdate::UpdatePhase::Available),
+                    static_cast<int>(controller.state().phase));
+        controller.downloadPackage();
+        controller.waitForIdle();
+        selfupdate::UpdateStatus stErr = controller.state();
+        CHECK_EQUAL(static_cast<int>(selfupdate::UpdatePhase::Error),
+                    static_cast<int>(stErr.phase));
+        CHECK_FALSE(stErr.errorMessage.empty());
+    }
+}
+
+#ifdef AIMON_EDA_BRIDGE_WITH_QT
+TEST(EdaBridge_UnifiedAppConfigAndToggles, EdaTrayWindowSelfUpdatePeriodicAndManualUiFlow) {
+    int listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK_TRUE(listenFd >= 0);
+    int opt = 1;
+    ::setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    CHECK_EQUAL(0, ::bind(listenFd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)));
+    CHECK_EQUAL(0, ::listen(listenFd, 16));
+
+    socklen_t addrLen = sizeof(addr);
+    CHECK_EQUAL(0, ::getsockname(listenFd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen));
+    uint16_t port = ntohs(addr.sin_port);
+
+    const std::string fakePayload = "MZ-FAKE-QT-TRAY-INSTALLER-2026";
+    const std::string validSha256 = selfupdate::Sha256::hashString(fakePayload);
+    const int64_t installedCode = selfupdate::UpdateManifest::parseVersionCode(AIMON_VERSION_STRING);
+
+    std::atomic<bool> stopServer{false};
+    std::atomic<int64_t> servedVersionCode{installedCode};
+
+    std::thread httpThread([&]() {
+        while (!stopServer.load()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(listenFd, &rfds);
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 40000;
+            int sel = ::select(listenFd + 1, &rfds, nullptr, nullptr, &tv);
+            if (sel <= 0) {
+                continue;
+            }
+            struct sockaddr_in cliAddr;
+            socklen_t cliLen = sizeof(cliAddr);
+            int clientFd = ::accept(listenFd, reinterpret_cast<struct sockaddr*>(&cliAddr), &cliLen);
+            if (clientFd < 0) {
+                continue;
+            }
+
+            char buf[2048];
+            ssize_t n = ::recv(clientFd, buf, sizeof(buf) - 1, 0);
+            if (n > 0) {
+                buf[n] = '\0';
+                std::string req(buf, static_cast<size_t>(n));
+                std::string body;
+                std::string contentType = "application/json";
+
+                if (req.find("GET /software/windows/aimon-setup.exe") != std::string::npos) {
+                    body = fakePayload;
+                    contentType = "application/octet-stream";
+                } else {
+                    int64_t verCode = servedVersionCode.load();
+                    std::string verName = (verCode > installedCode) ? "99.0.0" : AIMON_VERSION_STRING;
+                    std::string pkgUrl =
+                        "http://127.0.0.1:" + std::to_string(port) + "/software/windows/aimon-setup.exe";
+                    nlohmann::json appEntry = {
+                        {"applicationId", "com.selfso.aimon"},
+                        {"slug", "aimon"},
+                        {"versionName", verName},
+                        {"versionCode", verCode},
+                        {"packageUrl", pkgUrl},
+                        {"downloadUrl", pkgUrl},
+                        {"sha256", validSha256},
+                        {"sizeBytes", static_cast<int64_t>(fakePayload.size())},
+                        {"installMode", "installer"},
+                        {"installType", "installer"},
+                        {"installerArgs", "--silent"},
+                        {"releaseNotes", "Qt tray self-update test release notes"}
+                    };
+                    nlohmann::json manifest = {
+                        {"apps", {
+                            {"com.selfso.aimon", appEntry}
+                        }}
+                    };
+                    body = manifest.dump();
+                }
+
+                std::string resp =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: " + contentType + "\r\n"
+                    "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                    "Connection: close\r\n\r\n" + body;
+                (void)::send(clientFd, resp.data(), resp.size(), 0);
+            }
+            ::close(clientFd);
+        }
+    });
+
+    struct ScopedHttpGuard {
+        std::atomic<bool>& stop;
+        std::thread& thr;
+        int fd;
+        ~ScopedHttpGuard() {
+            stop.store(true);
+            if (thr.joinable()) {
+                thr.join();
+            }
+            if (fd >= 0) {
+                ::close(fd);
+            }
+        }
+    } guard{stopServer, httpThread, listenFd};
+
+    EdaRpcServerOptions srvOpts;
+    srvOpts.listenHost = "127.0.0.1";
+    srvOpts.port = 0;
+    srvOpts.pluginPort = 0;
+    srvOpts.allowedRoot = _ws;
+    EdaRpcServer srv(srvOpts);
+
+    EdaBridgeAppSettings settings;
+    settings.autoCheckUpdates = true;
+    settings.updateCheckIntervalMinutes = 360;
+    settings.updateManifestUrl =
+        "http://127.0.0.1:" + std::to_string(port) + "/software/windows/manifest.json";
+    settings.aimonHost = "127.0.0.1";
+    settings.aimonWebPort = 1;
+    std::string cfgPath = _ws + "/tray-settings.json";
+
+    EdaTrayWindow win(srv, settings, cfgPath);
+
+    CHECK_TRUE(win.findChild<QPushButton*>("btnCheckUpdates") != nullptr);
+    CHECK_TRUE(win.findChild<QFrame*>("updateBannerFrame") != nullptr);
+    CHECK_TRUE(win.findChild<QCheckBox*>("chkAutoCheckUpdates") != nullptr);
+    CHECK_TRUE(win.findChild<QPushButton*>("btnSettingsCheckUpdates") != nullptr);
+    CHECK_FALSE(win.isSelfUpdateBannerVisible());
+    STRCMP_EQUAL("Check for Updates", win.checkUpdatesButtonText().c_str());
+    STRCMP_EQUAL("Check for Updates...", win.trayCheckUpdatesActionText().c_str());
+
+    auto pumpUntilPhase = [&](selfupdate::UpdatePhase targetPhase) -> bool {
+        for (int i = 0; i < 150; ++i) {
+            QApplication::processEvents();
+            if (win.currentSelfUpdateStatus().phase == targetPhase) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        QApplication::processEvents();
+        return win.currentSelfUpdateStatus().phase == targetPhase;
+    };
+
+    // 1. Background / periodic check when up-to-date keeps banner hidden
+    servedVersionCode.store(installedCode);
+    win.checkForAppUpdates(false);
+    CHECK_TRUE(pumpUntilPhase(selfupdate::UpdatePhase::UpToDate));
+    CHECK_FALSE(win.isSelfUpdateBannerVisible());
+    STRCMP_EQUAL("Check for Updates", win.checkUpdatesButtonText().c_str());
+
+    // 2. Manual check when up-to-date displays inline status banner feedback
+    win.checkForAppUpdates(true);
+    CHECK_TRUE(pumpUntilPhase(selfupdate::UpdatePhase::UpToDate));
+    CHECK_TRUE(win.isSelfUpdateBannerVisible());
+
+    // 3. Periodic check discovering a newer version (v99.0.0) reveals banner & updates buttons/tray
+    servedVersionCode.store(990000);
+    win.checkForAppUpdates(false);
+    CHECK_TRUE(pumpUntilPhase(selfupdate::UpdatePhase::Available));
+    CHECK_TRUE(win.isSelfUpdateBannerVisible());
+    CHECK_TRUE(win.checkUpdatesButtonText().find("99.0.0") != std::string::npos);
+    CHECK_TRUE(win.trayCheckUpdatesActionText().find("99.0.0") != std::string::npos);
+
+    // 4. Open modal AimonSelfUpdateDialog and verify populated version & release notes
+    win.openSelfUpdateDialog(false);
+    QApplication::processEvents();
+    QDialog* dlg = win.findChild<QDialog*>("aimonSelfUpdateDialog");
+    CHECK_TRUE(dlg != nullptr);
+    QLabel* latestLbl = dlg->findChild<QLabel*>("lblUpdateLatestVer");
+    CHECK_TRUE(latestLbl != nullptr);
+    CHECK_TRUE(latestLbl->text().toStdString().find("99.0.0") != std::string::npos);
+    QPlainTextEdit* notesTxt = dlg->findChild<QPlainTextEdit*>("txtUpdateReleaseNotes");
+    CHECK_TRUE(notesTxt != nullptr);
+    CHECK_TRUE(notesTxt->toPlainText().toStdString().find("Qt tray self-update test release notes") !=
+               std::string::npos);
+    dlg->hide();
+}
+#endif
+
 TEST_GROUP(EdaBridgeDaemon_Integration) {
     std::string _ws;
 
@@ -3621,6 +4081,15 @@ TEST(EdaBridgeDaemon_Integration, EdaBridgeDynamicBestCapabilityRoutingAndLocalF
     gateway.stop();
 }
 
+#ifdef AIMON_EDA_BRIDGE_WITH_QT
+extern "C" const char* __lsan_default_suppressions() {
+    return "leak:QGuiApplicationPrivate::init\n"
+           "leak:QWindowSystemInterface::handleScreenAdded\n"
+           "leak:QPlatformCursor\n"
+           "leak:libqoffscreen.so\n";
+}
+#endif
+
 int main(int ac, char** av) {
     for (int i = 1; i < ac; ++i) {
         if (std::strcmp(av[i], "--negative-control") == 0) {
@@ -3665,6 +4134,14 @@ int main(int ac, char** av) {
             return 0;
         }
     }
+#ifdef AIMON_EDA_BRIDGE_WITH_QT
+    MemoryLeakWarningPlugin::turnOffNewDeleteOverloads();
+    ::setenv("QT_QPA_PLATFORM", "offscreen", 0);
+    int qtArgc = 1;
+    char qtAppName[] = "test_eda_bridge_daemon";
+    char* qtArgv[] = {qtAppName, nullptr};
+    QApplication qtApp(qtArgc, qtArgv);
+#endif
     return CommandLineTestRunner::RunAllTests(ac, av);
 }
 

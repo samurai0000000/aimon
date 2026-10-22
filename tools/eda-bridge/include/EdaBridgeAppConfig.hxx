@@ -10,8 +10,15 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <selfupdate/SelfUpdateController.hxx>
+#include <selfupdate/UpdateManifest.hxx>
 #include "EdaRpcServer.hxx"
 #include "Version.hxx"
+
+namespace selfupdate {
+using SelfUpdateConfig = CheckerConfig;
+using UpdateStatus = UpdateState;
+} // namespace selfupdate
 
 namespace aimon {
 
@@ -24,6 +31,9 @@ struct EdaBridgeAppSettings {
     bool startMinimizedToTray = true;
     bool launchAtLogin = false;
     bool disallowExports = false;
+    bool autoCheckUpdates = true;
+    int updateCheckIntervalMinutes = 360;
+    std::string updateManifestUrl = "https://www.selfso.com/software/windows/";
     std::string connectionMode = "bidirectional"; // "listen" | "gateway" | "bidirectional"
     std::string listenHost = "0.0.0.0";
     int rpcPort = 3892;
@@ -126,6 +136,7 @@ public:
                            const EdaBridgeAppSettings& settings,
                            std::string& outError);
     static EdaRpcServerOptions toServerOptions(const EdaBridgeAppSettings& settings);
+    static selfupdate::SelfUpdateConfig toSelfUpdateConfig(const EdaBridgeAppSettings& settings);
 
     // Embedded zero-Python plugin deployment & .eext ZIP packager
     static std::vector<uint8_t> buildEasyEdaEextZipBytes();

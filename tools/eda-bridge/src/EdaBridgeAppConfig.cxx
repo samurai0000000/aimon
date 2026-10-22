@@ -6941,6 +6941,13 @@ bool EdaBridgeAppConfig::loadFromFile(const std::string& path,
     s.startMinimizedToTray = j.value("start_minimized_to_tray", s.startMinimizedToTray);
     s.launchAtLogin = j.value("launch_at_login", s.launchAtLogin);
     s.disallowExports = j.value("disallow_exports", s.disallowExports);
+    s.autoCheckUpdates = j.value("auto_check_updates", s.autoCheckUpdates);
+    s.updateCheckIntervalMinutes =
+        std::clamp(j.value("update_check_interval_minutes", s.updateCheckIntervalMinutes), 15, 10080);
+    s.updateManifestUrl = j.value("update_manifest_url", s.updateManifestUrl);
+    if (s.updateManifestUrl.empty()) {
+        s.updateManifestUrl = selfupdate::UpdateManifest::DEFAULT_MANIFEST_URL;
+    }
     s.connectionMode = j.value("connection_mode", s.connectionMode);
     s.listenHost = j.value("listen_host", s.listenHost);
     s.rpcPort = j.value("rpc_port", s.rpcPort);
@@ -6980,6 +6987,11 @@ bool EdaBridgeAppConfig::saveToFile(const std::string& path,
         {"start_minimized_to_tray", settings.startMinimizedToTray},
         {"launch_at_login", settings.launchAtLogin},
         {"disallow_exports", settings.disallowExports},
+        {"auto_check_updates", settings.autoCheckUpdates},
+        {"update_check_interval_minutes", std::clamp(settings.updateCheckIntervalMinutes, 15, 10080)},
+        {"update_manifest_url", settings.updateManifestUrl.empty()
+            ? std::string(selfupdate::UpdateManifest::DEFAULT_MANIFEST_URL)
+            : settings.updateManifestUrl},
         {"connection_mode", settings.connectionMode},
         {"listen_host", settings.listenHost},
         {"rpc_port", settings.rpcPort},
@@ -7012,6 +7024,23 @@ EdaRpcServerOptions EdaBridgeAppConfig::toServerOptions(const EdaBridgeAppSettin
     opts.enableFreeCad = settings.enableFreeCad;
     opts.disallowExports = settings.disallowExports;
     return opts;
+}
+
+selfupdate::SelfUpdateConfig EdaBridgeAppConfig::toSelfUpdateConfig(
+    const EdaBridgeAppSettings& settings) {
+    selfupdate::SelfUpdateConfig cfg;
+    cfg.applicationId = "com.selfso.aimon";
+    cfg.installedVersionName = settings.version.empty()
+        ? std::string(AIMON_VERSION_STRING)
+        : settings.version;
+    cfg.installedVersionCode =
+        selfupdate::UpdateManifest::parseVersionCode(cfg.installedVersionName);
+    cfg.manifestUrl = settings.updateManifestUrl.empty()
+        ? std::string(selfupdate::UpdateManifest::DEFAULT_MANIFEST_URL)
+        : settings.updateManifestUrl;
+    cfg.connectTimeoutMs = 15000;
+    cfg.readTimeoutMs = 15000;
+    return cfg;
 }
 
 std::vector<uint8_t> EdaBridgeAppConfig::buildEasyEdaEextZipBytes() {

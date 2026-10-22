@@ -10,12 +10,14 @@
 #ifdef AIMON_EDA_BRIDGE_WITH_QT
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include <QAction>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QDialog>
+#include <QFrame>
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
@@ -28,10 +30,13 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <selfupdate/SelfUpdateController.hxx>
 #include "EdaBridgeAppConfig.hxx"
 #include "EdaRpcServer.hxx"
 
 namespace aimon {
+
+class AimonSelfUpdateDialog;
 
 class EdaTrayWindow : public QDialog {
 public:
@@ -44,12 +49,22 @@ public:
     void showQuotasTab();
     void showBridgesTab();
 
+    void setSelfUpdateController(std::unique_ptr<selfupdate::SelfUpdateController> controller);
+    void checkForAppUpdates(bool manual = true);
+    void openSelfUpdateDialog(bool triggerCheck = false);
+    selfupdate::UpdateStatus currentSelfUpdateStatus() const { return _currentUpdateState; }
+    bool isSelfUpdateBannerVisible() const;
+    std::string checkUpdatesButtonText() const;
+    std::string trayCheckUpdatesActionText() const;
+
 protected:
     void closeEvent(QCloseEvent* event) override;
 
 private:
     void buildUi();
     void buildTrayIcon();
+    void initSelfUpdateController();
+    void onSelfUpdateStatusChanged(const selfupdate::UpdateStatus& st);
     QIcon createBrandAppIcon() const;
     QIcon createStatusTrayIcon(bool healthy, bool activePlugin) const;
 
@@ -192,12 +207,30 @@ private:
     QCheckBox* _chkAutoDeployPlugins = nullptr;
     QCheckBox* _chkStartMinimized = nullptr;
     QCheckBox* _chkLaunchAtLogin = nullptr;
+    QCheckBox* _chkAutoCheckUpdates = nullptr;
+    QPushButton* _btnSettingsCheckUpdates = nullptr;
 
     QLineEdit* _edtAimonHost = nullptr;
     QSpinBox* _spnAimonWebPort = nullptr;
     QSpinBox* _spnGatewayPort = nullptr;
     QLineEdit* _edtAuthSecret = nullptr;
     QLabel* _lblSettingsStatus = nullptr;
+
+    // Self-Update Header, Inline Banner, Dialog & Controller
+    QPushButton* _btnCheckUpdates = nullptr;
+    QFrame* _updateBannerFrame = nullptr;
+    QLabel* _lblUpdateBannerText = nullptr;
+    QProgressBar* _prgUpdateBanner = nullptr;
+    QPushButton* _btnUpdateBannerAction = nullptr;
+    QPushButton* _btnUpdateBannerDismiss = nullptr;
+    AimonSelfUpdateDialog* _updateDialog = nullptr;
+
+    std::unique_ptr<selfupdate::SelfUpdateController> _updateController;
+    selfupdate::UpdateStatus _currentUpdateState;
+    QTimer* _updateCheckTimer = nullptr;
+    bool _lastUpdateCheckManual = false;
+    bool _updateBannerDismissed = false;
+    int64_t _lastNotifiedUpdateVersionCode = 0;
 
     // System Tray Icon & Menu
     QSystemTrayIcon* _trayIcon = nullptr;
@@ -209,6 +242,7 @@ private:
     QAction* _actTrayEasyEda = nullptr;
     QAction* _actTrayKiCad = nullptr;
     QAction* _actTrayFreeCad = nullptr;
+    QAction* _actCheckUpdates = nullptr;
 
     QTimer* _statusTimer = nullptr;
     QTimer* _quotaTimer = nullptr;

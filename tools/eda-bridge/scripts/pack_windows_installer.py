@@ -6,8 +6,8 @@
 #
 # Stages the cross-compiled Qt6 Windows System Tray application (aimon.exe),
 # EasyEDA Pro extension archive (aimon-easyeda-bridge.eext), and required
-# Qt6 / MinGW runtime DLLs into build/windows/app/, then packages the versioned
-# self-contained Windows installer at build/windows/aimon-setup-<version>.exe.
+# Qt6 / MinGW runtime DLLs in an ephemeral staging directory, then packages the
+# versioned self-contained Windows installer at build/windows/aimon-setup-<version>.exe.
 #
 
 import argparse
@@ -423,7 +423,7 @@ def main() -> int:
     tmp_pkg_root = Path(tempfile.mkdtemp(prefix="aimon-win-pkg-"))
     try:
         tmp_out_dir = tmp_pkg_root / "windows"
-        tmp_stage_dir = tmp_out_dir / "app"
+        tmp_stage_dir = tmp_pkg_root / "app"
         tmp_installer_exe = tmp_out_dir / f"aimon-setup-{version}.exe"
 
         stage_windows_app(root_dir, build_dir, qt_prefix, tmp_stage_dir, tmp_out_dir, version)
@@ -447,9 +447,7 @@ def main() -> int:
         if tmp_pkg_root.exists():
             shutil.rmtree(tmp_pkg_root, ignore_errors=True)
 
-    stage_dir = out_dir / "app"
     installer_exe = out_dir / f"aimon-setup-{version}.exe"
-    print(f"[aimon] Staged Windows System Tray app: {stage_dir / 'aimon.exe'}")
     print(f"[aimon] Packaged versioned Windows installer: {installer_exe}")
     print(f"[aimon] Packaged EasyEDA Pro extension archive: {out_dir / 'aimon-easyeda-bridge.eext'}")
     return 0
