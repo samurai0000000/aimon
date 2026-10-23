@@ -435,8 +435,7 @@ CREATE TABLE IF NOT EXISTS agent_telemetry_samples (
     tool_calls_sec      REAL NOT NULL,
     error_rate_pct      REAL NOT NULL,
     avg_turn_latency_ms REAL NOT NULL,
-    p95_turn_latency_ms REAL NOT NULL,
-    approval_wait_ms    REAL NOT NULL
+    p95_turn_latency_ms REAL NOT NULL
 );
 
 -- Aggregated hourly rollups (365-day retention)
@@ -453,7 +452,6 @@ CREATE TABLE IF NOT EXISTS agent_hourly_rollups (
     avg_turn_ms          REAL NOT NULL,
     p95_turn_ms          REAL NOT NULL,
     max_turn_ms          REAL NOT NULL,
-    avg_approval_wait_ms REAL NOT NULL,
     PRIMARY KEY (hour_timestamp, agent_type, model_name)
 );
 ```
@@ -463,26 +461,16 @@ When the web frontend or mobile app queries timeseries data over wide windows (`
 
 ---
 
-## 9. Mobile Companion Action Approval Latching Subsystem (`MobileGateway`)
+## 9. Mobile Companion Authentication & Pairing (`MobileGateway`)
 
-Autonomous agent tasks frequently stall when sensitive tools (`run_command`, `write_to_file`, `multi_replace_file_content`, `embdevenv_mcu_power`) request human confirmation. `aimon` provides an asynchronous action approval latching engine that delivers real-time confirmation requests directly to the developer's mobile device lock screen.
-
-### 9.1 Latching Protocol & Concurrency Architecture
-1. **Hook Interception**: When Antigravity or Cursor triggers a sensitive tool, the configured IDE hook interceptor intercepts the JSON invocation and executes a synchronous `POST /api/approvals/request` to `aimon`.
-2. **Promise Latch Creation**: `MobileGateway::requestApproval()` registers a pending action record with a unique UUID and initializes a `std::promise<ApprovalVerdict>`. The calling HTTP worker thread blocks synchronously on `std::future<ApprovalVerdict>::get()`.
-3. **Multicast Notification**: `MobileGateway` broadcasts an SSE / WebSocket approval notification to paired Android devices.
-4. **Lock-Screen Verdict**: The operator taps `[Approve]` or `[Deny]` directly from the Android heads-up notification. The mobile app posts the verdict back to `/api/approvals/decision`.
-5. **Latch Resolution**: The promise resolves instantly in C++, unblocking the HTTP worker thread and returning the approval decision to the IDE hook.
-6. **Reaper Fallback**: If no mobile response is received within 120 seconds, a background timeout reaper thread automatically expires the request and fails safely.
-
-### 9.2 Cryptographic Authentication & Replay Defense
+`MobileGateway` manages cryptographic authentication and session management for the Android mobile companion application:
 - **128-bit Pairing Secrets**: Pairing generates a high-entropy 128-bit cryptographic secret formatted for QR code scanning or manual entry.
-- **Single-Use Action Tokens**: Each notification payload includes a single-use action token. Once a decision is submitted, the token is permanently invalidated to prevent replay attacks.
+- **256-bit Session Tokens**: Upon pairing, the mobile device receives a 256-bit session token persisted with `0600` POSIX permissions.
 - **Instant Revocation**: Devices can be audited and revoked individually from the web dashboard or CLI.
 
 ---
 
-## 10. Web Analytics & Multi-Surface Approvals Dashboard
+## 10. Web Analytics & Mobile Pairing Dashboard
 
 The `aimon` dashboard (`web/index.html`, `web/app.js`, `web/style.css`, `include/WebAssets.hxx`) provides a multi-tab single-page interface:
 
@@ -490,25 +478,16 @@ The `aimon` dashboard (`web/index.html`, `web/app.js`, `web/style.css`, `include
 2. **Agent Telemetry & Analytics (`#subpanel-telemetry`)**: Fed by lifecycle hooks from Antigravity, Cursor and Claude Code (see section 8.0). Interactive SVG/Canvas charts for Token Velocity, Turn Latency & P95 Distribution, Tool Invocation Matrices, and Session Waterfalls with timeframe selectors (`1H`, `24H`, `7D`, `30D`, `1Y`).
 3. **Usage Insights (`#subpanel-insights`)**: Programmatic and workflow-coaching findings across Claude Code, Cursor, and Antigravity (`7D`, `30D`, `90D`), severity/confidence badges, suggested experiments, per-project and per-model token/cache/cost tables, and dataset export instructions.
 4. **Tool Bridges (`#subpanel-bridges`, `data-subpanel="bridges"`)**: Placed directly next to `usage insights` inside `#aimon-subnav`, providing global transport settings (`client` / `gateway` / `bidirectional`, host, RPC port `3892`, loopback plugin port `3893`, `~/work` $\leftrightarrow$ `Z:\` path mapping, masked `auth_secret`), four dedicated configuration and live telemetry cards (**Local CPU Accelerators**, **EasyEDA Pro**, **KiCad**, **FreeCAD**), and a rolling 50-call activity log table backed by session-protected `GET /api/eda/status`, `POST /api/eda/config`, and `POST /api/eda/probe`.
-5. **Action Approvals (`#subpanel-approvals`)**: Live pending approval actions, 128-bit mobile pairing QR interface, and paired device management.
+5. **Mobile Pairing (`#subpanel-approvals`)**: 128-bit mobile pairing QR interface and paired device management.
 6. **Dynamic Satellite Panels (`#panel-<id>`)**: Seamless embedded iframe monitors for connected subsystems (`netmon`, `meshmon`, `embdevenv`, `abc80`).
 
 ---
 
-## 11. Dual-IDE Hook Protocol
-
-IDE tool approval hooks standardize tool interception across both IDEs:
-- **Google Antigravity**: Configured via `.agents/hooks.json` (`PreToolUse`, `PostToolUse`).
-- **Cursor IDE**: Configured via `.cursor/hooks.json` (`preTool`, `postTool`).
-
-
----
-
-## 12. Android Companion Application Architecture
+## 11. Android Companion Application Architecture
 
 The Android companion application (`com.selfso.aimon`) is built using Kotlin and Jetpack Compose:
-- **`AimonWebSocketClient`**: OkHttp client with automatic exponential backoff reconnection and 15s heartbeats.
-- **`AimonNotificationManager`**: Native Android `NotificationCompat` builder creating high-priority heads-up notifications with embedded `[Approve]` and `[Deny]` action buttons.
+- **`AimonWebSocketClient` & `AimonSseService`**: Persistent foreground service with OkHttp SSE/WebSocket streaming, automatic exponential backoff reconnection, and 15s heartbeats.
+- **`AimonNotificationManager`**: Native Android `NotificationCompat` builder delivering agent step notifications and foreground service status.
 - **Glance AppWidget**: Android home-screen widget displaying real-time AI quota balances and active agent session counts.
 
 ---

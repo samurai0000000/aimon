@@ -12,18 +12,11 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <future>
+#include <functional>
 #include <chrono>
 #include <nlohmann/json.hpp>
 
 namespace aimon {
-
-enum class ApprovalVerdict {
-    PENDING,
-    APPROVED,
-    DENIED,
-    TIMED_OUT
-};
 
 struct MobileSession {
     std::string deviceId;
@@ -32,19 +25,6 @@ struct MobileSession {
     time_t      pairedAt = 0;
     time_t      lastSeenAt = 0;
     bool        isRevoked = false;
-};
-
-struct ApprovalRequest {
-    std::string approvalId;
-    std::string agentType;
-    std::string toolName;
-    std::string workspace;
-    nlohmann::json toolArgs;
-    std::string reason;
-    time_t requestedAt = 0;
-    int timeoutSeconds = 120;
-    ApprovalVerdict verdict = ApprovalVerdict::PENDING;
-    std::shared_ptr<std::promise<ApprovalVerdict>> promise;
 };
 
 class MobileGateway {
@@ -95,24 +75,6 @@ public:
         return listDevices();
     }
 
-    // Action Approvals
-    std::string submitApprovalRequest(const std::string &agentType,
-                                      const std::string &toolName,
-                                      const std::string &workspace,
-                                      const nlohmann::json &toolArgs,
-                                      const std::string &reason = "",
-                                      int timeoutSeconds = 120);
-    ApprovalVerdict waitForApproval(const std::string &approvalId, int timeoutSeconds = 120);
-    bool resolveApproval(const std::string &approvalId, ApprovalVerdict verdict);
-    std::vector<nlohmann::json> listPendingApprovals();
-    std::vector<nlohmann::json> getPendingApprovals() {
-        return listPendingApprovals();
-    }
-    nlohmann::json getPendingApprovalsJson() {
-        return nlohmann::json(listPendingApprovals());
-    }
-    nlohmann::json getApprovalStatus(const std::string &approvalId);
-
     // Notification / WS Broadcast Dispatcher Callback
     using BroadcastCallback = std::function<void(const std::string &type, const nlohmann::json &payload)>;
     void setBroadcastCallback(BroadcastCallback cb);
@@ -132,8 +94,6 @@ private:
     time_t _lastGeneratedExpires = 0;
     std::map<std::string, time_t> _pairingSecrets;
     std::map<std::string, MobileSession> _sessions;
-    std::map<std::string, std::shared_ptr<ApprovalRequest>> _pendingApprovals;
-    std::map<std::string, ApprovalVerdict> _resolvedApprovals;
     BroadcastCallback _broadcastCb;
 };
 

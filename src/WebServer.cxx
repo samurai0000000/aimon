@@ -704,21 +704,8 @@ void WebServer::setupRoutes() {
             return httplib::Server::HandlerResponse::Unhandled;
         }
 
-        // Local CLI hooks on loopback or authenticated mobile/UI clients may submit/poll approval requests
-        if (req.path == "/api/approvals/request" || req.path == "/api/approvals/status") {
-            if (!isLoopbackRequest(req) && !isValidMobileOrUiRequest(req)) {
-                res.status = 401;
-                res.set_header("Access-Control-Allow-Origin", "*");
-                res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
-                return httplib::Server::HandlerResponse::Handled;
-            }
-            return httplib::Server::HandlerResponse::Unhandled;
-        }
-
-        // Protected mobile, approval, agent, workspace, and EDA mutation endpoints require a valid token or UI session
-        if (req.path == "/api/approvals/pending" ||
-            req.path == "/api/approvals/decision" ||
-            req.path == "/api/mobile/devices" ||
+        // Protected mobile, agent, workspace, and EDA mutation endpoints require a valid token or UI session
+        if (req.path == "/api/mobile/devices" ||
             req.path == "/api/mobile/revoke" ||
             req.path == "/api/agent" ||
             req.path.rfind("/api/agent/", 0) == 0 ||
@@ -1084,7 +1071,6 @@ void WebServer::setupRoutes() {
                 sample.errorRatePct = body.value("tool_error_rate_pct", body.value("error_rate_pct", 0.0));
                 sample.avgTurnLatencyMs = body.value("turn_latency_ms", body.value("avg_turn_latency_ms", 0.0));
                 sample.p95TurnLatencyMs = body.value("turn_latency_p95_ms", body.value("p95_turn_latency_ms", 0.0));
-                sample.approvalWaitMs = body.value("approval_wait_latency_ms", body.value("approval_wait_ms", 0.0));
                 AgentTelemetryDb::getInstance().insertSample(sample);
             } else {
                 AgentLifecycleEvent ev;
@@ -1177,134 +1163,6 @@ void WebServer::setupRoutes() {
         }
         auto data = AgentTelemetryDb::getInstance().queryToolStats(hours);
         res.set_content(data.dump(2), "application/json");
-    });
-
-    // --- Action Approval Endpoints ---
-
-    _server->Post("/api/approvals/request", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        if (!isLoopbackRequest(req) && !isValidMobileOrUiRequest(req)) {
-            res.status = 401;
-            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
-            return;
-        }
-        try {
-            nlohmann::json body = nlohmann::json::parse(req.body);
-            std::string agentType = body.value("agent_type", body.value("agent", "antigravity"));
-            std::string toolName = body.value("tool_name", body.value("action_type", "run_command"));
-            std::string workspace = body.value("workspace", "");
-            nlohmann::json toolArgs = body.value("tool_args", nlohmann::json::object());
-            if (body.contains("command") && !toolArgs.contains("CommandLine")) {
-                toolArgs["CommandLine"] = body["command"];
-            }
-            if (body.contains("details") && toolArgs.empty() && body["details"].is_object()) {
-                toolArgs = body["details"];
-            }
-            std::string reason = body.value("reason", "");
-            int timeoutSec = body.value("timeout_seconds", 120);
-            bool waitSync = body.value("wait", !body.contains("action_type") && !body.value("async", false));
-
-            MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
-            std::string approvalId = gw.submitApprovalRequest(
-                agentType, toolName, workspace, toolArgs, reason, timeoutSec);
-
-            if (!waitSync) {
-                nlohmann::json resp;
-                resp["id"] = approvalId;
-                resp["request_id"] = approvalId;
-                resp["approval_id"] = approvalId;
-                resp["status"] = "pending";
-                resp["verdict"] = "PENDING";
-                res.set_content(resp.dump(2), "application/json");
-                return;
-            }
-
-            // Block and wait for mobile / UI approval
-            ApprovalVerdict verdict = gw.waitForApproval(approvalId, timeoutSec);
-            std::string verdictStr = (verdict == ApprovalVerdict::APPROVED) ? "APPROVED" :
-                                     (verdict == ApprovalVerdict::DENIED) ? "DENIED" : "TIMED_OUT";
-            std::string statusStr = (verdict == ApprovalVerdict::APPROVED) ? "approved" :
-                                    (verdict == ApprovalVerdict::DENIED) ? "denied" : "expired";
-
-            nlohmann::json resp;
-            resp["id"] = approvalId;
-            resp["request_id"] = approvalId;
-            resp["approval_id"] = approvalId;
-            resp["status"] = statusStr;
-            resp["verdict"] = verdictStr;
-            res.set_content(resp.dump(2), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-        }
-    });
-
-    _server->Get("/api/approvals/status", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        if (!isLoopbackRequest(req) && !isValidMobileOrUiRequest(req)) {
-            res.status = 401;
-            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
-            return;
-        }
-        std::string id;
-        if (req.has_param("id")) {
-            id = req.get_param_value("id");
-        } else if (req.has_param("approval_id")) {
-            id = req.get_param_value("approval_id");
-        } else if (req.has_param("request_id")) {
-            id = req.get_param_value("request_id");
-        }
-        if (id.empty()) {
-            res.status = 400;
-            res.set_content("{\"error\":\"Missing approval id\"}", "application/json");
-            return;
-        }
-        MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
-        auto st = gw.getApprovalStatus(id);
-        res.set_content(st.dump(2), "application/json");
-    });
-
-    _server->Post("/api/approvals/decision", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        if (!isValidMobileOrUiRequest(req)) {
-            res.status = 401;
-            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
-            return;
-        }
-        try {
-            nlohmann::json body = nlohmann::json::parse(req.body);
-            std::string approvalId = body.value("approval_id", body.value("id", ""));
-            std::string decision = body.value("decision", "deny");
-
-            std::string lower = decision;
-            for (char &c : lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-
-            ApprovalVerdict verdict = (lower == "allow" || lower == "approve" || lower == "approved")
-                ? ApprovalVerdict::APPROVED : ApprovalVerdict::DENIED;
-
-            MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
-            bool resolved = gw.resolveApproval(approvalId, verdict);
-            nlohmann::json resp;
-            resp["approval_id"] = approvalId;
-            resp["resolved"] = resolved;
-            res.set_content(resp.dump(2), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-        }
-    });
-
-    _server->Get("/api/approvals/pending", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        if (!isValidMobileOrUiRequest(req)) {
-            res.status = 401;
-            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
-            return;
-        }
-        MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
-        auto pending = gw.listPendingApprovals();
-        nlohmann::json arr = pending;
-        res.set_content(arr.dump(2), "application/json");
     });
 
     // --- Mobile Gateway & Pairing Endpoints ---

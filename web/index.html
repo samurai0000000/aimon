@@ -34,8 +34,7 @@
                 </button>
                 <button type="button" class="aimon-subnav-tab" data-subpanel="approvals">
                     <span class="subnav-indicator"></span>
-                    <span class="subnav-title">action approvals</span>
-                    <span class="tab-badge badge-amber hidden" id="approvals-badge">0</span>
+                    <span class="subnav-title">mobile pairing</span>
                 </button>
                 <button type="button" class="aimon-subnav-tab" data-subpanel="insights">
                     <span class="subnav-indicator"></span>
@@ -432,31 +431,14 @@
                         </div>
                     </div>
                     <div class="waterfall-timeline-container" id="waterfall-container">
-                        <div class="waterfall-empty-hint">Select a session above to inspect turn breakdown, tool executions, and approval wait times.</div>
+                        <div class="waterfall-empty-hint">Select a session above to inspect turn breakdown and tool executions.</div>
                     </div>
                 </div>
             </div>
 
-            <!-- Subpanel 3: Action Approvals & Mobile Companion -->
+            <!-- Subpanel 3: Mobile Companion Pairing & Devices -->
             <div class="aimon-subpanel hidden" id="subpanel-approvals">
                 <div class="approvals-grid">
-                    <!-- Pending Approvals Card -->
-                    <div class="glass-card pending-approvals-card">
-                        <div class="card-header">
-                            <h2>Pending Action Approvals</h2>
-                            <span class="badge badge-amber" id="pending-approvals-count">0 Pending</span>
-                        </div>
-                        <div class="pending-list" id="pending-approvals-list">
-                            <div class="no-pending-hint">
-                                <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="1.8" fill="none">
-                                    <circle cx="12" cy="12" r="10"></circle>
-                                    <polyline points="12 6 12 12 14 14"></polyline>
-                                </svg>
-                                <p>No actions currently waiting for approval.</p>
-                            </div>
-                        </div>
-                    </div>
-
                     <!-- Mobile Companion Pairing Card -->
                     <div class="glass-card mobile-pairing-card">
                         <div class="card-header">

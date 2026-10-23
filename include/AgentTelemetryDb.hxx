@@ -37,7 +37,6 @@ struct AgentTelemetrySample {
     double  errorRatePct = 0.0;
     double  avgTurnLatencyMs = 0.0;
     double  p95TurnLatencyMs = 0.0;
-    double  approvalWaitMs = 0.0;
 };
 
 struct AgentSessionRecord {

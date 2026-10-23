@@ -76,7 +76,6 @@ static void testBasicOperations() {
         s.errorRatePct = 0.0;
         s.avgTurnLatencyMs = 1200.0;
         s.p95TurnLatencyMs = 1500.0;
-        s.approvalWaitMs = 0.0;
         samples.push_back(s);
     }
     assert(db.insertSamplesBatch(samples));

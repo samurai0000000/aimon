@@ -103,15 +103,6 @@ static void testSessionPersistenceAndPermissions() {
         struct stat st;
         assert(stat(tempFile.c_str(), &st) == 0);
         assert((st.st_mode & 0777) == 0600);
-
-        nlohmann::json toolArgs = {{"CommandLine", "echo test"}};
-        std::string appId = gw1.submitApprovalRequest("antigravity", "run_command", "/workspace/aimon", toolArgs, "Verify remaining_seconds", 90);
-        auto pending = gw1.getPendingApprovals();
-        assert(pending.size() == 1);
-        int rem = pending[0].value("remaining_seconds", 0);
-        assert(rem > 0 && rem <= 90);
-        assert(gw1.resolveApproval(appId, ApprovalVerdict::APPROVED));
-        assert(gw1.waitForApproval(appId, 2) == ApprovalVerdict::APPROVED);
     }
 
     // Second instance restores paired sessions from tempFile
@@ -184,117 +175,6 @@ static void testRapidCheckTokenValidation() {
     std::cout << "[TestMobileGateway] testRapidCheckTokenValidation passed!" << std::endl;
 }
 
-static void testApprovalLatching() {
-    std::cout << "[TestMobileGateway] Running testApprovalLatching..." << std::endl;
-    auto &gw = MobileGateway::getInstance();
-
-    std::string lastBroadcastType;
-    nlohmann::json lastBroadcastPayload;
-    gw.setBroadcastCallback([&](const std::string &type, const nlohmann::json &payload) {
-        lastBroadcastType = type;
-        lastBroadcastPayload = payload;
-    });
-
-    nlohmann::json toolArgs;
-    toolArgs["CommandLine"] = "make -j8";
-
-    std::string approvalId = gw.submitApprovalRequest("antigravity", "run_command", "/workspace/aimon", toolArgs, "Build target", 5);
-    assert(!approvalId.empty());
-    assert(lastBroadcastType == "approval_request");
-    assert(lastBroadcastPayload.value("timeout_seconds", 0) == 5);
-
-    // Check default timeout fallback when timeoutSeconds <= 0
-    std::string defaultTimeoutId = gw.submitApprovalRequest("antigravity", "run_command", "/workspace/aimon", toolArgs, "Default timeout", 0);
-    auto stDefault = gw.getApprovalStatus(defaultTimeoutId);
-    assert(stDefault.value("status", "") == "pending");
-    assert(stDefault.value("verdict", "") == "PENDING");
-    assert(stDefault.value("remaining_seconds", 0) > 60 && stDefault.value("remaining_seconds", 0) <= 120);
-    assert(gw.resolveApproval(defaultTimeoutId, ApprovalVerdict::DENIED));
-    assert(lastBroadcastType == "approval_resolved");
-    assert(lastBroadcastPayload.value("verdict", "") == "DENIED");
-    auto stDeniedPending = gw.getApprovalStatus(defaultTimeoutId);
-    assert(stDeniedPending.value("status", "") == "denied");
-    assert(stDeniedPending.value("verdict", "") == "DENIED");
-    assert(gw.waitForApproval(defaultTimeoutId, 0) == ApprovalVerdict::DENIED);
-    auto stDeniedResolved = gw.getApprovalStatus(defaultTimeoutId);
-    assert(stDeniedResolved.value("status", "") == "denied");
-    assert(stDeniedResolved.value("verdict", "") == "DENIED");
-
-    // Check pending list
-    auto pending = gw.listPendingApprovals();
-    assert(pending.size() == 1);
-    assert(pending[0]["approval_id"] == approvalId);
-    assert(pending[0]["tool_name"] == "run_command");
-    assert(pending[0].value("remaining_seconds", 0) > 0 && pending[0].value("remaining_seconds", 0) <= 5);
-
-    auto stPending = gw.getApprovalStatus(approvalId);
-    assert(stPending.value("status", "") == "pending");
-    assert(stPending.value("verdict", "") == "PENDING");
-    assert(stPending.value("remaining_seconds", 0) > 0 && stPending.value("remaining_seconds", 0) <= 5);
-
-    // Spawn background thread to simulate user approving from Android app
-    std::thread approverThread([&gw, approvalId]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        assert(gw.resolveApproval(approvalId, ApprovalVerdict::APPROVED));
-    });
-
-    // Main thread waits on approval
-    ApprovalVerdict verdict = gw.waitForApproval(approvalId, 5);
-    assert(verdict == ApprovalVerdict::APPROVED);
-
-    approverThread.join();
-    assert(lastBroadcastType == "approval_resolved");
-    assert(lastBroadcastPayload.value("verdict", "") == "APPROVED");
-
-    auto stApprovedResolved = gw.getApprovalStatus(approvalId);
-    assert(stApprovedResolved.value("status", "") == "approved");
-    assert(stApprovedResolved.value("verdict", "") == "APPROVED");
-
-    // Also test getApprovalStatus when resolved before waitForApproval erases from _pendingApprovals
-    std::string preResolveId = gw.submitApprovalRequest("antigravity", "run_command", "/workspace/aimon", toolArgs, "Pre-resolve", 5);
-    assert(gw.resolveApproval(preResolveId, ApprovalVerdict::APPROVED));
-    auto stApprovedPending = gw.getApprovalStatus(preResolveId);
-    assert(stApprovedPending.value("status", "") == "approved");
-    assert(stApprovedPending.value("verdict", "") == "APPROVED");
-    assert(gw.waitForApproval(preResolveId, 5) == ApprovalVerdict::APPROVED);
-
-    // Re-resolving resolved approval should fail
-    assert(!gw.resolveApproval(approvalId, ApprovalVerdict::APPROVED));
-    gw.setBroadcastCallback(nullptr);
-
-    std::cout << "[TestMobileGateway] testApprovalLatching passed!" << std::endl;
-}
-
-static void testApprovalTimeout() {
-    std::cout << "[TestMobileGateway] Running testApprovalTimeout..." << std::endl;
-    auto &gw = MobileGateway::getInstance();
-
-    nlohmann::json toolArgs;
-    toolArgs["TargetFile"] = "/tmp/sensitive.conf";
-
-    std::string approvalId = gw.submitApprovalRequest("cursor", "write_to_file", "/workspace/aimon", toolArgs, "Write config", 1);
-    assert(!approvalId.empty());
-
-    // Wait with 1-second timeout (no one resolves)
-    ApprovalVerdict verdict = gw.waitForApproval(approvalId, 1);
-    assert(verdict == ApprovalVerdict::TIMED_OUT);
-
-    auto stExpiredResolved = gw.getApprovalStatus(approvalId);
-    assert(stExpiredResolved.value("status", "") == "expired");
-    assert(stExpiredResolved.value("verdict", "") == "TIMED_OUT");
-
-    // Also verify expired entry still in _pendingApprovals before waitForApproval is called
-    std::string expirePendingId = gw.submitApprovalRequest("cursor", "write_to_file", "/workspace/aimon", toolArgs, "Expire pending", 1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    assert(gw.listPendingApprovals().empty());
-    auto stExpiredPending = gw.getApprovalStatus(expirePendingId);
-    assert(stExpiredPending.value("status", "") == "expired");
-    assert(stExpiredPending.value("verdict", "") == "TIMED_OUT");
-    assert(gw.waitForApproval(expirePendingId, 1) == ApprovalVerdict::TIMED_OUT);
-
-    std::cout << "[TestMobileGateway] testApprovalTimeout passed!" << std::endl;
-}
-
 static void testWebServerMobileAuth() {
     std::cout << "[TestMobileGateway] Running testWebServerMobileAuth..." << std::endl;
     std::string tempFile = "/tmp/aimon_ws_mobile_" + std::to_string(getpid()) + ".json";
@@ -324,9 +204,6 @@ static void testWebServerMobileAuth() {
     auto resUnauthConv = client.Get("/api/agent/conversations", spoofHeaders);
     assert(resUnauthConv && resUnauthConv->status == 401);
 
-    auto resUnauthPending = client.Get("/api/approvals/pending", spoofHeaders);
-    assert(resUnauthPending && resUnauthPending->status == 401);
-
     auto resUnauthDevs = client.Get("/api/mobile/devices", spoofHeaders);
     assert(resUnauthDevs && resUnauthDevs->status == 401);
 
@@ -338,7 +215,7 @@ static void testWebServerMobileAuth() {
         {"User-Agent", "aimon-mobile/2.0"},
         {"X-Mobile-Token", "invalid-token-value"}
     };
-    auto resBadToken = client.Get("/api/approvals/pending", badTokenHeaders);
+    auto resBadToken = client.Get("/api/mobile/devices", badTokenHeaders);
     assert(resBadToken && resBadToken->status == 401);
 
     // 3. Pairing via /api/mobile/qr (loopback) + /api/mobile/pair (no prior token) succeeds
@@ -367,9 +244,6 @@ static void testWebServerMobileAuth() {
     auto resAuthConv = client.Get("/api/agent/conversations", validHeaders);
     assert(resAuthConv && resAuthConv->status == 200);
 
-    auto resAuthPending = client.Get("/api/approvals/pending", validHeaders);
-    assert(resAuthPending && resAuthPending->status == 200);
-
     auto resAuthDevs = client.Get("/api/mobile/devices", validHeaders);
     assert(resAuthDevs && resAuthDevs->status == 200);
 
@@ -377,15 +251,15 @@ static void testWebServerMobileAuth() {
     httplib::Headers bearerHeaders = {
         {"Authorization", "Bearer " + validToken}
     };
-    auto resBearerPending = client.Get("/api/approvals/pending", bearerHeaders);
-    assert(resBearerPending && resBearerPending->status == 200);
+    auto resBearerDevs = client.Get("/api/mobile/devices", bearerHeaders);
+    assert(resBearerDevs && resBearerDevs->status == 200);
 
     // 6. Revoking the device invalidates its token immediately
     json revokeReq = {{"device_id", "ws-auth-dev"}};
     auto resRevoke = client.Post("/api/mobile/revoke", validHeaders, revokeReq.dump(), "application/json");
     assert(resRevoke && resRevoke->status == 200);
 
-    auto resAfterRevoke = client.Get("/api/approvals/pending", validHeaders);
+    auto resAfterRevoke = client.Get("/api/mobile/devices", validHeaders);
     assert(resAfterRevoke && resAfterRevoke->status == 401);
 
     server.stop();
@@ -1268,8 +1142,6 @@ int main() {
     testPairingAndAuth();
     testSessionPersistenceAndPermissions();
     testRapidCheckTokenValidation();
-    testApprovalLatching();
-    testApprovalTimeout();
     testWebServerMobileAuth();
     testMultiRootBrainConversationDiscovery();
     testTranscriptJsonlParsingAndRapidCheck();

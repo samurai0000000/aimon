@@ -100,7 +100,7 @@ bool AgentTelemetryDb::isOpen() const {
 }
 
 static bool isExcludedSession(const std::string &sid) {
-    return sid.empty() || sid.rfind("approval-", 0) == 0 ||
+    return sid.empty() ||
            sid == "hook-selftest" || sid == "t1" || sid == "s1" ||
            sid == "default_session" || sid == "test-cursor-1" || sid == "default";
 }
@@ -152,8 +152,7 @@ bool AgentTelemetryDb::initSchema() {
         "  tool_calls_sec      REAL NOT NULL,"
         "  error_rate_pct      REAL NOT NULL,"
         "  avg_turn_latency_ms REAL NOT NULL,"
-        "  p95_turn_latency_ms REAL NOT NULL,"
-        "  approval_wait_ms    REAL NOT NULL"
+        "  p95_turn_latency_ms REAL NOT NULL"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_samples_ts ON agent_telemetry_samples(timestamp);";
 
@@ -171,7 +170,6 @@ bool AgentTelemetryDb::initSchema() {
         "  avg_turn_ms         REAL NOT NULL,"
         "  p95_turn_ms         REAL NOT NULL,"
         "  max_turn_ms         REAL NOT NULL,"
-        "  avg_approval_wait_ms REAL NOT NULL,"
         "  PRIMARY KEY (hour_timestamp, agent_type, model_name)"
         ");";
 
@@ -200,6 +198,10 @@ bool AgentTelemetryDb::initSchema() {
         return false;
     }
 
+    // Migrate legacy schema columns if present on existing databases
+    sqlite3_exec(_db, "ALTER TABLE agent_telemetry_samples DROP COLUMN approval_wait_ms;", nullptr, nullptr, nullptr);
+    sqlite3_exec(_db, "ALTER TABLE agent_hourly_rollups DROP COLUMN avg_approval_wait_ms;", nullptr, nullptr, nullptr);
+
     // Database Purge & Deduplication Migration
     const char *sqlDedupe =
         "DELETE FROM agent_lifecycle_events "
@@ -210,7 +212,6 @@ bool AgentTelemetryDb::initSchema() {
     sqlite3_exec(_db, sqlDedupe, nullptr, nullptr, nullptr);
 
     const char *sqlPurgeSessions =
-        "DELETE FROM agent_sessions WHERE session_id LIKE 'approval-%';"
         "DELETE FROM agent_sessions WHERE session_id IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default');";
     sqlite3_exec(_db, sqlPurgeSessions, nullptr, nullptr, nullptr);
 
@@ -247,7 +248,6 @@ bool AgentTelemetryDb::initSchema() {
         "  AVG(CASE WHEN duration_ms > 0 THEN duration_ms ELSE NULL END) AS avg_turn_ms "
         "FROM agent_lifecycle_events "
         "WHERE session_id NOT IN (SELECT session_id FROM agent_sessions) "
-        "  AND session_id NOT LIKE 'approval-%' "
         "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
         "GROUP BY session_id;";
     sqlite3_exec(_db, sqlBackfill, nullptr, nullptr, nullptr);
@@ -265,8 +265,8 @@ void AgentTelemetryDb::prepareStatements() {
     const char *sqlSample =
         "INSERT INTO agent_telemetry_samples ("
         "  timestamp, active_agents, prompt_tokens_sec, comp_tokens_sec, tool_calls_sec,"
-        "  error_rate_pct, avg_turn_latency_ms, p95_turn_latency_ms, approval_wait_ms"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        "  error_rate_pct, avg_turn_latency_ms, p95_turn_latency_ms"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
     sqlite3_prepare_v2(_db, sqlSample, -1, &_stmtInsertSample, nullptr);
 
     const char *sqlInsertSession =
@@ -572,7 +572,6 @@ bool AgentTelemetryDb::insertSample(const AgentTelemetrySample &sample) {
     sqlite3_bind_double(_stmtInsertSample, 6, sample.errorRatePct);
     sqlite3_bind_double(_stmtInsertSample, 7, sample.avgTurnLatencyMs);
     sqlite3_bind_double(_stmtInsertSample, 8, sample.p95TurnLatencyMs);
-    sqlite3_bind_double(_stmtInsertSample, 9, sample.approvalWaitMs);
 
     return sqlite3_step(_stmtInsertSample) == SQLITE_DONE;
 }
@@ -596,7 +595,6 @@ bool AgentTelemetryDb::insertSamplesBatch(const std::vector<AgentTelemetrySample
         sqlite3_bind_double(_stmtInsertSample, 6, sample.errorRatePct);
         sqlite3_bind_double(_stmtInsertSample, 7, sample.avgTurnLatencyMs);
         sqlite3_bind_double(_stmtInsertSample, 8, sample.p95TurnLatencyMs);
-        sqlite3_bind_double(_stmtInsertSample, 9, sample.approvalWaitMs);
         sqlite3_step(_stmtInsertSample);
     }
     sqlite3_exec(_db, "COMMIT;", nullptr, nullptr, nullptr);
@@ -623,7 +621,6 @@ json AgentTelemetryDb::queryOverview(int windowHours) {
         "  SUM(total_errors) AS total_errors,"
         "  AVG(CASE WHEN avg_turn_ms > 0 THEN avg_turn_ms ELSE NULL END) AS overall_avg_turn_ms "
         "FROM agent_sessions WHERE (end_timestamp >= ? OR (end_timestamp = 0 AND start_timestamp >= ?)) "
-        "  AND session_id NOT LIKE 'approval-%' "
         "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default');";
 
     sqlite3_stmt *stmt = nullptr;
@@ -653,7 +650,6 @@ json AgentTelemetryDb::queryOverview(int windowHours) {
         "  SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END),"
         "  AVG(CASE WHEN duration_ms > 0 THEN duration_ms ELSE NULL END) "
         "FROM agent_lifecycle_events WHERE timestamp >= ? "
-        "  AND session_id NOT LIKE 'approval-%' "
         "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default');";
 
     if (sqlite3_prepare_v2(_db, sqlEvents, -1, &stmt, nullptr) == SQLITE_OK) {
@@ -720,7 +716,6 @@ json AgentTelemetryDb::queryTimeseries(const std::string &window, int maxPoints)
         "  MAX(duration_ms) AS p95_turn_latency_ms "
         "FROM agent_lifecycle_events "
         "WHERE timestamp >= ? AND timestamp <= ? "
-        "  AND session_id NOT LIKE 'approval-%' "
         "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
         "GROUP BY bucket_ts ORDER BY bucket_ts ASC;";
 
@@ -732,7 +727,6 @@ json AgentTelemetryDb::queryTimeseries(const std::string &window, int maxPoints)
     json errorRate = json::array();
     json avgLatency = json::array();
     json p95Latency = json::array();
-    json approvalWait = json::array();
 
     sqlite3_stmt *stmt = nullptr;
     if (sqlite3_prepare_v2(_db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
@@ -748,7 +742,6 @@ json AgentTelemetryDb::queryTimeseries(const std::string &window, int maxPoints)
             errorRate.push_back(sqlite3_column_double(stmt, 3));
             avgLatency.push_back(sqlite3_column_double(stmt, 4));
             p95Latency.push_back(sqlite3_column_double(stmt, 5));
-            approvalWait.push_back(0.0);
         }
         sqlite3_finalize(stmt);
     }
@@ -762,7 +755,6 @@ json AgentTelemetryDb::queryTimeseries(const std::string &window, int maxPoints)
     result["series"]["error_rate_pct"] = errorRate;
     result["series"]["avg_turn_latency_ms"] = avgLatency;
     result["series"]["p95_turn_latency_ms"] = p95Latency;
-    result["series"]["approval_wait_ms"] = approvalWait;
 
     return result;
 }
@@ -801,7 +793,6 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
         "       start_timestamp, end_timestamp, status, total_turns, total_tool_calls, total_errors "
         "FROM agent_sessions "
         "WHERE start_timestamp <= ? AND (end_timestamp >= ? OR end_timestamp == 0) "
-        "  AND session_id NOT LIKE 'approval-%' "
         "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
         "ORDER BY start_timestamp DESC LIMIT ?;";
 
@@ -872,7 +863,6 @@ json AgentTelemetryDb::queryActivityTimeline(const std::string &window, int maxS
         "  SUM(CASE WHEN event_type IN ('TOOL_CALL', 'TOOL_PRE_USE') THEN 1 ELSE 0 END) AS tools "
         "FROM agent_lifecycle_events "
         "WHERE timestamp >= ? AND timestamp <= ? "
-        "  AND session_id NOT LIKE 'approval-%' "
         "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
         "GROUP BY b_ts, a_type ORDER BY b_ts ASC;";
 
@@ -964,8 +954,7 @@ json AgentTelemetryDb::querySessions(int limit, const std::string &status) {
         "       start_timestamp, end_timestamp, status, total_turns, total_prompt_tokens,"
         "       total_comp_tokens, total_tool_calls, total_errors, avg_turn_ms "
         "FROM agent_sessions "
-        "WHERE session_id NOT LIKE 'approval-%' "
-        "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') ";
+        "WHERE session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') ";
     if (!status.empty()) {
         sql += "AND status = ? ";
     }
@@ -1069,7 +1058,6 @@ json AgentTelemetryDb::queryToolStats(int windowHours) {
         "       MAX(duration_ms) AS max_duration_ms "
         "FROM agent_lifecycle_events "
         "WHERE timestamp >= ? AND tool_name != '' AND tool_name IS NOT NULL "
-        "  AND session_id NOT LIKE 'approval-%' "
         "  AND session_id NOT IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default') "
         "GROUP BY tool_name ORDER BY invocations DESC;";
 
@@ -1143,8 +1131,7 @@ size_t AgentTelemetryDb::rollupAndPrune(int rawRetentionDays) {
         "       SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) AS total_errors, "
         "       COALESCE(AVG(CASE WHEN event_type = 'TURN_END' THEN duration_ms ELSE NULL END), 0.0), "
         "       COALESCE(MAX(duration_ms), 0.0), "
-        "       COALESCE(MAX(duration_ms), 0.0), "
-        "       COALESCE(AVG(CASE WHEN event_type = 'APPROVAL_WAIT' THEN duration_ms ELSE NULL END), 0.0) "
+        "       COALESCE(MAX(duration_ms), 0.0) "
         "FROM agent_lifecycle_events "
         "WHERE timestamp < ? "
         "GROUP BY hour_ts, agent_type;";

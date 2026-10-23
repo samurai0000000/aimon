@@ -1158,12 +1158,11 @@ function renderMonitorTabs(monitors) {
 }
 
 // ==========================================================================
-// Agent Telemetry, Historical Analytics & Approvals Frontend Engine
+// Agent Telemetry & Historical Analytics Frontend Engine
 // ==========================================================================
 
 let activeTelemetryWindow = '24h';
 let telemetryTimer = null;
-let approvalsTimer = null;
 
 async function fetchTelemetryOverview() {
     try {
@@ -1804,7 +1803,6 @@ async function fetchSessionWaterfall(sessionId) {
                         let blockClass = 'wf-block-tool';
                         if (ev.event_type === 'SESSION_START' || ev.event_type === 'TURN_START' || ev.event_type === 'USER_TURN') blockClass = 'wf-block-prompt';
                         else if (ev.event_type === 'THINKING') blockClass = 'wf-block-think';
-                        else if (ev.event_type === 'APPROVAL_WAIT') blockClass = 'wf-block-approval';
                         else if (ev.status === 'ERROR') blockClass = 'wf-block-error';
 
                         const durationStr = ev.duration_ms > 0 ? ` (${Math.round(ev.duration_ms)}ms)` : '';
@@ -1818,63 +1816,7 @@ async function fetchSessionWaterfall(sessionId) {
     } catch (_) {}
 }
 
-// --- Action Approvals & Mobile Companion Client ---
-
-async function fetchPendingApprovals() {
-    try {
-        const res = await fetch('/api/approvals/pending');
-        if (!res.ok) return;
-        const list = await res.json();
-
-        const badge = document.getElementById('pending-approvals-count');
-        const navBadge = document.getElementById('approvals-badge');
-        const container = document.getElementById('pending-approvals-list');
-
-        if (badge) badge.textContent = `${list.length} Pending`;
-        if (navBadge) navBadge.textContent = list.length > 0 ? `${list.length} Action` : 'Mobile';
-
-        if (!container) return;
-        if (!list || list.length === 0) {
-            container.innerHTML = `
-                <div class="no-pending-hint">
-                    <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="1.8" fill="none">
-                        <circle cx="12" cy="12" r="10"></circle>
-                        <polyline points="12 6 12 14 14 14"></polyline>
-                    </svg>
-                    <p>No actions currently waiting for approval.</p>
-                </div>
-            `;
-            return;
-        }
-
-        container.innerHTML = list.map(item => `
-            <div class="approval-item-card" id="approval-card-${item.approval_id}">
-                <div class="approval-item-header">
-                    <span class="approval-tool-badge">[${item.agent_type.toUpperCase()}] ${item.tool_name}</span>
-                    <span class="badge badge-amber">⏱️ ${item.remaining_seconds}s left</span>
-                </div>
-                <div class="approval-item-body">${item.reason || ''}\nWorkspace: ${item.workspace}\nArgs: ${JSON.stringify(item.tool_args, null, 2)}</div>
-                <div class="approval-actions">
-                    <button class="btn-deny" onclick="submitApprovalDecision('${item.approval_id}', 'deny')">Deny</button>
-                    <button class="btn-approve" onclick="submitApprovalDecision('${item.approval_id}', 'allow')">Approve Action</button>
-                </div>
-            </div>
-        `).join('');
-    } catch (_) {}
-}
-
-async function submitApprovalDecision(approvalId, decision) {
-    try {
-        const res = await fetch('/api/approvals/decision', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ approval_id: approvalId, decision: decision })
-        });
-        if (res.ok) {
-            fetchPendingApprovals();
-        }
-    } catch (_) {}
-}
+// --- Mobile Companion Client ---
 
 async function fetchMobileQr() {
     try {
@@ -2013,7 +1955,6 @@ function switchToSubpanel(subpanelId) {
         fetchTelemetryTools();
         fetchTelemetrySessions();
     } else if (subpanelId === 'approvals') {
-        fetchPendingApprovals();
         fetchMobileQr();
         fetchMobileDevices();
     } else if (subpanelId === 'insights') {
@@ -2491,7 +2432,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(fetchSessions, 10000);
     setInterval(fetchMonitors, 15000);
 
-    // Refresh telemetry, approvals, insights & bridges periodically when respective subpanel is active
+    // Refresh telemetry, mobile pairing, insights & bridges periodically when respective subpanel is active
     setInterval(() => {
         if (activeSubpanelId === 'telemetry') {
             fetchTelemetryOverview();
@@ -2499,7 +2440,7 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchActivityTimeline();
             fetchTelemetryTools();
         } else if (activeSubpanelId === 'approvals') {
-            fetchPendingApprovals();
+            fetchMobileDevices();
         } else if (activeSubpanelId === 'insights') {
             fetchInsightsTab();
         } else if (activeSubpanelId === 'bridges') {

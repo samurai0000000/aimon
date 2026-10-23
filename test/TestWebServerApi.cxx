@@ -152,47 +152,7 @@ int main() {
     json devs = json::parse(resDevs->body);
     assert(devs.size() == 1);
 
-    // 5. Action Approval Request & Asynchronous Decision API
-    std::thread approverThread([mobileAuthHeaders]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        httplib::Client mobileClient("http://127.0.0.1:3899");
-        mobileClient.set_connection_timeout(2, 0);
-        mobileClient.set_read_timeout(5, 0);
-
-        // Poll pending
-        auto resPending = mobileClient.Get("/api/approvals/pending", mobileAuthHeaders);
-        assert(resPending && resPending->status == 200);
-        json pendingList = json::parse(resPending->body);
-        assert(!pendingList.empty());
-        std::string approvalId = pendingList[0]["approval_id"];
-
-        // Submit decision
-        json decBody = {
-            {"approval_id", approvalId},
-            {"decision", "allow"}
-        };
-        auto resDec = mobileClient.Post("/api/approvals/decision", mobileAuthHeaders, decBody.dump(), "application/json");
-        assert(resDec && resDec->status == 200);
-    });
-
-
-    json reqBody = {
-        {"agent_type", "antigravity"},
-        {"tool_name", "run_command"},
-        {"workspace", "/workspace/aimon"},
-        {"tool_args", {{"CommandLine", "make"}}},
-        {"reason", "Test compilation approval"},
-        {"timeout_seconds", 5}
-    };
-
-    auto resAppr = client.Post("/api/approvals/request", reqBody.dump(), "application/json");
-    assert(resAppr && resAppr->status == 200);
-    json apprResp = json::parse(resAppr->body);
-    assert(apprResp.value("verdict", "") == "APPROVED");
-
-    approverThread.join();
-
-    // 6. Locked Terminal Conversation Port Pinning, Anti-Hijacking & Stale Port Pruning
+    // 5. Locked Terminal Conversation Port Pinning, Anti-Hijacking & Stale Port Pruning
     {
         namespace fs = std::filesystem;
         fs::path tmpDir = "/tmp/test_webserver_agy_pinning";

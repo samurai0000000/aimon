@@ -46,8 +46,7 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                 </button>
                 <button type="button" class="aimon-subnav-tab" data-subpanel="approvals">
                     <span class="subnav-indicator"></span>
-                    <span class="subnav-title">action approvals</span>
-                    <span class="tab-badge badge-amber hidden" id="approvals-badge">0</span>
+                    <span class="subnav-title">mobile pairing</span>
                 </button>
                 <button type="button" class="aimon-subnav-tab" data-subpanel="insights">
                     <span class="subnav-indicator"></span>
@@ -444,31 +443,14 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                         </div>
                     </div>
                     <div class="waterfall-timeline-container" id="waterfall-container">
-                        <div class="waterfall-empty-hint">Select a session above to inspect turn breakdown, tool executions, and approval wait times.</div>
+                        <div class="waterfall-empty-hint">Select a session above to inspect turn breakdown and tool executions.</div>
                     </div>
                 </div>
             </div>
 
-            <!-- Subpanel 3: Action Approvals & Mobile Companion -->
+            <!-- Subpanel 3: Mobile Companion Pairing & Devices -->
             <div class="aimon-subpanel hidden" id="subpanel-approvals">
                 <div class="approvals-grid">
-                    <!-- Pending Approvals Card -->
-                    <div class="glass-card pending-approvals-card">
-                        <div class="card-header">
-                            <h2>Pending Action Approvals</h2>
-                            <span class="badge badge-amber" id="pending-approvals-count">0 Pending</span>
-                        </div>
-                        <div class="pending-list" id="pending-approvals-list">
-                            <div class="no-pending-hint">
-                                <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="1.8" fill="none">
-                                    <circle cx="12" cy="12" r="10"></circle>
-                                    <polyline points="12 6 12 12 14 14"></polyline>
-                                </svg>
-                                <p>No actions currently waiting for approval.</p>
-                            </div>
-                        </div>
-                    </div>
-
                     <!-- Mobile Companion Pairing Card -->
                     <div class="glass-card mobile-pairing-card">
                         <div class="card-header">
@@ -3399,26 +3381,14 @@ body {
     color: #4ade80;
 }
 
-.wf-block-approval {
-    background: rgba(245, 158, 11, 0.15);
-    border-color: rgba(245, 158, 11, 0.45);
-    color: #fbbf24;
-    animation: pulseGlow 2s infinite ease-in-out;
-}
-
 .wf-block-error {
     background: rgba(239, 68, 68, 0.15);
     border-color: rgba(239, 68, 68, 0.35);
     color: #f87171;
 }
 
-@keyframes pulseGlow {
-    0%, 100% { box-shadow: 0 0 6px rgba(245, 158, 11, 0.2); }
-    50% { box-shadow: 0 0 16px rgba(245, 158, 11, 0.5); }
-}
-
 /* ==========================================================================
-   Action Approvals & Mobile Companion Styles
+   Mobile Companion Pairing & Devices Styles
    ========================================================================== */
 
 .approvals-grid {
@@ -3428,7 +3398,6 @@ body {
     margin-bottom: 20px;
 }
 
-.pending-approvals-card,
 .mobile-pairing-card,
 .devices-card {
     padding: 20px;
@@ -3436,95 +3405,6 @@ body {
     backdrop-filter: blur(12px);
     border: 1px solid rgba(255, 255, 255, 0.07);
     border-radius: 14px;
-}
-
-.pending-list {
-    margin-top: 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-}
-
-.no-pending-hint {
-    text-align: center;
-    padding: 36px 16px;
-    color: var(--text-muted);
-}
-
-.no-pending-hint svg {
-    opacity: 0.6;
-    margin-bottom: 8px;
-}
-
-.approval-item-card {
-    background: rgba(0, 0, 0, 0.35);
-    border: 1px solid rgba(245, 158, 11, 0.35);
-    border-radius: 10px;
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-}
-
-.approval-item-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-}
-
-.approval-tool-badge {
-    font-family: var(--font-mono);
-    font-size: 0.85rem;
-    font-weight: 700;
-    color: #fbbf24;
-}
-
-.approval-item-body {
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-    background: rgba(0, 0, 0, 0.4);
-    padding: 10px 14px;
-    border-radius: 6px;
-    color: var(--text-secondary);
-    white-space: pre-wrap;
-    word-break: break-all;
-}
-
-.approval-actions {
-    display: flex;
-    gap: 10px;
-    justify-content: flex-end;
-}
-
-.btn-approve {
-    background: rgba(34, 197, 94, 0.25);
-    color: #4ade80;
-    border: 1px solid rgba(34, 197, 94, 0.45);
-    padding: 8px 18px;
-    border-radius: 8px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s;
-}
-
-.btn-approve:hover {
-    background: rgba(34, 197, 94, 0.4);
-    box-shadow: 0 0 14px rgba(34, 197, 94, 0.35);
-}
-
-.btn-deny {
-    background: rgba(239, 68, 68, 0.2);
-    color: #f87171;
-    border: 1px solid rgba(239, 68, 68, 0.4);
-    padding: 8px 18px;
-    border-radius: 8px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s;
-}
-
-.btn-deny:hover {
-    background: rgba(239, 68, 68, 0.35);
 }
 
 /* Pairing Card */
@@ -5248,12 +5128,11 @@ function renderMonitorTabs(monitors) {
 }
 
 // ==========================================================================
-// Agent Telemetry, Historical Analytics & Approvals Frontend Engine
+// Agent Telemetry & Historical Analytics Frontend Engine
 // ==========================================================================
 
 let activeTelemetryWindow = '24h';
 let telemetryTimer = null;
-let approvalsTimer = null;
 
 async function fetchTelemetryOverview() {
     try {
@@ -5894,7 +5773,6 @@ async function fetchSessionWaterfall(sessionId) {
                         let blockClass = 'wf-block-tool';
                         if (ev.event_type === 'SESSION_START' || ev.event_type === 'TURN_START' || ev.event_type === 'USER_TURN') blockClass = 'wf-block-prompt';
                         else if (ev.event_type === 'THINKING') blockClass = 'wf-block-think';
-                        else if (ev.event_type === 'APPROVAL_WAIT') blockClass = 'wf-block-approval';
                         else if (ev.status === 'ERROR') blockClass = 'wf-block-error';
 
                         const durationStr = ev.duration_ms > 0 ? ` (${Math.round(ev.duration_ms)}ms)` : '';
@@ -5908,63 +5786,7 @@ async function fetchSessionWaterfall(sessionId) {
     } catch (_) {}
 }
 
-// --- Action Approvals & Mobile Companion Client ---
-
-async function fetchPendingApprovals() {
-    try {
-        const res = await fetch('/api/approvals/pending');
-        if (!res.ok) return;
-        const list = await res.json();
-
-        const badge = document.getElementById('pending-approvals-count');
-        const navBadge = document.getElementById('approvals-badge');
-        const container = document.getElementById('pending-approvals-list');
-
-        if (badge) badge.textContent = `${list.length} Pending`;
-        if (navBadge) navBadge.textContent = list.length > 0 ? `${list.length} Action` : 'Mobile';
-
-        if (!container) return;
-        if (!list || list.length === 0) {
-            container.innerHTML = `
-                <div class="no-pending-hint">
-                    <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="1.8" fill="none">
-                        <circle cx="12" cy="12" r="10"></circle>
-                        <polyline points="12 6 12 14 14 14"></polyline>
-                    </svg>
-                    <p>No actions currently waiting for approval.</p>
-                </div>
-            `;
-            return;
-        }
-
-        container.innerHTML = list.map(item => `
-            <div class="approval-item-card" id="approval-card-${item.approval_id}">
-                <div class="approval-item-header">
-                    <span class="approval-tool-badge">[${item.agent_type.toUpperCase()}] ${item.tool_name}</span>
-                    <span class="badge badge-amber">⏱️ ${item.remaining_seconds}s left</span>
-                </div>
-                <div class="approval-item-body">${item.reason || ''}\nWorkspace: ${item.workspace}\nArgs: ${JSON.stringify(item.tool_args, null, 2)}</div>
-                <div class="approval-actions">
-                    <button class="btn-deny" onclick="submitApprovalDecision('${item.approval_id}', 'deny')">Deny</button>
-                    <button class="btn-approve" onclick="submitApprovalDecision('${item.approval_id}', 'allow')">Approve Action</button>
-                </div>
-            </div>
-        `).join('');
-    } catch (_) {}
-}
-
-async function submitApprovalDecision(approvalId, decision) {
-    try {
-        const res = await fetch('/api/approvals/decision', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ approval_id: approvalId, decision: decision })
-        });
-        if (res.ok) {
-            fetchPendingApprovals();
-        }
-    } catch (_) {}
-}
+// --- Mobile Companion Client ---
 
 async function fetchMobileQr() {
     try {
@@ -6103,7 +5925,6 @@ function switchToSubpanel(subpanelId) {
         fetchTelemetryTools();
         fetchTelemetrySessions();
     } else if (subpanelId === 'approvals') {
-        fetchPendingApprovals();
         fetchMobileQr();
         fetchMobileDevices();
     } else if (subpanelId === 'insights') {
@@ -6581,7 +6402,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(fetchSessions, 10000);
     setInterval(fetchMonitors, 15000);
 
-    // Refresh telemetry, approvals, insights & bridges periodically when respective subpanel is active
+    // Refresh telemetry, mobile pairing, insights & bridges periodically when respective subpanel is active
     setInterval(() => {
         if (activeSubpanelId === 'telemetry') {
             fetchTelemetryOverview();
@@ -6589,7 +6410,7 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchActivityTimeline();
             fetchTelemetryTools();
         } else if (activeSubpanelId === 'approvals') {
-            fetchPendingApprovals();
+            fetchMobileDevices();
         } else if (activeSubpanelId === 'insights') {
             fetchInsightsTab();
         } else if (activeSubpanelId === 'bridges') {
