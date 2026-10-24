@@ -585,12 +585,11 @@ static std::string cleanProviderUserPrompt(const std::string& raw) {
     auto uqEnd = text.find("</user_query>");
     if (uqStart != std::string::npos && uqEnd != std::string::npos && uqEnd >= uqStart + 12) {
         text = text.substr(uqStart + 12, uqEnd - (uqStart + 12));
-    } else {
-        auto urStart = text.find("<USER_REQUEST>");
-        auto urEnd = text.find("</USER_REQUEST>");
-        if (urStart != std::string::npos && urEnd != std::string::npos && urEnd >= urStart + 14) {
-            text = text.substr(urStart + 14, urEnd - (urStart + 14));
-        }
+    }
+    auto urStart = text.find("<USER_REQUEST>");
+    auto urEnd = text.find("</USER_REQUEST>");
+    if (urStart != std::string::npos && urEnd != std::string::npos && urEnd >= urStart + 14) {
+        text = text.substr(urStart + 14, urEnd - (urStart + 14));
     }
     auto stripBlock = [&](const std::string& openT, const std::string& closeT) {
         while (true) {
@@ -604,6 +603,7 @@ static std::string cleanProviderUserPrompt(const std::string& raw) {
             text.erase(s, (e + closeT.size()) - s);
         }
     };
+    stripBlock("<CONTEXT_SUMMARY>", "</CONTEXT_SUMMARY>");
     stripBlock("<ide_opened_file>", "</ide_opened_file>");
     stripBlock("<ide_selection>", "</ide_selection>");
     stripBlock("<system-reminder>", "</system-reminder>");
@@ -615,6 +615,66 @@ static std::string cleanProviderUserPrompt(const std::string& raw) {
     if (first == std::string::npos) return "";
     auto last = text.find_last_not_of(" \n\r\t");
     return text.substr(first, last - first + 1);
+}
+
+static nlohmann::json normalizeQuestionsJson(const nlohmann::json& rawQ) {
+    nlohmann::json parsedQ = rawQ;
+    if (rawQ.is_string()) {
+        auto p = nlohmann::json::parse(rawQ.get<std::string>(), nullptr, false);
+        if (!p.is_discarded()) {
+            parsedQ = std::move(p);
+        }
+    }
+    nlohmann::json items = nlohmann::json::array();
+    if (parsedQ.is_array()) {
+        items = parsedQ;
+    } else if (parsedQ.is_object() && parsedQ.contains("question")) {
+        items.push_back(parsedQ);
+    }
+
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& qObj : items) {
+        if (!qObj.is_object()) continue;
+        std::string qText = qObj.value("question", "");
+        bool isMulti = qObj.value("is_multi_select", qObj.value("isMultiSelect", false));
+        nlohmann::json optsStrArr = nlohmann::json::array();
+        nlohmann::json optObjsArr = nlohmann::json::array();
+
+        if (qObj.contains("options")) {
+            nlohmann::json rawOpts = qObj["options"];
+            if (rawOpts.is_string()) {
+                auto po = nlohmann::json::parse(rawOpts.get<std::string>(), nullptr, false);
+                if (!po.is_discarded()) {
+                    rawOpts = std::move(po);
+                }
+            }
+            if (rawOpts.is_array()) {
+                for (size_t idx = 0; idx < rawOpts.size(); ++idx) {
+                    const auto& opt = rawOpts[idx];
+                    if (opt.is_string()) {
+                        std::string txt = opt.get<std::string>();
+                        optsStrArr.push_back(txt);
+                        optObjsArr.push_back({{"id", std::to_string(idx + 1)}, {"text", txt}});
+                    } else if (opt.is_object()) {
+                        std::string txt = opt.value("text", opt.value("label", ""));
+                        std::string idStr = opt.value("id", std::to_string(idx + 1));
+                        optsStrArr.push_back(txt);
+                        optObjsArr.push_back({{"id", idStr}, {"text", txt}});
+                    }
+                }
+            }
+        }
+
+        if (qText.empty() && optsStrArr.empty()) continue;
+        out.push_back({
+            {"question", qText},
+            {"options", optsStrArr},
+            {"optionObjects", optObjsArr},
+            {"is_multi_select", isMulti},
+            {"isMultiSelect", isMulti}
+        });
+    }
+    return out;
 }
 
 static void inferWorkspaceFromProjectSlug(const std::string& slug,
@@ -724,6 +784,13 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         }
 
         std::string role = j.value("type", "");
+        if (role == "system" && j.value("subtype", "") == "compact_boundary") {
+            out.steps.clear();
+            out.userPrompts.clear();
+            stepIdx = 0;
+            out.totalSteps = 0;
+            continue;
+        }
         if (role != "user" && role != "assistant") {
             role = j.value("role", "");
         }
@@ -738,6 +805,16 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         }
 
         if (role == "user") {
+            if (!summaryOnly) {
+                for (auto& prevSt : out.steps) {
+                    if (prevSt.is_object() && prevSt.contains("askQuestion") &&
+                        prevSt["askQuestion"].is_object() &&
+                        prevSt["askQuestion"].value("answered", true) == false) {
+                        prevSt["askQuestion"]["answered"] = true;
+                    }
+                }
+            }
+
             std::string rawUserText;
             if (msgObj.contains("content")) {
                 if (msgObj["content"].is_string()) {
@@ -754,6 +831,41 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                     }
                 }
             }
+
+            if (j.value("isCompactSummary", false)) {
+                out.steps.clear();
+                out.userPrompts.clear();
+                stepIdx = 0;
+                int curIdx = stepIdx++;
+                out.totalSteps = curIdx + 1;
+                out.hasValidTurns = true;
+                if (out.firstPrompt.empty()) {
+                    out.firstPrompt = "Compacted Claude Code Session";
+                }
+                if (!summaryOnly) {
+                    std::string compactDisplay = "📦 **Context Compacted**\n\n" + rawUserText;
+                    nlohmann::json stepJson = {
+                        {"index", curIdx},
+                        {"stepIndex", curIdx},
+                        {"step_index", curIdx},
+                        {"type", "PLANNER_RESPONSE"},
+                        {"status", "DONE"},
+                        {"content", compactDisplay},
+                        {"thinking", ""},
+                        {"plannerResponse", ""},
+                        {"text", compactDisplay},
+                        {"tool_calls", nlohmann::json::array()},
+                        {"createdAt", tsStr},
+                        {"step", {{"case", "text"}, {"value", compactDisplay}}}
+                    };
+                    out.lastStepObj = stepJson;
+                    if (sinceIndex < 0 || curIdx > sinceIndex) {
+                        out.steps.push_back(std::move(stepJson));
+                    }
+                }
+                continue;
+            }
+
             std::string cleanText = cleanProviderUserPrompt(rawUserText);
             if (cleanText.empty()) {
                 continue;
@@ -798,9 +910,18 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 out.hasValidTurns = true;
                 continue;
             }
+            for (auto& prevSt : out.steps) {
+                if (prevSt.is_object() && prevSt.contains("askQuestion") &&
+                    prevSt["askQuestion"].is_object() &&
+                    prevSt["askQuestion"].value("answered", true) == false) {
+                    prevSt["askQuestion"]["answered"] = true;
+                }
+            }
+
             std::string thinkingText;
             std::string replyText;
             nlohmann::json parsedToolCalls = nlohmann::json::array();
+            nlohmann::json stepAskQuestions = nlohmann::json::array();
 
             if (msgObj.contains("content")) {
                 if (msgObj["content"].is_string()) {
@@ -826,6 +947,18 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                             nlohmann::json inputObj = (blk.contains("input") && blk["input"].is_object())
                                                           ? blk["input"]
                                                           : nlohmann::json::object();
+                            if (toolName == "AskUserQuestion" || toolName == "ask_question") {
+                                nlohmann::json normQ = inputObj.contains("questions")
+                                    ? normalizeQuestionsJson(inputObj["questions"])
+                                    : nlohmann::json::array();
+                                if (normQ.empty() && inputObj.contains("question") && inputObj["question"].is_string()) {
+                                    normQ = normalizeQuestionsJson(nlohmann::json::array({inputObj}));
+                                }
+                                if (!normQ.empty()) {
+                                    inputObj["questions"] = normQ;
+                                    stepAskQuestions = normQ;
+                                }
+                            }
                             std::string cmd = inputObj.value("command", inputObj.value("CommandLine", ""));
                             std::string summary = inputObj.value("description",
                                                   inputObj.value("toolSummary",
@@ -869,6 +1002,13 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                     {"value", displayValue}
                 }}
             };
+            if (!stepAskQuestions.empty()) {
+                stepJson["askQuestion"] = {
+                    {"questions", stepAskQuestions},
+                    {"answered", false},
+                    {"answers", nlohmann::json::array()}
+                };
+            }
             out.lastStepObj = stepJson;
             if (sinceIndex < 0 || curIdx > sinceIndex) {
                 out.steps.push_back(std::move(stepJson));
@@ -2770,12 +2910,10 @@ void WebServer::setupRoutes() {
                 if (!mj.is_discarded() && mj.is_object() &&
                     mj.contains("conversations") && mj["conversations"].is_object()) {
                     for (auto it = mj["conversations"].begin(); it != mj["conversations"].end(); ++it) {
-                        if (it.value().is_object() && it.value().value("is_internal", false)) {
-                            auto sumIt = summariesMap.find(it.key());
-                            if (sumIt == summariesMap.end() || sumIt->second.nestingDepth > 0 ||
-                                !sumIt->second.parentConversationId.empty()) {
-                                subagentIds.insert(it.key());
-                            }
+                        if (it.value().is_object() &&
+                            (it.value().value("is_internal", false) ||
+                             !it.value().value("parent_conversation_id", "").empty())) {
+                            subagentIds.insert(it.key());
                         }
                     }
                 }
@@ -2837,6 +2975,22 @@ void WebServer::setupRoutes() {
             if (seenIds.count(id)) return;
             if (phantomIds.count(id)) return;
             if (!includeSubagents && subagentIds.count(id)) return;
+            if (!includeSubagents && !cdir.empty()) {
+                fs::path perConvMeta = cdir / "cache" / "conversation_metadata.json";
+                std::error_code mEc;
+                if (fs::exists(perConvMeta, mEc) && !mEc) {
+                    try {
+                        std::ifstream mf(perConvMeta);
+                        auto mj = nlohmann::json::parse(mf, nullptr, false);
+                        if (!mj.is_discarded() && mj.is_object() &&
+                            (mj.value("is_internal", false) ||
+                             !mj.value("parent_conversation_id", "").empty())) {
+                            subagentIds.insert(id);
+                            return;
+                        }
+                    } catch (...) {}
+                }
+            }
 
             fs::path transcriptPath = cdir.empty() ? fs::path() : (cdir / ".system_generated" / "logs" / "transcript.jsonl");
             fs::path taskMdPath = cdir.empty() ? fs::path() : (cdir / "task.md");
@@ -2967,7 +3121,6 @@ void WebServer::setupRoutes() {
             const std::string& sourceLabel = cand.sourceLabel;
             uint64_t ts = cand.ts;
             bool hasTranscript = cand.hasTranscript;
-            bool hasTaskMd = cand.hasTaskMd;
             bool hasDbSummary = cand.hasDbSummary;
 
             if (sourceLabel == "claude" || sourceLabel == "cursor") {
@@ -3096,7 +3249,7 @@ void WebServer::setupRoutes() {
                         ++lineNum;
                         totalStepsInTranscript = std::max(totalStepsInTranscript, stepIdx + 1);
                         std::string stype = j.value("type", "");
-                        if (lineNum == 1 && stype == "SYSTEM_MESSAGE" && !hasTaskMd && !hasDbSummary && !includeSubagents) {
+                        if (lineNum == 1 && (stype == "SYSTEM_MESSAGE" || j.value("source", "") == "SYSTEM") && !includeSubagents) {
                             isInternalSubagent = true;
                             break;
                         }
@@ -3462,6 +3615,53 @@ void WebServer::setupRoutes() {
                                         {"tool_calls", nlohmann::json::array()},
                                         {"step", {{"case", !pText.empty() ? "text" : "plannerResponse"}, {"value", !pText.empty() ? pText : pThink}}}
                                     });
+                                } else if (stType == "CORTEX_STEP_TYPE_ASK_QUESTION" ||
+                                           rs.contains("askQuestion") ||
+                                           (rs.contains("requestedInteraction") && rs["requestedInteraction"].is_object() &&
+                                            rs["requestedInteraction"].contains("askQuestion"))) {
+                                    nlohmann::json rawQ = nlohmann::json::array();
+                                    if (rs.contains("askQuestion") && rs["askQuestion"].is_object() &&
+                                        rs["askQuestion"].contains("questions")) {
+                                        rawQ = rs["askQuestion"]["questions"];
+                                    } else if (rs.contains("requestedInteraction") && rs["requestedInteraction"].is_object() &&
+                                               rs["requestedInteraction"].contains("askQuestion") &&
+                                               rs["requestedInteraction"]["askQuestion"].is_object() &&
+                                               rs["requestedInteraction"]["askQuestion"].contains("questions")) {
+                                        rawQ = rs["requestedInteraction"]["askQuestion"]["questions"];
+                                    }
+                                    nlohmann::json normQ = normalizeQuestionsJson(rawQ);
+                                    bool isAnswered = (rs.value("status", "") != "CORTEX_STEP_STATUS_WAITING");
+                                    std::string qDisplayText;
+                                    for (size_t qi = 0; qi < normQ.size(); ++qi) {
+                                        if (!qDisplayText.empty()) qDisplayText += "\n\n";
+                                        qDisplayText += normQ[qi].value("question", "Question");
+                                        if (normQ[qi].contains("options") && normQ[qi]["options"].is_array()) {
+                                            size_t oi = 0;
+                                            for (const auto& optStr : normQ[qi]["options"]) {
+                                                if (optStr.is_string()) {
+                                                    qDisplayText += "\n" + std::to_string(++oi) + ". " + optStr.get<std::string>();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    parsedLiveSteps.push_back({
+                                        {"index", stepIdx},
+                                        {"stepIndex", stepIdx},
+                                        {"type", "ASK_QUESTION"},
+                                        {"status", isAnswered ? "DONE" : "WAITING"},
+                                        {"text", qDisplayText},
+                                        {"askQuestion", {
+                                            {"questions", normQ},
+                                            {"answered", isAnswered},
+                                            {"answers", nlohmann::json::array()}
+                                        }},
+                                        {"step", {
+                                            {"case", "askQuestion"},
+                                            {"value", qDisplayText},
+                                            {"questions", normQ},
+                                            {"answered", isAnswered}
+                                        }}
+                                    });
                                 } else if (stType == "CORTEX_STEP_TYPE_ERROR_MESSAGE" && rs.contains("errorMessage")) {
                                     std::string errText = "Agent execution error";
                                     if (rs["errorMessage"].contains("error") && rs["errorMessage"]["error"].is_object()) {
@@ -3587,16 +3787,83 @@ void WebServer::setupRoutes() {
                 std::string thinking = j.value("thinking", "");
                 std::string createdAt = j.value("created_at", "");
 
+                if (type == "GENERIC" || type == "USER_INPUT") {
+                    for (auto& prevSt : steps) {
+                        if (prevSt.is_object() && prevSt.contains("askQuestion") &&
+                            prevSt["askQuestion"].is_object() &&
+                            prevSt["askQuestion"].value("answered", true) == false) {
+                            prevSt["askQuestion"]["answered"] = true;
+                            if (prevSt.contains("step") && prevSt["step"].is_object() && prevSt["step"].contains("answered")) {
+                                prevSt["step"]["answered"] = true;
+                            }
+                            nlohmann::json ansArr = nlohmann::json::array();
+                            std::istringstream iss(content);
+                            std::string aLine;
+                            while (std::getline(iss, aLine)) {
+                                auto fPos = aLine.find_first_not_of(" \t\r\n");
+                                if (fPos == std::string::npos) continue;
+                                auto lPos = aLine.find_last_not_of(" \t\r\n");
+                                std::string trimmedLine = aLine.substr(fPos, lPos - fPos + 1);
+                                if (trimmedLine.size() > 3 && trimmedLine[0] == 'A' &&
+                                    std::isdigit(static_cast<unsigned char>(trimmedLine[1]))) {
+                                    auto colonPos = trimmedLine.find(':');
+                                    if (colonPos != std::string::npos && colonPos + 1 < trimmedLine.size()) {
+                                        std::string val = trimmedLine.substr(colonPos + 1);
+                                        auto vf = val.find_first_not_of(" \t");
+                                        if (vf != std::string::npos) val = val.substr(vf);
+                                        if (!val.empty()) ansArr.push_back(val);
+                                        continue;
+                                    }
+                                }
+                                if (type == "USER_INPUT") {
+                                    std::string cleanAns = stripUserRequestTags(content);
+                                    if (!cleanAns.empty()) {
+                                        ansArr.push_back(cleanAns);
+                                    }
+                                    break;
+                                }
+                            }
+                            if (!ansArr.empty()) {
+                                prevSt["askQuestion"]["answers"] = ansArr;
+                            }
+                        }
+                    }
+                }
+
                 nlohmann::json parsedToolCalls = nlohmann::json::array();
+                nlohmann::json stepAskQuestions = nlohmann::json::array();
                 if (j.contains("tool_calls") && j["tool_calls"].is_array()) {
                     for (const auto& tc : j["tool_calls"]) {
                         if (!tc.is_object()) continue;
                         std::string toolName = tc.value("name", "tool");
                         nlohmann::json argsObj = nlohmann::json::object();
-                        if (tc.contains("arguments") && tc["arguments"].is_object()) {
-                            argsObj = tc["arguments"];
-                        } else if (tc.contains("args") && tc["args"].is_object()) {
-                            argsObj = tc["args"];
+                        if (tc.contains("arguments")) {
+                            if (tc["arguments"].is_object()) {
+                                argsObj = tc["arguments"];
+                            } else if (tc["arguments"].is_string()) {
+                                auto pa = nlohmann::json::parse(tc["arguments"].get<std::string>(), nullptr, false);
+                                if (!pa.is_discarded() && pa.is_object()) argsObj = std::move(pa);
+                            }
+                        } else if (tc.contains("args")) {
+                            if (tc["args"].is_object()) {
+                                argsObj = tc["args"];
+                            } else if (tc["args"].is_string()) {
+                                auto pa = nlohmann::json::parse(tc["args"].get<std::string>(), nullptr, false);
+                                if (!pa.is_discarded() && pa.is_object()) argsObj = std::move(pa);
+                            }
+                        }
+
+                        if (toolName == "ask_question" || toolName == "AskUserQuestion") {
+                            nlohmann::json normQ = argsObj.contains("questions")
+                                ? normalizeQuestionsJson(argsObj["questions"])
+                                : nlohmann::json::array();
+                            if (normQ.empty() && argsObj.contains("question") && argsObj["question"].is_string()) {
+                                normQ = normalizeQuestionsJson(nlohmann::json::array({argsObj}));
+                            }
+                            if (!normQ.empty()) {
+                                argsObj["questions"] = normQ;
+                                stepAskQuestions = normQ;
+                            }
                         }
 
                         auto unquoteStr = [](const std::string& s) -> std::string {
@@ -3645,7 +3912,7 @@ void WebServer::setupRoutes() {
                     });
                 } else if (type == "PLANNER_RESPONSE") {
                     std::string displayValue = !content.empty() ? content : thinking;
-                    steps.push_back({
+                    nlohmann::json stepJson = {
                         {"index", stepIdx},
                         {"stepIndex", stepIdx},
                         {"type", "PLANNER_RESPONSE"},
@@ -3658,7 +3925,15 @@ void WebServer::setupRoutes() {
                             {"case", !content.empty() ? "text" : "plannerResponse"},
                             {"value", displayValue}
                         }}
-                    });
+                    };
+                    if (!stepAskQuestions.empty()) {
+                        stepJson["askQuestion"] = {
+                            {"questions", stepAskQuestions},
+                            {"answered", false},
+                            {"answers", nlohmann::json::array()}
+                        };
+                    }
+                    steps.push_back(std::move(stepJson));
                 } else if (type == "ERROR_MESSAGE") {
                     std::string errText = !content.empty() ? content : j.value("error", "Agent execution error");
                     steps.push_back({
@@ -3675,7 +3950,7 @@ void WebServer::setupRoutes() {
                 } else if (!parsedToolCalls.empty()) {
                     std::string firstTool = parsedToolCalls[0].value("name", "tool");
                     std::string firstCmd = parsedToolCalls[0].value("command", "");
-                    steps.push_back({
+                    nlohmann::json stepJson = {
                         {"index", stepIdx},
                         {"stepIndex", stepIdx},
                         {"type", type.empty() ? "TOOL_CALL" : type},
@@ -3688,7 +3963,15 @@ void WebServer::setupRoutes() {
                             {"tool", firstTool},
                             {"command", firstCmd}
                         }}
-                    });
+                    };
+                    if (!stepAskQuestions.empty()) {
+                        stepJson["askQuestion"] = {
+                            {"questions", stepAskQuestions},
+                            {"answered", false},
+                            {"answers", nlohmann::json::array()}
+                        };
+                    }
+                    steps.push_back(std::move(stepJson));
                 }
             } catch (...) {}
         }
@@ -3727,6 +4010,39 @@ void WebServer::setupRoutes() {
         std::string requestedModel = j.value("model", "");
         std::string requestedSource = toLowerAscii(j.value("source", ""));
         bool autoApprove = j.value("autoApprove", true);
+        bool hasQuestionResponses = j.contains("questionResponses") &&
+                                    j["questionResponses"].is_array() &&
+                                    !j["questionResponses"].empty();
+        if (text.empty() && hasQuestionResponses) {
+            for (const auto& qr : j["questionResponses"]) {
+                if (!qr.is_object()) continue;
+                if (qr.contains("selectedOptions") && qr["selectedOptions"].is_array()) {
+                    for (const auto& so : qr["selectedOptions"]) {
+                        if (so.is_string() && !so.get<std::string>().empty()) {
+                            if (!text.empty()) text += "\n";
+                            text += so.get<std::string>();
+                        }
+                    }
+                } else if (qr.contains("selectedOptionIds") && qr["selectedOptionIds"].is_array()) {
+                    for (const auto& sid : qr["selectedOptionIds"]) {
+                        if (sid.is_string() && !sid.get<std::string>().empty()) {
+                            if (!text.empty()) text += "\n";
+                            text += sid.get<std::string>();
+                        }
+                    }
+                }
+                if (qr.contains("writeInResponse") && qr["writeInResponse"].is_string()) {
+                    std::string wir = qr["writeInResponse"].get<std::string>();
+                    if (!wir.empty()) {
+                        if (!text.empty()) text += "\n";
+                        text += wir;
+                    }
+                }
+            }
+            if (text.empty()) {
+                text = "1";
+            }
+        }
         if (text.empty()) {
             res.status = 400;
             res.set_content("{\"status\":\"error\",\"error\":\"Prompt text cannot be empty\"}", "application/json");
@@ -3761,37 +4077,280 @@ void WebServer::setupRoutes() {
         }
 
         if (targetProvider == "claude" || targetProvider == "cursor") {
+            std::string cmdVerb;
+            std::string cmdArgs;
             if (!trimmedText.empty() && trimmedText[0] == '/') {
                 auto spPos = trimmedText.find_first_of(" \t\r\n");
-                std::string cmdVerb = toLowerAscii(spPos == std::string::npos ? trimmedText : trimmedText.substr(0, spPos));
-                if (cmdVerb == "/clear" || cmdVerb == "/new" || cmdVerb == "/reset") {
-                    res.set_content(nlohmann::json({
-                        {"status", "cleared"},
-                        {"agentId", targetProvider},
-                        {"source", targetProvider},
-                        {"conversationId", "new"},
-                        {"command", cmdVerb},
-                        {"response", "Conversation cleared."}
-                    }).dump(2), "application/json");
-                    return;
+                cmdVerb = toLowerAscii(spPos == std::string::npos ? trimmedText : trimmedText.substr(0, spPos));
+                if (spPos != std::string::npos) {
+                    auto argStart = trimmedText.find_first_not_of(" \t\r\n", spPos);
+                    if (argStart != std::string::npos) {
+                        cmdArgs = trimmedText.substr(argStart);
+                    }
                 }
-                if (cmdVerb == "/help") {
-                    std::string helpText = (targetProvider == "claude")
-                        ? "Claude Code Mobile Commands:\n/help\tShow available commands\n/clear\tStart a fresh conversation\n/compact\tCompact conversation context\n/model\tSwitch Claude model\n/provider\tSwitch AI provider (agy, claude, cursor)\n/settings\tOpen AIMon mobile Settings tab\n"
-                        : "Cursor Agent Mobile Commands:\n/help\tShow available commands\n/clear\tStart a fresh conversation\n/model\tSwitch Cursor model\n/provider\tSwitch AI provider (agy, claude, cursor)\n/settings\tOpen AIMon mobile Settings tab\n";
+            }
+
+            if (cmdVerb == "/clear" || cmdVerb == "/new" || cmdVerb == "/reset") {
+                res.set_content(nlohmann::json({
+                    {"status", "cleared"},
+                    {"agentId", targetProvider},
+                    {"source", targetProvider},
+                    {"conversationId", "new"},
+                    {"command", cmdVerb},
+                    {"response", "Conversation cleared."}
+                }).dump(2), "application/json");
+                return;
+            }
+            if (cmdVerb == "/help") {
+                std::string helpText = (targetProvider == "claude")
+                    ? "Claude Code Mobile Commands:\n"
+                      "/compact [focus]\tCompact & summarize conversation context\n"
+                      "/clear\tStart a fresh Claude Code conversation\n"
+                      "/plan <prompt>\tRun prompt in read-only planning mode (--permission-mode plan)\n"
+                      "/effort <level> [prompt]\tRun with effort level (low, medium, high, max)\n"
+                      "/status\tShow active session, workspace & model\n"
+                      "/doctor\tCheck Claude Code CLI binary & version\n"
+                      "/model\tSwitch Claude model\n"
+                      "/models\tList available Claude Code models\n"
+                      "/provider\tSwitch AI provider (agy, claude, cursor)\n"
+                      "/settings\tOpen AIMon mobile Settings tab\n"
+                      "/help\tShow available commands\n"
+                    : "Cursor Agent Mobile Commands:\n"
+                      "/compact [focus]\tCompact & roll over Cursor Agent session context\n"
+                      "/summarize [focus]\tAlias for /compact\n"
+                      "/clear\tStart a fresh Cursor Agent conversation\n"
+                      "/plan <prompt>\tRun prompt in read-only plan mode (--mode plan)\n"
+                      "/ask <question>\tRun prompt in read-only Q&A ask mode (--mode ask)\n"
+                      "/status\tShow active session, workspace & model\n"
+                      "/doctor\tCheck Cursor Agent CLI binary & version\n"
+                      "/model\tSwitch Cursor Agent model\n"
+                      "/models\tList available Cursor Agent models\n"
+                      "/provider\tSwitch AI provider (agy, claude, cursor)\n"
+                      "/settings\tOpen AIMon mobile Settings tab\n"
+                      "/help\tShow available commands\n";
+                res.set_content(nlohmann::json({
+                    {"status", "command_response"},
+                    {"agentId", targetProvider},
+                    {"source", targetProvider},
+                    {"conversationId", cid.empty() ? "new" : cid},
+                    {"command", cmdVerb},
+                    {"response", helpText}
+                }).dump(2), "application/json");
+                return;
+            }
+
+            std::string providerBin = (targetProvider == "claude") ? getClaudeBin() : getCursorBin();
+            std::string wsDir = getWorkspaceRoot().string();
+            std::string activeModel = !requestedModel.empty()
+                ? requestedModel
+                : ((targetProvider == "claude") ? "claude-sonnet-4-6" : "cursor-auto");
+            std::string existingSlug;
+            fs::path existingTranscriptPath;
+            if (!cid.empty() && cid != "new") {
+                std::string dummySrc;
+                existingTranscriptPath = findProviderTranscriptById(cid, dummySrc, existingSlug);
+                if (!existingTranscriptPath.empty()) {
+                    auto parsed = parseProviderTranscriptJsonl(existingTranscriptPath, targetProvider, 999999, existingSlug, true);
+                    if (!parsed.workspacePath.empty() && fs::exists(parsed.workspacePath)) {
+                        wsDir = parsed.workspacePath;
+                    }
+                    if (requestedModel.empty() && !parsed.model.empty()) {
+                        activeModel = parsed.model;
+                    }
+                }
+            }
+
+            if (cmdVerb == "/status") {
+                std::string providerLabel = (targetProvider == "claude") ? "Claude Code" : "Cursor Agent";
+                std::string statusMd = "**" + providerLabel + " Session Status**\n"
+                    "- **Provider**: `" + targetProvider + "`\n"
+                    "- **Session ID**: `" + (cid.empty() ? "new" : cid) + "`\n"
+                    "- **Model**: `" + activeModel + "`\n"
+                    "- **Workspace**: `" + wsDir + "`\n"
+                    "- **CLI Binary**: `" + (providerBin.empty() ? std::string("not found") : providerBin) + "`";
+                res.set_content(nlohmann::json({
+                    {"status", "command_response"},
+                    {"agentId", targetProvider},
+                    {"source", targetProvider},
+                    {"conversationId", cid.empty() ? "new" : cid},
+                    {"command", cmdVerb},
+                    {"response", statusMd}
+                }).dump(2), "application/json");
+                return;
+            }
+
+            if (cmdVerb == "/models") {
+                std::string modelsMd = (targetProvider == "claude")
+                    ? "**Available Claude Code Models**\n"
+                      "- `claude-sonnet-4-6` — Claude Sonnet 4.6 (Default)\n"
+                      "- `claude-opus-4-6` — Claude Opus 4.6 (Most capable)\n"
+                      "- `claude-haiku-4-5` — Claude Haiku 4.5 (Fast & lightweight)\n"
+                      "Active model: `" + activeModel + "`"
+                    : "**Available Cursor Agent Models**\n"
+                      "- `auto` — Cursor Auto Router (Default)\n"
+                      "- `claude-4.6-sonnet` — Claude 4.6 Sonnet\n"
+                      "- `claude-4.6-opus` — Claude 4.6 Opus\n"
+                      "- `gpt-5.3-codex` — GPT-5.3 Codex\n"
+                      "- `gpt-5` — GPT-5\n"
+                      "- `gemini-2.5-pro` — Gemini 2.5 Pro\n"
+                      "Active model: `" + activeModel + "`";
+                res.set_content(nlohmann::json({
+                    {"status", "command_response"},
+                    {"agentId", targetProvider},
+                    {"source", targetProvider},
+                    {"conversationId", cid.empty() ? "new" : cid},
+                    {"command", cmdVerb},
+                    {"response", modelsMd}
+                }).dump(2), "application/json");
+                return;
+            }
+
+            if (cmdVerb == "/doctor") {
+                bool binOk = !providerBin.empty() && fs::exists(providerBin) && access(providerBin.c_str(), X_OK) == 0;
+                std::string verOut = "Binary not found or not executable";
+                if (binOk) {
+                    int pfd[2];
+                    if (pipe(pfd) == 0) {
+                        pid_t ch = fork();
+                        if (ch == 0) {
+                            close(pfd[0]);
+                            dup2(pfd[1], STDOUT_FILENO);
+                            dup2(pfd[1], STDERR_FILENO);
+                            close(pfd[1]);
+                            char* const argv[] = {
+                                const_cast<char*>(providerBin.c_str()),
+                                const_cast<char*>("--version"),
+                                nullptr
+                            };
+                            execv(providerBin.c_str(), argv);
+                            _exit(127);
+                        } else if (ch > 0) {
+                            close(pfd[1]);
+                            std::string vBuf;
+                            char buf[512];
+                            ssize_t n;
+                            while ((n = read(pfd[0], buf, sizeof(buf))) > 0) {
+                                vBuf.append(buf, static_cast<size_t>(n));
+                            }
+                            close(pfd[0]);
+                            int st = 0;
+                            waitpid(ch, &st, 0);
+                            auto f = vBuf.find_first_not_of(" \t\r\n");
+                            if (f != std::string::npos) {
+                                auto l = vBuf.find_last_not_of(" \t\r\n");
+                                verOut = vBuf.substr(f, l - f + 1);
+                            } else {
+                                verOut = "OK (no version output)";
+                            }
+                        } else {
+                            close(pfd[0]);
+                            close(pfd[1]);
+                        }
+                    }
+                }
+                std::string docMd = "**" + std::string(targetProvider == "claude" ? "Claude Code" : "Cursor Agent") + " Doctor**\n"
+                    "- **Binary**: `" + (providerBin.empty() ? std::string("missing") : providerBin) + "`\n"
+                    "- **Executable**: " + std::string(binOk ? "Yes" : "No") + "\n"
+                    "- **Version**: `" + verOut + "`\n"
+                    "- **Workspace**: `" + wsDir + "`";
+                res.set_content(nlohmann::json({
+                    {"status", "command_response"},
+                    {"agentId", targetProvider},
+                    {"source", targetProvider},
+                    {"conversationId", cid.empty() ? "new" : cid},
+                    {"command", cmdVerb},
+                    {"response", docMd}
+                }).dump(2), "application/json");
+                return;
+            }
+
+            if ((cmdVerb == "/compact" || cmdVerb == "/summarize" || cmdVerb == "/compress") &&
+                (cid.empty() || cid == "new")) {
+                res.set_content(nlohmann::json({
+                    {"status", "command_response"},
+                    {"agentId", targetProvider},
+                    {"source", targetProvider},
+                    {"conversationId", "new"},
+                    {"command", cmdVerb},
+                    {"response", "No active conversation to compact yet. Send a prompt first."}
+                }).dump(2), "application/json");
+                return;
+            }
+
+            std::vector<std::string> extraCliArgs;
+            if (cmdVerb == "/plan") {
+                if (cmdArgs.empty()) {
                     res.set_content(nlohmann::json({
                         {"status", "command_response"},
                         {"agentId", targetProvider},
                         {"source", targetProvider},
                         {"conversationId", cid.empty() ? "new" : cid},
                         {"command", cmdVerb},
-                        {"response", helpText}
+                        {"response", "Usage: `/plan <prompt>` — runs your prompt in read-only planning mode."}
                     }).dump(2), "application/json");
                     return;
                 }
+                text = cmdArgs;
+                if (targetProvider == "claude") {
+                    extraCliArgs = {"--permission-mode", "plan"};
+                } else {
+                    extraCliArgs = {"--mode", "plan"};
+                }
+            } else if (cmdVerb == "/ask") {
+                if (cmdArgs.empty()) {
+                    res.set_content(nlohmann::json({
+                        {"status", "command_response"},
+                        {"agentId", targetProvider},
+                        {"source", targetProvider},
+                        {"conversationId", cid.empty() ? "new" : cid},
+                        {"command", cmdVerb},
+                        {"response", "Usage: `/ask <question>` — runs your question in read-only Q&A ask mode."}
+                    }).dump(2), "application/json");
+                    return;
+                }
+                text = cmdArgs;
+                if (targetProvider == "cursor") {
+                    extraCliArgs = {"--mode", "ask"};
+                } else {
+                    extraCliArgs = {"--permission-mode", "plan"};
+                }
+            } else if (cmdVerb == "/effort") {
+                auto sp2 = cmdArgs.find_first_of(" \t\r\n");
+                std::string level = toLowerAscii(sp2 == std::string::npos ? cmdArgs : cmdArgs.substr(0, sp2));
+                bool validLevel = (level == "low" || level == "medium" || level == "high" || level == "max");
+                if (cmdArgs.empty() || !validLevel) {
+                    res.set_content(nlohmann::json({
+                        {"status", "command_response"},
+                        {"agentId", targetProvider},
+                        {"source", targetProvider},
+                        {"conversationId", cid.empty() ? "new" : cid},
+                        {"command", cmdVerb},
+                        {"response", "Usage: `/effort <low|medium|high|max> [prompt]`"}
+                    }).dump(2), "application/json");
+                    return;
+                }
+                std::string trailingPrompt;
+                if (sp2 != std::string::npos) {
+                    auto pStart = cmdArgs.find_first_not_of(" \t\r\n", sp2);
+                    if (pStart != std::string::npos) {
+                        trailingPrompt = cmdArgs.substr(pStart);
+                    }
+                }
+                if (trailingPrompt.empty()) {
+                    res.set_content(nlohmann::json({
+                        {"status", "command_response"},
+                        {"agentId", targetProvider},
+                        {"source", targetProvider},
+                        {"conversationId", cid.empty() ? "new" : cid},
+                        {"command", cmdVerb},
+                        {"response", "Claude Code effort level: `" + level + "`. Pass `/effort " + level + " <prompt>` to run with that effort."}
+                    }).dump(2), "application/json");
+                    return;
+                }
+                text = trailingPrompt;
+                extraCliArgs = {"--effort", level};
             }
 
-            std::string providerBin = (targetProvider == "claude") ? getClaudeBin() : getCursorBin();
             if (providerBin.empty() || !fs::exists(providerBin) || access(providerBin.c_str(), X_OK) != 0) {
                 res.status = 503;
                 res.set_content(nlohmann::json({
@@ -3802,110 +4361,257 @@ void WebServer::setupRoutes() {
                 return;
             }
 
-            std::string wsDir = getWorkspaceRoot().string();
-            if (!cid.empty() && cid != "new") {
-                std::string dummySrc;
-                std::string slug;
-                fs::path pPath = findProviderTranscriptById(cid, dummySrc, slug);
-                if (!pPath.empty()) {
-                    auto parsed = parseProviderTranscriptJsonl(pPath, targetProvider, 999999, slug);
-                    if (!parsed.workspacePath.empty() && fs::exists(parsed.workspacePath)) {
-                        wsDir = parsed.workspacePath;
-                    }
+            auto runProviderCli = [&](const std::string& promptArg,
+                                      const std::string& resumeCid,
+                                      const std::vector<std::string>& extraArgs,
+                                      std::string& outRaw,
+                                      std::string& outReply,
+                                      std::string& outSessionId) -> bool {
+                int pipeFd[2];
+                if (pipe(pipeFd) != 0) {
+                    return false;
                 }
-            }
+                pid_t child = fork();
+                if (child == 0) {
+                    close(pipeFd[0]);
+                    dup2(pipeFd[1], STDOUT_FILENO);
+                    dup2(pipeFd[1], STDERR_FILENO);
+                    close(pipeFd[1]);
+                    if (!wsDir.empty()) {
+                        int chRes = chdir(wsDir.c_str());
+                        (void)chRes;
+                    }
+                    std::vector<std::string> argStorage;
+                    argStorage.push_back(providerBin);
+                    argStorage.push_back("-p");
+                    argStorage.push_back(promptArg);
+                    argStorage.push_back("--output-format");
+                    argStorage.push_back("json");
+                    if (!resumeCid.empty() && resumeCid != "new") {
+                        argStorage.push_back("--resume");
+                        argStorage.push_back(resumeCid);
+                    }
+                    if (!requestedModel.empty()) {
+                        argStorage.push_back("--model");
+                        argStorage.push_back(requestedModel);
+                    }
+                    for (const auto& ea : extraArgs) {
+                        argStorage.push_back(ea);
+                    }
+                    if (autoApprove) {
+                        if (targetProvider == "claude") {
+                            argStorage.push_back("--dangerously-skip-permissions");
+                        } else {
+                            argStorage.push_back("-f");
+                        }
+                    }
+                    std::vector<char*> argv;
+                    for (auto& s : argStorage) {
+                        argv.push_back(const_cast<char*>(s.c_str()));
+                    }
+                    argv.push_back(nullptr);
+                    execv(providerBin.c_str(), argv.data());
+                    _exit(127);
+                } else if (child > 0) {
+                    close(pipeFd[1]);
+                    outRaw.clear();
+                    char buf[1024];
+                    ssize_t n;
+                    while ((n = read(pipeFd[0], buf, sizeof(buf))) > 0) {
+                        outRaw.append(buf, static_cast<size_t>(n));
+                    }
+                    close(pipeFd[0]);
+                    int st = 0;
+                    waitpid(child, &st, 0);
 
-            int pipeFd[2];
-            if (pipe(pipeFd) != 0) {
-                res.status = 500;
-                res.set_content("{\"status\":\"error\",\"error\":\"Failed to create pipe for provider CLI\"}", "application/json");
-                return;
-            }
+                    outReply = outRaw;
+                    outSessionId = (!resumeCid.empty() && resumeCid != "new") ? resumeCid : "";
+                    auto pj = nlohmann::json::parse(outRaw, nullptr, false);
+                    if (!pj.is_discarded() && pj.is_object()) {
+                        if (pj.contains("session_id") && pj["session_id"].is_string()) {
+                            outSessionId = pj["session_id"].get<std::string>();
+                        } else if (pj.contains("conversation_id") && pj["conversation_id"].is_string()) {
+                            outSessionId = pj["conversation_id"].get<std::string>();
+                        }
+                        if (pj.contains("result") && pj["result"].is_string()) {
+                            outReply = pj["result"].get<std::string>();
+                        } else if (pj.contains("response") && pj["response"].is_string()) {
+                            outReply = pj["response"].get<std::string>();
+                        }
+                    }
+                    return true;
+                } else {
+                    close(pipeFd[0]);
+                    close(pipeFd[1]);
+                    return false;
+                }
+            };
 
-            pid_t child = fork();
-            if (child == 0) {
-                close(pipeFd[0]);
-                dup2(pipeFd[1], STDOUT_FILENO);
-                dup2(pipeFd[1], STDERR_FILENO);
-                close(pipeFd[1]);
-                if (!wsDir.empty()) {
-                    int chRes = chdir(wsDir.c_str());
-                    (void)chRes;
-                }
-                std::vector<std::string> argStorage;
-                argStorage.push_back(providerBin);
-                argStorage.push_back("-p");
-                argStorage.push_back(text);
-                argStorage.push_back("--output-format");
-                argStorage.push_back("json");
-                if (!cid.empty() && cid != "new") {
-                    argStorage.push_back("--resume");
-                    argStorage.push_back(cid);
-                }
-                if (!requestedModel.empty()) {
-                    argStorage.push_back("--model");
-                    argStorage.push_back(requestedModel);
-                }
-                if (autoApprove) {
-                    if (targetProvider == "claude") {
-                        argStorage.push_back("--dangerously-skip-permissions");
-                    } else {
-                        argStorage.push_back("-f");
-                    }
-                }
-                std::vector<char*> argv;
-                for (auto& s : argStorage) {
-                    argv.push_back(const_cast<char*>(s.c_str()));
-                }
-                argv.push_back(nullptr);
-                execv(providerBin.c_str(), argv.data());
-                _exit(127);
-            } else if (child > 0) {
-                close(pipeFd[1]);
-                std::string cmdOut;
-                char buf[1024];
-                ssize_t n;
-                while ((n = read(pipeFd[0], buf, sizeof(buf))) > 0) {
-                    cmdOut.append(buf, static_cast<size_t>(n));
-                }
-                close(pipeFd[0]);
-                int st = 0;
-                waitpid(child, &st, 0);
+            if (cmdVerb == "/compact" || cmdVerb == "/summarize" || cmdVerb == "/compress") {
+                NormalizedProviderTranscript parsedFull = !existingTranscriptPath.empty()
+                    ? parseProviderTranscriptJsonl(existingTranscriptPath, targetProvider, -1, existingSlug, false)
+                    : NormalizedProviderTranscript{};
 
-                std::string replyText = cmdOut;
-                std::string resolvedCid = (!cid.empty() && cid != "new") ? cid : "";
-                auto pj = nlohmann::json::parse(cmdOut, nullptr, false);
-                if (!pj.is_discarded() && pj.is_object()) {
-                    if (pj.contains("session_id") && pj["session_id"].is_string()) {
-                        resolvedCid = pj["session_id"].get<std::string>();
-                    } else if (pj.contains("conversation_id") && pj["conversation_id"].is_string()) {
-                        resolvedCid = pj["conversation_id"].get<std::string>();
-                    }
-                    if (pj.contains("result") && pj["result"].is_string()) {
-                        replyText = pj["result"].get<std::string>();
-                    } else if (pj.contains("response") && pj["response"].is_string()) {
-                        replyText = pj["response"].get<std::string>();
+                // Step A: Claude Code native in-place /compact when >= 4 steps exist
+                if (targetProvider == "claude" && parsedFull.steps.size() >= 4 && !existingTranscriptPath.empty()) {
+                    std::string rawOut;
+                    std::string replyText;
+                    std::string resolvedCid;
+                    std::string nativeCmd = cmdArgs.empty() ? "/compact" : ("/compact " + cmdArgs);
+                    if (runProviderCli(nativeCmd, cid, {}, rawOut, replyText, resolvedCid)) {
+                        std::ifstream checkIn(existingTranscriptPath);
+                        std::string fileContent((std::istreambuf_iterator<char>(checkIn)),
+                                                std::istreambuf_iterator<char>());
+                        if ((fileContent.find("\"compact_boundary\"") != std::string::npos ||
+                             fileContent.find("\"isCompactSummary\"") != std::string::npos) &&
+                            replyText.find("Not compacted") == std::string::npos) {
+                            auto compactedParsed = parseProviderTranscriptJsonl(
+                                existingTranscriptPath, "claude", -1, existingSlug, false);
+                            res.set_content(nlohmann::json({
+                                {"status", "compacted"},
+                                {"compactedFrom", cid},
+                                {"agentId", "claude"},
+                                {"source", "claude"},
+                                {"conversationId", cid},
+                                {"command", cmdVerb},
+                                {"steps", compactedParsed.steps},
+                                {"response", replyText}
+                            }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                            return;
+                        }
                     }
                 }
-                if (resolvedCid.empty()) {
-                    resolvedCid = "new";
+
+                // Step B: Context-Summary Session Rollover (Cursor Agent & Claude Fallback)
+                std::string transcriptDigest;
+                size_t totalSteps = parsedFull.steps.size();
+                size_t startIdx = (totalSteps > 20) ? (totalSteps - 20) : 0;
+                for (size_t i = startIdx; i < totalSteps; ++i) {
+                    const auto& st = parsedFull.steps[i];
+                    if (!st.is_object()) continue;
+                    std::string stType = st.value("type", "");
+                    std::string roleLabel = (stType == "USER_INPUT") ? "User" : "Assistant";
+                    std::string stContent = st.value("text", st.value("content", ""));
+                    if (stContent.size() > 800) {
+                        stContent = stContent.substr(0, 797) + "...";
+                    }
+                    if (!stContent.empty()) {
+                        transcriptDigest += "[" + roleLabel + "]: " + stContent + "\n";
+                    }
+                    if (st.contains("tool_calls") && st["tool_calls"].is_array() && !st["tool_calls"].empty()) {
+                        transcriptDigest += "[Tools]: ";
+                        for (size_t ti = 0; ti < st["tool_calls"].size(); ++ti) {
+                            if (ti > 0) transcriptDigest += ", ";
+                            transcriptDigest += st["tool_calls"][ti].value("name", "tool");
+                        }
+                        transcriptDigest += "\n";
+                    }
+                    if (transcriptDigest.size() >= 12000) {
+                        transcriptDigest = transcriptDigest.substr(0, 12000) + "\n...[truncated]";
+                        break;
+                    }
                 }
+                if (transcriptDigest.empty()) {
+                    transcriptDigest = "[Session ID]: " + cid;
+                }
+
+                std::string displayCmd = cmdArgs.empty() ? "/compact" : ("/compact " + cmdArgs);
+                std::string seedPrompt =
+                    "<CONTEXT_SUMMARY>\n" +
+                    transcriptDigest +
+                    "\n</CONTEXT_SUMMARY>\n"
+                    "<USER_REQUEST>" + displayCmd + "</USER_REQUEST>\n"
+                    "Please compact and summarize our conversation context in <CONTEXT_SUMMARY> into a concise, high-signal checkpoint covering:\n"
+                    "1. Core Objective & Current Status\n"
+                    "2. Completed Changes & Key Files\n"
+                    "3. Active Constraints & Decisions\n"
+                    "4. Immediate Next Steps";
+                if (!cmdArgs.empty()) {
+                    seedPrompt += "\nFocus especially on: " + cmdArgs;
+                }
+
+                std::string rawOut;
+                std::string replyText;
+                std::string newCid;
+                if (!runProviderCli(seedPrompt, "", {}, rawOut, replyText, newCid)) {
+                    res.status = 500;
+                    res.set_content("{\"status\":\"error\",\"error\":\"Failed to fork provider CLI for /compact\"}", "application/json");
+                    return;
+                }
+                if (newCid.empty() || newCid == "new" || newCid == cid) {
+                    newCid = cid + "-compacted";
+                }
+
+                nlohmann::json compactedSteps = nlohmann::json::array();
+                std::string newSrc;
+                std::string newSlug;
+                fs::path newPath = findProviderTranscriptById(newCid, newSrc, newSlug);
+                if (!newPath.empty() && fs::exists(newPath)) {
+                    auto newParsed = parseProviderTranscriptJsonl(newPath, targetProvider, -1, newSlug, false);
+                    if (!newParsed.steps.empty()) {
+                        compactedSteps = std::move(newParsed.steps);
+                    }
+                }
+                if (compactedSteps.empty()) {
+                    compactedSteps.push_back({
+                        {"index", 0},
+                        {"stepIndex", 0},
+                        {"step_index", 0},
+                        {"type", "USER_INPUT"},
+                        {"status", "DONE"},
+                        {"content", displayCmd},
+                        {"text", displayCmd},
+                        {"userInput", displayCmd},
+                        {"step", {{"case", "userInput"}, {"value", displayCmd}}}
+                    });
+                    compactedSteps.push_back({
+                        {"index", 1},
+                        {"stepIndex", 1},
+                        {"step_index", 1},
+                        {"type", "PLANNER_RESPONSE"},
+                        {"status", "DONE"},
+                        {"content", replyText},
+                        {"thinking", ""},
+                        {"plannerResponse", ""},
+                        {"text", replyText},
+                        {"tool_calls", nlohmann::json::array()},
+                        {"step", {{"case", "text"}, {"value", replyText}}}
+                    });
+                }
+
                 res.set_content(nlohmann::json({
-                    {"status", "ok"},
+                    {"status", "compacted"},
+                    {"compactedFrom", cid},
                     {"agentId", targetProvider},
                     {"source", targetProvider},
-                    {"conversationId", resolvedCid},
-                    {"autoApprove", autoApprove},
+                    {"conversationId", newCid},
+                    {"command", cmdVerb},
+                    {"steps", compactedSteps},
                     {"response", replyText}
                 }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
-            } else {
-                close(pipeFd[0]);
-                close(pipeFd[1]);
+            }
+
+            std::string rawOut;
+            std::string replyText;
+            std::string resolvedCid;
+            if (!runProviderCli(text, cid, extraCliArgs, rawOut, replyText, resolvedCid)) {
                 res.status = 500;
                 res.set_content("{\"status\":\"error\",\"error\":\"Failed to fork provider CLI\"}", "application/json");
                 return;
             }
+            if (resolvedCid.empty()) {
+                resolvedCid = "new";
+            }
+            res.set_content(nlohmann::json({
+                {"status", "ok"},
+                {"agentId", targetProvider},
+                {"source", targetProvider},
+                {"conversationId", resolvedCid},
+                {"autoApprove", autoApprove},
+                {"response", replyText}
+            }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+            return;
         }
 
         std::string agyBin = PathUtils::expandHome("~/.local/bin/agy");
@@ -4241,6 +4947,192 @@ void WebServer::setupRoutes() {
             return false;
         };
 
+        auto tryHandleWaitingAskQuestion = [&](const LsEndpoint& ep, const std::string& targetCid, std::string& outBody) -> bool {
+            if (targetCid.empty() || targetCid == "new") return false;
+            try {
+                httplib::Client cli("127.0.0.1", ep.port);
+                cli.set_connection_timeout(0, 500000);
+                cli.set_read_timeout(3, 0);
+                httplib::Headers hdrs = {
+                    {"Content-Type", "application/json"},
+                    {"x-codeium-csrf-token", ep.csrf}
+                };
+                auto trajRes = cli.Post(
+                    "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory",
+                    hdrs,
+                    nlohmann::json({{"cascadeId", targetCid}}).dump(),
+                    "application/json"
+                );
+                if (!trajRes || trajRes->status != 200) {
+                    return false;
+                }
+                auto tj = nlohmann::json::parse(trajRes->body, nullptr, false);
+                if (tj.is_discarded() || !tj.is_object() || !tj.contains("trajectory") || !tj["trajectory"].is_object()) {
+                    return false;
+                }
+                const auto& steps = tj["trajectory"].value("steps", nlohmann::json::array());
+                for (int i = static_cast<int>(steps.size()) - 1; i >= 0; --i) {
+                    const auto& rs = steps[static_cast<size_t>(i)];
+                    if (!rs.is_object()) continue;
+                    std::string stStatus = rs.value("status", "");
+                    std::string stType = rs.value("type", "");
+                    bool hasAskQ = (stType == "CORTEX_STEP_TYPE_ASK_QUESTION") ||
+                                   rs.contains("askQuestion") ||
+                                   (rs.contains("requestedInteraction") && rs["requestedInteraction"].is_object() &&
+                                    rs["requestedInteraction"].contains("askQuestion"));
+                    if (stStatus != "CORTEX_STEP_STATUS_WAITING" || !hasAskQ) {
+                        continue;
+                    }
+
+                    std::string trajectoryId = tj["trajectory"].value("trajectoryId", targetCid);
+                    int stepIndex = i;
+                    if (rs.contains("metadata") && rs["metadata"].is_object() &&
+                        rs["metadata"].contains("sourceTrajectoryStepInfo") &&
+                        rs["metadata"]["sourceTrajectoryStepInfo"].is_object()) {
+                        const auto& stInfo = rs["metadata"]["sourceTrajectoryStepInfo"];
+                        trajectoryId = stInfo.value("trajectoryId", trajectoryId);
+                        stepIndex = stInfo.value("stepIndex", stepIndex);
+                    }
+
+                    nlohmann::json rawQuestions = nlohmann::json::array();
+                    if (rs.contains("requestedInteraction") && rs["requestedInteraction"].is_object() &&
+                        rs["requestedInteraction"].contains("askQuestion") &&
+                        rs["requestedInteraction"]["askQuestion"].is_object() &&
+                        rs["requestedInteraction"]["askQuestion"].contains("questions")) {
+                        rawQuestions = rs["requestedInteraction"]["askQuestion"]["questions"];
+                    } else if (rs.contains("askQuestion") && rs["askQuestion"].is_object() &&
+                               rs["askQuestion"].contains("questions")) {
+                        rawQuestions = rs["askQuestion"]["questions"];
+                    }
+                    nlohmann::json normQuestions = normalizeQuestionsJson(rawQuestions);
+                    if (normQuestions.empty()) {
+                        return false;
+                    }
+
+                    nlohmann::json responses = nlohmann::json::array();
+                    for (size_t qIdx = 0; qIdx < normQuestions.size(); ++qIdx) {
+                        const auto& nq = normQuestions[qIdx];
+                        std::string qText = nq.value("question", "");
+                        bool isMulti = nq.value("isMultiSelect", false);
+                        nlohmann::json qOptObjs = nq.value("optionObjects", nlohmann::json::array());
+                        nlohmann::json selectedOptionIds = nlohmann::json::array();
+                        std::string writeInResponse;
+
+                        auto matchOptionStringToId = [&](const std::string& candidate) -> std::string {
+                            auto cf = candidate.find_first_not_of(" \t\r\n");
+                            if (cf == std::string::npos) return "";
+                            auto cl = candidate.find_last_not_of(" \t\r\n");
+                            std::string cTrim = candidate.substr(cf, cl - cf + 1);
+                            if (cTrim.empty()) return "";
+
+                            bool allDigits = std::all_of(cTrim.begin(), cTrim.end(), [](unsigned char ch) {
+                                return std::isdigit(ch) != 0;
+                            });
+                            if (allDigits) {
+                                try {
+                                    int idx1 = std::stoi(cTrim);
+                                    if (idx1 >= 1 && static_cast<size_t>(idx1) <= qOptObjs.size()) {
+                                        return qOptObjs[static_cast<size_t>(idx1 - 1)].value("id", std::to_string(idx1));
+                                    }
+                                } catch (...) {}
+                            }
+
+                            std::string cLow = toLowerAscii(cTrim);
+                            for (const auto& optObj : qOptObjs) {
+                                if (!optObj.is_object()) continue;
+                                std::string oId = optObj.value("id", "");
+                                std::string oTxt = optObj.value("text", "");
+                                std::string oTxtLow = toLowerAscii(oTxt);
+                                if (toLowerAscii(oId) == cLow || oTxtLow == cLow) {
+                                    return oId;
+                                }
+                            }
+                            for (const auto& optObj : qOptObjs) {
+                                if (!optObj.is_object()) continue;
+                                std::string oId = optObj.value("id", "");
+                                std::string oTxtLow = toLowerAscii(optObj.value("text", ""));
+                                if (!oTxtLow.empty() && oTxtLow.find(cLow) != std::string::npos) {
+                                    return oId;
+                                }
+                            }
+                            return "";
+                        };
+
+                        if (hasQuestionResponses && qIdx < j["questionResponses"].size() &&
+                            j["questionResponses"][qIdx].is_object()) {
+                            const auto& qr = j["questionResponses"][qIdx];
+                            if (qr.contains("selectedOptionIds") && qr["selectedOptionIds"].is_array()) {
+                                for (const auto& sid : qr["selectedOptionIds"]) {
+                                    if (sid.is_string() && !sid.get<std::string>().empty()) {
+                                        selectedOptionIds.push_back(sid.get<std::string>());
+                                    }
+                                }
+                            } else if (qr.contains("selectedOptions") && qr["selectedOptions"].is_array()) {
+                                for (const auto& so : qr["selectedOptions"]) {
+                                    if (!so.is_string()) continue;
+                                    std::string sVal = so.get<std::string>();
+                                    std::string matchedId = matchOptionStringToId(sVal);
+                                    if (!matchedId.empty()) {
+                                        selectedOptionIds.push_back(matchedId);
+                                    } else if (!sVal.empty()) {
+                                        if (!writeInResponse.empty()) writeInResponse += ", ";
+                                        writeInResponse += sVal;
+                                    }
+                                }
+                            }
+                            if (qr.contains("writeInResponse") && qr["writeInResponse"].is_string()) {
+                                std::string wir = qr["writeInResponse"].get<std::string>();
+                                if (!wir.empty()) {
+                                    writeInResponse = wir;
+                                }
+                            }
+                        } else {
+                            std::string matchedId = matchOptionStringToId(trimmedText);
+                            if (!matchedId.empty()) {
+                                selectedOptionIds.push_back(matchedId);
+                            } else {
+                                writeInResponse = trimmedText;
+                            }
+                        }
+
+                        responses.push_back({
+                            {"question", qText},
+                            {"options", qOptObjs},
+                            {"isMultiSelect", isMulti},
+                            {"selectedOptionIds", selectedOptionIds},
+                            {"writeInResponse", writeInResponse}
+                        });
+                    }
+
+                    nlohmann::json interactionPayload = {
+                        {"cascadeId", targetCid},
+                        {"interaction", {
+                            {"trajectoryId", trajectoryId},
+                            {"stepIndex", stepIndex},
+                            {"askQuestion", {
+                                {"responses", responses},
+                                {"cancelled", false}
+                            }}
+                        }}
+                    };
+                    auto intRes = cli.Post(
+                        "/exa.language_server_pb.LanguageServerService/HandleCascadeUserInteraction",
+                        hdrs,
+                        interactionPayload.dump(),
+                        "application/json"
+                    );
+                    if (intRes && intRes->status == 200) {
+                        outBody = intRes->body;
+                        std::lock_guard<std::mutex> lk(*lastRpcMutex);
+                        *lastRpcEndpoint = {ep.port, ep.csrf};
+                        return true;
+                    }
+                    break;
+                }
+            } catch (...) {}
+            return false;
+        };
+
         if (!cid.empty() && cid != "new") {
             const LsEndpoint* firstReachableEp = nullptr;
             for (const auto& ep : endpoints) {
@@ -4254,6 +5146,18 @@ void WebServer::setupRoutes() {
                     if (lockedHttpPort <= 0 && ep.lockedConversationId != cid) {
                         continue;
                     }
+                }
+                std::string interactionOut;
+                if (tryHandleWaitingAskQuestion(ep, cid, interactionOut)) {
+                    nlohmann::json resp;
+                    resp["status"] = "dispatched";
+                    resp["interactionHandled"] = true;
+                    resp["agentId"] = agentId;
+                    resp["conversationId"] = cid;
+                    resp["output"] = interactionOut;
+                    resp["response"] = interactionOut;
+                    res.set_content(resp.dump(2), "application/json");
+                    return;
                 }
                 bool reachable = false;
                 if (isLockedByRunningAgy || endpointOwnsConversation(ep, cid, reachable)) {
@@ -5235,6 +6139,29 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
 
     MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
 
+    std::set<std::string> knownSubagentIds;
+    for (const std::string& rPath : {cliBrain, ideBrain}) {
+        if (rPath.empty()) continue;
+        fs::path metaCachePath = fs::path(rPath).parent_path() / "cache" / "conversation_metadata.json";
+        std::error_code mEc;
+        if (fs::exists(metaCachePath, mEc) && !mEc) {
+            try {
+                std::ifstream mf(metaCachePath);
+                auto mj = nlohmann::json::parse(mf, nullptr, false);
+                if (!mj.is_discarded() && mj.is_object() &&
+                    mj.contains("conversations") && mj["conversations"].is_object()) {
+                    for (auto it = mj["conversations"].begin(); it != mj["conversations"].end(); ++it) {
+                        if (it.value().is_object() &&
+                            (it.value().value("is_internal", false) ||
+                             !it.value().value("parent_conversation_id", "").empty())) {
+                            knownSubagentIds.insert(it.key());
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
     std::vector<std::pair<std::string, std::string>> roots = {
         {"cli", cliBrain},
         {"ide", ideBrain}
@@ -5273,6 +6200,26 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
 
             int64_t mtimeTicks = mtime.time_since_epoch().count();
             WatchedTranscriptState& st = _watchedTranscripts[cid];
+            if (st.isSubagent) {
+                continue;
+            }
+            if (knownSubagentIds.count(cid) > 0) {
+                st.isSubagent = true;
+                continue;
+            }
+            fs::path perConvMetaPath = entry.path() / "cache" / "conversation_metadata.json";
+            if (fs::exists(perConvMetaPath, fEc) && !fEc) {
+                try {
+                    std::ifstream pmf(perConvMetaPath);
+                    auto pmj = nlohmann::json::parse(pmf, nullptr, false);
+                    if (!pmj.is_discarded() && pmj.is_object() &&
+                        (pmj.value("is_internal", false) ||
+                         !pmj.value("parent_conversation_id", "").empty())) {
+                        st.isSubagent = true;
+                        continue;
+                    }
+                } catch (...) {}
+            }
 
             if (!seedOnly && st.seeded &&
                 mtimeTicks == st.lastMtimeTicks &&
@@ -5310,6 +6257,7 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
             nlohmann::json lastStepObj;
             std::string prevGenericContent;
             std::string line;
+            bool seenFirstValidStep = false;
             while (std::getline(in, line)) {
                 if (line.empty()) continue;
                 auto j = nlohmann::json::parse(line, nullptr, false);
@@ -5320,6 +6268,13 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                     maxStepIdx = sIdx;
                 }
                 std::string sType = j.value("type", "");
+                if (!seenFirstValidStep) {
+                    seenFirstValidStep = true;
+                    if (sType == "SYSTEM_MESSAGE" || j.value("source", "") == "SYSTEM") {
+                        st.isSubagent = true;
+                        break;
+                    }
+                }
                 if (st.cachedTitle.empty() && sType == "USER_INPUT") {
                     std::string uText = stripUserTags(j.value("content", ""));
                     if (!uText.empty()) {
@@ -5336,6 +6291,11 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                     prevGenericContent.clear();
                 }
                 lastStepObj = std::move(j);
+            }
+
+            if (st.isSubagent) {
+                st.pendingStepIndex = -1;
+                continue;
             }
 
             if (seedOnly) {
@@ -5394,11 +6354,16 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                         }
                     }
 
-                    if (tcName == "ask_question") {
+                    if (tcName == "ask_question" || tcName == "AskUserQuestion") {
                         isAgentQuestion = true;
-                        if (argsObj.contains("questions") && argsObj["questions"].is_array() &&
-                            !argsObj["questions"].empty() && argsObj["questions"][0].is_object()) {
-                            questionSnippet = trimText(argsObj["questions"][0].value("question", ""));
+                        if (argsObj.contains("questions")) {
+                            nlohmann::json normQ = normalizeQuestionsJson(argsObj["questions"]);
+                            if (normQ.is_array() && !normQ.empty() && normQ[0].is_object()) {
+                                questionSnippet = trimText(normQ[0].value("question", ""));
+                            }
+                        }
+                        if (questionSnippet.empty() && argsObj.contains("question") && argsObj["question"].is_string()) {
+                            questionSnippet = trimText(argsObj["question"].get<std::string>());
                         }
                         break;
                     }
@@ -5437,7 +6402,9 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                                 !lastStepObj["tool_calls"].empty();
             if (lastType == "PLANNER_RESPONSE" && !hasToolCalls) {
                 std::string replyContent = trimText(lastStepObj.value("content", ""));
-                bool waitingForBgTask = (prevGenericContent.find("Tool is running as a background task with task id:") != std::string::npos);
+                bool waitingForBgTask =
+                    (prevGenericContent.find("Tool is running as a background task with task id:") != std::string::npos) ||
+                    (prevGenericContent.find("Created the following subagent:") != std::string::npos);
                 if (!replyContent.empty() && !waitingForBgTask) {
                     if (st.pendingStepIndex != lastStepIdx) {
                         st.pendingStepIndex = lastStepIdx;

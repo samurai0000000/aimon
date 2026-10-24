@@ -118,6 +118,7 @@ private:
         std::string cachedTitle;
         std::string cachedWorkspace;
         bool seeded = false;
+        bool isSubagent = false;
     };
     std::mutex _watchedTranscriptsMutex;
     std::map<std::string, WatchedTranscriptState> _watchedTranscripts;

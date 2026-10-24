@@ -1563,6 +1563,477 @@ static void testMultiProviderClaudeAndCursorSessionsAndNotifications() {
     std::cout << "[TestMobileGateway] testMultiProviderClaudeAndCursorSessionsAndNotifications passed!" << std::endl;
 }
 
+static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
+    std::cout << "[TestMobileGateway] Running testSubagentFilterAskQuestionAndProviderSlashCommands..." << std::endl;
+    std::string baseDir = "/tmp/aimon_subagent_ux_" + std::to_string(getpid());
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliBrain = baseDir + "/cli_brain";
+    std::string claudeProjects = baseDir + "/claude_projects";
+    std::string cursorProjects = baseDir + "/cursor_projects";
+    std::string tempMobileDb = baseDir + "/mobile_devices.json";
+    fs::remove_all(baseDir);
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+    fs::create_directories(claudeProjects + "/-tmp-work-aimon");
+    fs::create_directories(cursorProjects + "/tmp-work-aimon/agent-transcripts/cursor-sess-1");
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_CLAUDE_PROJECTS_DIR", claudeProjects.c_str(), 1);
+    setenv("AIMON_CURSOR_PROJECTS_DIR", cursorProjects.c_str(), 1);
+    setenv("AIMON_WORKSPACE_ROOT", baseDir.c_str(), 1);
+    setenv("AIMON_NOTIFICATION_SETTLE_MS", "20", 1);
+
+    // 1. Seed a main parent conversation
+    std::string mainCid = "main-parent-1";
+    fs::path mainLogDir = fs::path(cliBrain) / mainCid / ".system_generated" / "logs";
+    fs::create_directories(mainLogDir);
+    fs::path mainTranscript = mainLogDir / "transcript.jsonl";
+    {
+        std::ofstream f(mainTranscript);
+        f << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-10-24T05:00:00Z\",\"content\":\"<USER_REQUEST>\\nOrchestrate multi-envelope plan\\n</USER_REQUEST>\"}\n";
+    }
+
+    // 2. Seed a Cursor conversation for /compact rollover testing
+    fs::path cursorFile = fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "cursor-sess-1" / "cursor-sess-1.jsonl";
+    {
+        std::ofstream f(cursorFile);
+        f << "{\"role\":\"user\",\"timestamp\":\"2026-10-24T05:01:00Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<user_query>\\nImplement dynamic prompt box\\n</user_query>\"}]}}\n";
+        f << "{\"role\":\"assistant\",\"timestamp\":\"2026-10-24T05:02:00Z\",\"message\":{\"model\":\"gpt-5\",\"content\":[{\"type\":\"text\",\"text\":\"Updated MessageInput.kt with dynamic heightIn.\"}]}}\n";
+    }
+
+    // 3. Start a local mock LanguageServer to test HandleCascadeUserInteraction for waiting ask_question steps
+    httplib::Server mockLs;
+    std::mutex lsMutex;
+    json lastInteractionReq;
+    int interactionCallCount = 0;
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory",
+                [&](const httplib::Request& req, httplib::Response& res) {
+        auto body = json::parse(req.body, nullptr, false);
+        std::string reqCid = body.value("cascadeId", "");
+        if (reqCid != mainCid) {
+            res.status = 404;
+            res.set_content("{}", "application/json");
+            return;
+        }
+        json traj = {
+            {"trajectory", {
+                {"trajectoryId", "traj-main-1"},
+                {"steps", json::array({
+                    {
+                        {"type", "CORTEX_STEP_TYPE_USER_INPUT"},
+                        {"status", "CORTEX_STEP_STATUS_DONE"},
+                        {"userInput", {{"userResponse", "Orchestrate multi-envelope plan"}}}
+                    },
+                    {
+                        {"type", "CORTEX_STEP_TYPE_ASK_QUESTION"},
+                        {"status", "CORTEX_STEP_STATUS_WAITING"},
+                        {"metadata", {
+                            {"sourceTrajectoryStepInfo", {
+                                {"trajectoryId", "traj-main-1"},
+                                {"stepIndex", 5}
+                            }}
+                        }},
+                        {"requestedInteraction", {
+                            {"askQuestion", {
+                                {"questions", json::array({
+                                    {
+                                        {"question", "Which option do you prefer?"},
+                                        {"isMultiSelect", false},
+                                        {"options", json::array({
+                                            {{"id", "1"}, {"text", "(Recommended) Option Alpha"}},
+                                            {{"id", "2"}, {"text", "Option Beta"}}
+                                        })}
+                                    }
+                                })}
+                            }}
+                        }}
+                    }
+                })}
+            }}
+        };
+        res.set_content(traj.dump(), "application/json");
+    });
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/HandleCascadeUserInteraction",
+                [&](const httplib::Request& req, httplib::Response& res) {
+        std::lock_guard<std::mutex> lk(lsMutex);
+        lastInteractionReq = json::parse(req.body, nullptr, false);
+        ++interactionCallCount;
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+
+    int lsPort = mockLs.bind_to_any_port("127.0.0.1");
+    assert(lsPort > 0);
+    std::thread lsThread([&]() { mockLs.listen_after_bind(); });
+    mockLs.wait_until_ready();
+
+    std::string mockAgy = baseDir + "/mock_agy_ux.sh";
+    {
+        std::ofstream mf(mockAgy);
+        mf << "#!/bin/sh\nexit 0\n";
+    }
+    chmod(mockAgy.c_str(), 0755);
+    setenv("AIMON_AGY_BIN", mockAgy.c_str(), 1);
+    setenv("AGY_LS_PORT", std::to_string(lsPort).c_str(), 1);
+    setenv("AGY_LS_CSRF_TOKEN", "ux-csrf-token", 1);
+
+    MobileGateway& gw = MobileGateway::getInstance();
+    assert(gw.init(tempMobileDb));
+    gw.clearAgentEvents();
+    std::string secret = gw.createPairingSecret(120);
+    std::string validToken;
+    assert(gw.verifyPairingCode(secret, "subagent-ux-dev", "Test Phone", validToken));
+
+    StateStore& stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.endpointsEnabled = false;
+
+    WebServer server(stateStore, historyStore, config);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", validToken}};
+
+    // --- Part 1: Subagent Exclusion in GET /api/agent/conversations & scanTranscriptsForNotifications ---
+    // Create a subagent with SYSTEM_MESSAGE at step 0 AND a task.md file (plus a corrupted JSON line fault)
+    std::string subCid1 = "subagent-with-task";
+    fs::path subDir1 = fs::path(cliBrain) / subCid1;
+    fs::create_directories(subDir1 / ".system_generated" / "logs");
+    {
+        std::ofstream tf(subDir1 / "task.md");
+        tf << "# Subagent Envelope 1 Task\n";
+        std::ofstream lf(subDir1 / ".system_generated" / "logs" / "transcript.jsonl");
+        lf << "{corrupted json line that must be skipped\n";
+        lf << "{\"step_index\":0,\"type\":\"SYSTEM_MESSAGE\",\"source\":\"SYSTEM\",\"status\":\"DONE\",\"content\":\"You are executing Envelope 1\"}\n";
+        lf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Subagent finished work\",\"tool_calls\":[]}\n";
+    }
+
+    // Create a second subagent marked via per-conversation cache/conversation_metadata.json
+    std::string subCid2 = "subagent-meta-internal";
+    fs::path subDir2 = fs::path(cliBrain) / subCid2;
+    fs::create_directories(subDir2 / ".system_generated" / "logs");
+    fs::create_directories(subDir2 / "cache");
+    {
+        std::ofstream mf(subDir2 / "cache" / "conversation_metadata.json");
+        mf << "{\"is_internal\":true,\"parent_conversation_id\":\"main-parent-1\"}\n";
+        std::ofstream lf(subDir2 / ".system_generated" / "logs" / "transcript.jsonl");
+        lf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"Internal task\"}\n";
+        lf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Internal subagent done\",\"tool_calls\":[]}\n";
+    }
+
+    // Verify GET /api/agent/conversations excludes both subagents by default
+    auto resConvsDefault = client.Get("/api/agent/conversations", headers);
+    assert(resConvsDefault && resConvsDefault->status == 200);
+    json convsDefault = json::parse(resConvsDefault->body)["conversations"];
+    for (const auto& c : convsDefault) {
+        std::string cidVal = c.value("id", "");
+        assert(cidVal != subCid1);
+        assert(cidVal != subCid2);
+    }
+
+    // Verify include_subagents=true includes them
+    auto resConvsAll = client.Get("/api/agent/conversations?include_subagents=true", headers);
+    assert(resConvsAll && resConvsAll->status == 200);
+    json convsAll = json::parse(resConvsAll->body)["conversations"];
+    bool foundSub1 = false;
+    bool foundSub2 = false;
+    for (const auto& c : convsAll) {
+        if (c.value("id", "") == subCid1) foundSub1 = true;
+        if (c.value("id", "") == subCid2) foundSub2 = true;
+    }
+    assert(foundSub1 && foundSub2);
+
+    // Verify scanTranscriptsForNotifications emits ZERO notifications for subagents even after settle delay
+    server.scanTranscriptsForNotifications(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    server.scanTranscriptsForNotifications(false);
+    assert(gw.getRecentAgentEventsSince(0).empty());
+
+    // --- Part 2: Main Agent Pausing on "Created the following subagent:" ---
+    {
+        std::ofstream f(mainTranscript, std::ios::app);
+        f << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Spawning Envelope 1 subagent.\",\"tool_calls\":[{\"name\":\"invoke_subagent\",\"args\":{\"Role\":\"Envelope 1 Executor\"}}]}\n";
+        f << "{\"step_index\":2,\"type\":\"GENERIC\",\"status\":\"DONE\",\"content\":\"Created the following subagent:\\n- Conversation ID: subagent-with-task\"}\n";
+        f << "{\"step_index\":3,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Spawned subagent, waiting for completion.\",\"tool_calls\":[]}\n";
+        fs::last_write_time(mainTranscript, fs::file_time_type::clock::now());
+    }
+    server.scanTranscriptsForNotifications(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    server.scanTranscriptsForNotifications(false);
+    // Must NOT emit a premature prompt_answered while main agent is waiting for subagent!
+    assert(gw.getRecentAgentEventsSince(0).empty());
+
+    // --- Part 3: Stringified ask_question in transcript.jsonl & HandleCascadeUserInteraction ---
+    {
+        std::ofstream f(mainTranscript, std::ios::app);
+        f << "{\"step_index\":4,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"<USER_REQUEST>\\n/grill-me\\n</USER_REQUEST>\"}\n";
+        f << "{\"step_index\":5,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"thinking\":\"Formulating question\",\"content\":\"\",\"tool_calls\":[{\"name\":\"ask_question\",\"args\":{\"questions\":\"[{\\\"is_multi_select\\\":false,\\\"options\\\":[\\\"(Recommended) Option Alpha\\\",\\\"Option Beta\\\"],\\\"question\\\":\\\"Which option do you prefer?\\\"}]\"}}]}\n";
+        fs::last_write_time(mainTranscript, fs::file_time_type::clock::now());
+    }
+    server.scanTranscriptsForNotifications(false);
+    auto qEvents = gw.getRecentAgentEventsSince(0);
+    assert(qEvents.size() == 1);
+    assert(qEvents[0].event == "agent_question");
+    assert(qEvents[0].conversationId == mainCid);
+    assert(qEvents[0].snippet == "Which option do you prefer?");
+    uint64_t lastSeq = qEvents.back().seq;
+
+    // Verify GET /api/agent/transcript parses stringified args.questions into structured askQuestion
+    auto resMainTrans = client.Get(("/api/agent/transcript?id=" + mainCid).c_str(), headers);
+    assert(resMainTrans && resMainTrans->status == 200);
+    json mainTransJson = json::parse(resMainTrans->body);
+    bool foundAskQStep = false;
+    for (const auto& st : mainTransJson["steps"]) {
+        if (st.value("stepIndex", -1) == 5) {
+            foundAskQStep = true;
+            assert(st.contains("askQuestion") && st["askQuestion"].is_object());
+            assert(st["askQuestion"].value("answered", true) == false);
+            const auto& qs = st["askQuestion"]["questions"];
+            assert(qs.is_array() && qs.size() == 1);
+            assert(qs[0].value("question", "") == "Which option do you prefer?");
+            assert(qs[0]["options"].size() == 2);
+            assert(qs[0]["options"][0].get<std::string>() == "(Recommended) Option Alpha");
+            assert(qs[0]["options"][1].get<std::string>() == "Option Beta");
+            assert(st["tool_calls"][0]["arguments"]["questions"].is_array());
+        }
+    }
+    assert(foundAskQStep);
+
+    // Send structured questionResponses (with empty text!) to POST /api/agent/prompt and verify HandleCascadeUserInteraction
+    json ansReq1 = {
+        {"conversationId", mainCid},
+        {"text", ""},
+        {"questionResponses", json::array({
+            {
+                {"selectedOptions", json::array({"(Recommended) Option Alpha"})},
+                {"writeInResponse", ""}
+            }
+        })}
+    };
+    auto resAns1 = client.Post("/api/agent/prompt", headers, ansReq1.dump(), "application/json");
+    assert(resAns1 && resAns1->status == 200);
+    json ansBody1 = json::parse(resAns1->body);
+    assert(ansBody1.value("status", "") == "dispatched");
+    assert(ansBody1.value("interactionHandled", false) == true);
+    {
+        std::lock_guard<std::mutex> lk(lsMutex);
+        assert(interactionCallCount == 1);
+        assert(lastInteractionReq.value("cascadeId", "") == mainCid);
+        const auto& respArr = lastInteractionReq["interaction"]["askQuestion"]["responses"];
+        assert(respArr.is_array() && respArr.size() == 1);
+        assert(respArr[0]["selectedOptionIds"].size() == 1);
+        assert(respArr[0]["selectedOptionIds"][0].get<std::string>() == "1");
+        assert(lastInteractionReq["interaction"]["askQuestion"].value("cancelled", true) == false);
+    }
+
+    // Also test plain numeric text "2" from the prompt box when ask_question is waiting
+    json ansReq2 = {
+        {"conversationId", mainCid},
+        {"text", "2"}
+    };
+    auto resAns2 = client.Post("/api/agent/prompt", headers, ansReq2.dump(), "application/json");
+    assert(resAns2 && resAns2->status == 200);
+    {
+        std::lock_guard<std::mutex> lk(lsMutex);
+        assert(interactionCallCount == 2);
+        const auto& respArr = lastInteractionReq["interaction"]["askQuestion"]["responses"];
+        assert(respArr[0]["selectedOptionIds"].size() == 1);
+        assert(respArr[0]["selectedOptionIds"][0].get<std::string>() == "2");
+    }
+
+    // Append GENERIC answer step + final PLANNER_RESPONSE and verify askQuestion.answered == true & prompt_answered fires
+    {
+        std::ofstream f(mainTranscript, std::ios::app);
+        f << "{\"step_index\":6,\"type\":\"GENERIC\",\"status\":\"DONE\",\"content\":\"Q1: Which option do you prefer?\\nA1: (Recommended) Option Alpha\"}\n";
+        f << "{\"step_index\":7,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"All envelopes completed.\",\"tool_calls\":[]}\n";
+        fs::last_write_time(mainTranscript, fs::file_time_type::clock::now());
+    }
+    auto resMainTransAfter = client.Get(("/api/agent/transcript?id=" + mainCid).c_str(), headers);
+    assert(resMainTransAfter && resMainTransAfter->status == 200);
+    json mainTransAfterJson = json::parse(resMainTransAfter->body);
+    for (const auto& st : mainTransAfterJson["steps"]) {
+        if (st.value("stepIndex", -1) == 5) {
+            assert(st["askQuestion"].value("answered", false) == true);
+            assert(!st["askQuestion"]["answers"].empty());
+            assert(st["askQuestion"]["answers"][0].get<std::string>() == "(Recommended) Option Alpha");
+        }
+    }
+
+    server.scanTranscriptsForNotifications(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    server.scanTranscriptsForNotifications(false);
+    auto finalEvs = gw.getRecentAgentEventsSince(lastSeq);
+    assert(finalEvs.size() == 1);
+    assert(finalEvs[0].event == "prompt_answered");
+    assert(finalEvs[0].conversationId == mainCid);
+    assert(finalEvs[0].snippet == "All envelopes completed.");
+
+    // --- Part 4: Provider Slash Commands (/clear, /compact, /status, /doctor, /models, /plan, /ask, /effort) ---
+    std::string mockClaudeBin = baseDir + "/mock_claude_slash.sh";
+    std::string claudeArgsLog = baseDir + "/claude_slash_args.txt";
+    {
+        std::ofstream mf(mockClaudeBin);
+        mf << "#!/bin/sh\n";
+        mf << "if [ \"$1\" = \"--version\" ]; then\n";
+        mf << "  echo \"2.1.112 (Claude Code)\"\n";
+        mf << "  exit 0\n";
+        mf << "fi\n";
+        mf << "printf '%s\\n' \"$@\" > \"" << claudeArgsLog << "\"\n";
+        mf << "printf '{\"type\":\"result\",\"result\":\"Claude compacted/executed OK\",\"session_id\":\"claude-compacted-99\"}\\n'\n";
+    }
+    chmod(mockClaudeBin.c_str(), 0755);
+    setenv("AIMON_CLAUDE_BIN", mockClaudeBin.c_str(), 1);
+
+    std::string mockCursorBin = baseDir + "/mock_cursor_slash.sh";
+    std::string cursorArgsLog = baseDir + "/cursor_slash_args.txt";
+    {
+        std::ofstream mf(mockCursorBin);
+        mf << "#!/bin/sh\n";
+        mf << "if [ \"$1\" = \"--version\" ]; then\n";
+        mf << "  echo \"cursor-agent 0.48.0\"\n";
+        mf << "  exit 0\n";
+        mf << "fi\n";
+        mf << "printf '%s\\n' \"$@\" > \"" << cursorArgsLog << "\"\n";
+        mf << "printf '{\"type\":\"result\",\"result\":\"Cursor checkpoint summary ready\",\"session_id\":\"cursor-compacted-88\"}\\n'\n";
+    }
+    chmod(mockCursorBin.c_str(), 0755);
+    setenv("AIMON_CURSOR_BIN", mockCursorBin.c_str(), 1);
+
+    // 4a. /clear on claude and cursor
+    for (const std::string prov : {"claude", "cursor"}) {
+        json reqClear = {{"text", "/clear"}, {"source", prov}, {"conversationId", prov + "-sess-1"}};
+        auto resCl = client.Post("/api/agent/prompt", headers, reqClear.dump(), "application/json");
+        assert(resCl && resCl->status == 200);
+        json bCl = json::parse(resCl->body);
+        assert(bCl.value("status", "") == "cleared");
+        assert(bCl.value("conversationId", "") == "new");
+        assert(bCl.value("source", "") == prov);
+    }
+
+    // 4b. Boundary: /compact on "new" session returns command_response without invoking CLI
+    {
+        json reqCompNew = {{"text", "/compact"}, {"source", "cursor"}, {"conversationId", "new"}};
+        auto resCompNew = client.Post("/api/agent/prompt", headers, reqCompNew.dump(), "application/json");
+        assert(resCompNew && resCompNew->status == 200);
+        json bCompNew = json::parse(resCompNew->body);
+        assert(bCompNew.value("status", "") == "command_response");
+        assert(bCompNew.value("response", "").find("No active conversation") != std::string::npos);
+    }
+
+    // 4c. /compact focus on tests on active cursor-sess-1 rolls over to fresh session WITHOUT --resume
+    {
+        json reqComp = {{"text", "/compact focus on tests"}, {"source", "cursor"}, {"conversationId", "cursor-sess-1"}};
+        auto resComp = client.Post("/api/agent/prompt", headers, reqComp.dump(), "application/json");
+        assert(resComp && resComp->status == 200);
+        json bComp = json::parse(resComp->body);
+        assert(bComp.value("status", "") == "compacted");
+        assert(bComp.value("compactedFrom", "") == "cursor-sess-1");
+        assert(bComp.value("conversationId", "") == "cursor-compacted-88");
+        assert(bComp.contains("steps") && bComp["steps"].size() == 2);
+        assert(bComp["steps"][0].value("text", "") == "/compact focus on tests");
+        assert(bComp["steps"][1].value("text", "") == "Cursor checkpoint summary ready");
+
+        std::ifstream af(cursorArgsLog);
+        std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
+        assert(logged.find("--resume") == std::string::npos);
+        assert(logged.find("<CONTEXT_SUMMARY>") != std::string::npos);
+        assert(logged.find("Updated MessageInput.kt with dynamic heightIn.") != std::string::npos);
+        assert(logged.find("Focus especially on: focus on tests") != std::string::npos);
+    }
+
+    // 4d. Verify Claude Code native compact_boundary + isCompactSummary JSONL parsing
+    {
+        fs::path claudeCompFile = fs::path(claudeProjects) / "-tmp-work-aimon" / "claude-native-comp.jsonl";
+        std::ofstream cf(claudeCompFile);
+        cf << "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Old turn before compact\"}}\n";
+        cf << "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"Old assistant turn\"}}\n";
+        cf << "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n";
+        cf << "{\"type\":\"user\",\"isCompactSummary\":true,\"message\":{\"role\":\"user\",\"content\":\"This session is being continued from a previous conversation. Summary: Envelope 1 done.\"}}\n";
+        cf.close();
+
+        auto resCompTrans = client.Get("/api/agent/transcript?id=claude-native-comp", headers);
+        assert(resCompTrans && resCompTrans->status == 200);
+        json compTrans = json::parse(resCompTrans->body);
+        assert(compTrans["steps"].size() == 1);
+        assert(compTrans["steps"][0].value("type", "") == "PLANNER_RESPONSE");
+        assert(compTrans["steps"][0].value("text", "").find("Context Compacted") != std::string::npos);
+        assert(compTrans["steps"][0].value("text", "").find("Summary: Envelope 1 done.") != std::string::npos);
+    }
+
+    // 4e. /plan, /ask, /effort, /status, /doctor, /models
+    {
+        json reqPlanClaude = {{"text", "/plan Design auth flow"}, {"source", "claude"}, {"conversationId", "claude-sess-1"}};
+        auto resPlanClaude = client.Post("/api/agent/prompt", headers, reqPlanClaude.dump(), "application/json");
+        assert(resPlanClaude && resPlanClaude->status == 200);
+        std::ifstream af(claudeArgsLog);
+        std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
+        assert(logged.find("--permission-mode\nplan") != std::string::npos);
+        assert(logged.find("Design auth flow") != std::string::npos);
+    }
+    {
+        json reqPlanCursor = {{"text", "/plan Design auth flow"}, {"source", "cursor"}, {"conversationId", "cursor-sess-1"}};
+        auto resPlanCursor = client.Post("/api/agent/prompt", headers, reqPlanCursor.dump(), "application/json");
+        assert(resPlanCursor && resPlanCursor->status == 200);
+        std::ifstream af(cursorArgsLog);
+        std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
+        assert(logged.find("--mode\nplan") != std::string::npos);
+        assert(logged.find("Design auth flow") != std::string::npos);
+    }
+    {
+        json reqAskCursor = {{"text", "/ask How does auth work?"}, {"source", "cursor"}, {"conversationId", "cursor-sess-1"}};
+        auto resAskCursor = client.Post("/api/agent/prompt", headers, reqAskCursor.dump(), "application/json");
+        assert(resAskCursor && resAskCursor->status == 200);
+        std::ifstream af(cursorArgsLog);
+        std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
+        assert(logged.find("--mode\nask") != std::string::npos);
+        assert(logged.find("How does auth work?") != std::string::npos);
+    }
+    {
+        json reqEffortClaude = {{"text", "/effort high Refactor parser"}, {"source", "claude"}, {"conversationId", "claude-sess-1"}};
+        auto resEffortClaude = client.Post("/api/agent/prompt", headers, reqEffortClaude.dump(), "application/json");
+        assert(resEffortClaude && resEffortClaude->status == 200);
+        std::ifstream af(claudeArgsLog);
+        std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
+        assert(logged.find("--effort\nhigh") != std::string::npos);
+        assert(logged.find("Refactor parser") != std::string::npos);
+    }
+    for (const std::string cmd : {"/status", "/doctor", "/models"}) {
+        for (const std::string prov : {"claude", "cursor"}) {
+            json reqCmd = {{"text", cmd}, {"source", prov}, {"conversationId", prov + "-sess-1"}};
+            auto resCmd = client.Post("/api/agent/prompt", headers, reqCmd.dump(), "application/json");
+            assert(resCmd && resCmd->status == 200);
+            json bCmd = json::parse(resCmd->body);
+            assert(bCmd.value("status", "") == "command_response");
+            assert(bCmd.value("command", "") == cmd);
+            assert(!bCmd.value("response", "").empty());
+        }
+    }
+
+    server.stop();
+    mockLs.stop();
+    if (lsThread.joinable()) lsThread.join();
+
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_CLAUDE_PROJECTS_DIR");
+    unsetenv("AIMON_CURSOR_PROJECTS_DIR");
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    unsetenv("AIMON_NOTIFICATION_SETTLE_MS");
+    unsetenv("AIMON_AGY_BIN");
+    unsetenv("AGY_LS_PORT");
+    unsetenv("AGY_LS_CSRF_TOKEN");
+    unsetenv("AIMON_CLAUDE_BIN");
+    unsetenv("AIMON_CURSOR_BIN");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] testSubagentFilterAskQuestionAndProviderSlashCommands passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -1578,6 +2049,7 @@ int main() {
     testAgentPromptPreservesCascadeConfigAndModelM418();
     testSlashCommandsAndSessionNotifications();
     testMultiProviderClaudeAndCursorSessionsAndNotifications();
+    testSubagentFilterAskQuestionAndProviderSlashCommands();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;
