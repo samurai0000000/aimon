@@ -2836,6 +2836,7 @@ void WebServer::setupRoutes() {
             std::string status;
             std::string parentConversationId;
             int nestingDepth = 0;
+            std::string agentName;
         };
 
         std::map<std::string, DbConvSummary> summariesMap;
@@ -2853,12 +2854,25 @@ void WebServer::setupRoutes() {
             if (sqlite3_open_v2(summariesDbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK && db) {
                 sqlite3_busy_timeout(db, 300);
                 sqlite3_stmt* stmt = nullptr;
-                const char* sql =
+                const char* sqlWithAgent =
+                    "SELECT conversation_id, title, preview, step_count, "
+                    "CAST(strftime('%s', substr(last_modified_time, 1, 19)) AS INTEGER), "
+                    "workspace_uris, status, parent_conversation_id, nesting_depth, agent_name "
+                    "FROM conversation_summaries";
+                const char* sqlFallback =
                     "SELECT conversation_id, title, preview, step_count, "
                     "CAST(strftime('%s', substr(last_modified_time, 1, 19)) AS INTEGER), "
                     "workspace_uris, status, parent_conversation_id, nesting_depth "
                     "FROM conversation_summaries";
-                if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK && stmt) {
+                if (sqlite3_prepare_v2(db, sqlWithAgent, -1, &stmt, nullptr) != SQLITE_OK) {
+                    if (stmt) {
+                        sqlite3_finalize(stmt);
+                        stmt = nullptr;
+                    }
+                    sqlite3_prepare_v2(db, sqlFallback, -1, &stmt, nullptr);
+                }
+                if (stmt) {
+                    int colCount = sqlite3_column_count(stmt);
                     while (sqlite3_step(stmt) == SQLITE_ROW) {
                         const char* cId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
                         if (!cId || !*cId) continue;
@@ -2888,9 +2902,16 @@ void WebServer::setupRoutes() {
                         const char* cPar = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
                         if (cPar) ds.parentConversationId = cPar;
                         ds.nestingDepth = sqlite3_column_int(stmt, 8);
+                        if (colCount >= 10) {
+                            const char* cAg = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
+                            if (cAg) ds.agentName = cAg;
+                        }
 
-                        if (ds.nestingDepth > 0 || !ds.parentConversationId.empty()) {
+                        if (ds.nestingDepth > 0 || !ds.parentConversationId.empty() || !ds.agentName.empty()) {
                             subagentIds.insert(ds.id);
+                        }
+                        if (ds.stepCount <= 0 && ds.title.empty() && ds.preview.empty()) {
+                            continue;
                         }
                         summariesMap[ds.id] = std::move(ds);
                     }
@@ -3138,6 +3159,9 @@ void WebServer::setupRoutes() {
                     title = title.substr(0, nlPos);
                 }
                 if (title.empty()) {
+                    if (!includeSubagents) {
+                        return false;
+                    }
                     title = "Conversation " + id.substr(0, std::min<size_t>(8, id.length()));
                 } else if (title.length() > 80) {
                     title = title.substr(0, 77) + "...";
@@ -3307,6 +3331,10 @@ void WebServer::setupRoutes() {
             if (isInternalSubagent) {
                 return false;
             }
+            if (!includeSubagents && hasTranscript && firstPrompt.empty() &&
+                (!hasDbSummary || sumIt->second.title.empty())) {
+                return false;
+            }
 
             if (firstPrompt.empty() && hasDbSummary && !sumIt->second.preview.empty()) {
                 std::string cleanPrev = stripUserRequestTags(sumIt->second.preview);
@@ -3331,6 +3359,9 @@ void WebServer::setupRoutes() {
                 }
             }
             if (title.empty()) {
+                if (!includeSubagents) {
+                    return false;
+                }
                 title = "Conversation " + id.substr(0, std::min<size_t>(8, id.length()));
             } else if (title.length() > 80) {
                 title = title.substr(0, 77) + "...";
@@ -6258,6 +6289,7 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
             std::string prevGenericContent;
             std::string line;
             bool seenFirstValidStep = false;
+            bool seenUserInput = false;
             while (std::getline(in, line)) {
                 if (line.empty()) continue;
                 auto j = nlohmann::json::parse(line, nullptr, false);
@@ -6274,6 +6306,9 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                         st.isSubagent = true;
                         break;
                     }
+                }
+                if (sType == "USER_INPUT") {
+                    seenUserInput = true;
                 }
                 if (st.cachedTitle.empty() && sType == "USER_INPUT") {
                     std::string uText = stripUserTags(j.value("content", ""));
@@ -6293,7 +6328,7 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                 lastStepObj = std::move(j);
             }
 
-            if (st.isSubagent) {
+            if (st.isSubagent || !seenUserInput) {
                 st.pendingStepIndex = -1;
                 continue;
             }

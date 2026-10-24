@@ -1727,7 +1727,16 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         lf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Internal subagent done\",\"tool_calls\":[]}\n";
     }
 
-    // Verify GET /api/agent/conversations excludes both subagents by default
+    // Create a third session with only PLANNER_RESPONSE (no USER_INPUT and no title)
+    std::string subCid3 = "subagent-planner-only";
+    fs::path subDir3 = fs::path(cliBrain) / subCid3;
+    fs::create_directories(subDir3 / ".system_generated" / "logs");
+    {
+        std::ofstream lf(subDir3 / ".system_generated" / "logs" / "transcript.jsonl");
+        lf << "{\"step_index\":0,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Unprompted background output\",\"tool_calls\":[]}\n";
+    }
+
+    // Verify GET /api/agent/conversations excludes all three by default
     auto resConvsDefault = client.Get("/api/agent/conversations", headers);
     assert(resConvsDefault && resConvsDefault->status == 200);
     json convsDefault = json::parse(resConvsDefault->body)["conversations"];
@@ -1735,6 +1744,7 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         std::string cidVal = c.value("id", "");
         assert(cidVal != subCid1);
         assert(cidVal != subCid2);
+        assert(cidVal != subCid3);
     }
 
     // Verify include_subagents=true includes them
