@@ -2128,6 +2128,73 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         assert(pollObj["steps"].size() == 0);
     }
 
+    // 4f-2. Cursor active subagent live merging, CallDynamicTool unwrapping, GetDynamicTools filtering, and synthetic prompt filtering
+    {
+        fs::path cursorLiveDir = fs::path(cursorProjects) / "home-samurai-work-aimon" / "agent-transcripts" / "cursor-live-sub-sess";
+        fs::create_directories(cursorLiveDir / "subagents");
+        fs::path parentJsonl = cursorLiveDir / "cursor-live-sub-sess.jsonl";
+        {
+            std::ofstream pf(parentJsonl);
+            pf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<timestamp>2026-10-25T01:55:22.405Z</timestamp>\\n<user_query>\\nstart-plan\\n</user_query>\"}]}}\n";
+            pf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.\"}]}}\n";
+            pf << "{\"role\":\"assistant\",\"message\":{\"content\":["
+               << "{\"type\":\"text\",\"text\":\"I'll start by reading the plan-lifecycle skill and plan/plan_windows_kvm_pmuserenr.md, then inspect the collaboration-planning skill and prepare execution.\"},"
+               << "{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"/tmp/SKILL.md\"}},"
+               << "{\"type\":\"tool_use\",\"name\":\"GetDynamicTools\",\"input\":{\"namespace\":\"cursor\",\"toolName\":\"Task\"}},"
+               << "{\"type\":\"tool_use\",\"name\":\"CallDynamicTool\",\"input\":{\"toolName\":\"Task\",\"arguments\":{\"description\":\"Envelope 1 execution\"}}}"
+               << "]}}\n";
+        }
+        auto baseTime = fs::file_time_type::clock::now();
+        fs::last_write_time(parentJsonl, baseTime);
+
+        fs::path subJsonl = cursorLiveDir / "subagents" / "9b75b6dd-e834-4fd0-aa79-c4659ae95f3a.jsonl";
+        {
+            std::ofstream sf(subJsonl);
+            sf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<timestamp>2026-10-25T01:58:18.732Z</timestamp>\\n<user_query>\\nExecute Envelope 1 CAN plumbing\\nDetails here\\n</user_query>\"}]}}\n";
+            sf << "{\"role\":\"assistant\",\"message\":{\"content\":["
+               << "{\"type\":\"thinking\",\"thinking\":\"Checking target files\"},"
+               << "{\"type\":\"text\",\"text\":\"**Envelope state: Accepted.** All gates passed.\"},"
+               << "{\"type\":\"tool_use\",\"name\":\"UpdateCurrentStep\",\"input\":{\"completed_subtitle\":\"Verified E1\",\"final_summary\":\"Done\"}}"
+               << "]}}\n";
+        }
+        fs::last_write_time(subJsonl, baseTime + std::chrono::seconds(10));
+
+        auto resLive = client.Get("/api/agent/transcript?id=cursor-live-sub-sess", headers);
+        assert(resLive && resLive->status == 200);
+        json liveObj = json::parse(resLive->body);
+        const auto& lSteps = liveObj["steps"];
+        // Step 0: USER_INPUT ("start-plan") — synthetic background prompt filtered out
+        // Step 1: PLANNER_RESPONSE text bubble ("I'll start by reading...")
+        // Step 2: PLANNER_RESPONSE tool_calls (Read + unwrapped Task; GetDynamicTools filtered out)
+        // Step 3: Subagent banner ("🤖 **Subagent (9b75b6dd)** — Execute Envelope 1 CAN plumbing")
+        // Step 4: Subagent completion text bubble ("**Envelope state: Accepted.** All gates passed.")
+        assert(lSteps.size() == 5);
+        assert(lSteps[0].value("type", "") == "USER_INPUT");
+        assert(lSteps[0].value("text", "") == "start-plan");
+        assert(lSteps[0].value("createdAt", "") == "2026-10-25T01:55:22.405Z");
+
+        assert(lSteps[1].value("type", "") == "PLANNER_RESPONSE");
+        assert(lSteps[1]["step"].value("case", "") == "text");
+        assert(lSteps[1].value("text", "").find("I'll start by reading") != std::string::npos);
+        assert(lSteps[1]["tool_calls"].empty());
+
+        assert(lSteps[2].value("type", "") == "PLANNER_RESPONSE");
+        assert(lSteps[2]["tool_calls"].size() == 2);
+        assert(lSteps[2]["tool_calls"][0].value("name", "") == "Read");
+        assert(lSteps[2]["tool_calls"][1].value("name", "") == "Task");
+        assert(lSteps[2]["tool_calls"][1].value("toolSummary", "") == "Envelope 1 execution");
+
+        assert(lSteps[3].value("type", "") == "PLANNER_RESPONSE");
+        assert(lSteps[3]["step"].value("case", "") == "text");
+        assert(lSteps[3].value("text", "").find("Subagent (9b75b6dd)") != std::string::npos);
+        assert(lSteps[3].value("text", "").find("Execute Envelope 1 CAN plumbing") != std::string::npos);
+
+        assert(lSteps[4].value("type", "") == "PLANNER_RESPONSE");
+        assert(lSteps[4]["step"].value("case", "") == "text");
+        assert(lSteps[4].value("text", "") == "**Envelope state: Accepted.** All gates passed.");
+        assert(lSteps[4]["tool_calls"].empty());
+    }
+
     // 4e. /plan, /ask, /effort, /status, /doctor, /models
     {
         json reqPlanClaude = {{"text", "/plan Design auth flow"}, {"source", "claude"}, {"conversationId", "claude-sess-1"}};

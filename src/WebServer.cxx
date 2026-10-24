@@ -689,7 +689,11 @@ static std::string cleanProviderUserPrompt(const std::string& raw) {
     auto first = text.find_first_not_of(" \n\r\t");
     if (first == std::string::npos) return "";
     auto last = text.find_last_not_of(" \n\r\t");
-    return text.substr(first, last - first + 1);
+    std::string trimmed = text.substr(first, last - first + 1);
+    if (trimmed == "Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.") {
+        return "";
+    }
+    return trimmed;
 }
 
 static nlohmann::json normalizeQuestionsJson(const nlohmann::json& rawQ) {
@@ -1140,6 +1144,13 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             out.workspaceShort = fs::path(cwd).filename().string();
         }
         std::string tsStr = j.value("timestamp", j.value("created_at", ""));
+        if (tsStr.empty()) {
+            auto tsTagStart = line.find("<timestamp>");
+            auto tsTagEnd = line.find("</timestamp>");
+            if (tsTagStart != std::string::npos && tsTagEnd != std::string::npos && tsTagEnd > tsTagStart + 11) {
+                tsStr = line.substr(tsTagStart + 11, tsTagEnd - (tsTagStart + 11));
+            }
+        }
         uint64_t parsedSec = parseIso8601ToEpochSec(tsStr);
         if (parsedSec > out.lastActivitySec) {
             out.lastActivitySec = parsedSec;
@@ -1288,18 +1299,13 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 }
             }
         } else if (role == "assistant") {
-            if (summaryOnly) {
-                int curIdx = stepIdx++;
-                out.totalSteps = curIdx + 1;
-                out.hasValidTurns = true;
-                lastConsecutiveUserPrompt.clear();
-                continue;
-            }
-            for (auto& prevSt : out.steps) {
-                if (prevSt.is_object() && prevSt.contains("askQuestion") &&
-                    prevSt["askQuestion"].is_object() &&
-                    prevSt["askQuestion"].value("answered", true) == false) {
-                    prevSt["askQuestion"]["answered"] = true;
+            if (!summaryOnly) {
+                for (auto& prevSt : out.steps) {
+                    if (prevSt.is_object() && prevSt.contains("askQuestion") &&
+                        prevSt["askQuestion"].is_object() &&
+                        prevSt["askQuestion"].value("answered", true) == false) {
+                        prevSt["askQuestion"]["answered"] = true;
+                    }
                 }
             }
 
@@ -1338,6 +1344,37 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                             nlohmann::json inputObj = (blk.contains("input") && blk["input"].is_object())
                                                           ? blk["input"]
                                                           : nlohmann::json::object();
+                            if (toolName == "GetDynamicTools") {
+                                continue;
+                            }
+                            if (toolName == "UpdateCurrentStep") {
+                                std::string curStep = inputObj.value("current_step", "");
+                                std::string compSub = inputObj.value("completed_subtitle", "");
+                                std::string finSum = inputObj.value("final_summary", "");
+                                std::string stepNote;
+                                if (!curStep.empty()) stepNote = curStep;
+                                if (!compSub.empty()) {
+                                    if (!stepNote.empty()) stepNote += " — ";
+                                    stepNote += compSub;
+                                }
+                                if (!stepNote.empty()) {
+                                    if (!thinkingText.empty()) thinkingText += "\n";
+                                    thinkingText += stepNote;
+                                }
+                                if (!finSum.empty() && leadingText.empty() && replyText.empty()) {
+                                    replyText = finSum;
+                                }
+                                continue;
+                            }
+                            if (toolName == "CallDynamicTool") {
+                                std::string innerName = inputObj.value("toolName", "");
+                                if (!innerName.empty()) {
+                                    toolName = innerName;
+                                }
+                                if (inputObj.contains("arguments") && inputObj["arguments"].is_object()) {
+                                    inputObj = inputObj["arguments"];
+                                }
+                            }
                             if (toolName == "AskUserQuestion" || toolName == "ask_question") {
                                 nlohmann::json normQ = inputObj.contains("questions")
                                     ? normalizeQuestionsJson(inputObj["questions"])
@@ -1354,7 +1391,18 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                             std::string summary = inputObj.value("description",
                                                   inputObj.value("toolSummary",
                                                   inputObj.value("path",
-                                                  inputObj.value("file_path", ""))));
+                                                  inputObj.value("file_path",
+                                                  inputObj.value("pattern",
+                                                  inputObj.value("glob_pattern",
+                                                  inputObj.value("target_directory",
+                                                  inputObj.value("query", ""))))))));
+                            if (summary.empty() && toolName == "TodoWrite" &&
+                                inputObj.contains("todos") && inputObj["todos"].is_array()) {
+                                summary = std::to_string(inputObj["todos"].size()) + " todo items";
+                            }
+                            if (summary.empty() && toolName == "AwaitShell" && inputObj.contains("shell_id")) {
+                                summary = "shell " + inputObj.value("shell_id", "");
+                            }
                             parsedToolCalls.push_back({
                                 {"name", toolName},
                                 {"toolAction", ""},
@@ -1368,7 +1416,43 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 }
             }
 
-            if (!parsedToolCalls.empty()) {
+            bool isSubagentTranscript = (filePath.parent_path().filename() == "subagents");
+            bool splitLeadingTextAsBubble = !parsedToolCalls.empty() &&
+                                            !leadingText.empty() &&
+                                            stepAskQuestions.empty() &&
+                                            (isSubagentTranscript || leadingText.size() >= 60 || parsedToolCalls.size() > 2);
+
+            if (splitLeadingTextAsBubble) {
+                lastConsecutiveUserPrompt.clear();
+                int leadIdx = stepIdx++;
+                out.totalSteps = leadIdx + 1;
+                out.hasValidTurns = true;
+                if (!summaryOnly) {
+                    nlohmann::json leadStepJson = {
+                        {"index", leadIdx},
+                        {"stepIndex", leadIdx},
+                        {"step_index", leadIdx},
+                        {"type", "PLANNER_RESPONSE"},
+                        {"status", "DONE"},
+                        {"content", leadingText},
+                        {"thinking", thinkingText},
+                        {"plannerResponse", thinkingText},
+                        {"text", leadingText},
+                        {"tool_calls", nlohmann::json::array()},
+                        {"createdAt", tsStr},
+                        {"step", {
+                            {"case", "text"},
+                            {"value", leadingText}
+                        }}
+                    };
+                    out.lastStepObj = leadStepJson;
+                    if (sinceIndex < 0 || leadIdx > sinceIndex) {
+                        out.steps.push_back(std::move(leadStepJson));
+                    }
+                }
+                leadingText.clear();
+                thinkingText.clear();
+            } else if (!parsedToolCalls.empty()) {
                 if (!leadingText.empty() && stepAskQuestions.empty()) {
                     if (!thinkingText.empty()) thinkingText += "\n";
                     thinkingText += leadingText;
@@ -1397,34 +1481,154 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             out.totalSteps = curIdx + 1;
             out.hasValidTurns = true;
 
-            std::string displayValue = !replyText.empty() ? replyText : thinkingText;
-            nlohmann::json stepJson = {
-                {"index", curIdx},
-                {"stepIndex", curIdx},
-                {"step_index", curIdx},
-                {"type", "PLANNER_RESPONSE"},
-                {"status", "DONE"},
-                {"content", replyText},
-                {"thinking", thinkingText},
-                {"plannerResponse", thinkingText},
-                {"text", replyText},
-                {"tool_calls", parsedToolCalls},
-                {"createdAt", tsStr},
-                {"step", {
-                    {"case", !replyText.empty() ? "text" : "plannerResponse"},
-                    {"value", displayValue}
-                }}
-            };
-            if (!stepAskQuestions.empty()) {
-                stepJson["askQuestion"] = {
-                    {"questions", stepAskQuestions},
-                    {"answered", false},
-                    {"answers", nlohmann::json::array()}
+            if (!summaryOnly) {
+                std::string displayValue = !replyText.empty() ? replyText : thinkingText;
+                nlohmann::json stepJson = {
+                    {"index", curIdx},
+                    {"stepIndex", curIdx},
+                    {"step_index", curIdx},
+                    {"type", "PLANNER_RESPONSE"},
+                    {"status", "DONE"},
+                    {"content", replyText},
+                    {"thinking", thinkingText},
+                    {"plannerResponse", thinkingText},
+                    {"text", replyText},
+                    {"tool_calls", parsedToolCalls},
+                    {"createdAt", tsStr},
+                    {"step", {
+                        {"case", !replyText.empty() ? "text" : "plannerResponse"},
+                        {"value", displayValue}
+                    }}
                 };
+                if (!stepAskQuestions.empty()) {
+                    stepJson["askQuestion"] = {
+                        {"questions", stepAskQuestions},
+                        {"answered", false},
+                        {"answers", nlohmann::json::array()}
+                    };
+                }
+                out.lastStepObj = stepJson;
+                if (sinceIndex < 0 || curIdx > sinceIndex) {
+                    out.steps.push_back(std::move(stepJson));
+                }
             }
-            out.lastStepObj = stepJson;
-            if (sinceIndex < 0 || curIdx > sinceIndex) {
-                out.steps.push_back(std::move(stepJson));
+        }
+    }
+
+    if (providerSource == "cursor" && filePath.parent_path().filename() != "subagents") {
+        fs::path subDir = filePath.parent_path() / "subagents";
+        std::error_code subEc;
+        if (fs::exists(subDir, subEc) && fs::is_directory(subDir, subEc)) {
+            auto fileMtimeSec = [](const fs::path& p) -> uint64_t {
+                try {
+                    auto ftime = fs::last_write_time(p);
+                    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+                    );
+                    auto secs = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
+                    return (secs > 0) ? static_cast<uint64_t>(secs) : 0;
+                } catch (...) {
+                    return 0;
+                }
+            };
+            uint64_t parentMtimeSec = fileMtimeSec(filePath);
+            struct ActiveSubagentFile {
+                fs::path path;
+                std::string subId;
+                uint64_t startSec = 0;
+                uint64_t mtimeSec = 0;
+            };
+            std::vector<ActiveSubagentFile> activeSubs;
+            for (const auto& subEntry : fs::directory_iterator(subDir, subEc)) {
+                if (subEc || !subEntry.is_regular_file() || subEntry.path().extension() != ".jsonl") continue;
+                uint64_t subMtimeSec = fileMtimeSec(subEntry.path());
+                if (subMtimeSec == 0 || subMtimeSec < parentMtimeSec) continue;
+                std::string subId = subEntry.path().stem().string();
+                uint64_t startSec = 0;
+                std::ifstream sf(subEntry.path());
+                std::string firstLine;
+                if (sf.is_open() && std::getline(sf, firstLine)) {
+                    auto tsTagStart = firstLine.find("<timestamp>");
+                    auto tsTagEnd = firstLine.find("</timestamp>");
+                    if (tsTagStart != std::string::npos && tsTagEnd != std::string::npos && tsTagEnd > tsTagStart + 11) {
+                        startSec = parseIso8601ToEpochSec(
+                            firstLine.substr(tsTagStart + 11, tsTagEnd - (tsTagStart + 11)));
+                    }
+                    if (startSec == 0) {
+                        startSec = extractFastTimestamp(firstLine);
+                    }
+                }
+                if (startSec == 0) startSec = subMtimeSec;
+                activeSubs.push_back({subEntry.path(), subId, startSec, subMtimeSec});
+            }
+            std::sort(activeSubs.begin(), activeSubs.end(), [](const ActiveSubagentFile& a, const ActiveSubagentFile& b) {
+                if (a.startSec != b.startSec) return a.startSec < b.startSec;
+                if (a.mtimeSec != b.mtimeSec) return a.mtimeSec < b.mtimeSec;
+                return a.subId < b.subId;
+            });
+            for (const auto& subInfo : activeSubs) {
+                NormalizedProviderTranscript subParsed = parseProviderTranscriptJsonl(
+                    subInfo.path, "cursor", -1, projectSlug, false);
+                if (subParsed.steps.size() < 2) {
+                    continue;
+                }
+                if (subInfo.mtimeSec > out.lastActivitySec) {
+                    out.lastActivitySec = subInfo.mtimeSec;
+                }
+                if (subParsed.lastActivitySec > out.lastActivitySec) {
+                    out.lastActivitySec = subParsed.lastActivitySec;
+                }
+                std::string shortSubId = subInfo.subId.substr(0, std::min<size_t>(8, subInfo.subId.size()));
+                for (auto& subStep : subParsed.steps) {
+                    if (!subStep.is_object()) continue;
+                    int curIdx = stepIdx++;
+                    out.totalSteps = curIdx + 1;
+                    out.hasValidTurns = true;
+                    if (summaryOnly) continue;
+
+                    std::string stType = subStep.value("type", "");
+                    if (stType == "USER_INPUT") {
+                        std::string rawTask = subStep.value("text", "");
+                        std::string firstLine = rawTask;
+                        auto nl = firstLine.find_first_of("\r\n");
+                        if (nl != std::string::npos) {
+                            firstLine = firstLine.substr(0, nl);
+                        }
+                        if (firstLine.size() > 160) {
+                            firstLine = firstLine.substr(0, 157) + "...";
+                        }
+                        std::string banner = "🤖 **Subagent (" + shortSubId + ")**" +
+                                             (firstLine.empty() ? "" : (" — " + firstLine));
+                        nlohmann::json bannerStep = {
+                            {"index", curIdx},
+                            {"stepIndex", curIdx},
+                            {"step_index", curIdx},
+                            {"type", "PLANNER_RESPONSE"},
+                            {"status", "DONE"},
+                            {"content", banner},
+                            {"thinking", ""},
+                            {"plannerResponse", ""},
+                            {"text", banner},
+                            {"tool_calls", nlohmann::json::array()},
+                            {"createdAt", subStep.value("createdAt", "")},
+                            {"isSubagentStep", true},
+                            {"step", {{"case", "text"}, {"value", banner}}}
+                        };
+                        out.lastStepObj = bannerStep;
+                        if (sinceIndex < 0 || curIdx > sinceIndex) {
+                            out.steps.push_back(std::move(bannerStep));
+                        }
+                    } else {
+                        subStep["index"] = curIdx;
+                        subStep["stepIndex"] = curIdx;
+                        subStep["step_index"] = curIdx;
+                        subStep["isSubagentStep"] = true;
+                        out.lastStepObj = subStep;
+                        if (sinceIndex < 0 || curIdx > sinceIndex) {
+                            out.steps.push_back(std::move(subStep));
+                        }
+                    }
+                }
             }
         }
     }
@@ -7384,7 +7588,8 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
         bool hasToolCalls = lastStepObj.contains("tool_calls") &&
                             lastStepObj["tool_calls"].is_array() &&
                             !lastStepObj["tool_calls"].empty();
-        if (lastType == "PLANNER_RESPONSE" && !hasToolCalls) {
+        bool isSubagentStep = lastStepObj.value("isSubagentStep", false);
+        if (lastType == "PLANNER_RESPONSE" && !hasToolCalls && !isSubagentStep) {
             std::string replyContent = trimText(lastStepObj.value("text", ""));
             if (!replyContent.empty()) {
                 if (st.pendingStepIndex != lastStepIdx) {
