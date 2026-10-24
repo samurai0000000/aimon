@@ -610,6 +610,26 @@ static std::string cleanProviderUserPrompt(const std::string& raw) {
     stripBlock("<ADDITIONAL_METADATA>", "</ADDITIONAL_METADATA>");
     stripBlock("<USER_SETTINGS_CHANGE>", "</USER_SETTINGS_CHANGE>");
     stripBlock("<SYSTEM_MESSAGE>", "</SYSTEM_MESSAGE>");
+    stripBlock("<task-notification>", "</task-notification>");
+    stripBlock("<agent-message>", "</agent-message>");
+    stripBlock("<local-command-caveat>", "</local-command-caveat>");
+    stripBlock("<command-name>", "</command-name>");
+    stripBlock("<command-message>", "</command-message>");
+    stripBlock("<command-args>", "</command-args>");
+    stripBlock("<local-command-stdout>", "</local-command-stdout>");
+    stripBlock("<local-command-stderr>", "</local-command-stderr>");
+    stripBlock("<tools-used-before-summary>", "</tools-used-before-summary>");
+
+    while (true) {
+        auto rPos = text.find("Read the output file to retrieve the result:");
+        if (rPos == std::string::npos) break;
+        auto nl = text.find('\n', rPos);
+        if (nl == std::string::npos) {
+            text.erase(rPos);
+            break;
+        }
+        text.erase(rPos, nl - rPos + 1);
+    }
 
     auto first = text.find_first_not_of(" \n\r\t");
     if (first == std::string::npos) return "";
@@ -702,6 +722,164 @@ static void inferWorkspaceFromProjectSlug(const std::string& slug,
     }
 }
 
+static bool readCursorHookStateMetadata(const std::string& cid,
+                                        std::string& outModel,
+                                        std::string& outWorkspace,
+                                        int* outTurns = nullptr,
+                                        int* outStep = nullptr) {
+    if (cid.empty() || cid.find("..") != std::string::npos || cid.find('/') != std::string::npos) {
+        return false;
+    }
+    std::vector<fs::path> candidates;
+    std::string cursorProjects = getCursorProjectsDir();
+    if (!cursorProjects.empty()) {
+        candidates.push_back(fs::path(cursorProjects).parent_path() / "hooks" / "state" / (cid + ".json"));
+    }
+    const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
+    const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
+    if ((!envCli || !*envCli) && (!envIde || !*envIde)) {
+        candidates.push_back(fs::path(PathUtils::expandHome("~/.cursor/hooks/state")) / (cid + ".json"));
+    }
+    std::error_code ec;
+    for (const auto& p : candidates) {
+        if (!fs::exists(p, ec) || !fs::is_regular_file(p, ec)) continue;
+        std::ifstream f(p);
+        if (!f.is_open()) continue;
+        auto j = nlohmann::json::parse(f, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) continue;
+        std::string m = j.value("model", "");
+        if (!m.empty() && m != "Cursor") {
+            outModel = m;
+        }
+        std::string ws = j.value("workspace", "");
+        if (!ws.empty()) {
+            outWorkspace = ws;
+        }
+        if (outTurns) {
+            *outTurns = j.value("turns", -1);
+        }
+        if (outStep) {
+            *outStep = j.value("step", 0);
+        }
+        return true;
+    }
+    return false;
+}
+
+static void collectCursorSubagentIdsAndParentMtimes(
+    const std::string& cursorRoot,
+    std::set<std::string>& outSubagentIds,
+    std::map<std::string, uint64_t>& outParentMaxSubagentTs) {
+    if (cursorRoot.empty()) return;
+    std::error_code ec;
+    if (!fs::exists(cursorRoot, ec) || !fs::is_directory(cursorRoot, ec)) return;
+
+    auto fileMtimeSec = [](const fs::path& p) -> uint64_t {
+        try {
+            auto ftime = fs::last_write_time(p);
+            auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+            );
+            auto secs = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
+            return (secs > 0) ? static_cast<uint64_t>(secs) : 0;
+        } catch (...) {
+            return 0;
+        }
+    };
+
+    std::map<std::string, std::string> subToParent;
+    for (const auto& projEntry : fs::directory_iterator(cursorRoot, ec)) {
+        if (ec || !projEntry.is_directory()) continue;
+        fs::path transDir = projEntry.path() / "agent-transcripts";
+        std::error_code tEc;
+        if (!fs::exists(transDir, tEc) || !fs::is_directory(transDir, tEc)) continue;
+        for (const auto& convEntry : fs::directory_iterator(transDir, tEc)) {
+            if (tEc || !convEntry.is_directory()) continue;
+            std::string parentId = convEntry.path().filename().string();
+            if (parentId.empty() || parentId[0] == '.' || parentId == "subagents") continue;
+            fs::path subDir = convEntry.path() / "subagents";
+            std::error_code sEc;
+            if (fs::exists(subDir, sEc) && fs::is_directory(subDir, sEc)) {
+                for (const auto& subFile : fs::directory_iterator(subDir, sEc)) {
+                    if (sEc || !subFile.is_regular_file() || subFile.path().extension() != ".jsonl") continue;
+                    std::string subId = subFile.path().stem().string();
+                    if (subId.empty()) continue;
+                    outSubagentIds.insert(subId);
+                    subToParent[subId] = parentId;
+                    uint64_t mSec = fileMtimeSec(subFile.path());
+                    if (mSec > outParentMaxSubagentTs[parentId]) {
+                        outParentMaxSubagentTs[parentId] = mSec;
+                    }
+                }
+            }
+        }
+        // Second loop over transDir to fold top-level duplicate subagent mtimes into parent and check hook state
+        for (const auto& convEntry : fs::directory_iterator(transDir, tEc)) {
+            if (tEc || !convEntry.is_directory()) continue;
+            std::string cid = convEntry.path().filename().string();
+            if (cid.empty() || cid[0] == '.' || cid == "subagents") continue;
+            fs::path topJsonl = convEntry.path() / (cid + ".jsonl");
+            auto spIt = subToParent.find(cid);
+            if (spIt != subToParent.end()) {
+                uint64_t topSec = fileMtimeSec(topJsonl);
+                if (topSec > outParentMaxSubagentTs[spIt->second]) {
+                    outParentMaxSubagentTs[spIt->second] = topSec;
+                }
+            }
+            std::string dummyModel, dummyWs;
+            int hTurns = -1, hStep = 0;
+            if (readCursorHookStateMetadata(cid, dummyModel, dummyWs, &hTurns, &hStep)) {
+                if (hTurns == 0 && hStep > 0) {
+                    outSubagentIds.insert(cid);
+                }
+            }
+        }
+    }
+
+    // Also check <cursorRoot>/../chats/*/<cid>/store.db for subagentInfo / parentAgentId
+    fs::path chatsDir = fs::path(cursorRoot).parent_path() / "chats";
+    std::error_code cEc;
+    if (fs::exists(chatsDir, cEc) && fs::is_directory(chatsDir, cEc)) {
+        for (const auto& wsEntry : fs::directory_iterator(chatsDir, cEc)) {
+            if (cEc || !wsEntry.is_directory()) continue;
+            std::error_code uEc;
+            for (const auto& chatEntry : fs::directory_iterator(wsEntry.path(), uEc)) {
+                if (uEc || !chatEntry.is_directory()) continue;
+                std::string cid = chatEntry.path().filename().string();
+                fs::path storeDb = chatEntry.path() / "store.db";
+                if (!fs::exists(storeDb, uEc) || !fs::is_regular_file(storeDb, uEc)) continue;
+                sqlite3* db = nullptr;
+                if (sqlite3_open_v2(storeDb.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK && db) {
+                    sqlite3_busy_timeout(db, 100);
+                    sqlite3_stmt* stmt = nullptr;
+                    if (sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key='0'", -1, &stmt, nullptr) == SQLITE_OK && stmt) {
+                        if (sqlite3_step(stmt) == SQLITE_ROW) {
+                            const char* hexVal = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                            if (hexVal && *hexVal) {
+                                std::string hexStr(hexVal);
+                                std::string decoded;
+                                decoded.reserve(hexStr.size() / 2);
+                                for (size_t i = 0; i + 1 < hexStr.size(); i += 2) {
+                                    char byte = static_cast<char>(std::strtol(hexStr.substr(i, 2).c_str(), nullptr, 16));
+                                    decoded.push_back(byte);
+                                }
+                                if (decoded.find("\"subagentInfo\"") != std::string::npos ||
+                                    decoded.find("\"parentAgentId\"") != std::string::npos) {
+                                    outSubagentIds.insert(cid);
+                                }
+                            }
+                        }
+                        sqlite3_finalize(stmt);
+                    }
+                    sqlite3_close(db);
+                } else if (db) {
+                    sqlite3_close(db);
+                }
+            }
+        }
+    }
+}
+
 struct NormalizedProviderTranscript {
     nlohmann::json steps = nlohmann::json::array();
     int totalSteps = 0;
@@ -725,6 +903,17 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     bool summaryOnly = false) {
     NormalizedProviderTranscript out;
     inferWorkspaceFromProjectSlug(projectSlug, out.workspacePath, out.workspaceShort);
+    if (providerSource == "cursor") {
+        std::string cid = filePath.stem().string();
+        std::string hookModel, hookWorkspace;
+        if (readCursorHookStateMetadata(cid, hookModel, hookWorkspace)) {
+            if (!hookModel.empty()) out.model = hookModel;
+            if (!hookWorkspace.empty()) {
+                out.workspacePath = hookWorkspace;
+                out.workspaceShort = fs::path(hookWorkspace).filename().string();
+            }
+        }
+    }
     std::ifstream in(filePath);
     if (!in.is_open()) {
         return out;
@@ -785,10 +974,6 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
 
         std::string role = j.value("type", "");
         if (role == "system" && j.value("subtype", "") == "compact_boundary") {
-            out.steps.clear();
-            out.userPrompts.clear();
-            stepIdx = 0;
-            out.totalSteps = 0;
             continue;
         }
         if (role != "user" && role != "assistant") {
@@ -801,10 +986,34 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         const nlohmann::json& msgObj = (j.contains("message") && j["message"].is_object()) ? j["message"] : j;
         if (msgObj.contains("model") && msgObj["model"].is_string()) {
             std::string m = msgObj["model"].get<std::string>();
-            if (!m.empty()) out.model = m;
+            if (!m.empty() && (providerSource != "cursor" || out.model.empty())) out.model = m;
         }
 
         if (role == "user") {
+            if (stepIdx == 0 && line.find("<CONTEXT_SUMMARY>") != std::string::npos &&
+                (line.find("/compact") != std::string::npos ||
+                 line.find("Please compact and summarize our conversation context") != std::string::npos)) {
+                out.hasValidTurns = false;
+                return out;
+            }
+
+            if (!j.value("isCompactSummary", false)) {
+                bool isSyntheticUser = j.value("isMeta", false) ||
+                                       j.value("queueTranscriptOnly", false) ||
+                                       (j.value("promptSource", "") == "system") ||
+                                       (j.value("turnOrigin", "") == "task_notification") ||
+                                       (j.value("turnOrigin", "") == "peer");
+                if (!isSyntheticUser && j.contains("origin") && j["origin"].is_object()) {
+                    std::string origKind = j["origin"].value("kind", "");
+                    if (origKind == "task-notification" || origKind == "peer") {
+                        isSyntheticUser = true;
+                    }
+                }
+                if (isSyntheticUser) {
+                    continue;
+                }
+            }
+
             if (!summaryOnly) {
                 for (auto& prevSt : out.steps) {
                     if (prevSt.is_object() && prevSt.contains("askQuestion") &&
@@ -833,9 +1042,6 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             }
 
             if (j.value("isCompactSummary", false)) {
-                out.steps.clear();
-                out.userPrompts.clear();
-                stepIdx = 0;
                 int curIdx = stepIdx++;
                 out.totalSteps = curIdx + 1;
                 out.hasValidTurns = true;
@@ -1012,6 +1218,55 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             out.lastStepObj = stepJson;
             if (sinceIndex < 0 || curIdx > sinceIndex) {
                 out.steps.push_back(std::move(stepJson));
+            }
+        }
+    }
+
+    if (providerSource == "cursor" && !summaryOnly) {
+        fs::path compDir = filePath.parent_path() / "compaction";
+        std::error_code compEc;
+        if (fs::exists(compDir, compEc) && fs::is_directory(compDir, compEc)) {
+            std::string latestSegmentFile;
+            for (const auto& entry : fs::directory_iterator(compDir, compEc)) {
+                if (compEc || !entry.is_regular_file()) continue;
+                std::string fname = entry.path().filename().string();
+                if (fname.rfind("segment_", 0) == 0 && entry.path().extension() == ".md") {
+                    if (fname > latestSegmentFile) {
+                        latestSegmentFile = fname;
+                    }
+                }
+            }
+            if (!latestSegmentFile.empty()) {
+                std::ifstream segFile(compDir / latestSegmentFile);
+                if (segFile.is_open()) {
+                    std::stringstream buffer;
+                    buffer << segFile.rdbuf();
+                    std::string segmentContent = buffer.str();
+                    if (!segmentContent.empty()) {
+                        int curIdx = stepIdx++;
+                        out.totalSteps = curIdx + 1;
+                        out.hasValidTurns = true;
+                        std::string compactDisplay = "📦 **Context Compacted**\n\n" + segmentContent;
+                        nlohmann::json stepJson = {
+                            {"index", curIdx},
+                            {"stepIndex", curIdx},
+                            {"step_index", curIdx},
+                            {"type", "PLANNER_RESPONSE"},
+                            {"status", "DONE"},
+                            {"content", compactDisplay},
+                            {"thinking", ""},
+                            {"plannerResponse", ""},
+                            {"text", compactDisplay},
+                            {"tool_calls", nlohmann::json::array()},
+                            {"createdAt", ""},
+                            {"step", {{"case", "text"}, {"value", compactDisplay}}}
+                        };
+                        out.lastStepObj = stepJson;
+                        if (sinceIndex < 0 || curIdx > sinceIndex) {
+                            out.steps.push_back(std::move(stepJson));
+                        }
+                    }
+                }
             }
         }
     }
@@ -2841,6 +3096,7 @@ void WebServer::setupRoutes() {
 
         std::map<std::string, DbConvSummary> summariesMap;
         std::set<std::string> subagentIds;
+        std::map<std::string, uint64_t> cursorParentMaxSubagentTs;
         std::set<std::string> phantomIds = {
             "74e1eba3-a305-4cf7-8ada-b6979fe09fd4",
             "7b329a4c-496a-4459-ac49-a55c176bfea1",
@@ -3046,6 +3302,7 @@ void WebServer::setupRoutes() {
                                             const std::string& projectSlug) {
             if (id.empty() || id[0] == '.') return;
             if (seenIds.count(id)) return;
+            if (!includeSubagents && subagentIds.count(id)) return;
             std::error_code ec;
             if (!fs::exists(jsonlPath, ec) || !fs::is_regular_file(jsonlPath, ec)) return;
             if (fs::file_size(jsonlPath, ec) == 0 || ec) return;
@@ -3059,6 +3316,13 @@ void WebServer::setupRoutes() {
                 auto secs = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
                 if (secs > 0) ts = static_cast<uint64_t>(secs);
             } catch (...) {}
+
+            if (sourceLabel == "cursor") {
+                auto pIt = cursorParentMaxSubagentTs.find(id);
+                if (pIt != cursorParentMaxSubagentTs.end() && pIt->second > ts) {
+                    ts = pIt->second;
+                }
+            }
 
             seenIds.insert(id);
             candidates.push_back({id, jsonlPath.parent_path(), sourceLabel, ts, true, false, false, jsonlPath, projectSlug});
@@ -3108,6 +3372,7 @@ void WebServer::setupRoutes() {
         // Scan Cursor sessions (~/.cursor/projects/<project-slug>/agent-transcripts/<uuid>/<uuid>.jsonl)
         {
             std::string cursorRoot = getCursorProjectsDir();
+            collectCursorSubagentIdsAndParentMtimes(cursorRoot, subagentIds, cursorParentMaxSubagentTs);
             std::error_code ec;
             if (!cursorRoot.empty() && fs::exists(cursorRoot, ec) && fs::is_directory(cursorRoot, ec)) {
                 for (const auto& projEntry : fs::directory_iterator(cursorRoot, ec)) {
@@ -3152,6 +3417,12 @@ void WebServer::setupRoutes() {
                 }
                 if (norm.lastActivitySec > ts) {
                     ts = norm.lastActivitySec;
+                }
+                if (sourceLabel == "cursor") {
+                    auto pIt = cursorParentMaxSubagentTs.find(id);
+                    if (pIt != cursorParentMaxSubagentTs.end() && pIt->second > ts) {
+                        ts = pIt->second;
+                    }
                 }
                 std::string title = norm.firstPrompt;
                 auto nlPos = title.find_first_of("\r\n");
@@ -4295,19 +4566,6 @@ void WebServer::setupRoutes() {
                 return;
             }
 
-            if ((cmdVerb == "/compact" || cmdVerb == "/summarize" || cmdVerb == "/compress") &&
-                (cid.empty() || cid == "new")) {
-                res.set_content(nlohmann::json({
-                    {"status", "command_response"},
-                    {"agentId", targetProvider},
-                    {"source", targetProvider},
-                    {"conversationId", "new"},
-                    {"command", cmdVerb},
-                    {"response", "No active conversation to compact yet. Send a prompt first."}
-                }).dump(2), "application/json");
-                return;
-            }
-
             std::vector<std::string> extraCliArgs;
             if (cmdVerb == "/plan") {
                 if (cmdArgs.empty()) {
@@ -4398,6 +4656,19 @@ void WebServer::setupRoutes() {
                                       std::string& outRaw,
                                       std::string& outReply,
                                       std::string& outSessionId) -> bool {
+                std::vector<std::string> priorCursorLines;
+                if (targetProvider == "cursor" && !resumeCid.empty() && resumeCid != "new" &&
+                    !existingTranscriptPath.empty() && fs::exists(existingTranscriptPath)) {
+                    std::ifstream fIn(existingTranscriptPath);
+                    std::string l;
+                    while (std::getline(fIn, l)) {
+                        if (!l.empty() && l.find("\"type\":\"turn_ended\"") == std::string::npos &&
+                            l.find("\"type\": \"turn_ended\"") == std::string::npos) {
+                            priorCursorLines.push_back(l);
+                        }
+                    }
+                }
+
                 int pipeFd[2];
                 if (pipe(pipeFd) != 0) {
                     return false;
@@ -4455,6 +4726,28 @@ void WebServer::setupRoutes() {
                     int st = 0;
                     waitpid(child, &st, 0);
 
+                    if (!priorCursorLines.empty() && fs::exists(existingTranscriptPath)) {
+                        std::vector<std::string> afterLines;
+                        {
+                            std::ifstream fAfter(existingTranscriptPath);
+                            std::string l;
+                            while (std::getline(fAfter, l)) {
+                                if (!l.empty()) {
+                                    afterLines.push_back(l);
+                                }
+                            }
+                        }
+                        if (!afterLines.empty() && (afterLines.size() < priorCursorLines.size() || afterLines[0] != priorCursorLines[0])) {
+                            std::ofstream fOut(existingTranscriptPath, std::ios::trunc);
+                            for (const auto& pl : priorCursorLines) {
+                                fOut << pl << "\n";
+                            }
+                            for (const auto& al : afterLines) {
+                                fOut << al << "\n";
+                            }
+                        }
+                    }
+
                     outReply = outRaw;
                     outSessionId = (!resumeCid.empty() && resumeCid != "new") ? resumeCid : "";
                     auto pj = nlohmann::json::parse(outRaw, nullptr, false);
@@ -4479,17 +4772,66 @@ void WebServer::setupRoutes() {
             };
 
             if (cmdVerb == "/compact" || cmdVerb == "/summarize" || cmdVerb == "/compress") {
-                NormalizedProviderTranscript parsedFull = !existingTranscriptPath.empty()
-                    ? parseProviderTranscriptJsonl(existingTranscriptPath, targetProvider, -1, existingSlug, false)
-                    : NormalizedProviderTranscript{};
+                if (cid.empty() || cid == "new" || existingTranscriptPath.empty() || !fs::exists(existingTranscriptPath)) {
+                    res.set_content(nlohmann::json({
+                        {"status", "command_response"},
+                        {"agentId", targetProvider},
+                        {"source", targetProvider},
+                        {"conversationId", cid.empty() ? "new" : cid},
+                        {"command", cmdVerb},
+                        {"response", "No active conversation to compact."}
+                    }).dump(2), "application/json");
+                    return;
+                }
 
-                // Step A: Claude Code native in-place /compact when >= 4 steps exist
-                if (targetProvider == "claude" && parsedFull.steps.size() >= 4 && !existingTranscriptPath.empty()) {
-                    std::string rawOut;
-                    std::string replyText;
-                    std::string resolvedCid;
-                    std::string nativeCmd = cmdArgs.empty() ? "/compact" : ("/compact " + cmdArgs);
-                    if (runProviderCli(nativeCmd, cid, {}, rawOut, replyText, resolvedCid)) {
+                NormalizedProviderTranscript parsedFull = parseProviderTranscriptJsonl(
+                    existingTranscriptPath, targetProvider, -1, existingSlug, false);
+
+                if (targetProvider == "claude") {
+                    if (parsedFull.steps.size() >= 4) {
+                        size_t priorLineCount = 0;
+                        {
+                            std::ifstream countIn(existingTranscriptPath);
+                            std::string dummyLine;
+                            while (std::getline(countIn, dummyLine)) {
+                                if (!dummyLine.empty()) ++priorLineCount;
+                            }
+                        }
+                        std::string rawOut;
+                        std::string replyText;
+                        std::string resolvedCid;
+                        std::string nativeCmd = cmdArgs.empty() ? "/compact" : ("/compact " + cmdArgs);
+                        runProviderCli(nativeCmd, cid, {}, rawOut, replyText, resolvedCid);
+
+                        if (fs::exists(existingTranscriptPath)) {
+                            std::vector<std::string> curLines;
+                            {
+                                std::ifstream fIn(existingTranscriptPath);
+                                std::string cl;
+                                while (std::getline(fIn, cl)) {
+                                    if (!cl.empty()) curLines.push_back(cl);
+                                }
+                            }
+                            std::vector<std::string> filteredLines;
+                            for (size_t li = 0; li < curLines.size(); ++li) {
+                                const auto& cl = curLines[li];
+                                if (li >= priorLineCount &&
+                                    (cl.find("\"entrypoint\":\"sdk-cli\"") != std::string::npos ||
+                                     cl.find("\"entrypoint\": \"sdk-cli\"") != std::string::npos) &&
+                                    cl.find("\"task-notification\"") != std::string::npos &&
+                                    cl.find("<status>stopped</status>") != std::string::npos) {
+                                    continue;
+                                }
+                                filteredLines.push_back(cl);
+                            }
+                            if (filteredLines.size() != curLines.size()) {
+                                std::ofstream fOut(existingTranscriptPath, std::ios::trunc);
+                                for (const auto& fl : filteredLines) {
+                                    fOut << fl << "\n";
+                                }
+                            }
+                        }
+
                         std::ifstream checkIn(existingTranscriptPath);
                         std::string fileContent((std::istreambuf_iterator<char>(checkIn)),
                                                 std::istreambuf_iterator<char>());
@@ -4511,116 +4853,34 @@ void WebServer::setupRoutes() {
                             return;
                         }
                     }
-                }
 
-                // Step B: Context-Summary Session Rollover (Cursor Agent & Claude Fallback)
-                std::string transcriptDigest;
-                size_t totalSteps = parsedFull.steps.size();
-                size_t startIdx = (totalSteps > 20) ? (totalSteps - 20) : 0;
-                for (size_t i = startIdx; i < totalSteps; ++i) {
-                    const auto& st = parsedFull.steps[i];
-                    if (!st.is_object()) continue;
-                    std::string stType = st.value("type", "");
-                    std::string roleLabel = (stType == "USER_INPUT") ? "User" : "Assistant";
-                    std::string stContent = st.value("text", st.value("content", ""));
-                    if (stContent.size() > 800) {
-                        stContent = stContent.substr(0, 797) + "...";
-                    }
-                    if (!stContent.empty()) {
-                        transcriptDigest += "[" + roleLabel + "]: " + stContent + "\n";
-                    }
-                    if (st.contains("tool_calls") && st["tool_calls"].is_array() && !st["tool_calls"].empty()) {
-                        transcriptDigest += "[Tools]: ";
-                        for (size_t ti = 0; ti < st["tool_calls"].size(); ++ti) {
-                            if (ti > 0) transcriptDigest += ", ";
-                            transcriptDigest += st["tool_calls"][ti].value("name", "tool");
-                        }
-                        transcriptDigest += "\n";
-                    }
-                    if (transcriptDigest.size() >= 12000) {
-                        transcriptDigest = transcriptDigest.substr(0, 12000) + "\n...[truncated]";
-                        break;
-                    }
-                }
-                if (transcriptDigest.empty()) {
-                    transcriptDigest = "[Session ID]: " + cid;
-                }
-
-                std::string displayCmd = cmdArgs.empty() ? "/compact" : ("/compact " + cmdArgs);
-                std::string seedPrompt =
-                    "<CONTEXT_SUMMARY>\n" +
-                    transcriptDigest +
-                    "\n</CONTEXT_SUMMARY>\n"
-                    "<USER_REQUEST>" + displayCmd + "</USER_REQUEST>\n"
-                    "Please compact and summarize our conversation context in <CONTEXT_SUMMARY> into a concise, high-signal checkpoint covering:\n"
-                    "1. Core Objective & Current Status\n"
-                    "2. Completed Changes & Key Files\n"
-                    "3. Active Constraints & Decisions\n"
-                    "4. Immediate Next Steps";
-                if (!cmdArgs.empty()) {
-                    seedPrompt += "\nFocus especially on: " + cmdArgs;
-                }
-
-                std::string rawOut;
-                std::string replyText;
-                std::string newCid;
-                if (!runProviderCli(seedPrompt, "", {}, rawOut, replyText, newCid)) {
-                    res.status = 500;
-                    res.set_content("{\"status\":\"error\",\"error\":\"Failed to fork provider CLI for /compact\"}", "application/json");
+                    res.set_content(nlohmann::json({
+                        {"status", "command_response"},
+                        {"agentId", "claude"},
+                        {"source", "claude"},
+                        {"conversationId", cid},
+                        {"command", cmdVerb},
+                        {"response", "Conversation is too short to compact (fewer than 4 steps). Existing history preserved."}
+                    }).dump(2), "application/json");
                     return;
                 }
-                if (newCid.empty() || newCid == "new" || newCid == cid) {
-                    newCid = cid + "-compacted";
-                }
 
-                nlohmann::json compactedSteps = nlohmann::json::array();
-                std::string newSrc;
-                std::string newSlug;
-                fs::path newPath = findProviderTranscriptById(newCid, newSrc, newSlug);
-                if (!newPath.empty() && fs::exists(newPath)) {
-                    auto newParsed = parseProviderTranscriptJsonl(newPath, targetProvider, -1, newSlug, false);
-                    if (!newParsed.steps.empty()) {
-                        compactedSteps = std::move(newParsed.steps);
+                if (targetProvider == "cursor") {
+                    std::string compNote = "Cursor Agent sessions are compacted natively in the Cursor prompt via `/summarize` (or `/compress`); `cursor-agent --print` does not expose a headless compaction action. Full session history (" + std::to_string(parsedFull.steps.size()) + " steps) preserved.";
+                    fs::path compIndex = existingTranscriptPath.parent_path() / "compaction" / "INDEX.md";
+                    if (fs::exists(compIndex)) {
+                        compNote = "Native Cursor compaction checkpoint present (`compaction/INDEX.md`). " + compNote;
                     }
+                    res.set_content(nlohmann::json({
+                        {"status", "command_response"},
+                        {"agentId", "cursor"},
+                        {"source", "cursor"},
+                        {"conversationId", cid},
+                        {"command", cmdVerb},
+                        {"response", compNote}
+                    }).dump(2), "application/json");
+                    return;
                 }
-                if (compactedSteps.empty()) {
-                    compactedSteps.push_back({
-                        {"index", 0},
-                        {"stepIndex", 0},
-                        {"step_index", 0},
-                        {"type", "USER_INPUT"},
-                        {"status", "DONE"},
-                        {"content", displayCmd},
-                        {"text", displayCmd},
-                        {"userInput", displayCmd},
-                        {"step", {{"case", "userInput"}, {"value", displayCmd}}}
-                    });
-                    compactedSteps.push_back({
-                        {"index", 1},
-                        {"stepIndex", 1},
-                        {"step_index", 1},
-                        {"type", "PLANNER_RESPONSE"},
-                        {"status", "DONE"},
-                        {"content", replyText},
-                        {"thinking", ""},
-                        {"plannerResponse", ""},
-                        {"text", replyText},
-                        {"tool_calls", nlohmann::json::array()},
-                        {"step", {{"case", "text"}, {"value", replyText}}}
-                    });
-                }
-
-                res.set_content(nlohmann::json({
-                    {"status", "compacted"},
-                    {"compactedFrom", cid},
-                    {"agentId", targetProvider},
-                    {"source", targetProvider},
-                    {"conversationId", newCid},
-                    {"command", cmdVerb},
-                    {"steps", compactedSteps},
-                    {"response", replyText}
-                }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
-                return;
             }
 
             std::string rawOut;
@@ -6503,6 +6763,10 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
 
     std::string cursorRoot = getCursorProjectsDir();
     if (!cursorRoot.empty()) {
+        std::set<std::string> cursorSubagentIds;
+        std::map<std::string, uint64_t> dummyParentTs;
+        collectCursorSubagentIdsAndParentMtimes(cursorRoot, cursorSubagentIds, dummyParentTs);
+
         std::error_code ec;
         if (fs::exists(cursorRoot, ec) && fs::is_directory(cursorRoot, ec)) {
             for (const auto& projEntry : fs::directory_iterator(cursorRoot, ec)) {
@@ -6517,6 +6781,7 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                     if (convEntry.is_directory()) {
                         std::string cid = convEntry.path().filename().string();
                         if (cid.empty() || cid[0] == '.' || cid == "subagents") continue;
+                        if (cursorSubagentIds.count(cid)) continue;
                         fs::path jPath = convEntry.path() / (cid + ".jsonl");
                         std::error_code fEc;
                         if (fs::exists(jPath, fEc) && !fEc) {
@@ -6524,7 +6789,7 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                         }
                     } else if (convEntry.is_regular_file() && convEntry.path().extension() == ".jsonl") {
                         std::string cid = convEntry.path().stem().string();
-                        if (!cid.empty() && cid[0] != '.') {
+                        if (!cid.empty() && cid[0] != '.' && !cursorSubagentIds.count(cid)) {
                             providerItems.push_back({cid, "cursor", slug, convEntry.path()});
                         }
                     }
@@ -6562,6 +6827,10 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
         st.seeded = true;
 
         auto parsed = parseProviderTranscriptJsonl(item.transcriptPath, item.source, -1, item.projectSlug, seedOnly);
+        if (!parsed.hasValidTurns || parsed.firstPrompt.empty()) {
+            st.pendingStepIndex = -1;
+            continue;
+        }
         if (st.cachedTitle.empty() && !parsed.firstPrompt.empty()) {
             st.cachedTitle = parsed.firstPrompt;
             auto nlPos = st.cachedTitle.find_first_of("\r\n");

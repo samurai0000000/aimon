@@ -1370,6 +1370,28 @@ static void testMultiProviderClaudeAndCursorSessionsAndNotifications() {
 
         std::ofstream fSub(fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "cursor-sess-1" / "subagents" / "sub-1.jsonl");
         fSub << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Subagent task\"}]}}\n";
+
+        // Create hooks/state/cursor-sess-1.json
+        fs::create_directories(fs::path(cursorProjects).parent_path() / "hooks" / "state");
+        std::ofstream fHook(fs::path(cursorProjects).parent_path() / "hooks" / "state" / "cursor-sess-1.json");
+        fHook << "{\"session_id\":\"cursor-sess-1\",\"model\":\"auto-smart\",\"workspace\":\"/tmp/work/aimon\",\"turns\":2,\"step\":5}\n";
+
+        // Top-level duplicate directory for subagent sub-1
+        fs::create_directories(fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "sub-1");
+        std::ofstream fSubTop(fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "sub-1" / "sub-1.jsonl");
+        fSubTop << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Subagent task top-level duplicate\"}]}}\n";
+
+        // One-shot hook subagent sub-hook-0
+        fs::create_directories(fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "sub-hook-0");
+        std::ofstream fSubHook(fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "sub-hook-0" / "sub-hook-0.jsonl");
+        fSubHook << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"One-shot hook subagent\"}]}}\n";
+        std::ofstream fHook0(fs::path(cursorProjects).parent_path() / "hooks" / "state" / "sub-hook-0.json");
+        fHook0 << "{\"turns\":0,\"step\":10}\n";
+
+        // <CONTEXT_SUMMARY> rollover orphan transcript
+        fs::create_directories(fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "cursor-rollover-orphan");
+        std::ofstream fRoll(fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "cursor-rollover-orphan" / "cursor-rollover-orphan.jsonl");
+        fRoll << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<CONTEXT_SUMMARY>\\nDigest\\n</CONTEXT_SUMMARY>\\n<USER_REQUEST>/compact</USER_REQUEST>\\nPlease compact and summarize our conversation context in <CONTEXT_SUMMARY>\"}]}}\n";
     }
 
     // Set deterministic mtimes matching the activity order: agy (1000s ago), claude (500s ago), cursor (100s ago)
@@ -1414,6 +1436,7 @@ static void testMultiProviderClaudeAndCursorSessionsAndNotifications() {
     assert(convs.size() == 3);
     assert(convs[0].value("id", "") == "cursor-sess-1");
     assert(convs[0].value("source", "") == "cursor");
+    assert(convs[0].value("model", "") == "auto-smart");
     assert(convs[0].value("title", "") == "Fix Cursor session parser");
     assert(convs[1].value("id", "") == "claude-sess-1");
     assert(convs[1].value("source", "") == "claude");
@@ -1444,6 +1467,8 @@ static void testMultiProviderClaudeAndCursorSessionsAndNotifications() {
     assert(resCursorTrans && resCursorTrans->status == 200);
     json cursorTrans = json::parse(resCursorTrans->body);
     assert(cursorTrans.value("source", "") == "cursor");
+    assert(cursorTrans.value("model", "") == "auto-smart");
+    assert(cursorTrans.value("workspace", "") == "aimon");
     assert(cursorTrans["steps"].size() == 2);
     assert(cursorTrans["steps"][0].value("type", "") == "USER_INPUT");
     assert(cursorTrans["steps"][0].value("text", "") == "Fix Cursor session parser");
@@ -1936,25 +1961,21 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         assert(bCompNew.value("response", "").find("No active conversation") != std::string::npos);
     }
 
-    // 4c. /compact focus on tests on active cursor-sess-1 rolls over to fresh session WITHOUT --resume
+    // 4c. /compact focus on tests on active cursor-sess-1 returns command_response preserving session history
     {
         json reqComp = {{"text", "/compact focus on tests"}, {"source", "cursor"}, {"conversationId", "cursor-sess-1"}};
         auto resComp = client.Post("/api/agent/prompt", headers, reqComp.dump(), "application/json");
         assert(resComp && resComp->status == 200);
         json bComp = json::parse(resComp->body);
-        assert(bComp.value("status", "") == "compacted");
-        assert(bComp.value("compactedFrom", "") == "cursor-sess-1");
-        assert(bComp.value("conversationId", "") == "cursor-compacted-88");
-        assert(bComp.contains("steps") && bComp["steps"].size() == 2);
-        assert(bComp["steps"][0].value("text", "") == "/compact focus on tests");
-        assert(bComp["steps"][1].value("text", "") == "Cursor checkpoint summary ready");
+        assert(bComp.value("status", "") == "command_response");
+        assert(bComp.value("conversationId", "") == "cursor-sess-1");
 
-        std::ifstream af(cursorArgsLog);
-        std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
-        assert(logged.find("--resume") == std::string::npos);
-        assert(logged.find("<CONTEXT_SUMMARY>") != std::string::npos);
-        assert(logged.find("Updated MessageInput.kt with dynamic heightIn.") != std::string::npos);
-        assert(logged.find("Focus especially on: focus on tests") != std::string::npos);
+        auto resTrans = client.Get("/api/agent/transcript?id=cursor-sess-1", headers);
+        assert(resTrans && resTrans->status == 200);
+        json tObj = json::parse(resTrans->body);
+        assert(tObj["steps"].size() == 2);
+        assert(tObj["steps"][0].value("type", "") == "USER_INPUT");
+        assert(tObj["steps"][1].value("type", "") == "PLANNER_RESPONSE");
     }
 
     // 4d. Verify Claude Code native compact_boundary + isCompactSummary JSONL parsing
@@ -1963,17 +1984,31 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         std::ofstream cf(claudeCompFile);
         cf << "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Old turn before compact\"}}\n";
         cf << "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"Old assistant turn\"}}\n";
+        cf << "{\"type\":\"user\",\"entrypoint\":\"sdk-cli\",\"origin\":{\"kind\":\"task-notification\"},\"promptSource\":\"system\",\"queueTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"<task-notification>\\n<status>stopped</status>\\n</task-notification>\\nRead the output file to retrieve the result: /tmp/out\"}}\n";
         cf << "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n";
         cf << "{\"type\":\"user\",\"isCompactSummary\":true,\"message\":{\"role\":\"user\",\"content\":\"This session is being continued from a previous conversation. Summary: Envelope 1 done.\"}}\n";
+        cf << "{\"type\":\"user\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"<local-command-caveat>Caveat</local-command-caveat>\"}}\n";
+        cf << "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<command-name>/compact</command-name>\\n<command-message>compact</command-message>\\n<command-args></command-args>\"}}\n";
+        cf << "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>\"}}\n";
         cf.close();
 
         auto resCompTrans = client.Get("/api/agent/transcript?id=claude-native-comp", headers);
         assert(resCompTrans && resCompTrans->status == 200);
         json compTrans = json::parse(resCompTrans->body);
-        assert(compTrans["steps"].size() == 1);
-        assert(compTrans["steps"][0].value("type", "") == "PLANNER_RESPONSE");
-        assert(compTrans["steps"][0].value("text", "").find("Context Compacted") != std::string::npos);
-        assert(compTrans["steps"][0].value("text", "").find("Summary: Envelope 1 done.") != std::string::npos);
+        assert(compTrans["steps"].size() == 3);
+        assert(compTrans["steps"][0].value("type", "") == "USER_INPUT");
+        assert(compTrans["steps"][0].value("text", "") == "Old turn before compact");
+        assert(compTrans["steps"][1].value("type", "") == "PLANNER_RESPONSE");
+        assert(compTrans["steps"][1].value("text", "") == "Old assistant turn");
+        assert(compTrans["steps"][2].value("type", "") == "PLANNER_RESPONSE");
+        assert(compTrans["steps"][2].value("text", "").find("Context Compacted") != std::string::npos);
+        assert(compTrans["steps"][2].value("text", "").find("Summary: Envelope 1 done.") != std::string::npos);
+
+        for (const auto& step : compTrans["steps"]) {
+            std::string content = step.value("content", "") + " " + step.value("text", "");
+            assert(content.find("<task-notification>") == std::string::npos);
+            assert(content.find("<local-command-") == std::string::npos);
+        }
     }
 
     // 4e. /plan, /ask, /effort, /status, /doctor, /models
