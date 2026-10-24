@@ -1315,6 +1315,254 @@ static void testSlashCommandsAndSessionNotifications() {
     std::cout << "[TestMobileGateway] testSlashCommandsAndSessionNotifications passed!" << std::endl;
 }
 
+static void testMultiProviderClaudeAndCursorSessionsAndNotifications() {
+    std::cout << "[TestMobileGateway] Running testMultiProviderClaudeAndCursorSessionsAndNotifications..." << std::endl;
+    std::string baseDir = "/tmp/aimon_multiprovider_" + std::to_string(getpid());
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliBrain = baseDir + "/cli_brain";
+    std::string claudeProjects = baseDir + "/claude_projects";
+    std::string cursorProjects = baseDir + "/cursor_projects";
+    std::string tempMobileDb = baseDir + "/mobile_devices.json";
+    fs::remove_all(baseDir);
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+    fs::create_directories(claudeProjects + "/-tmp-work-aimon");
+    fs::create_directories(cursorProjects + "/tmp-work-aimon/agent-transcripts/cursor-sess-1/subagents");
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_CLAUDE_PROJECTS_DIR", claudeProjects.c_str(), 1);
+    setenv("AIMON_CURSOR_PROJECTS_DIR", cursorProjects.c_str(), 1);
+    setenv("AIMON_WORKSPACE_ROOT", baseDir.c_str(), 1);
+    setenv("AIMON_NOTIFICATION_SETTLE_MS", "20", 1);
+
+    // 1. Create an older Antigravity CLI session (last activity: 2026-10-24T01:00:00Z)
+    fs::path agyLogDir = fs::path(cliBrain) / "agy-sess-1" / ".system_generated" / "logs";
+    fs::create_directories(agyLogDir);
+    {
+        std::ofstream f(agyLogDir / "transcript.jsonl");
+        f << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-10-24T01:00:00Z\",\"content\":\"<USER_REQUEST>\\nAntigravity prompt 1\\n</USER_REQUEST>\"}\n";
+    }
+
+    // 2. Create a newer Claude Code session (last activity: 2026-10-24T03:00:00Z)
+    fs::path claudeFile = fs::path(claudeProjects) / "-tmp-work-aimon" / "claude-sess-1.jsonl";
+    {
+        std::ofstream f(claudeFile);
+        f << "{\"type\":\"user\",\"isSidechain\":false,\"cwd\":\"/tmp/work/aimon\",\"timestamp\":\"2026-10-24T02:55:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<ide_opened_file>foo.cxx</ide_opened_file>\"},{\"type\":\"text\",\"text\":\"Analyze Claude Code session integration\"}]}}\n";
+        f << "{\"type\":\"assistant\",\"isSidechain\":false,\"cwd\":\"/tmp/work/aimon\",\"timestamp\":\"2026-10-24T02:56:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Inspecting WebServer.cxx for Claude JSONL normalization\"},{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"ls -la\",\"description\":\"List workspace files\"}},{\"type\":\"text\",\"text\":\"I inspected the workspace files.\"}]}}\n";
+        // Tool result turn (should NOT become a USER_INPUT step)
+        f << "{\"type\":\"user\",\"isSidechain\":false,\"cwd\":\"/tmp/work/aimon\",\"timestamp\":\"2026-10-24T03:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"total 42\"}]}}\n";
+    }
+
+    // Boundary: sidechain-only Claude file and empty file should be ignored
+    {
+        std::ofstream fSide(fs::path(claudeProjects) / "-tmp-work-aimon" / "claude-sidechain.jsonl");
+        fSide << "{\"type\":\"user\",\"isSidechain\":true,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Subagent internal prompt\"}]}}\n";
+        std::ofstream fEmpty(fs::path(claudeProjects) / "-tmp-work-aimon" / "claude-empty.jsonl");
+    }
+
+    // 3. Create the newest Cursor session (last activity: 2026-10-24T04:00:00Z) + a subagent file that must be excluded
+    fs::path cursorFile = fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "cursor-sess-1" / "cursor-sess-1.jsonl";
+    {
+        std::ofstream f(cursorFile);
+        f << "{\"role\":\"user\",\"timestamp\":\"2026-10-24T03:58:00Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<user_query>\\nFix Cursor session parser\\n</user_query>\"}]}}\n";
+        f << "{\"role\":\"assistant\",\"timestamp\":\"2026-10-24T04:00:00Z\",\"message\":{\"model\":\"gpt-5\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Checking Cursor transcript format\"},{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"src/WebServer.cxx\"}},{\"type\":\"text\",\"text\":\"Cursor parser updated cleanly.\"}]}}\n";
+
+        std::ofstream fSub(fs::path(cursorProjects) / "tmp-work-aimon" / "agent-transcripts" / "cursor-sess-1" / "subagents" / "sub-1.jsonl");
+        fSub << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Subagent task\"}]}}\n";
+    }
+
+    // Set deterministic mtimes matching the activity order: agy (1000s ago), claude (500s ago), cursor (100s ago)
+    auto nowFt = fs::file_time_type::clock::now();
+    fs::last_write_time(agyLogDir / "transcript.jsonl", nowFt - std::chrono::seconds(1000));
+    fs::last_write_time(claudeFile, nowFt - std::chrono::seconds(500));
+    fs::last_write_time(cursorFile, nowFt - std::chrono::seconds(100));
+
+    MobileGateway& gw = MobileGateway::getInstance();
+    assert(gw.init(tempMobileDb));
+    std::string secret = gw.createPairingSecret(120);
+    std::string validToken;
+    assert(gw.verifyPairingCode(secret, "multiprovider-dev", "Pixel 9 Pro", validToken));
+
+    StateStore& stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.endpointsEnabled = false;
+
+    WebServer server(stateStore, historyStore, config);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", validToken}};
+
+    // Verify /api/agent/available lists antigravity, claude, and cursor
+    auto resAvail = client.Get("/api/agent/available", headers);
+    assert(resAvail && resAvail->status == 200);
+    json availJson = json::parse(resAvail->body);
+    assert(availJson.contains("agents") && availJson["agents"].size() >= 3);
+
+    // Verify /api/agent/conversations discovers all 3 sessions in descending order of last activity
+    // and excludes subagents & sidechains
+    auto resConvs = client.Get("/api/agent/conversations", headers);
+    assert(resConvs && resConvs->status == 200);
+    json convsJson = json::parse(resConvs->body);
+    assert(convsJson.contains("conversations") && convsJson["conversations"].is_array());
+    auto convs = convsJson["conversations"];
+    assert(convs.size() == 3);
+    assert(convs[0].value("id", "") == "cursor-sess-1");
+    assert(convs[0].value("source", "") == "cursor");
+    assert(convs[0].value("title", "") == "Fix Cursor session parser");
+    assert(convs[1].value("id", "") == "claude-sess-1");
+    assert(convs[1].value("source", "") == "claude");
+    assert(convs[1].value("title", "") == "Analyze Claude Code session integration");
+    assert(convs[1].value("workspace", "") == "aimon");
+    assert(convs[2].value("id", "") == "agy-sess-1");
+    assert(convs[2].value("source", "") == "cli");
+    assert(convs[0].value("timestamp", uint64_t(0)) >= convs[1].value("timestamp", uint64_t(0)));
+    assert(convs[1].value("timestamp", uint64_t(0)) >= convs[2].value("timestamp", uint64_t(0)));
+
+    // Verify GET /api/agent/transcript for Claude Code session
+    auto resClaudeTrans = client.Get("/api/agent/transcript?id=claude-sess-1", headers);
+    assert(resClaudeTrans && resClaudeTrans->status == 200);
+    json claudeTrans = json::parse(resClaudeTrans->body);
+    assert(claudeTrans.value("source", "") == "claude");
+    assert(claudeTrans["steps"].size() == 2); // tool_result-only user turn is skipped
+    assert(claudeTrans["steps"][0].value("type", "") == "USER_INPUT");
+    assert(claudeTrans["steps"][0].value("text", "") == "Analyze Claude Code session integration");
+    assert(claudeTrans["steps"][1].value("type", "") == "PLANNER_RESPONSE");
+    assert(claudeTrans["steps"][1].value("thinking", "") == "Inspecting WebServer.cxx for Claude JSONL normalization");
+    assert(claudeTrans["steps"][1].value("text", "") == "I inspected the workspace files.");
+    assert(claudeTrans["steps"][1]["tool_calls"].size() == 1);
+    assert(claudeTrans["steps"][1]["tool_calls"][0].value("name", "") == "Bash");
+    assert(claudeTrans["steps"][1]["tool_calls"][0].value("command", "") == "ls -la");
+
+    // Verify GET /api/agent/transcript for Cursor session
+    auto resCursorTrans = client.Get("/api/agent/transcript?id=cursor-sess-1", headers);
+    assert(resCursorTrans && resCursorTrans->status == 200);
+    json cursorTrans = json::parse(resCursorTrans->body);
+    assert(cursorTrans.value("source", "") == "cursor");
+    assert(cursorTrans["steps"].size() == 2);
+    assert(cursorTrans["steps"][0].value("type", "") == "USER_INPUT");
+    assert(cursorTrans["steps"][0].value("text", "") == "Fix Cursor session parser");
+    assert(cursorTrans["steps"][1].value("type", "") == "PLANNER_RESPONSE");
+    assert(cursorTrans["steps"][1].value("text", "") == "Cursor parser updated cleanly.");
+    assert(cursorTrans["steps"][1]["tool_calls"].size() == 1);
+    assert(cursorTrans["steps"][1]["tool_calls"][0].value("name", "") == "Read");
+
+    // Fault path: non-existent Claude binary returns 503
+    setenv("AIMON_CLAUDE_BIN", (baseDir + "/missing_claude").c_str(), 1);
+    json faultPrompt = {{"prompt", "Hello Claude"}, {"source", "claude"}, {"conversationId", "claude-sess-1"}};
+    auto resFault = client.Post("/api/agent/prompt", headers, faultPrompt.dump(), "application/json");
+    assert(resFault && resFault->status == 503);
+
+    // Nominal prompt dispatch & autoApprove flag verification for Claude and Cursor
+    std::string mockClaudeBin = baseDir + "/mock_claude.sh";
+    std::string claudeArgsLog = baseDir + "/claude_args.txt";
+    {
+        std::ofstream mf(mockClaudeBin);
+        mf << "#!/bin/sh\n";
+        mf << "echo \"$@\" > \"" << claudeArgsLog << "\"\n";
+        mf << "printf '{\"type\":\"result\",\"result\":\"Claude reply OK\",\"session_id\":\"claude-sess-1\"}\\n'\n";
+    }
+    chmod(mockClaudeBin.c_str(), 0755);
+    setenv("AIMON_CLAUDE_BIN", mockClaudeBin.c_str(), 1);
+
+    std::string mockCursorBin = baseDir + "/mock_cursor.sh";
+    std::string cursorArgsLog = baseDir + "/cursor_args.txt";
+    {
+        std::ofstream mf(mockCursorBin);
+        mf << "#!/bin/sh\n";
+        mf << "echo \"$@\" > \"" << cursorArgsLog << "\"\n";
+        mf << "printf '{\"type\":\"result\",\"result\":\"Cursor reply OK\"}\\n'\n";
+    }
+    chmod(mockCursorBin.c_str(), 0755);
+    setenv("AIMON_CURSOR_BIN", mockCursorBin.c_str(), 1);
+
+    json claudePromptReq = {
+        {"prompt", "Continue Claude work"},
+        {"source", "claude"},
+        {"conversationId", "claude-sess-1"},
+        {"model", "claude-sonnet-4-6"},
+        {"autoApprove", true}
+    };
+    auto resClaudePrompt = client.Post("/api/agent/prompt", headers, claudePromptReq.dump(), "application/json");
+    assert(resClaudePrompt && resClaudePrompt->status == 200);
+    {
+        std::ifstream af(claudeArgsLog);
+        std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
+        assert(logged.find("--resume claude-sess-1") != std::string::npos);
+        assert(logged.find("--dangerously-skip-permissions") != std::string::npos);
+        assert(logged.find("--model claude-sonnet-4-6") != std::string::npos);
+    }
+
+    json cursorPromptReq = {
+        {"prompt", "Continue Cursor work"},
+        {"source", "cursor"},
+        {"conversationId", "cursor-sess-1"},
+        {"model", "gpt-5"},
+        {"autoApprove", true}
+    };
+    auto resCursorPrompt = client.Post("/api/agent/prompt", headers, cursorPromptReq.dump(), "application/json");
+    assert(resCursorPrompt && resCursorPrompt->status == 200);
+    {
+        std::ifstream af(cursorArgsLog);
+        std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
+        assert(logged.find("--resume cursor-sess-1") != std::string::npos);
+        assert(logged.find("-f") != std::string::npos);
+        assert(logged.find("--model gpt-5") != std::string::npos);
+    }
+
+    // Verify notifications for Claude Code (agent_question via AskUserQuestion) and Cursor (prompt_answered)
+    uint64_t baseSeq = 0;
+    auto initEvs = gw.getRecentAgentEventsSince(0);
+    if (!initEvs.empty()) baseSeq = initEvs.back().seq;
+
+    {
+        std::ofstream f(claudeFile, std::ios::app);
+        f << "{\"type\":\"assistant\",\"isSidechain\":false,\"cwd\":\"/tmp/work/aimon\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Should Claude auto-approve tool calls?\"}]}}]}}\n";
+        fs::last_write_time(claudeFile, fs::file_time_type::clock::now());
+    }
+    server.scanTranscriptsForNotifications(false);
+    auto claudeEvs = gw.getRecentAgentEventsSince(baseSeq);
+    assert(claudeEvs.size() == 1);
+    assert(claudeEvs[0].event == "agent_question");
+    assert(claudeEvs[0].source == "claude");
+    assert(claudeEvs[0].conversationId == "claude-sess-1");
+    assert(claudeEvs[0].snippet == "Should Claude auto-approve tool calls?");
+    baseSeq = claudeEvs.back().seq;
+
+    {
+        std::ofstream f(cursorFile, std::ios::app);
+        f << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Run tests\"}]}}\n";
+        f << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"All Cursor unit tests passed!\"}]}}\n";
+        fs::last_write_time(cursorFile, fs::file_time_type::clock::now());
+    }
+    server.scanTranscriptsForNotifications(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    server.scanTranscriptsForNotifications(false);
+    auto cursorEvs = gw.getRecentAgentEventsSince(baseSeq);
+    assert(cursorEvs.size() == 1);
+    assert(cursorEvs[0].event == "prompt_answered");
+    assert(cursorEvs[0].source == "cursor");
+    assert(cursorEvs[0].conversationId == "cursor-sess-1");
+    assert(cursorEvs[0].snippet.find("All Cursor unit tests passed!") != std::string::npos);
+
+    server.stop();
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_CLAUDE_PROJECTS_DIR");
+    unsetenv("AIMON_CURSOR_PROJECTS_DIR");
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    unsetenv("AIMON_NOTIFICATION_SETTLE_MS");
+    unsetenv("AIMON_CLAUDE_BIN");
+    unsetenv("AIMON_CURSOR_BIN");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] testMultiProviderClaudeAndCursorSessionsAndNotifications passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -1329,6 +1577,7 @@ int main() {
     testAgentPromptNoFakeElizaAndRealBridge();
     testAgentPromptPreservesCascadeConfigAndModelM418();
     testSlashCommandsAndSessionNotifications();
+    testMultiProviderClaudeAndCursorSessionsAndNotifications();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;
