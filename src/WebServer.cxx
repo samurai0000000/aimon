@@ -334,16 +334,63 @@ static std::map<int, std::pair<std::string, std::string>> syncAndPruneCliEndpoin
 
     bool stateChanged = false;
     if (scanProcEnv && !hasProcsOverride && fs::exists("/proc")) {
+        std::vector<pid_t> fastChildPids;
+        std::set<pid_t> seenFastPids;
+
+        auto readChildPids = [](const std::string& pStr) -> std::vector<pid_t> {
+            std::vector<pid_t> cPids;
+            std::error_code ec;
+            std::string taskPath = "/proc/" + pStr + "/task";
+            if (!fs::exists(taskPath, ec)) return cPids;
+            for (const auto& tentry : fs::directory_iterator(taskPath, ec)) {
+                if (ec || !tentry.is_directory()) continue;
+                std::ifstream cf(tentry.path() / "children");
+                if (!cf.is_open()) continue;
+                std::string word;
+                while (cf >> word) {
+                    if (!word.empty() && std::all_of(word.begin(), word.end(), ::isdigit)) {
+                        try { cPids.push_back(std::stoi(word)); } catch (...) {}
+                    }
+                }
+            }
+            return cPids;
+        };
+
+        for (const auto& agyProc : agyProcs) {
+            if (agyProc.pidStr.empty()) continue;
+            auto ch1 = readChildPids(agyProc.pidStr);
+            for (pid_t c1 : ch1) {
+                if (seenFastPids.insert(c1).second) {
+                    fastChildPids.push_back(c1);
+                }
+                auto ch2 = readChildPids(std::to_string(c1));
+                for (pid_t c2 : ch2) {
+                    if (seenFastPids.insert(c2).second) {
+                        fastChildPids.push_back(c2);
+                    }
+                }
+            }
+        }
+
         std::vector<pid_t> procPids;
+        procPids.insert(procPids.end(), fastChildPids.begin(), fastChildPids.end());
+
+        std::vector<pid_t> generalPids;
         std::error_code ec;
         for (const auto& entry : fs::directory_iterator("/proc", ec)) {
             if (ec || !entry.is_directory()) continue;
             std::string dname = entry.path().filename().string();
             if (!dname.empty() && std::all_of(dname.begin(), dname.end(), ::isdigit)) {
-                try { procPids.push_back(std::stoi(dname)); } catch (...) {}
+                try {
+                    pid_t p = std::stoi(dname);
+                    if (seenFastPids.find(p) == seenFastPids.end()) {
+                        generalPids.push_back(p);
+                    }
+                } catch (...) {}
             }
         }
-        std::sort(procPids.begin(), procPids.end(), std::greater<pid_t>());
+        std::sort(generalPids.begin(), generalPids.end(), std::greater<pid_t>());
+        procPids.insert(procPids.end(), generalPids.begin(), generalPids.end());
 
         for (pid_t pid : procPids) {
             std::ifstream envFile("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
@@ -1895,7 +1942,7 @@ void WebServer::setupRoutes() {
 
     // --- Telemetry Endpoints ---
 
-    _server->Post("/api/telemetry/event", [](const httplib::Request& req, httplib::Response& res) {
+    auto handleTelemetryOrHookEvent = [](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         try {
             nlohmann::json body = nlohmann::json::parse(req.body);
@@ -1946,12 +1993,86 @@ void WebServer::setupRoutes() {
                 }
             }
             if (!recordedEndpointFromDetails && agentType == "antigravity") {
+                auto agyProcs = discoverRunningAgyProcesses();
+                bool anyMissingToken = false;
+                {
+                    std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                    for (const auto& proc : agyProcs) {
+                        if (proc.httpPort > 0 && s_cachedCliTokens.find(proc.httpPort) == s_cachedCliTokens.end()) {
+                            anyMissingToken = true;
+                            break;
+                        }
+                    }
+                }
+
                 static std::atomic<int64_t> s_lastHookProcScanEpoch{0};
                 int64_t nowEpoch = static_cast<int64_t>(std::time(nullptr));
                 int64_t prevEpoch = s_lastHookProcScanEpoch.load();
-                if (nowEpoch - prevEpoch >= 3 &&
-                    s_lastHookProcScanEpoch.compare_exchange_strong(prevEpoch, nowEpoch)) {
-                    syncAndPruneCliEndpointsState(discoverRunningAgyProcesses(), true);
+                bool isPreToolUse = (eventType == "PRE_TOOL_USE" || eventType == "PreToolUse");
+
+                if (anyMissingToken || isPreToolUse || (nowEpoch - prevEpoch >= 3 &&
+                    s_lastHookProcScanEpoch.compare_exchange_strong(prevEpoch, nowEpoch))) {
+                    syncAndPruneCliEndpointsState(agyProcs, true);
+                }
+
+                bool stillLacksToken = false;
+                std::vector<AgyProcessInfo> procsLackingToken;
+                {
+                    std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                    for (const auto& proc : agyProcs) {
+                        if (proc.httpPort > 0 && s_cachedCliTokens.find(proc.httpPort) == s_cachedCliTokens.end()) {
+                            stillLacksToken = true;
+                            procsLackingToken.push_back(proc);
+                        }
+                    }
+                }
+
+                if ((isPreToolUse || stillLacksToken) && !procsLackingToken.empty()) {
+                    static std::atomic<bool> s_fastChildWatchActive{false};
+                    bool expected = false;
+                    if (s_fastChildWatchActive.compare_exchange_strong(expected, true)) {
+                        std::thread([procsLackingToken]() {
+                            for (int iter = 0; iter < 60; ++iter) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                                bool foundAny = false;
+                                for (const auto& proc : procsLackingToken) {
+                                    if (proc.pidStr.empty()) continue;
+                                    std::error_code ec;
+                                    std::string taskDir = "/proc/" + proc.pidStr + "/task";
+                                    if (!fs::exists(taskDir, ec)) continue;
+                                    std::vector<pid_t> chPids;
+                                    for (const auto& tentry : fs::directory_iterator(taskDir, ec)) {
+                                        if (ec || !tentry.is_directory()) continue;
+                                        std::ifstream cf(tentry.path() / "children");
+                                        if (!cf.is_open()) continue;
+                                        std::string word;
+                                        while (cf >> word) {
+                                            if (!word.empty() && std::all_of(word.begin(), word.end(), ::isdigit)) {
+                                                try { chPids.push_back(std::stoi(word)); } catch (...) {}
+                                            }
+                                        }
+                                    }
+                                    for (pid_t cpid : chPids) {
+                                        std::ifstream envFile("/proc/" + std::to_string(cpid) + "/environ", std::ios::binary);
+                                        if (!envFile.is_open()) continue;
+                                        std::string envContent((std::istreambuf_iterator<char>(envFile)),
+                                                               std::istreambuf_iterator<char>());
+                                        if (envContent.find("ANTIGRAVITY_CSRF_TOKEN=") != std::string::npos &&
+                                            envContent.find("ANTIGRAVITY_LS_ADDRESS=") != std::string::npos) {
+                                            foundAny = true;
+                                            break;
+                                        }
+                                    }
+                                    if (foundAny) break;
+                                }
+                                if (foundAny) {
+                                    syncAndPruneCliEndpointsState(discoverRunningAgyProcesses(), true);
+                                    break;
+                                }
+                            }
+                            s_fastChildWatchActive.store(false);
+                        }).detach();
+                    }
                 }
             }
 
@@ -2001,7 +2122,9 @@ void WebServer::setupRoutes() {
             res.status = 400;
             res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
         }
-    });
+    };
+    _server->Post("/api/telemetry/event", handleTelemetryOrHookEvent);
+    _server->Post("/api/hooks/event", handleTelemetryOrHookEvent);
 
     _server->Get("/api/telemetry/overview", [](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
@@ -3390,7 +3513,8 @@ void WebServer::setupRoutes() {
             bool hasTaskMd = !taskMdPath.empty() && fs::exists(taskMdPath);
             auto sumIt = summariesMap.find(id);
             bool hasDbSummary = (sumIt != summariesMap.end());
-            if (!hasTranscript && !hasTaskMd && !hasDbSummary) return;
+            bool isRunningInAgy = (runningAgyByConvId.find(id) != runningAgyByConvId.end());
+            if (!hasTranscript && !hasTaskMd && !isRunningInAgy) return;
 
             uint64_t ts = hasDbSummary ? sumIt->second.lastModifiedSec : 0;
             if (!cdir.empty() && fs::exists(cdir)) {
@@ -3459,6 +3583,13 @@ void WebServer::setupRoutes() {
         scanRoot(getCliBrainDir(), "cli");
 
         for (const auto& kv : summariesMap) {
+            if (seenIds.count(kv.first)) continue;
+            if (!includeSubagents && subagentIds.count(kv.first)) continue;
+            fs::path cdir = fs::path(getCliBrainDir()) / kv.first;
+            addCandidate(kv.first, fs::exists(cdir) ? cdir : fs::path(), "cli");
+        }
+
+        for (const auto& kv : runningAgyByConvId) {
             if (seenIds.count(kv.first)) continue;
             if (!includeSubagents && subagentIds.count(kv.first)) continue;
             fs::path cdir = fs::path(getCliBrainDir()) / kv.first;
@@ -3732,27 +3863,6 @@ void WebServer::setupRoutes() {
                 }
             }
 
-            std::string title;
-            if (hasDbSummary && !sumIt->second.title.empty()) {
-                title = sumIt->second.title;
-            } else if (!mdTitle.empty()) {
-                title = mdTitle;
-            } else if (!firstPrompt.empty()) {
-                title = firstPrompt;
-                auto nlPos = title.find_first_of("\r\n");
-                if (nlPos != std::string::npos) {
-                    title = title.substr(0, nlPos);
-                }
-            }
-            if (title.empty()) {
-                if (!includeSubagents) {
-                    return false;
-                }
-                title = "Conversation " + id.substr(0, std::min<size_t>(8, id.length()));
-            } else if (title.length() > 80) {
-                title = title.substr(0, 77) + "...";
-            }
-
             bool openInTerminal = false;
             std::string terminalPts;
             std::string workspacePath = hasDbSummary ? sumIt->second.workspacePath : "";
@@ -3766,6 +3876,36 @@ void WebServer::setupRoutes() {
                     workspacePath = agyIt->second.cwd;
                     workspaceShort = fs::path(workspacePath).filename().string();
                 }
+            }
+
+            if (ts == 0 && openInTerminal) {
+                ts = nowSec;
+            }
+
+            std::string title;
+            if (hasDbSummary && !sumIt->second.title.empty()) {
+                title = sumIt->second.title;
+            } else if (!mdTitle.empty()) {
+                title = mdTitle;
+            } else if (!firstPrompt.empty()) {
+                title = firstPrompt;
+                auto nlPos = title.find_first_of("\r\n");
+                if (nlPos != std::string::npos) {
+                    title = title.substr(0, nlPos);
+                }
+            }
+            if (title.empty()) {
+                if (openInTerminal) {
+                    title = !workspaceShort.empty()
+                        ? ("New Session (" + workspaceShort + ")")
+                        : ("New Session " + id.substr(0, std::min<size_t>(8, id.length())));
+                } else if (!includeSubagents) {
+                    return false;
+                } else {
+                    title = "Conversation " + id.substr(0, std::min<size_t>(8, id.length()));
+                }
+            } else if (title.length() > 80) {
+                title = title.substr(0, 77) + "...";
             }
 
             bool isActive = openInTerminal;
@@ -4187,6 +4327,58 @@ void WebServer::setupRoutes() {
                 resp["model"] = liveModel;
                 resp["stepCount"] = liveTotalSteps;
                 resp["steps"] = liveSteps;
+                res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                return;
+            }
+
+            fs::path cliIdDir = fs::path(getCliBrainDir()) / id;
+            fs::path ideIdDir = fs::path(getIdeBrainDir()) / id;
+            bool cliHasTaskMd = fs::exists(cliIdDir / "task.md") || fs::exists(cliIdDir / "implementation_plan.md");
+            bool ideHasTaskMd = fs::exists(ideIdDir / "task.md") || fs::exists(ideIdDir / "implementation_plan.md");
+
+            if (isLockedByRunningAgy || cliHasTaskMd || ideHasTaskMd) {
+                fs::path fallbackBrainDir = (fs::exists(cliIdDir) || isLockedByRunningAgy) ? cliIdDir : ideIdDir;
+                nlohmann::json fallbackSteps = nlohmann::json::array();
+                fs::path mdPath = fs::exists(fallbackBrainDir / "task.md") ? (fallbackBrainDir / "task.md")
+                                : (fs::exists(fallbackBrainDir / "implementation_plan.md") ? (fallbackBrainDir / "implementation_plan.md") : fs::path());
+                if (!mdPath.empty()) {
+                    std::ifstream mdf(mdPath);
+                    if (mdf.is_open()) {
+                        std::string mdContent((std::istreambuf_iterator<char>(mdf)),
+                                              std::istreambuf_iterator<char>());
+                        fallbackSteps.push_back({
+                            {"index", 0},
+                            {"stepIndex", 0},
+                            {"type", "PLANNER_RESPONSE"},
+                            {"thinking", ""},
+                            {"plannerResponse", ""},
+                            {"text", mdContent},
+                            {"tool_calls", nlohmann::json::array()},
+                            {"step", {{"case", "text"}, {"value", mdContent}}}
+                        });
+                    }
+                }
+
+                nlohmann::json resp;
+                resp["conversationId"] = id;
+                resp["source"] = isLockedByRunningAgy ? "cli" : "ide";
+                resp["model"] = extractConversationModelById(id);
+                resp["stepCount"] = static_cast<int>(fallbackSteps.size());
+                resp["steps"] = fallbackSteps;
+                resp["openInTerminal"] = isLockedByRunningAgy;
+
+                if (isLockedByRunningAgy) {
+                    for (const auto& proc : discoverRunningAgyProcesses()) {
+                        if (proc.lockedConversationId == id) {
+                            resp["terminalPts"] = proc.terminalPts;
+                            std::string wsPath = proc.cwd;
+                            resp["workspacePath"] = wsPath;
+                            resp["workspace"] = !wsPath.empty() ? fs::path(wsPath).filename().string() : "";
+                            break;
+                        }
+                    }
+                }
+
                 res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
             }
@@ -5935,6 +6127,55 @@ void WebServer::setupRoutes() {
             resp["agentId"] = agentId;
             resp["conversationId"] = cid;
             resp["output"] = "{\"status\":\"resumed_cli_conversation\"}";
+            res.set_content(resp.dump(2), "application/json");
+            return;
+        }
+
+        // 6. Fallback for 0-step locked CLI conversations without CSRF token in workspace: start new detached prompt in wsPath
+        if (isLockedByRunningAgy && !hasCliDiskConversation && !wsPath.empty()) {
+            std::string cliModelId = mapLabelToCliModelId(desiredModel);
+            std::thread([agyBin, text, wsPath, cliModelId]() {
+                pid_t child = fork();
+                if (child == 0) {
+                    setsid();
+                    if (!wsPath.empty()) {
+                        if (chdir(wsPath.c_str()) != 0) {}
+                    }
+                    int devNull = open("/dev/null", O_RDWR);
+                    if (devNull >= 0) {
+                        dup2(devNull, STDIN_FILENO);
+                        dup2(devNull, STDOUT_FILENO);
+                        dup2(devNull, STDERR_FILENO);
+                        if (devNull > 2) close(devNull);
+                    }
+                    unsetenv("ANTIGRAVITY_CONVERSATION_ID");
+                    unsetenv("AGY_LS_PORT");
+                    unsetenv("AGY_LS_CSRF_TOKEN");
+                    unsetenv("ANTIGRAVITY_LS_ADDRESS");
+                    unsetenv("ANTIGRAVITY_CSRF_TOKEN");
+                    std::string modelArg = "--model=" + cliModelId;
+                    std::vector<char*> argv;
+                    argv.push_back(const_cast<char*>(agyBin.c_str()));
+                    argv.push_back(const_cast<char*>("--dangerously-skip-permissions"));
+                    if (!cliModelId.empty()) {
+                        argv.push_back(const_cast<char*>(modelArg.c_str()));
+                    }
+                    argv.push_back(const_cast<char*>("-p"));
+                    argv.push_back(const_cast<char*>(text.c_str()));
+                    argv.push_back(nullptr);
+                    execv(agyBin.c_str(), argv.data());
+                    _exit(127);
+                } else if (child > 0) {
+                    int status = 0;
+                    waitpid(child, &status, 0);
+                }
+            }).detach();
+
+            nlohmann::json resp;
+            resp["status"] = "dispatched";
+            resp["agentId"] = agentId;
+            resp["conversationId"] = cid;
+            resp["output"] = "{\"status\":\"started_cli_conversation_in_workspace\"}";
             res.set_content(resp.dump(2), "application/json");
             return;
         }

@@ -157,7 +157,7 @@ int main() {
         namespace fs = std::filesystem;
         fs::path tmpDir = "/tmp/test_webserver_agy_pinning";
         fs::remove_all(tmpDir);
-        fs::create_directories(tmpDir / "cli_brain");
+        fs::create_directories(tmpDir / "cli_brain" / "locked-conv-uuid-777");
         fs::create_directories(tmpDir / "ide_brain");
 
         const int wrongPort = 39111;

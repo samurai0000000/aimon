@@ -16,6 +16,7 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #endif
 #include <httplib.h>
+#include <sqlite3.h>
 #include "MobileGateway.hxx"
 #include "AgentTelemetryDb.hxx"
 #include "WebServer.hxx"
@@ -2274,6 +2275,175 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
     std::cout << "[TestMobileGateway] testSubagentFilterAskQuestionAndProviderSlashCommands passed!" << std::endl;
 }
 
+static void testOrphanSummaryFilteringAndZeroStepTerminalSession() {
+    std::cout << "[TestMobileGateway] Running testOrphanSummaryFilteringAndZeroStepTerminalSession..." << std::endl;
+    std::string baseDir = "/tmp/aimon_orphan_zero_step_test_" + std::to_string(getpid());
+    fs::remove_all(baseDir);
+
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliRoot = baseDir + "/cli_root";
+    std::string cliBrain = cliRoot + "/brain";
+    std::string dbPath = cliRoot + "/conversation_summaries.db";
+    std::string procsFile = baseDir + "/running_agy.json";
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+
+    // 1. Create conversation_summaries.db with an orphan row
+    //    step_count = 4, title = "Asking for Identity and Time"
+    //    NO transcript.jsonl, NO task.md, NO running agy process
+    {
+        sqlite3* db = nullptr;
+        assert(sqlite3_open(dbPath.c_str(), &db) == SQLITE_OK);
+        const char* createSql =
+            "CREATE TABLE conversation_summaries ("
+            "conversation_id TEXT PRIMARY KEY, "
+            "title TEXT NOT NULL DEFAULT '', "
+            "preview TEXT NOT NULL DEFAULT '', "
+            "step_count INTEGER NOT NULL DEFAULT 0, "
+            "last_modified_time TEXT NOT NULL, "
+            "workspace_uris TEXT NOT NULL DEFAULT '[]', "
+            "status TEXT NOT NULL DEFAULT '', "
+            "parent_conversation_id TEXT NOT NULL DEFAULT '', "
+            "nesting_depth INTEGER NOT NULL DEFAULT 0, "
+            "agent_name TEXT NOT NULL DEFAULT ''"
+            ");";
+        char* err = nullptr;
+        assert(sqlite3_exec(db, createSql, nullptr, nullptr, &err) == SQLITE_OK);
+
+        const char* insertSql =
+            "INSERT INTO conversation_summaries "
+            "(conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status) "
+            "VALUES ('orphan-conv-db-only', 'Asking for Identity and Time', 'What time is it?', 4, "
+            "'2026-10-24 15:00:00', '[\"file:///tmp/work/orphan_ws\"]', 'CASCADE_RUN_STATUS_COMPLETED');";
+        assert(sqlite3_exec(db, insertSql, nullptr, nullptr, &err) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+
+    // 2. Setup running agy processes file for a 0-step session locked by running agy
+    //    zero-step-terminal-conv in workspace /tmp/work/telemetry_project
+    //    NO transcript.jsonl on disk
+    std::string zeroStepCid = "zero-step-terminal-conv";
+    fs::create_directories(cliBrain + "/" + zeroStepCid);
+    {
+        std::ofstream pf(procsFile);
+        json pj = {
+            {"processes", json::array({
+                {
+                    {"pid", 999123},
+                    {"cwd", "/tmp/work/telemetry_project"},
+                    {"lockedConversationId", zeroStepCid},
+                    {"terminalPts", "pts/42"},
+                    {"httpPort", 43210}
+                }
+            })}
+        };
+        pf << pj.dump(2);
+    }
+
+    // 3. Setup a task.md-only session with NO transcript.jsonl
+    std::string taskMdCid = "task-md-only-conv";
+    fs::create_directories(cliBrain + "/" + taskMdCid);
+    {
+        std::ofstream mf(cliBrain + "/" + taskMdCid + "/task.md");
+        mf << "# Implementation Plan for ABC-80 Hardware Diagnostics\n\n1. Inspect ports\n2. Run loopback\n";
+    }
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_AGY_PROCESSES_FILE", procsFile.c_str(), 1);
+    setenv("AIMON_WORKSPACE_ROOT", baseDir.c_str(), 1);
+
+    auto& gw = MobileGateway::getInstance();
+    std::string pairingFile = baseDir + "/mobile_devices.json";
+    assert(gw.init(pairingFile));
+    std::string secret = gw.createPairingSecret(120);
+    std::string validToken;
+    assert(gw.pairDevice(secret, "dev-orphan-test", "Pixel 9 Pro", validToken));
+
+    StateStore& stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.endpointsEnabled = false;
+
+    WebServer server(stateStore, historyStore, config);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", validToken}};
+
+    // Verify GET /api/agent/conversations
+    auto resConvs = client.Get("/api/agent/conversations", headers);
+    assert(resConvs && resConvs->status == 200);
+    json convsJson = json::parse(resConvs->body);
+    assert(convsJson.contains("conversations") && convsJson["conversations"].is_array());
+    const auto& convList = convsJson["conversations"];
+
+    bool foundOrphan = false;
+    bool foundZeroStep = false;
+    bool foundTaskMd = false;
+
+    for (const auto& c : convList) {
+        std::string cid = c.value("id", "");
+        if (cid == "orphan-conv-db-only") {
+            foundOrphan = true;
+        } else if (cid == zeroStepCid) {
+            foundZeroStep = true;
+            assert(c.value("openInTerminal", false) == true);
+            assert(c.value("title", "") == "New Session (telemetry_project)");
+            assert(c.value("terminalPts", "") == "pts/42");
+            assert(c.value("workspace", "") == "telemetry_project");
+        } else if (cid == taskMdCid) {
+            foundTaskMd = true;
+        }
+    }
+
+    // a) Orphan row in conversation_summaries.db must be excluded
+    assert(!foundOrphan);
+
+    // b) 0-step conversation locked by running agy must be included
+    assert(foundZeroStep);
+
+    // c) task.md-only conversation must be included
+    assert(foundTaskMd);
+
+    // Verify GET /api/agent/transcript for zero-step terminal session: returns 200 with steps: []
+    auto resZeroTrans = client.Get(("/api/agent/transcript?id=" + zeroStepCid).c_str(), headers);
+    assert(resZeroTrans && resZeroTrans->status == 200);
+    json zeroTrans = json::parse(resZeroTrans->body);
+    assert(zeroTrans.value("openInTerminal", false) == true);
+    assert(zeroTrans.value("terminalPts", "") == "pts/42");
+    assert(zeroTrans.value("workspace", "") == "telemetry_project");
+    assert(zeroTrans.value("stepCount", -1) == 0);
+    assert(zeroTrans.contains("steps") && zeroTrans["steps"].is_array());
+    assert(zeroTrans["steps"].empty());
+
+    // Verify GET /api/agent/transcript for task.md-only session: returns 200 with 1 PLANNER_RESPONSE step
+    auto resTaskTrans = client.Get(("/api/agent/transcript?id=" + taskMdCid).c_str(), headers);
+    assert(resTaskTrans && resTaskTrans->status == 200);
+    json taskTrans = json::parse(resTaskTrans->body);
+    assert(taskTrans.value("stepCount", -1) == 1);
+    assert(taskTrans.contains("steps") && taskTrans["steps"].size() == 1);
+    assert(taskTrans["steps"][0].value("type", "") == "PLANNER_RESPONSE");
+    std::string taskContent = taskTrans["steps"][0].value("text", "");
+    assert(taskContent.find("Implementation Plan for ABC-80 Hardware Diagnostics") != std::string::npos);
+
+    // Verify GET /api/agent/transcript for orphan session returns 404
+    auto resOrphanTrans = client.Get("/api/agent/transcript?id=orphan-conv-db-only", headers);
+    assert(resOrphanTrans && resOrphanTrans->status == 404);
+
+    server.stop();
+
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_AGY_PROCESSES_FILE");
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] testOrphanSummaryFilteringAndZeroStepTerminalSession passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -2290,6 +2460,7 @@ int main() {
     testSlashCommandsAndSessionNotifications();
     testMultiProviderClaudeAndCursorSessionsAndNotifications();
     testSubagentFilterAskQuestionAndProviderSlashCommands();
+    testOrphanSummaryFilteringAndZeroStepTerminalSession();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;
