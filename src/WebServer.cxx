@@ -619,6 +619,14 @@ static std::string cleanProviderUserPrompt(const std::string& raw) {
     stripBlock("<local-command-stdout>", "</local-command-stdout>");
     stripBlock("<local-command-stderr>", "</local-command-stderr>");
     stripBlock("<tools-used-before-summary>", "</tools-used-before-summary>");
+    stripBlock("<timestamp>", "</timestamp>");
+    stripBlock("<available_subagent_types>", "</available_subagent_types>");
+    stripBlock("<available_subagent_models>", "</available_subagent_models>");
+    stripBlock("<dynamic_tools>", "</dynamic_tools>");
+    stripBlock("<dynamic_tool_catalog>", "</dynamic_tool_catalog>");
+    stripBlock("<dynamic_tool_namespaces>", "</dynamic_tool_namespaces>");
+    stripBlock("<mcp_meta_tools>", "</mcp_meta_tools>");
+    stripBlock("<mcp_meta_tool_servers>", "</mcp_meta_tool_servers>");
 
     while (true) {
         auto rPos = text.find("Read the output file to retrieve the result:");
@@ -895,6 +903,44 @@ struct NormalizedProviderTranscript {
     nlohmann::json lastStepObj;
 };
 
+static std::string extractCompactionSummary(const std::string& rawSegment) {
+    std::string text = rawSegment;
+    if (text.rfind("---", 0) == 0) {
+        auto endFm = text.find("\n---", 3);
+        if (endFm != std::string::npos) {
+            size_t resume = endFm + 4;
+            if (resume < text.size() && text[resume] == '\r') resume++;
+            if (resume < text.size() && text[resume] == '\n') resume++;
+            text = text.substr(resume);
+        }
+    }
+
+    if (text.rfind("## Verbatim turns", 0) == 0 || text.rfind("# Verbatim turns", 0) == 0) {
+        text.clear();
+    } else {
+        auto vPos = text.find("\n## Verbatim turns");
+        if (vPos == std::string::npos) {
+            vPos = text.find("\n# Verbatim turns");
+        }
+        if (vPos != std::string::npos) {
+            text.erase(vPos);
+        }
+    }
+
+    auto first = text.find_first_not_of(" \r\n\t");
+    if (first == std::string::npos) return "";
+    auto last = text.find_last_not_of(" \r\n\t");
+    text = text.substr(first, last - first + 1);
+
+    constexpr size_t MAX_COMPACT_SUMMARY_LEN = 12288;
+    if (text.size() > MAX_COMPACT_SUMMARY_LEN) {
+        text = text.substr(0, MAX_COMPACT_SUMMARY_LEN);
+        text += "\n\n*(Compaction summary truncated)*";
+    }
+
+    return text;
+}
+
 static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     const fs::path& filePath,
     const std::string& providerSource,
@@ -932,8 +978,61 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         return parseIso8601ToEpochSec(rawLine.substr(q1 + 1, q2 - q1 - 1));
     };
 
-    std::string line;
     int stepIdx = 0;
+
+    if (providerSource == "cursor") {
+        fs::path compDir = filePath.parent_path() / "compaction";
+        std::error_code compEc;
+        if (fs::exists(compDir, compEc) && fs::is_directory(compDir, compEc)) {
+            std::string latestSegmentFile;
+            for (const auto& entry : fs::directory_iterator(compDir, compEc)) {
+                if (compEc || !entry.is_regular_file()) continue;
+                std::string fname = entry.path().filename().string();
+                if (fname.rfind("segment_", 0) == 0 && entry.path().extension() == ".md") {
+                    if (fname > latestSegmentFile) {
+                        latestSegmentFile = fname;
+                    }
+                }
+            }
+            if (!latestSegmentFile.empty()) {
+                std::ifstream segFile(compDir / latestSegmentFile);
+                if (segFile.is_open()) {
+                    std::stringstream buffer;
+                    buffer << segFile.rdbuf();
+                    std::string summaryBody = extractCompactionSummary(buffer.str());
+                    if (!summaryBody.empty()) {
+                        int curIdx = stepIdx++;
+                        out.totalSteps = curIdx + 1;
+                        out.hasValidTurns = true;
+                        if (!summaryOnly) {
+                            std::string compactDisplay = "📦 **Context Compacted**\n\n" + summaryBody;
+                            nlohmann::json stepJson = {
+                                {"index", curIdx},
+                                {"stepIndex", curIdx},
+                                {"step_index", curIdx},
+                                {"type", "PLANNER_RESPONSE"},
+                                {"status", "DONE"},
+                                {"content", compactDisplay},
+                                {"thinking", ""},
+                                {"plannerResponse", ""},
+                                {"text", compactDisplay},
+                                {"tool_calls", nlohmann::json::array()},
+                                {"createdAt", ""},
+                                {"step", {{"case", "text"}, {"value", compactDisplay}}}
+                            };
+                            out.lastStepObj = stepJson;
+                            if (sinceIndex < 0 || curIdx > sinceIndex) {
+                                out.steps.push_back(std::move(stepJson));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::string line;
+    std::string lastConsecutiveUserPrompt;
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         // Fast skip non-turn metadata records before invoking full JSON parser
@@ -953,6 +1052,7 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 int curIdx = stepIdx++;
                 out.totalSteps = curIdx + 1;
                 out.hasValidTurns = true;
+                lastConsecutiveUserPrompt.clear();
             }
             continue;
         }
@@ -1076,6 +1176,11 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             if (cleanText.empty()) {
                 continue;
             }
+            if (cleanText == lastConsecutiveUserPrompt) {
+                continue;
+            }
+            lastConsecutiveUserPrompt = cleanText;
+
             int curIdx = stepIdx++;
             out.totalSteps = curIdx + 1;
             out.hasValidTurns = true;
@@ -1114,6 +1219,7 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 int curIdx = stepIdx++;
                 out.totalSteps = curIdx + 1;
                 out.hasValidTurns = true;
+                lastConsecutiveUserPrompt.clear();
                 continue;
             }
             for (auto& prevSt : out.steps) {
@@ -1126,6 +1232,7 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
 
             std::string thinkingText;
             std::string replyText;
+            std::string leadingText;
             nlohmann::json parsedToolCalls = nlohmann::json::array();
             nlohmann::json stepAskQuestions = nlohmann::json::array();
 
@@ -1145,8 +1252,13 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                         } else if (btype == "text") {
                             std::string tx = blk.value("text", "");
                             if (!tx.empty()) {
-                                if (!replyText.empty()) replyText += "\n";
-                                replyText += tx;
+                                if (parsedToolCalls.empty()) {
+                                    if (!leadingText.empty()) leadingText += "\n";
+                                    leadingText += tx;
+                                } else {
+                                    if (!replyText.empty()) replyText += "\n";
+                                    replyText += tx;
+                                }
                             }
                         } else if (btype == "tool_use") {
                             std::string toolName = blk.value("name", "tool");
@@ -1183,9 +1295,31 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 }
             }
 
+            if (!parsedToolCalls.empty()) {
+                if (!leadingText.empty() && stepAskQuestions.empty()) {
+                    if (!thinkingText.empty()) thinkingText += "\n";
+                    thinkingText += leadingText;
+                } else if (!leadingText.empty()) {
+                    if (!replyText.empty()) {
+                        replyText = leadingText + "\n" + replyText;
+                    } else {
+                        replyText = std::move(leadingText);
+                    }
+                }
+            } else {
+                if (!leadingText.empty()) {
+                    if (!replyText.empty()) {
+                        replyText = leadingText + "\n" + replyText;
+                    } else {
+                        replyText = std::move(leadingText);
+                    }
+                }
+            }
+
             if (thinkingText.empty() && replyText.empty() && parsedToolCalls.empty()) {
                 continue;
             }
+            lastConsecutiveUserPrompt.clear();
             int curIdx = stepIdx++;
             out.totalSteps = curIdx + 1;
             out.hasValidTurns = true;
@@ -1222,53 +1356,8 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         }
     }
 
-    if (providerSource == "cursor" && !summaryOnly) {
-        fs::path compDir = filePath.parent_path() / "compaction";
-        std::error_code compEc;
-        if (fs::exists(compDir, compEc) && fs::is_directory(compDir, compEc)) {
-            std::string latestSegmentFile;
-            for (const auto& entry : fs::directory_iterator(compDir, compEc)) {
-                if (compEc || !entry.is_regular_file()) continue;
-                std::string fname = entry.path().filename().string();
-                if (fname.rfind("segment_", 0) == 0 && entry.path().extension() == ".md") {
-                    if (fname > latestSegmentFile) {
-                        latestSegmentFile = fname;
-                    }
-                }
-            }
-            if (!latestSegmentFile.empty()) {
-                std::ifstream segFile(compDir / latestSegmentFile);
-                if (segFile.is_open()) {
-                    std::stringstream buffer;
-                    buffer << segFile.rdbuf();
-                    std::string segmentContent = buffer.str();
-                    if (!segmentContent.empty()) {
-                        int curIdx = stepIdx++;
-                        out.totalSteps = curIdx + 1;
-                        out.hasValidTurns = true;
-                        std::string compactDisplay = "📦 **Context Compacted**\n\n" + segmentContent;
-                        nlohmann::json stepJson = {
-                            {"index", curIdx},
-                            {"stepIndex", curIdx},
-                            {"step_index", curIdx},
-                            {"type", "PLANNER_RESPONSE"},
-                            {"status", "DONE"},
-                            {"content", compactDisplay},
-                            {"thinking", ""},
-                            {"plannerResponse", ""},
-                            {"text", compactDisplay},
-                            {"tool_calls", nlohmann::json::array()},
-                            {"createdAt", ""},
-                            {"step", {{"case", "text"}, {"value", compactDisplay}}}
-                        };
-                        out.lastStepObj = stepJson;
-                        if (sinceIndex < 0 || curIdx > sinceIndex) {
-                            out.steps.push_back(std::move(stepJson));
-                        }
-                    }
-                }
-            }
-        }
+    if (out.firstPrompt.empty() && out.hasValidTurns) {
+        out.firstPrompt = (providerSource == "cursor") ? "Compacted Cursor Session" : "Compacted Session";
     }
 
     if (out.model.empty()) {

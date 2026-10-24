@@ -2011,6 +2011,69 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         }
     }
 
+    // 4f. Cursor compaction summary extraction, XML tag stripping, duplicate user prompt deduplication, text + tool_use grouping
+    {
+        fs::path cursorBugDir = fs::path(cursorProjects) / "home-samurai-work-aimon" / "agent-transcripts" / "cursor-comp-tool-sess";
+        fs::create_directories(cursorBugDir / "compaction");
+
+        {
+            std::ofstream seg(cursorBugDir / "compaction" / "segment_000.md");
+            seg << "---\nworkspace: /tmp\n---\n";
+            seg << "## Summary (curated by compaction step)\nCurated compaction summary point 1.\n";
+            seg << "## Verbatim turns\n";
+            seg << std::string(200000, 'X');
+        }
+
+        {
+            std::ofstream jf(cursorBugDir / "cursor-comp-tool-sess.jsonl");
+            jf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<user_query>\\nCursor has committed his code changes\\n</user_query>\"}]}}\n";
+            jf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<available_subagent_types>\\nSubagent catalog\\n</available_subagent_types>\"}]}}\n";
+            jf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<timestamp>2026-10-24T12:00:00Z</timestamp>\\n<user_query>\\nCursor has committed his code changes\\n</user_query>\"}]}}\n";
+            jf << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"I will inspect the git commit.\"},{\"type\":\"tool_use\",\"name\":\"Shell\",\"input\":{\"command\":\"git status\",\"description\":\"Check git status\"}}]}}\n";
+            jf << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"All checks passed.\"}]}}\n";
+        }
+
+        auto resTrans = client.Get("/api/agent/transcript?id=cursor-comp-tool-sess", headers);
+        assert(resTrans && resTrans->status == 200);
+        json tObj = json::parse(resTrans->body);
+        const auto& steps = tObj["steps"];
+        assert(steps.size() == 4);
+
+        // Step 0: compaction summary
+        assert(steps[0].value("type", "") == "PLANNER_RESPONSE");
+        std::string s0Text = steps[0].value("text", "");
+        assert(s0Text.find("Curated compaction summary point 1.") != std::string::npos);
+        assert(s0Text.find("Verbatim turns") == std::string::npos);
+        assert(s0Text.find("XXXX") == std::string::npos);
+        assert(steps[0]["text"].get<std::string>().size() < 13000);
+
+        // Step 1: deduplicated USER_INPUT
+        assert(steps[1].value("type", "") == "USER_INPUT");
+        assert(steps[1].value("text", "") == "Cursor has committed his code changes");
+
+        // Step 2: tool-calling assistant step
+        assert(steps[2].value("type", "") == "PLANNER_RESPONSE");
+        assert(steps[2].value("thinking", "") == "I will inspect the git commit.");
+        assert(steps[2].value("text", "") == "");
+        assert(steps[2]["step"].value("case", "") == "plannerResponse");
+        assert(steps[2]["step"].value("value", "") == "I will inspect the git commit.");
+        assert(steps[2]["tool_calls"].size() == 1);
+        assert(steps[2]["tool_calls"][0].value("name", "") == "Shell");
+
+        // Step 3: final assistant reply
+        assert(steps[3].value("type", "") == "PLANNER_RESPONSE");
+        assert(steps[3].value("text", "") == "All checks passed.");
+        assert(steps[3]["step"].value("case", "") == "text");
+        assert(steps[3]["step"].value("value", "") == "All checks passed.");
+
+        // Incremental poll since=3
+        auto resPoll = client.Get("/api/agent/transcript?id=cursor-comp-tool-sess&since=3", headers);
+        assert(resPoll && resPoll->status == 200);
+        json pollObj = json::parse(resPoll->body);
+        assert(pollObj["steps"].empty());
+        assert(pollObj["steps"].size() == 0);
+    }
+
     // 4e. /plan, /ask, /effort, /status, /doctor, /models
     {
         json reqPlanClaude = {{"text", "/plan Design auth flow"}, {"source", "claude"}, {"conversationId", "claude-sess-1"}};
