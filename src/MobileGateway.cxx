@@ -170,6 +170,8 @@ void MobileGateway::shutdown() {
     std::lock_guard<std::mutex> lock(_mutex);
     _pairingSecrets.clear();
     _sessions.clear();
+    _recentAgentEvents.clear();
+    _nextEventSeq = 0;
 }
 
 std::string MobileGateway::generateRandomHex(size_t byteCount) {
@@ -329,6 +331,54 @@ void MobileGateway::broadcastWsMessage(const std::string &type, const json &payl
     if (cb) {
         cb(type, payload);
     }
+}
+
+uint64_t MobileGateway::broadcastAgentSessionEvent(const AgentSessionEvent &ev) {
+    AgentSessionEvent stored = ev;
+    BroadcastCallback cb = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!stored.conversationId.empty() && stored.stepIndex >= 0) {
+            for (const auto &existing : _recentAgentEvents) {
+                if (existing.conversationId == stored.conversationId &&
+                    existing.stepIndex == stored.stepIndex &&
+                    existing.event == stored.event) {
+                    return existing.seq;
+                }
+            }
+        }
+        stored.seq = ++_nextEventSeq;
+        if (stored.timestamp <= 0) {
+            stored.timestamp = static_cast<int64_t>(time(nullptr));
+        }
+        _recentAgentEvents.push_back(stored);
+        if (_recentAgentEvents.size() > 64) {
+            _recentAgentEvents.erase(_recentAgentEvents.begin(),
+                                     _recentAgentEvents.begin() + (_recentAgentEvents.size() - 64));
+        }
+        cb = _broadcastCb;
+    }
+    if (cb) {
+        cb("agent_notification", stored.toJson());
+    }
+    return stored.seq;
+}
+
+std::vector<AgentSessionEvent> MobileGateway::getRecentAgentEventsSince(uint64_t sinceSeq) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<AgentSessionEvent> out;
+    for (const auto &ev : _recentAgentEvents) {
+        if (ev.seq > sinceSeq) {
+            out.push_back(ev);
+        }
+    }
+    return out;
+}
+
+void MobileGateway::clearAgentEvents() {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _recentAgentEvents.clear();
+    _nextEventSeq = 0;
 }
 
 } // namespace aimon

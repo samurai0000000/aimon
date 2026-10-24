@@ -27,6 +27,33 @@ struct MobileSession {
     bool        isRevoked = false;
 };
 
+struct AgentSessionEvent {
+    uint64_t    seq = 0;
+    std::string event;          // "prompt_answered" or "agent_question"
+    std::string conversationId;
+    std::string source;         // "cli" or "ide"
+    std::string title;
+    std::string workspace;
+    std::string snippet;
+    int         stepIndex = -1;
+    int64_t     timestamp = 0;
+
+    nlohmann::json toJson() const {
+        return {
+            {"type", "agent_notification"},
+            {"seq", seq},
+            {"event", event},
+            {"conversationId", conversationId},
+            {"source", source},
+            {"title", title},
+            {"workspace", workspace},
+            {"snippet", snippet},
+            {"stepIndex", stepIndex},
+            {"timestamp", timestamp}
+        };
+    }
+};
+
 class MobileGateway {
 public:
     static MobileGateway &getInstance();
@@ -80,6 +107,11 @@ public:
     void setBroadcastCallback(BroadcastCallback cb);
     void broadcastWsMessage(const std::string &type, const nlohmann::json &payload);
 
+    // Agent Session Event Ring Buffer & Broadcast (prompt_answered / agent_question)
+    uint64_t broadcastAgentSessionEvent(const AgentSessionEvent &ev);
+    std::vector<AgentSessionEvent> getRecentAgentEventsSince(uint64_t sinceSeq = 0);
+    void clearAgentEvents();
+
 private:
     MobileGateway(const MobileGateway &) = delete;
     MobileGateway &operator=(const MobileGateway &) = delete;
@@ -95,6 +127,8 @@ private:
     std::map<std::string, time_t> _pairingSecrets;
     std::map<std::string, MobileSession> _sessions;
     BroadcastCallback _broadcastCb;
+    uint64_t _nextEventSeq = 0;
+    std::vector<AgentSessionEvent> _recentAgentEvents;
 };
 
 } // namespace aimon

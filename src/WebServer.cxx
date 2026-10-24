@@ -707,6 +707,8 @@ void WebServer::setupRoutes() {
         // Protected mobile, agent, workspace, and EDA mutation endpoints require a valid token or UI session
         if (req.path == "/api/mobile/devices" ||
             req.path == "/api/mobile/revoke" ||
+            req.path == "/api/mobile/notifications" ||
+            req.path == "/api/mobile/test-notification" ||
             req.path == "/api/agent" ||
             req.path.rfind("/api/agent/", 0) == 0 ||
             req.path == "/api/workspace" ||
@@ -1253,6 +1255,67 @@ void WebServer::setupRoutes() {
             res.status = 400;
             res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
         }
+    });
+
+    _server->Get("/api/mobile/notifications", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        uint64_t sinceSeq = 0;
+        if (req.has_param("since")) {
+            try {
+                sinceSeq = std::stoull(req.get_param_value("since"));
+            } catch (...) {}
+        }
+        MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+        auto events = gw.getRecentAgentEventsSince(sinceSeq);
+        nlohmann::json arr = nlohmann::json::array();
+        uint64_t maxSeq = sinceSeq;
+        for (const auto& ev : events) {
+            arr.push_back(ev.toJson());
+            if (ev.seq > maxSeq) maxSeq = ev.seq;
+        }
+        res.set_content(nlohmann::json({
+            {"events", arr},
+            {"latestSeq", maxSeq}
+        }).dump(2), "application/json");
+    });
+
+    _server->Post("/api/mobile/test-notification", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        nlohmann::json body = nlohmann::json::object();
+        if (!req.body.empty()) {
+            auto parsed = nlohmann::json::parse(req.body, nullptr, false);
+            if (!parsed.is_discarded() && parsed.is_object()) {
+                body = parsed;
+            }
+        }
+        AgentSessionEvent ev;
+        ev.event = body.value("event", "prompt_answered");
+        ev.conversationId = body.value("conversationId", "new");
+        ev.source = body.value("source", "cli");
+        ev.title = body.value("title", "Antigravity Session Test");
+        ev.workspace = body.value("workspace", "aimon");
+        ev.snippet = body.value("snippet", "Test notification chime, vibration, and session deep-link.");
+        ev.stepIndex = -1; // Never suppress test notifications via stepIndex deduplication
+        ev.timestamp = static_cast<int64_t>(time(nullptr));
+
+        MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+        uint64_t seq = gw.broadcastAgentSessionEvent(ev);
+        ev.seq = seq;
+        res.set_content(nlohmann::json({
+            {"status", "ok"},
+            {"seq", seq},
+            {"event", ev.toJson()}
+        }).dump(2), "application/json");
     });
 
     // --- Zero-Python Native Antimatter Agent & Workspace Bridge Endpoints ---
@@ -3105,6 +3168,116 @@ void WebServer::setupRoutes() {
         if (envAgyBin && *envAgyBin) {
             agyBin = envAgyBin;
         }
+
+        // Trim leading/trailing whitespace to inspect potential slash commands
+        std::string trimmedText = text;
+        {
+            auto fPos = trimmedText.find_first_not_of(" \t\r\n");
+            if (fPos != std::string::npos) {
+                auto lPos = trimmedText.find_last_not_of(" \t\r\n");
+                trimmedText = trimmedText.substr(fPos, lPos - fPos + 1);
+            } else {
+                trimmedText.clear();
+            }
+        }
+
+        if (!trimmedText.empty() && trimmedText[0] == '/') {
+            auto spPos = trimmedText.find_first_of(" \t\r\n");
+            std::string cmdVerb = toLowerAscii(spPos == std::string::npos ? trimmedText : trimmedText.substr(0, spPos));
+            if (cmdVerb == "/clear" || cmdVerb == "/new" || cmdVerb == "/reset") {
+                res.set_content(nlohmann::json({
+                    {"status", "cleared"},
+                    {"agentId", agentId},
+                    {"conversationId", "new"},
+                    {"command", cmdVerb},
+                    {"response", "Conversation cleared."}
+                }).dump(2), "application/json");
+                return;
+            }
+
+            static const std::set<std::string> kStatelessPrintCommands = {
+                "/help", "/usage", "/quota", "/credits", "/agents",
+                "/skills", "/permissions", "/hooks", "/changelog"
+            };
+            if (kStatelessPrintCommands.count(cmdVerb) > 0) {
+                if (!fs::exists(agyBin) || access(agyBin.c_str(), X_OK) != 0) {
+                    res.status = 503;
+                    res.set_content(nlohmann::json({
+                        {"status", "error"},
+                        {"error", "Antigravity CLI binary (agy) is not available or not executable at " + agyBin}
+                    }).dump(2), "application/json");
+                    return;
+                }
+                int pipeFd[2];
+                if (pipe(pipeFd) == 0) {
+                    pid_t child = fork();
+                    if (child == 0) {
+                        close(pipeFd[0]);
+                        dup2(pipeFd[1], STDOUT_FILENO);
+                        dup2(pipeFd[1], STDERR_FILENO);
+                        close(pipeFd[1]);
+                        std::string wsDir = getWorkspaceRoot().string();
+                        if (!wsDir.empty()) {
+                            int chRes = chdir(wsDir.c_str());
+                            (void)chRes;
+                        }
+                        std::vector<char*> argv;
+                        argv.push_back(const_cast<char*>(agyBin.c_str()));
+                        argv.push_back(const_cast<char*>("-p"));
+                        argv.push_back(const_cast<char*>(trimmedText.c_str()));
+                        argv.push_back(const_cast<char*>("--output-format"));
+                        argv.push_back(const_cast<char*>("json"));
+                        argv.push_back(nullptr);
+                        execv(agyBin.c_str(), argv.data());
+                        _exit(127);
+                    } else if (child > 0) {
+                        close(pipeFd[1]);
+                        std::string cmdOut;
+                        char buf[1024];
+                        ssize_t n;
+                        while ((n = read(pipeFd[0], buf, sizeof(buf))) > 0) {
+                            cmdOut.append(buf, static_cast<size_t>(n));
+                        }
+                        close(pipeFd[0]);
+                        int st = 0;
+                        int waitedMs = 0;
+                        while (waitedMs < 8000) {
+                            if (waitpid(child, &st, WNOHANG) == child) break;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                            waitedMs += 20;
+                        }
+                        if (waitedMs >= 8000) {
+                            kill(child, SIGKILL);
+                            waitpid(child, &st, 0);
+                        }
+                        std::string responseMarkdown = cmdOut;
+                        auto cj = nlohmann::json::parse(cmdOut, nullptr, false);
+                        if (!cj.is_discarded() && cj.is_object()) {
+                            if (cj.contains("response") && cj["response"].is_string()) {
+                                responseMarkdown = cj["response"].get<std::string>();
+                            } else if (cj.contains("error") && cj["error"].is_string()) {
+                                responseMarkdown = cj["error"].get<std::string>();
+                            }
+                        }
+                        if (cmdVerb == "/help" && responseMarkdown.find("/compact") == std::string::npos) {
+                            responseMarkdown += "\n/clear\tStart a fresh conversation\n/compact\tCompact and summarize conversation context\n/settings\tOpen AIMon mobile Settings tab\n";
+                        }
+                        res.set_content(nlohmann::json({
+                            {"status", "command_response"},
+                            {"agentId", agentId},
+                            {"conversationId", cid.empty() ? "new" : cid},
+                            {"command", cmdVerb},
+                            {"response", responseMarkdown}
+                        }).dump(2), "application/json");
+                        return;
+                    } else {
+                        close(pipeFd[0]);
+                        close(pipeFd[1]);
+                    }
+                }
+            }
+        }
+
         if (!fs::exists(agyBin) || access(agyBin.c_str(), X_OK) != 0) {
             res.status = 503;
             res.set_content(nlohmann::json({
@@ -3780,17 +3953,17 @@ void WebServer::setupRoutes() {
 
 
     _server->Get("/sse", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!_mcpServer) {
-            res.status = 503;
-            res.set_content("MCP service not configured", "text/plain");
-            return;
-        }
-
         std::string profile;
         if (req.has_param("profile")) {
             profile = req.get_param_value("profile");
         } else if (req.has_header("X-Aimon-Profile")) {
             profile = req.get_header_value("X-Aimon-Profile");
+        }
+
+        if (!_mcpServer && profile != "mobile") {
+            res.status = 503;
+            res.set_content("MCP service not configured", "text/plain");
+            return;
         }
 
         std::string sessionId = generateSessionId();
@@ -4209,6 +4382,28 @@ bool WebServer::start(bool async) {
     setupRoutes();
     _running = true;
 
+    MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+    gw.setBroadcastCallback([this](const std::string&, const nlohmann::json& payload) {
+        this->broadcastSseNotification(payload.dump());
+    });
+
+    // Seed pre-existing transcript steps so historical turns do not fire alerts on startup
+    scanTranscriptsForNotifications(true);
+
+    _notificationThread = std::make_unique<std::thread>([this]() {
+        while (_running) {
+            std::unique_lock<std::mutex> lk(_notificationStopMutex);
+            _notificationStopCv.wait_for(lk, std::chrono::milliseconds(500), [this]() {
+                return !_running;
+            });
+            if (!_running) break;
+            lk.unlock();
+            try {
+                scanTranscriptsForNotifications(false);
+            } catch (...) {}
+        }
+    });
+
     _server->set_read_timeout(1, 0);
     _server->set_write_timeout(5, 0);
 
@@ -4269,10 +4464,293 @@ void WebServer::broadcastSseNotification(const std::string& jsonRpcNotification)
     }
 }
 
+void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
+    std::lock_guard<std::mutex> lock(_watchedTranscriptsMutex);
+
+    const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
+    std::string ideBrain = (envIde && *envIde) ? std::string(envIde) : PathUtils::expandHome("~/.gemini/antigravity-ide/brain");
+    const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
+    std::string cliBrain = (envCli && *envCli) ? std::string(envCli) : PathUtils::expandHome("~/.gemini/antigravity-cli/brain");
+
+    int settleMs = 1200;
+    const char* envSettle = std::getenv("AIMON_NOTIFICATION_SETTLE_MS");
+    if (envSettle && *envSettle) {
+        try {
+            settleMs = std::max(0, std::stoi(envSettle));
+        } catch (...) {}
+    }
+
+    auto stripUserTags = [](const std::string& raw) -> std::string {
+        std::string text = raw;
+        auto startTag = text.find("<USER_REQUEST>");
+        auto endTag = text.find("</USER_REQUEST>");
+        if (startTag != std::string::npos && endTag != std::string::npos && endTag >= startTag + 14) {
+            text = text.substr(startTag + 14, endTag - (startTag + 14));
+        }
+        auto first = text.find_first_not_of(" \n\r\t");
+        if (first == std::string::npos) return "";
+        auto last = text.find_last_not_of(" \n\r\t");
+        return text.substr(first, last - first + 1);
+    };
+
+    auto trimText = [](const std::string& s) -> std::string {
+        auto f = s.find_first_not_of(" \n\r\t");
+        if (f == std::string::npos) return "";
+        auto l = s.find_last_not_of(" \n\r\t");
+        return s.substr(f, l - f + 1);
+    };
+
+    MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+
+    std::vector<std::pair<std::string, std::string>> roots = {
+        {"cli", cliBrain},
+        {"ide", ideBrain}
+    };
+
+    for (const auto& rootPair : roots) {
+        const std::string& source = rootPair.first;
+        const std::string& rootPath = rootPair.second;
+        if (rootPath.empty()) continue;
+
+        std::error_code dirEc;
+        if (!fs::exists(rootPath, dirEc) || !fs::is_directory(rootPath, dirEc)) {
+            continue;
+        }
+
+        for (const auto& entry : fs::directory_iterator(rootPath, dirEc)) {
+            if (dirEc || !entry.is_directory()) continue;
+            std::string cid = entry.path().filename().string();
+            if (cid.empty() || cid[0] == '.') continue;
+
+            fs::path tPath = entry.path() / ".system_generated" / "logs" / "transcript.jsonl";
+            std::error_code fEc;
+            if (!fs::exists(tPath, fEc) || fEc) continue;
+
+            auto mtime = fs::last_write_time(tPath, fEc);
+            if (fEc) continue;
+            auto fsize = fs::file_size(tPath, fEc);
+            if (fEc) continue;
+
+            auto ageSec = std::chrono::duration_cast<std::chrono::seconds>(
+                fs::file_time_type::clock::now() - mtime).count();
+            bool alreadyTracked = (_watchedTranscripts.find(cid) != _watchedTranscripts.end());
+            if (ageSec > 900 && !alreadyTracked) {
+                continue;
+            }
+
+            int64_t mtimeTicks = mtime.time_since_epoch().count();
+            WatchedTranscriptState& st = _watchedTranscripts[cid];
+
+            if (!seedOnly && st.seeded &&
+                mtimeTicks == st.lastMtimeTicks &&
+                fsize == st.lastFileSize &&
+                st.pendingStepIndex < 0) {
+                continue;
+            }
+
+            st.lastMtimeTicks = mtimeTicks;
+            st.lastFileSize = fsize;
+            st.seeded = true;
+
+            if (st.cachedTitle.empty()) {
+                fs::path taskMdPath = entry.path() / "task.md";
+                if (fs::exists(taskMdPath, fEc)) {
+                    std::ifstream tf(taskMdPath);
+                    std::string tLine;
+                    while (std::getline(tf, tLine)) {
+                        std::string trimmed = trimText(tLine);
+                        if (!trimmed.empty() && trimmed[0] == '#') {
+                            size_t hPos = trimmed.find_first_not_of("# \t");
+                            if (hPos != std::string::npos) {
+                                st.cachedTitle = trimmed.substr(hPos, 80);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            std::ifstream in(tPath);
+            if (!in.is_open()) continue;
+
+            int maxStepIdx = -1;
+            nlohmann::json lastStepObj;
+            std::string prevGenericContent;
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.empty()) continue;
+                auto j = nlohmann::json::parse(line, nullptr, false);
+                if (j.is_discarded() || !j.is_object()) continue;
+
+                int sIdx = j.value("step_index", j.value("index", -1));
+                if (sIdx > maxStepIdx) {
+                    maxStepIdx = sIdx;
+                }
+                std::string sType = j.value("type", "");
+                if (st.cachedTitle.empty() && sType == "USER_INPUT") {
+                    std::string uText = stripUserTags(j.value("content", ""));
+                    if (!uText.empty()) {
+                        auto nlPos = uText.find('\n');
+                        if (nlPos != std::string::npos) {
+                            uText = uText.substr(0, nlPos);
+                        }
+                        st.cachedTitle = uText.substr(0, std::min<size_t>(uText.size(), 80));
+                    }
+                }
+                if (sType == "GENERIC" || sType == "SYSTEM_MESSAGE") {
+                    prevGenericContent = j.value("content", "");
+                } else if (sType == "USER_INPUT") {
+                    prevGenericContent.clear();
+                }
+                lastStepObj = std::move(j);
+            }
+
+            if (seedOnly) {
+                st.lastNotifiedStepIndex = maxStepIdx;
+                st.pendingStepIndex = -1;
+                continue;
+            }
+
+            if (lastStepObj.is_null() || !lastStepObj.is_object()) {
+                continue;
+            }
+
+            int lastStepIdx = lastStepObj.value("step_index", lastStepObj.value("index", -1));
+            if (lastStepIdx < 0 || lastStepIdx <= st.lastNotifiedStepIndex) {
+                st.pendingStepIndex = -1;
+                continue;
+            }
+
+            std::string lastType = lastStepObj.value("type", "");
+            std::string lastStatus = lastStepObj.value("status", "DONE");
+            if (lastStatus != "DONE") {
+                st.pendingStepIndex = -1;
+                continue;
+            }
+
+            // 1. Check for agent_question (ask_question tool call or ArtifactMetadata.RequestFeedback == true)
+            bool isAgentQuestion = false;
+            std::string questionSnippet;
+            if (lastStepObj.contains("tool_calls") && lastStepObj["tool_calls"].is_array()) {
+                for (const auto& tc : lastStepObj["tool_calls"]) {
+                    if (!tc.is_object()) continue;
+                    std::string tcName = tc.value("name", "");
+                    if (tcName.empty() && tc.contains("function") && tc["function"].is_object()) {
+                        tcName = tc["function"].value("name", "");
+                    }
+                    nlohmann::json argsObj = nlohmann::json::object();
+                    if (tc.contains("args")) {
+                        if (tc["args"].is_object()) argsObj = tc["args"];
+                        else if (tc["args"].is_string()) {
+                            auto p = nlohmann::json::parse(tc["args"].get<std::string>(), nullptr, false);
+                            if (!p.is_discarded() && p.is_object()) argsObj = p;
+                        }
+                    } else if (tc.contains("arguments")) {
+                        if (tc["arguments"].is_object()) argsObj = tc["arguments"];
+                        else if (tc["arguments"].is_string()) {
+                            auto p = nlohmann::json::parse(tc["arguments"].get<std::string>(), nullptr, false);
+                            if (!p.is_discarded() && p.is_object()) argsObj = p;
+                        }
+                    } else if (tc.contains("function") && tc["function"].is_object() &&
+                               tc["function"].contains("arguments")) {
+                        const auto& fa = tc["function"]["arguments"];
+                        if (fa.is_object()) argsObj = fa;
+                        else if (fa.is_string()) {
+                            auto p = nlohmann::json::parse(fa.get<std::string>(), nullptr, false);
+                            if (!p.is_discarded() && p.is_object()) argsObj = p;
+                        }
+                    }
+
+                    if (tcName == "ask_question") {
+                        isAgentQuestion = true;
+                        if (argsObj.contains("questions") && argsObj["questions"].is_array() &&
+                            !argsObj["questions"].empty() && argsObj["questions"][0].is_object()) {
+                            questionSnippet = trimText(argsObj["questions"][0].value("question", ""));
+                        }
+                        break;
+                    }
+                    if ((tcName == "write_file" || tcName == "edit_file") &&
+                        argsObj.contains("ArtifactMetadata") && argsObj["ArtifactMetadata"].is_object() &&
+                        argsObj["ArtifactMetadata"].value("RequestFeedback", false)) {
+                        isAgentQuestion = true;
+                        questionSnippet = trimText(argsObj["ArtifactMetadata"].value("Summary", "Plan is ready for your review."));
+                        break;
+                    }
+                }
+            }
+
+            if (isAgentQuestion) {
+                AgentSessionEvent ev;
+                ev.event = "agent_question";
+                ev.conversationId = cid;
+                ev.source = source;
+                ev.title = st.cachedTitle.empty() ? ("Session " + cid.substr(0, std::min<size_t>(cid.size(), 8))) : st.cachedTitle;
+                ev.workspace = st.cachedWorkspace;
+                ev.snippet = questionSnippet.empty()
+                    ? "Agent is waiting for your input."
+                    : questionSnippet.substr(0, std::min<size_t>(questionSnippet.size(), 180));
+                ev.stepIndex = lastStepIdx;
+                ev.timestamp = static_cast<int64_t>(time(nullptr));
+
+                st.lastNotifiedStepIndex = lastStepIdx;
+                st.pendingStepIndex = -1;
+                gw.broadcastAgentSessionEvent(ev);
+                continue;
+            }
+
+            // 2. Check for prompt_answered (terminal PLANNER_RESPONSE with empty tool_calls and non-empty content)
+            bool hasToolCalls = lastStepObj.contains("tool_calls") &&
+                                lastStepObj["tool_calls"].is_array() &&
+                                !lastStepObj["tool_calls"].empty();
+            if (lastType == "PLANNER_RESPONSE" && !hasToolCalls) {
+                std::string replyContent = trimText(lastStepObj.value("content", ""));
+                bool waitingForBgTask = (prevGenericContent.find("Tool is running as a background task with task id:") != std::string::npos);
+                if (!replyContent.empty() && !waitingForBgTask) {
+                    if (st.pendingStepIndex != lastStepIdx) {
+                        st.pendingStepIndex = lastStepIdx;
+                        st.pendingEvent = "prompt_answered";
+                        st.pendingSnippet = replyContent.substr(0, std::min<size_t>(replyContent.size(), 180));
+                        st.pendingSince = std::chrono::steady_clock::now();
+                    }
+                    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - st.pendingSince).count();
+                    if (elapsedMs >= settleMs) {
+                        AgentSessionEvent ev;
+                        ev.event = "prompt_answered";
+                        ev.conversationId = cid;
+                        ev.source = source;
+                        ev.title = st.cachedTitle.empty() ? ("Session " + cid.substr(0, std::min<size_t>(cid.size(), 8))) : st.cachedTitle;
+                        ev.workspace = st.cachedWorkspace;
+                        ev.snippet = st.pendingSnippet;
+                        ev.stepIndex = lastStepIdx;
+                        ev.timestamp = static_cast<int64_t>(time(nullptr));
+
+                        st.lastNotifiedStepIndex = lastStepIdx;
+                        st.pendingStepIndex = -1;
+                        gw.broadcastAgentSessionEvent(ev);
+                    }
+                    continue;
+                }
+            }
+
+            st.pendingStepIndex = -1;
+        }
+    }
+}
+
 void WebServer::stop() {
     if (!_running) return;
 
     _running = false;
+    _notificationStopCv.notify_all();
+    if (_notificationThread && _notificationThread->joinable()) {
+        _notificationThread->join();
+        _notificationThread.reset();
+    }
+
+    MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
+    gw.setBroadcastCallback(nullptr);
+
     {
         std::lock_guard<std::mutex> lock(_sessionsMutex);
         for (auto& pair : _sseSessions) {

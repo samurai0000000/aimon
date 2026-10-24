@@ -1135,6 +1135,186 @@ static void testAgentPromptPreservesCascadeConfigAndModelM418() {
     std::cout << "[TestMobileGateway] testAgentPromptPreservesCascadeConfigAndModelM418 passed!" << std::endl;
 }
 
+static void testSlashCommandsAndSessionNotifications() {
+    std::cout << "[TestMobileGateway] Running testSlashCommandsAndSessionNotifications..." << std::endl;
+    std::string baseDir = "/tmp/aimon_slash_notif_test_" + std::to_string(getpid());
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliBrain = baseDir + "/cli_brain";
+    std::string wsRoot = baseDir + "/workspace";
+    std::string tempMobileDb = baseDir + "/mobile_devices.json";
+    fs::remove_all(baseDir);
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+    fs::create_directories(wsRoot);
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_WORKSPACE_ROOT", wsRoot.c_str(), 1);
+    setenv("AIMON_NOTIFICATION_SETTLE_MS", "20", 1);
+
+    // Seed an existing conversation before starting WebServer to verify startup seeding does not fire old alerts
+    std::string seededCid = "conv-seeded-old";
+    fs::path seededLogDir = fs::path(cliBrain) / seededCid / ".system_generated" / "logs";
+    fs::create_directories(seededLogDir);
+    {
+        std::ofstream sf(seededLogDir / "transcript.jsonl");
+        sf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"<USER_REQUEST>\\nOld prompt\\n</USER_REQUEST>\"}\n";
+        sf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Old answer\",\"tool_calls\":[]}\n";
+    }
+
+    // Create mock agy binary supporting both `-p <slashCmd> --output-format json` and `agentapi send-message`
+    std::string mockAgy = baseDir + "/mock_agy_slash.sh";
+    {
+        std::ofstream mf(mockAgy);
+        mf << "#!/bin/sh\n"
+           << "if [ \"$1\" = \"-p\" ]; then\n"
+           << "  echo \"{\\\"status\\\":\\\"SUCCESS\\\",\\\"response\\\":\\\"Slash output for $2\\\",\\\"command\\\":{\\\"name\\\":\\\"cmd\\\"}}\"\n"
+           << "  exit 0\n"
+           << "fi\n"
+           << "if [ \"$1\" = \"agentapi\" ] && [ \"$2\" = \"send-message\" ]; then\n"
+           << "  echo \"{\\\"status\\\":\\\"sent\\\",\\\"recipient\\\":\\\"$3\\\",\\\"prompt\\\":\\\"$4\\\"}\"\n"
+           << "  exit 0\n"
+           << "fi\n"
+           << "exit 1\n";
+    }
+    chmod(mockAgy.c_str(), 0755);
+    setenv("AIMON_AGY_BIN", mockAgy.c_str(), 1);
+    setenv("AGY_LS_PORT", "46797", 1);
+    setenv("AGY_LS_CSRF_TOKEN", "slash-csrf", 1);
+
+    MobileGateway &gw = MobileGateway::getInstance();
+    assert(gw.init(tempMobileDb));
+    gw.clearAgentEvents();
+    std::string secret = gw.createPairingSecret(120);
+    std::string validToken;
+    assert(gw.verifyPairingCode(secret, "slash-notif-dev", "Test Phone", validToken));
+
+    StateStore &stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.endpointsEnabled = false;
+
+    WebServer server(stateStore, historyStore, config);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", validToken}};
+
+    // 1. Verify seeded conversation did not generate any startup notification
+    server.scanTranscriptsForNotifications(false);
+    assert(gw.getRecentAgentEventsSince(0).empty());
+
+    // 2. Verify /clear returns status="cleared" and conversationId="new"
+    json clearReq = {{"text", "/clear"}, {"conversationId", "conv-1"}};
+    auto resClear = client.Post("/api/agent/prompt", headers, clearReq.dump(), "application/json");
+    assert(resClear && resClear->status == 200);
+    json clearBody = json::parse(resClear->body);
+    assert(clearBody.value("status", "") == "cleared");
+    assert(clearBody.value("conversationId", "") == "new");
+
+    // 3. Verify stateless print-mode slash commands (/help, /usage, /credits) return status="command_response"
+    for (const std::string cmd : {"/help", "/usage", "/credits"}) {
+        json cmdReq = {{"text", cmd}, {"conversationId", "conv-1"}};
+        auto resCmd = client.Post("/api/agent/prompt", headers, cmdReq.dump(), "application/json");
+        assert(resCmd && resCmd->status == 200);
+        json cmdBody = json::parse(resCmd->body);
+        assert(cmdBody.value("status", "") == "command_response");
+        assert(cmdBody.value("command", "") == cmd);
+        assert(cmdBody.value("response", "").find("Slash output for " + cmd) != std::string::npos);
+    }
+
+    // 4. Verify session slash commands (/compact, /grill-me) route to the conversation via agy/ConnectRPC
+    json compactReq = {{"text", "/compact"}, {"conversationId", "conv-1"}};
+    auto resCompact = client.Post("/api/agent/prompt", headers, compactReq.dump(), "application/json");
+    assert(resCompact && resCompact->status == 200);
+    json compactBody = json::parse(resCompact->body);
+    assert(compactBody.value("status", "") == "dispatched");
+    assert(compactBody.value("output", "").find("/compact") != std::string::npos);
+
+    // 5. Verify agent_question detection when ask_question tool call is written to a live session
+    std::string liveCid = "conv-live-notif-42";
+    fs::path liveLogDir = fs::path(ideBrain) / liveCid / ".system_generated" / "logs";
+    fs::create_directories(liveLogDir);
+    fs::path liveTranscript = liveLogDir / "transcript.jsonl";
+    {
+        std::ofstream lf(liveTranscript);
+        lf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"<USER_REQUEST>\\nBuild mobile settings tab\\n</USER_REQUEST>\"}\n";
+        lf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"\",\"tool_calls\":[{\"name\":\"ask_question\",\"args\":{\"questions\":[{\"question\":\"Which sessions should trigger notifications?\"}]}}]}\n";
+    }
+    server.scanTranscriptsForNotifications(false);
+    auto eventsAfterQ = gw.getRecentAgentEventsSince(0);
+    assert(eventsAfterQ.size() == 1);
+    assert(eventsAfterQ[0].event == "agent_question");
+    assert(eventsAfterQ[0].conversationId == liveCid);
+    assert(eventsAfterQ[0].source == "ide");
+    assert(eventsAfterQ[0].title == "Build mobile settings tab");
+    assert(eventsAfterQ[0].snippet == "Which sessions should trigger notifications?");
+    assert(eventsAfterQ[0].stepIndex == 1);
+    uint64_t qSeq = eventsAfterQ[0].seq;
+
+    // Repeated scan does not duplicate step 1
+    server.scanTranscriptsForNotifications(false);
+    assert(gw.getRecentAgentEventsSince(qSeq).empty());
+
+    // 6. Verify intermediate background-task wait step does NOT fire a false prompt_answered
+    {
+        std::ofstream lf(liveTranscript, std::ios::app);
+        lf << "{\"step_index\":2,\"type\":\"GENERIC\",\"status\":\"DONE\",\"content\":\"Tool is running as a background task with task id: task-123\"}\n";
+        lf << "{\"step_index\":3,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Waiting for background build to finish...\",\"tool_calls\":[]}\n";
+    }
+    server.scanTranscriptsForNotifications(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    server.scanTranscriptsForNotifications(false);
+    assert(gw.getRecentAgentEventsSince(qSeq).empty());
+
+    // 7. Verify terminal PLANNER_RESPONSE fires prompt_answered once settled
+    {
+        std::ofstream lf(liveTranscript, std::ios::app);
+        lf << "{\"step_index\":4,\"type\":\"SYSTEM_MESSAGE\",\"status\":\"DONE\",\"content\":\"Background task completed\"}\n";
+        lf << "{\"step_index\":5,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"All settings and notifications have been implemented and verified.\",\"tool_calls\":[]}\n";
+    }
+    server.scanTranscriptsForNotifications(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    server.scanTranscriptsForNotifications(false);
+    auto eventsAfterAns = gw.getRecentAgentEventsSince(qSeq);
+    assert(eventsAfterAns.size() == 1);
+    assert(eventsAfterAns[0].event == "prompt_answered");
+    assert(eventsAfterAns[0].conversationId == liveCid);
+    assert(eventsAfterAns[0].stepIndex == 5);
+    assert(eventsAfterAns[0].snippet.find("All settings and notifications have been implemented") != std::string::npos);
+
+    // 8. Verify GET /api/mobile/notifications and POST /api/mobile/test-notification
+    auto resNotifs = client.Get("/api/mobile/notifications?since=0", headers);
+    assert(resNotifs && resNotifs->status == 200);
+    json notifsBody = json::parse(resNotifs->body);
+    assert(notifsBody.contains("events") && notifsBody["events"].size() == 2);
+
+    json testNotifReq = {
+        {"event", "prompt_answered"},
+        {"conversationId", liveCid},
+        {"title", "Manual Test"},
+        {"snippet", "Testing sound and vibration"}
+    };
+    auto resTestNotif = client.Post("/api/mobile/test-notification", headers, testNotifReq.dump(), "application/json");
+    assert(resTestNotif && resTestNotif->status == 200);
+    json testNotifBody = json::parse(resTestNotif->body);
+    assert(testNotifBody.value("status", "") == "ok");
+
+    server.stop();
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    unsetenv("AIMON_NOTIFICATION_SETTLE_MS");
+    unsetenv("AIMON_AGY_BIN");
+    unsetenv("AGY_LS_PORT");
+    unsetenv("AGY_LS_CSRF_TOKEN");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] testSlashCommandsAndSessionNotifications passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -1148,6 +1328,7 @@ int main() {
     testWorkspaceRecursiveTree();
     testAgentPromptNoFakeElizaAndRealBridge();
     testAgentPromptPreservesCascadeConfigAndModelM418();
+    testSlashCommandsAndSessionNotifications();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;

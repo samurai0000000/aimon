@@ -56,6 +56,7 @@ public:
     bool start(bool async = false);
     void stop();
     void broadcastSseNotification(const std::string& jsonRpcNotification);
+    void scanTranscriptsForNotifications(bool seedOnly = false);
 
     void setInsightEngine(InsightEngine* engine) {
         _insightEngine = engine;
@@ -105,6 +106,24 @@ private:
 
     std::map<std::string, std::shared_ptr<SseSession>> _sseSessions;
     std::mutex _sessionsMutex;
+
+    struct WatchedTranscriptState {
+        int64_t lastMtimeTicks = 0;
+        uintmax_t lastFileSize = 0;
+        int lastNotifiedStepIndex = -1;
+        int pendingStepIndex = -1;
+        std::string pendingEvent;
+        std::string pendingSnippet;
+        std::chrono::steady_clock::time_point pendingSince{};
+        std::string cachedTitle;
+        std::string cachedWorkspace;
+        bool seeded = false;
+    };
+    std::mutex _watchedTranscriptsMutex;
+    std::map<std::string, WatchedTranscriptState> _watchedTranscripts;
+    std::unique_ptr<std::thread> _notificationThread;
+    std::mutex _notificationStopMutex;
+    std::condition_variable _notificationStopCv;
 
     std::unique_ptr<httplib::Server> _server;
     std::unique_ptr<std::thread> _thread;
