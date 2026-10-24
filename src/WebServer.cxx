@@ -903,7 +903,7 @@ struct NormalizedProviderTranscript {
     nlohmann::json lastStepObj;
 };
 
-static std::string extractCompactionSummary(const std::string& rawSegment) {
+static std::string extractCompactionSummary(const std::string& rawSegment, size_t maxBytes = 12288) {
     std::string text = rawSegment;
     if (text.rfind("---", 0) == 0) {
         auto endFm = text.find("\n---", 3);
@@ -932,13 +932,39 @@ static std::string extractCompactionSummary(const std::string& rawSegment) {
     auto last = text.find_last_not_of(" \r\n\t");
     text = text.substr(first, last - first + 1);
 
-    constexpr size_t MAX_COMPACT_SUMMARY_LEN = 12288;
-    if (text.size() > MAX_COMPACT_SUMMARY_LEN) {
-        text = text.substr(0, MAX_COMPACT_SUMMARY_LEN);
+    if (text.size() > maxBytes) {
+        text = text.substr(0, maxBytes);
         text += "\n\n*(Compaction summary truncated)*";
     }
 
     return text;
+}
+
+static std::string extractAntigravityCheckpointSummary(const std::string& raw, size_t maxBytes = 12288) {
+    std::string body = raw;
+    auto sumStart = body.find("<summary>");
+    if (sumStart != std::string::npos) {
+        sumStart += 9;
+        auto sumEnd = body.find("</summary>", sumStart);
+        if (sumEnd != std::string::npos) {
+            body = body.substr(sumStart, sumEnd - sumStart);
+        } else {
+            body = body.substr(sumStart);
+        }
+    } else {
+        const std::string kHeader = "# Resuming from a compaction";
+        if (body.rfind(kHeader, 0) == 0) {
+            auto nl = body.find('\n');
+            if (nl != std::string::npos) {
+                body = body.substr(nl + 1);
+            }
+        }
+    }
+    std::string cleaned = extractCompactionSummary(body, maxBytes);
+    if (cleaned.empty()) {
+        cleaned = "Session context compacted.";
+    }
+    return "📦 **Context Compacted**\n\n" + cleaned;
 }
 
 static NormalizedProviderTranscript parseProviderTranscriptJsonl(
@@ -4068,6 +4094,23 @@ void WebServer::setupRoutes() {
                                         {"text", errText},
                                         {"step", {{"case", "errorMessage"}, {"value", errText}}}
                                     });
+                                } else if (stType == "CORTEX_STEP_TYPE_CHECKPOINT") {
+                                    std::string rawSummary;
+                                    if (rs.contains("checkpoint") && rs["checkpoint"].is_object()) {
+                                        rawSummary = rs["checkpoint"].value("sessionSummary",
+                                                     rs["checkpoint"].value("userIntent", ""));
+                                    }
+                                    std::string compactDisplay = extractAntigravityCheckpointSummary(rawSummary);
+                                    parsedLiveSteps.push_back({
+                                        {"index", stepIdx},
+                                        {"stepIndex", stepIdx},
+                                        {"type", "PLANNER_RESPONSE"},
+                                        {"thinking", ""},
+                                        {"plannerResponse", ""},
+                                        {"text", compactDisplay},
+                                        {"tool_calls", nlohmann::json::array()},
+                                        {"step", {{"case", "text"}, {"value", compactDisplay}}}
+                                    });
                                 }
                             }
                             if (hasUnknownModelError && parsedTotalSteps <= 2) {
@@ -4336,6 +4379,22 @@ void WebServer::setupRoutes() {
                         {"step", {
                             {"case", "errorMessage"},
                             {"value", errText}
+                        }}
+                    });
+                } else if (type == "CHECKPOINT") {
+                    std::string compactDisplay = extractAntigravityCheckpointSummary(content);
+                    steps.push_back({
+                        {"index", stepIdx},
+                        {"stepIndex", stepIdx},
+                        {"type", "PLANNER_RESPONSE"},
+                        {"thinking", ""},
+                        {"plannerResponse", ""},
+                        {"text", compactDisplay},
+                        {"tool_calls", nlohmann::json::array()},
+                        {"createdAt", createdAt},
+                        {"step", {
+                            {"case", "text"},
+                            {"value", compactDisplay}
                         }}
                     });
                 } else if (!parsedToolCalls.empty()) {
@@ -5207,9 +5266,90 @@ void WebServer::setupRoutes() {
                     {"Content-Type", "application/json"},
                     {"x-codeium-csrf-token", ep.csrf}
                 };
+                nlohmann::json itemsJson = nlohmann::json::array({{{"text", text}}});
+                if (!trimmedText.empty() && trimmedText[0] == '/' && trimmedText.size() > 1) {
+                    auto spPos = trimmedText.find_first_of(" \t\r\n");
+                    std::string rawCmd = (spPos == std::string::npos)
+                        ? trimmedText.substr(1)
+                        : trimmedText.substr(1, spPos - 1);
+                    std::string trailingText = (spPos == std::string::npos)
+                        ? ""
+                        : trimmedText.substr(spPos);
+                    std::string cmdLower = toLowerAscii(rawCmd);
+                    if (cmdLower == "summarize" || cmdLower == "compress") {
+                        cmdLower = "compact";
+                    }
+                    if (!cmdLower.empty() && cmdLower.find('/') == std::string::npos) {
+                        nlohmann::json slashInfo = nlohmann::json::object();
+                        // 1. Query GetSlashCommands on ep
+                        try {
+                            nlohmann::json slashReq = {
+                                {"cascadeConfig", cascadeCfg},
+                                {"cascadeId", targetCid}
+                            };
+                            if (cascadeCfg.contains("dynamicWorkspaceUris") && cascadeCfg["dynamicWorkspaceUris"].is_array()) {
+                                slashReq["workspaceUris"] = cascadeCfg["dynamicWorkspaceUris"];
+                            } else if (!wsPath.empty()) {
+                                slashReq["workspaceUris"] = nlohmann::json::array({"file://" + wsPath});
+                            }
+                            auto slashRes = cli.Post(
+                                "/exa.language_server_pb.LanguageServerService/GetSlashCommands",
+                                hdrs,
+                                slashReq.dump(),
+                                "application/json"
+                            );
+                            if (slashRes && slashRes->status == 200) {
+                                auto sj = nlohmann::json::parse(slashRes->body, nullptr, false);
+                                if (!sj.is_discarded() && sj.is_object() &&
+                                    sj.contains("commands") && sj["commands"].is_array()) {
+                                    for (const auto& cmdDef : sj["commands"]) {
+                                        if (cmdDef.is_object() && cmdDef.contains("info") && cmdDef["info"].is_object()) {
+                                            std::string defName = toLowerAscii(cmdDef["info"].value("name", ""));
+                                            if (defName == cmdLower) {
+                                                slashInfo = cmdDef["info"];
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (...) {}
+
+                        // 2. Fallback for built-in system slash commands if GetSlashCommands was unavailable or did not list it
+                        static const std::set<std::string> kBuiltinSystemSlashCommands = {
+                            "compact", "grill-me", "goal", "plan", "boost",
+                            "learn", "teamwork", "browser", "schedule"
+                        };
+                        if (slashInfo.empty() && kBuiltinSystemSlashCommands.count(cmdLower) > 0) {
+                            slashInfo = {
+                                {"name", cmdLower},
+                                {"type", "SLASH_COMMAND_TYPE_SYSTEM"}
+                            };
+                            if (cmdLower == "grill-me") {
+                                slashInfo["modelFacingText"] =
+                                    "<GRILL_ME>\nThe user has requested that you interview them about every aspect of their task until you've reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. For each question, provide your recommended answer.\n\nGuidelines:\n- Ask the questions one at a time.\n- If a question can be answered by exploring the codebase, explore the codebase instead.\n- Use the ask_question tool for asking questions to the user.\n</GRILL_ME>";
+                            }
+                        }
+
+                        if (!slashInfo.empty()) {
+                            itemsJson = nlohmann::json::array({
+                                {
+                                    {"item", {
+                                        {"slashCommand", {
+                                            {"info", slashInfo}
+                                        }}
+                                    }}
+                                },
+                                {
+                                    {"text", trailingText}
+                                }
+                            });
+                        }
+                    }
+                }
                 nlohmann::json payload = {
                     {"cascadeId", targetCid},
-                    {"items", nlohmann::json::array({{{"text", text}}})},
+                    {"items", itemsJson},
                     {"cascadeConfig", cascadeCfg}
                 };
                 auto rpcRes = cli.Post(
@@ -5329,6 +5469,7 @@ void WebServer::setupRoutes() {
 
         auto tryHandleWaitingAskQuestion = [&](const LsEndpoint& ep, const std::string& targetCid, std::string& outBody) -> bool {
             if (targetCid.empty() || targetCid == "new") return false;
+            if (!hasQuestionResponses && !trimmedText.empty() && trimmedText[0] == '/') return false;
             try {
                 httplib::Client cli("127.0.0.1", ep.port);
                 cli.set_connection_timeout(0, 500000);
@@ -6780,12 +6921,14 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                 continue;
             }
 
-            // 2. Check for prompt_answered (terminal PLANNER_RESPONSE with empty tool_calls and non-empty content)
+            // 2. Check for prompt_answered (terminal PLANNER_RESPONSE with empty tool_calls and non-empty content, or CHECKPOINT)
             bool hasToolCalls = lastStepObj.contains("tool_calls") &&
                                 lastStepObj["tool_calls"].is_array() &&
                                 !lastStepObj["tool_calls"].empty();
-            if (lastType == "PLANNER_RESPONSE" && !hasToolCalls) {
-                std::string replyContent = trimText(lastStepObj.value("content", ""));
+            if ((lastType == "PLANNER_RESPONSE" && !hasToolCalls) || lastType == "CHECKPOINT") {
+                std::string replyContent = (lastType == "CHECKPOINT")
+                    ? std::string("Context compacted.")
+                    : trimText(lastStepObj.value("content", ""));
                 bool waitingForBgTask =
                     (prevGenericContent.find("Tool is running as a background task with task id:") != std::string::npos) ||
                     (prevGenericContent.find("Created the following subagent:") != std::string::npos);

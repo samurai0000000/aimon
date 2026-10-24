@@ -1632,6 +1632,8 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
     std::mutex lsMutex;
     json lastInteractionReq;
     int interactionCallCount = 0;
+    json lastCascadeMsgReq;
+    int cascadeMsgCallCount = 0;
 
     mockLs.Post("/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory",
                 [&](const httplib::Request& req, httplib::Response& res) {
@@ -1675,10 +1677,61 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
                             }}
                         }}
                     }
+                })},
+                {"executorMetadatas", json::array({
+                    {
+                        {"cascadeConfig", {
+                            {"plannerConfig", {
+                                {"planModel", "MODEL_PLACEHOLDER_M418"}
+                            }}
+                        }}
+                    }
                 })}
             }}
         };
         res.set_content(traj.dump(), "application/json");
+    });
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/GetConversationMetadata",
+                [&](const httplib::Request& req, httplib::Response& res) {
+        auto body = json::parse(req.body, nullptr, false);
+        std::string reqCid = body.value("conversationId", "");
+        if (reqCid == mainCid) {
+            res.set_content("{\"metadata\":{\"title\":\"Main Session\"}}", "application/json");
+        } else {
+            res.status = 404;
+            res.set_content("{}", "application/json");
+        }
+    });
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/GetSlashCommands",
+                [&](const httplib::Request& req, httplib::Response& res) {
+        json slashResp = {
+            {"commands", json::array({
+                {
+                    {"info", {
+                        {"name", "compact"},
+                        {"type", "SLASH_COMMAND_TYPE_SYSTEM"}
+                    }}
+                },
+                {
+                    {"info", {
+                        {"name", "grill-me"},
+                        {"type", "SLASH_COMMAND_TYPE_SYSTEM"},
+                        {"modelFacingText", "<GRILL_ME>\nAsk questions one at a time.\n</GRILL_ME>"}
+                    }}
+                }
+            })}
+        };
+        res.set_content(slashResp.dump(), "application/json");
+    });
+
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage",
+                [&](const httplib::Request& req, httplib::Response& res) {
+        std::lock_guard<std::mutex> lk(lsMutex);
+        lastCascadeMsgReq = json::parse(req.body, nullptr, false);
+        ++cascadeMsgCallCount;
+        res.set_content(json({{"cascadeId", mainCid}}).dump(), "application/json");
     });
 
     mockLs.Post("/exa.language_server_pb.LanguageServerService/HandleCascadeUserInteraction",
@@ -2121,6 +2174,85 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
             assert(bCmd.value("command", "") == cmd);
             assert(!bCmd.value("response", "").empty());
         }
+    }
+
+    // 4g. Test Antigravity slash command dispatch (/compact) and CHECKPOINT step handling
+    {
+        {
+            std::lock_guard<std::mutex> lk(lsMutex);
+            cascadeMsgCallCount = 0;
+            lastCascadeMsgReq = nullptr;
+        }
+        json promptReq = {{"conversationId", mainCid}, {"text", "/compact"}};
+        auto res = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
+        assert(res && res->status == 200);
+        json b = json::parse(res->body);
+        assert(b.value("status", "") == "dispatched");
+        {
+            std::lock_guard<std::mutex> lk(lsMutex);
+            assert(cascadeMsgCallCount == 1);
+            assert(lastCascadeMsgReq.contains("items") && lastCascadeMsgReq["items"].is_array());
+            assert(lastCascadeMsgReq["items"].size() == 2);
+            assert(lastCascadeMsgReq["items"][0]["item"]["slashCommand"]["info"]["name"] == "compact");
+            assert(lastCascadeMsgReq["items"][0]["item"]["slashCommand"]["info"]["type"] == "SLASH_COMMAND_TYPE_SYSTEM");
+            assert(lastCascadeMsgReq["items"][1]["text"] == "");
+        }
+    }
+    {
+        json promptReq = {{"conversationId", mainCid}, {"text", "/compact focus on memory"}};
+        auto res = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
+        assert(res && res->status == 200);
+        json b = json::parse(res->body);
+        assert(b.value("status", "") == "dispatched");
+        {
+            std::lock_guard<std::mutex> lk(lsMutex);
+            assert(cascadeMsgCallCount == 2);
+            assert(lastCascadeMsgReq.contains("items") && lastCascadeMsgReq["items"].is_array());
+            assert(lastCascadeMsgReq["items"].size() == 2);
+            assert(lastCascadeMsgReq["items"][0]["item"]["slashCommand"]["info"]["name"] == "compact");
+            assert(lastCascadeMsgReq["items"][1]["text"] == " focus on memory");
+        }
+    }
+
+    // Append CHECKPOINT step (step_index: 8) to mainTranscript
+    {
+        std::ofstream tf(mainTranscript, std::ios::app);
+        tf << "{\"step_index\":8,\"source\":\"SYSTEM\",\"type\":\"CHECKPOINT\",\"status\":\"DONE\",\"content\":\"# Resuming from a compaction\\n\\n<summary>\\n1. **Task Overview**\\n   - Compacted Antigravity context.\\n</summary>\\n\"}\n";
+        fs::last_write_time(mainTranscript, fs::file_time_type::clock::now());
+    }
+
+    // Fetch GET /api/agent/transcript?id=<mainCid>
+    {
+        auto tRes = client.Get(("/api/agent/transcript?id=" + mainCid).c_str(), headers);
+        assert(tRes && tRes->status == 200);
+        json tj = json::parse(tRes->body);
+        assert(tj.contains("steps") && tj["steps"].is_array());
+        assert(!tj["steps"].empty());
+        const auto& lastStep = tj["steps"].back();
+        assert(lastStep.value("stepIndex", -1) == 8);
+        assert(lastStep.value("type", "") == "PLANNER_RESPONSE");
+        std::string txt = lastStep.value("text", "");
+        assert(txt.rfind("📦 **Context Compacted**", 0) == 0);
+        assert(txt.find("Compacted Antigravity context.") != std::string::npos);
+    }
+
+    // Run server.scanTranscriptsForNotifications(false) (with a 35ms sleep + second scan) and verify prompt_answered event
+    gw.clearAgentEvents();
+    server.scanTranscriptsForNotifications(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    server.scanTranscriptsForNotifications(false);
+    {
+        auto events = gw.getRecentAgentEventsSince(0);
+        bool foundCompactedEvent = false;
+        for (const auto& ev : events) {
+            if (ev.conversationId == mainCid && ev.event == "prompt_answered") {
+                assert(ev.snippet == "Context compacted.");
+                assert(ev.stepIndex == 8);
+                foundCompactedEvent = true;
+                break;
+            }
+        }
+        assert(foundCompactedEvent);
     }
 
     server.stop();
