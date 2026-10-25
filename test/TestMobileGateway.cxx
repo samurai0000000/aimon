@@ -1349,7 +1349,7 @@ static void testMultiProviderClaudeAndCursorSessionsAndNotifications() {
     fs::path claudeFile = fs::path(claudeProjects) / "-tmp-work-aimon" / "claude-sess-1.jsonl";
     {
         std::ofstream f(claudeFile);
-        f << "{\"type\":\"user\",\"isSidechain\":false,\"cwd\":\"/tmp/work/aimon\",\"timestamp\":\"2026-10-24T02:55:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<ide_opened_file>foo.cxx</ide_opened_file>\"},{\"type\":\"text\",\"text\":\"Analyze Claude Code session integration\"}]}}\n";
+        f << "{\"type\":\"user\",\"isSidechain\":false,\"cwd\":\"/tmp/work/aimon\",\"timestamp\":\"2026-10-24T02:55:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>foo.cxx</system-reminder>\"},{\"type\":\"text\",\"text\":\"Analyze Claude Code session integration\"}]}}\n";
         f << "{\"type\":\"assistant\",\"isSidechain\":false,\"cwd\":\"/tmp/work/aimon\",\"timestamp\":\"2026-10-24T02:56:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Inspecting WebServer.cxx for Claude JSONL normalization\"},{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"ls -la\",\"description\":\"List workspace files\"}},{\"type\":\"text\",\"text\":\"I inspected the workspace files.\"}]}}\n";
         // Tool result turn (should NOT become a USER_INPUT step)
         f << "{\"type\":\"user\",\"isSidechain\":false,\"cwd\":\"/tmp/work/aimon\",\"timestamp\":\"2026-10-24T03:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"total 42\"}]}}\n";
@@ -2738,10 +2738,15 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
     setenv("AIMON_CURSOR_BIN", mockAgentBin.c_str(), 1);
     setenv("AIMON_CLAUDE_BIN", mockClaudeBin.c_str(), 1);
 
-    // 1. Nominal test: Cursor in screen
+    // 1. Nominal test: Cursor in screen (with store.db)
     std::string cursorCid = "c0001111-2222-3333-4444-555566667777";
     std::string cursorTransDir = cursorProjects + "/test-proj/agent-transcripts/" + cursorCid;
     fs::create_directories(cursorTransDir);
+    fs::create_directories(cursorChats + "/test-ws/" + cursorCid);
+    {
+        std::ofstream sf(cursorChats + "/test-ws/" + cursorCid + "/store.db");
+        sf << "sqlite3-store";
+    }
     std::string cursorJsonl = cursorTransDir + "/" + cursorCid + ".jsonl";
     {
         std::ofstream jf(cursorJsonl);
@@ -2822,7 +2827,7 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
         assert(rj.value("response", "").find("ACK-SCREEN-CLAUDE-OK") != std::string::npos);
     }
 
-    // 3. Renderer-owned Cursor IDE session without store.db succeeds via CLI with preserved prior transcript
+    // 3. Renderer-owned Cursor IDE session without store.db and without screen is read-only and rejected with 409
     unsetenv("AIMON_SCREEN_SESSION_OVERRIDE");
     std::string ideCid = "ba472c97-57a4-4264-9d8f-6065fd61e174";
     std::string ideTransDir = cursorProjects + "/amba-virt/agent-transcripts/" + ideCid;
@@ -2838,23 +2843,44 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
     }
 
     {
+        auto convRes = client.Get("/api/agent/conversations?provider=cursor", headers);
+        assert(convRes && convRes->status == 200);
+        json convBody = json::parse(convRes->body);
+        bool sawCliInteractive = false;
+        bool sawIdeReadOnly = false;
+        for (const auto& c : convBody["conversations"]) {
+            std::string cidVal = c.value("id", "");
+            if (cidVal == cursorCid) {
+                sawCliInteractive = true;
+                assert(c.value("interactive", false) == true);
+                assert(c.value("nonInteractiveReason", "non-empty") == "");
+            } else if (cidVal == ideCid) {
+                sawIdeReadOnly = true;
+                assert(c.value("interactive", true) == false);
+                assert(c.value("nonInteractiveReason", "").find(
+                    "Cursor IDE GUI session is read-only") != std::string::npos);
+            }
+        }
+        assert(sawCliInteractive);
+        assert(sawIdeReadOnly);
+
         json req = {
             {"agentId", "cursor"},
             {"conversationId", ideCid},
             {"text", "Do not corrupt me"}
         };
         auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
-        assert(res && res->status == 200);
+        assert(res && res->status == 409);
         json rj = json::parse(res->body);
-        assert(rj.value("status", "") == "ok");
-        assert(rj.value("response", "").find("ACK-CLI-CURSOR-OK") != std::string::npos);
+        assert(rj.value("ok", true) == false);
+        assert(rj.value("interactive", true) == false);
+        assert(rj.value("nonInteractiveReason", "").find(
+            "Cursor IDE GUI session is read-only") != std::string::npos);
 
         std::ifstream checkIn(ideJsonl);
         std::string curContent((std::istreambuf_iterator<char>(checkIn)),
                                 std::istreambuf_iterator<char>());
-        assert(curContent.find(origIdeContent) == 0);
-        assert(curContent.find("Do not corrupt me") != std::string::npos);
-        assert(curContent.find("ACK-CLI-CURSOR-OK") != std::string::npos);
+        assert(curContent == origIdeContent);
     }
 
     // 4. Live non-screen owning process (ownerPid > 0) falls back to CLI --resume without 409 block
@@ -3100,10 +3126,10 @@ static void Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversatio
     std::cout << "[TestMobileGateway] Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversationsAndTranscript passed!" << std::endl;
 }
 
-static void OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorTranscript() {
-    std::cout << "[TestMobileGateway] Running OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorTranscript..." << std::endl;
+static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndRejectedOnPromptWith409() {
+    std::cout << "[TestMobileGateway] Running NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndRejectedOnPromptWith409..." << std::endl;
 
-    std::string baseDir = "/tmp/test_older_cursor_" + std::to_string(getpid());
+    std::string baseDir = "/tmp/test_readonly_ide_" + std::to_string(getpid());
     fs::remove_all(baseDir);
     std::string ideBrain = baseDir + "/ide_brain";
     std::string cliBrain = baseDir + "/cli_brain";
@@ -3116,7 +3142,7 @@ static void OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorT
 
     fs::create_directories(ideBrain);
     fs::create_directories(cliBrain);
-    fs::create_directories(claudeProjects);
+    fs::create_directories(claudeProjects + "/-home-samurai-work-aimon");
     fs::create_directories(cursorProjects);
     fs::create_directories(cursorChats);
     fs::create_directories(cursorHookState);
@@ -3131,33 +3157,84 @@ static void OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorT
     setenv("AIMON_CURSOR_HOOK_STATE_DIR", cursorHookState.c_str(), 1);
     setenv("AIMON_WORKSPACE_ROOT", wsRoot.c_str(), 1);
 
-    std::string oldCid = "a1b2c3d4-e5f6-4789-abcd-ef0123456789";
-    std::string transDir = cursorProjects + "/home-samurai-work-aimon/agent-transcripts/" + oldCid;
-    fs::create_directories(transDir);
-    std::string transPath = transDir + "/" + oldCid + ".jsonl";
-    std::string line1 = "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"First historic user question\"}]}}";
-    std::string line2 = "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"First historic assistant answer\"}]}}";
+    // 1. Cursor IDE GUI session (NO store.db / prompt_history.json, NO screen session)
+    std::string cursorIdeCid = "cursor-ide-gui-session-9999";
+    std::string cursorIdeDir = cursorProjects + "/home-samurai-work-aimon/agent-transcripts/" + cursorIdeCid;
+    fs::create_directories(cursorIdeDir);
+    std::string cursorIdePath = cursorIdeDir + "/" + cursorIdeCid + ".jsonl";
     {
-        std::ofstream tf(transPath);
-        tf << line1 << "\n" << line2 << "\n";
+        std::ofstream tf(cursorIdePath);
+        tf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"First historic user question\"}]}}\n"
+           << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"First historic assistant answer\"}]}}\n";
     }
 
-    // Mock Cursor CLI binary that records all args to captured_args.txt and simulates
-    // overwriting transPath during --resume to verify WebServer restores priorCursorLines!
-    std::string capturedArgsFile = baseDir + "/captured_args.txt";
+    // 2. Cursor CLI session (WITH store.db)
+    std::string cursorCliCid = "cursor-cli-session-6666";
+    std::string cursorCliDir = cursorProjects + "/home-samurai-work-aimon/agent-transcripts/" + cursorCliCid;
+    fs::create_directories(cursorCliDir);
+    fs::create_directories(cursorChats + "/ws-hash/" + cursorCliCid);
+    {
+        std::ofstream tf(cursorCliDir + "/" + cursorCliCid + ".jsonl");
+        tf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Cursor CLI user question\"}]}}\n"
+           << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Cursor CLI assistant answer\"}]}}\n";
+        std::ofstream sf(cursorChats + "/ws-hash/" + cursorCliCid + "/store.db");
+        sf << "sqlite3-store";
+    }
+
+    // 3. Claude Code IDE Extension session (with <ide_opened_file> and entrypoint: claude-vscode, NO screen session)
+    std::string claudeIdeCid = "claude-ide-ext-session-8888";
+    std::string claudeIdePath = claudeProjects + "/-home-samurai-work-aimon/" + claudeIdeCid + ".jsonl";
+    {
+        std::ofstream cf(claudeIdePath);
+        cf << "{\"type\":\"user\",\"entrypoint\":\"claude-vscode\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<ide_opened_file>/tmp/foo.cxx</ide_opened_file>\"},{\"type\":\"text\",\"text\":\"Claude IDE extension prompt\"}]}}\n"
+           << "{\"type\":\"assistant\",\"entrypoint\":\"claude-vscode\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Claude IDE extension reply\"}]}}\n";
+    }
+
+    // 4. Interactive Claude CLI session (entrypoint: cli)
+    std::string claudeCliCid = "claude-cli-session-7777";
+    std::string claudeCliPath = claudeProjects + "/-home-samurai-work-aimon/" + claudeCliCid + ".jsonl";
+    {
+        std::ofstream cf(claudeCliPath);
+        cf << "{\"type\":\"user\",\"entrypoint\":\"cli\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Claude CLI prompt\"}]}}\n"
+           << "{\"type\":\"assistant\",\"entrypoint\":\"cli\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Claude CLI reply\"}]}}\n";
+    }
+
+    // 5. Boundary: Claude session that started in claude-vscode and later transitioned to cli
+    std::string claudeTransCid = "claude-transitioned-session-5555";
+    std::string claudeTransPath = claudeProjects + "/-home-samurai-work-aimon/" + claudeTransCid + ".jsonl";
+    {
+        std::ofstream cf(claudeTransPath);
+        cf << "{\"type\":\"user\",\"entrypoint\":\"claude-vscode\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Initial VSCode turn\"}]}}\n"
+           << "{\"type\":\"assistant\",\"entrypoint\":\"claude-vscode\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Initial VSCode reply\"}]}}\n"
+           << "{\"type\":\"user\",\"entrypoint\":\"cli\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Resumed in CLI turn\"}]}}\n"
+           << "{\"type\":\"assistant\",\"entrypoint\":\"cli\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Resumed in CLI reply\"}]}}\n";
+    }
+
+    std::string capturedCursorArgs = baseDir + "/captured_cursor_args.txt";
     std::string mockCursorBin = binDir + "/agent";
     {
         std::ofstream mf(mockCursorBin);
         mf << "#!/bin/bash\n"
-           << "printf '%s\\n' \"$@\" > \"" << capturedArgsFile << "\"\n"
-           << "# Simulate CLI truncating/overwriting JSONL when store.db is absent\n"
-           << "echo '{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Follow-up from mobile\"}]}}' > \"" << transPath << "\"\n"
-           << "echo '{\"type\":\"result\",\"result\":\"Continued reply from CLI\",\"session_id\":\"" << oldCid << "\"}'\n"
+           << "printf '%s\\n' \"$@\" > \"" << capturedCursorArgs << "\"\n"
+           << "echo '{\"type\":\"result\",\"result\":\"Continued reply from Cursor CLI\",\"session_id\":\"" << cursorCliCid << "\"}'\n"
            << "exit 0\n";
         mf.close();
         chmod(mockCursorBin.c_str(), 0755);
     }
     setenv("AIMON_CURSOR_BIN", mockCursorBin.c_str(), 1);
+
+    std::string capturedClaudeArgs = baseDir + "/captured_claude_args.txt";
+    std::string mockClaudeBin = binDir + "/claude";
+    {
+        std::ofstream mf(mockClaudeBin);
+        mf << "#!/bin/bash\n"
+           << "printf '%s\\n' \"$@\" > \"" << capturedClaudeArgs << "\"\n"
+           << "echo '{\"type\":\"result\",\"result\":\"Continued reply from Claude CLI\",\"session_id\":\"" << claudeCliCid << "\"}'\n"
+           << "exit 0\n";
+        mf.close();
+        chmod(mockClaudeBin.c_str(), 0755);
+    }
+    setenv("AIMON_CLAUDE_BIN", mockClaudeBin.c_str(), 1);
 
     StateStore& stateStore = StateStore::getInstance();
     HistoryStore historyStore;
@@ -3174,53 +3251,161 @@ static void OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorT
     assert(gw.init(mobileFile));
     std::string secret = gw.createPairingSecret(120);
     std::string token;
-    assert(gw.verifyPairingCode(secret, "dev-older", "Pixel 9", token));
+    assert(gw.verifyPairingCode(secret, "dev-readonly", "Pixel 9", token));
 
     httplib::Client client("http://127.0.0.1:" + std::to_string(port));
     httplib::Headers headers = {{"X-Mobile-Token", token}};
 
-    json req = {
-        {"agentId", "cursor"},
-        {"conversationId", oldCid},
-        {"text", "Follow-up from mobile"}
-    };
-    auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
-    assert(res && res->status == 200);
-    json rj = json::parse(res->body);
-    assert(rj.value("status", "") == "ok");
-    assert(rj.value("conversationId", "") == oldCid);
-    assert(rj.value("response", "").find("Continued reply from CLI") != std::string::npos);
-
-    // Verify the mock CLI received injected [Prior Conversation Context in this Session]
+    // A. Assert via GET /api/agent/conversations?provider=cursor
     {
-        std::ifstream cf(capturedArgsFile);
-        std::string captured((std::istreambuf_iterator<char>(cf)),
-                             std::istreambuf_iterator<char>());
-        assert(captured.find("[Prior Conversation Context in this Session]") != std::string::npos);
-        assert(captured.find("First historic user question") != std::string::npos);
-        assert(captured.find("First historic assistant answer") != std::string::npos);
-        assert(captured.find("Follow-up from mobile") != std::string::npos);
-    }
-
-    // Verify transPath on disk still starts with line1 and line2, followed by the new turn
-    {
-        std::ifstream tf(transPath);
-        std::vector<std::string> lines;
-        std::string l;
-        while (std::getline(tf, l)) {
-            if (!l.empty()) lines.push_back(l);
+        auto res = client.Get("/api/agent/conversations?provider=cursor", headers);
+        assert(res && res->status == 200);
+        json rj = json::parse(res->body);
+        bool foundCursorIde = false;
+        bool foundCursorCli = false;
+        for (const auto& c : rj["conversations"]) {
+            std::string cid = c.value("id", "");
+            if (cid == cursorIdeCid) {
+                foundCursorIde = true;
+                assert(c.value("interactive", true) == false);
+                assert(c.value("nonInteractiveReason", "").find(
+                    "Cursor IDE GUI session is read-only") != std::string::npos);
+            } else if (cid == cursorCliCid) {
+                foundCursorCli = true;
+                assert(c.value("interactive", false) == true);
+                assert(c.value("nonInteractiveReason", "non-empty") == "");
+            }
         }
-        assert(lines.size() >= 4);
-        assert(lines[0] == line1);
-        assert(lines[1] == line2);
+        assert(foundCursorIde);
+        assert(foundCursorCli);
     }
 
-    // Verify GET /api/agent/transcript returns all 4 steps
+    // B. Assert via GET /api/agent/transcript?provider=cursor&conversationId=cursor-ide-gui-session-9999
     {
-        auto tres = client.Get(("/api/agent/transcript?id=" + oldCid + "&agent=cursor").c_str(), headers);
+        auto tres = client.Get(("/api/agent/transcript?provider=cursor&conversationId=" + cursorIdeCid).c_str(), headers);
         assert(tres && tres->status == 200);
         json tj = json::parse(tres->body);
-        assert(tj.value("stepCount", 0) >= 4);
+        assert(tj.value("stepCount", 0) >= 2);
+        assert(tj.value("interactive", true) == false);
+        assert(tj.value("nonInteractiveReason", "").find(
+            "Cursor IDE GUI session is read-only") != std::string::npos);
+    }
+
+    // C. Assert via POST /api/agent/prompt for cursor-ide-gui-session-9999 -> HTTP 409 Conflict
+    {
+        json req = {
+            {"provider", "cursor"},
+            {"conversationId", cursorIdeCid},
+            {"prompt", "Follow up from mobile"}
+        };
+        auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
+        assert(res && res->status == 409);
+        json rj = json::parse(res->body);
+        assert(rj.value("ok", true) == false);
+        assert(rj.value("interactive", true) == false);
+        assert(rj.value("nonInteractiveReason", "").find(
+            "Cursor IDE GUI session is read-only") != std::string::npos);
+        assert(!fs::exists(capturedCursorArgs));
+
+        auto dres = client.Get(("/api/agent/diagnostics?conversationId=" + cursorIdeCid).c_str(), headers);
+        assert(dres && dres->status == 200);
+        json dj = json::parse(dres->body);
+        assert(dj.value("interactive", true) == false);
+        assert(dj.value("selected_route", "") == "rejected_non_interactive_ide");
+        assert(dj.value("recommended_route", "") == "rejected_non_interactive_ide");
+    }
+
+    // D. Assert via GET /api/agent/conversations?provider=claude
+    {
+        auto res = client.Get("/api/agent/conversations?provider=claude", headers);
+        assert(res && res->status == 200);
+        json rj = json::parse(res->body);
+        bool foundClaudeIde = false;
+        bool foundClaudeCli = false;
+        bool foundClaudeTrans = false;
+        for (const auto& c : rj["conversations"]) {
+            std::string cid = c.value("id", "");
+            if (cid == claudeIdeCid) {
+                foundClaudeIde = true;
+                assert(c.value("interactive", true) == false);
+                assert(c.value("nonInteractiveReason", "").find(
+                    "Claude Code IDE extension session is read-only") != std::string::npos);
+            } else if (cid == claudeCliCid) {
+                foundClaudeCli = true;
+                assert(c.value("interactive", false) == true);
+                assert(c.value("nonInteractiveReason", "non-empty") == "");
+            } else if (cid == claudeTransCid) {
+                foundClaudeTrans = true;
+                assert(c.value("interactive", false) == true);
+                assert(c.value("nonInteractiveReason", "non-empty") == "");
+            }
+        }
+        assert(foundClaudeIde);
+        assert(foundClaudeCli);
+        assert(foundClaudeTrans);
+    }
+
+    // E. Assert via GET /api/agent/transcript?provider=claude&conversationId=claude-ide-ext-session-8888
+    {
+        auto tres = client.Get(("/api/agent/transcript?provider=claude&conversationId=" + claudeIdeCid).c_str(), headers);
+        assert(tres && tres->status == 200);
+        json tj = json::parse(tres->body);
+        assert(tj.value("stepCount", 0) >= 2);
+        assert(tj.value("interactive", true) == false);
+        assert(tj.value("nonInteractiveReason", "").find(
+            "Claude Code IDE extension session is read-only") != std::string::npos);
+    }
+
+    // F. Assert via POST /api/agent/prompt for claude-ide-ext-session-8888 -> HTTP 409 Conflict
+    {
+        json req = {
+            {"provider", "claude"},
+            {"conversationId", claudeIdeCid},
+            {"prompt", "Follow up to Claude IDE"}
+        };
+        auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
+        assert(res && res->status == 409);
+        json rj = json::parse(res->body);
+        assert(rj.value("ok", true) == false);
+        assert(rj.value("interactive", true) == false);
+        assert(rj.value("nonInteractiveReason", "").find(
+            "Claude Code IDE extension session is read-only") != std::string::npos);
+        assert(!fs::exists(capturedClaudeArgs));
+
+        auto dres = client.Get(("/api/agent/diagnostics?conversationId=" + claudeIdeCid).c_str(), headers);
+        assert(dres && dres->status == 200);
+        json dj = json::parse(dres->body);
+        assert(dj.value("interactive", true) == false);
+        assert(dj.value("selected_route", "") == "rejected_non_interactive_ide");
+        assert(dj.value("recommended_route", "") == "rejected_non_interactive_ide");
+    }
+
+    // G. Assert local slash commands (/status, /help) still succeed with 200 OK on read-only sessions,
+    // and interactive CLI sessions (cursorCliCid, claudeCliCid) succeed with 200 OK on POST /api/agent/prompt
+    {
+        json slashReq = {
+            {"provider", "cursor"},
+            {"conversationId", cursorIdeCid},
+            {"prompt", "/status"}
+        };
+        auto sres = client.Post("/api/agent/prompt", headers, slashReq.dump(), "application/json");
+        assert(sres && sres->status == 200);
+
+        json cliCursorReq = {
+            {"provider", "cursor"},
+            {"conversationId", cursorCliCid},
+            {"prompt", "Continue Cursor CLI"}
+        };
+        auto cres = client.Post("/api/agent/prompt", headers, cliCursorReq.dump(), "application/json");
+        assert(cres && cres->status == 200);
+
+        json cliClaudeReq = {
+            {"provider", "claude"},
+            {"conversationId", claudeCliCid},
+            {"prompt", "Continue Claude CLI"}
+        };
+        auto clres = client.Post("/api/agent/prompt", headers, cliClaudeReq.dump(), "application/json");
+        assert(clres && clres->status == 200);
     }
 
     server.stop();
@@ -3232,8 +3417,9 @@ static void OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorT
     unsetenv("AIMON_CURSOR_HOOK_STATE_DIR");
     unsetenv("AIMON_WORKSPACE_ROOT");
     unsetenv("AIMON_CURSOR_BIN");
+    unsetenv("AIMON_CLAUDE_BIN");
     fs::remove_all(baseDir);
-    std::cout << "[TestMobileGateway] OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorTranscript passed!" << std::endl;
+    std::cout << "[TestMobileGateway] NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndRejectedOnPromptWith409 passed!" << std::endl;
 }
 
 static void FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens() {
@@ -3270,10 +3456,13 @@ static void FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens() {
     std::string traceCid = "f00dbabe-1111-2222-3333-444455556666";
     std::string transDir = cursorProjects + "/home-samurai-work-aimon/agent-transcripts/" + traceCid;
     fs::create_directories(transDir);
+    fs::create_directories(cursorChats + "/ws-hash/" + traceCid);
     {
         std::ofstream tf(transDir + "/" + traceCid + ".jsonl");
         tf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Initial trace prompt\"}]}}\n"
            << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Initial trace reply\"}]}}\n";
+        std::ofstream sf(cursorChats + "/ws-hash/" + traceCid + "/store.db");
+        sf << "sqlite3-store";
     }
 
     std::string mockCursorBin = binDir + "/agent";
@@ -3410,7 +3599,7 @@ int main() {
     testOrphanSummaryFilteringAndZeroStepTerminalSession();
     testLiveScreenSessionRoutingAndIdeSessionProtection();
     Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversationsAndTranscript();
-    OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorTranscript();
+    NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndRejectedOnPromptWith409();
     FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;

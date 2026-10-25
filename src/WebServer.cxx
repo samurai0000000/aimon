@@ -1042,8 +1042,37 @@ struct NormalizedProviderTranscript {
     std::string model;
     std::string status = "DONE";
     bool hasValidTurns = false;
+    bool interactive = true;
+    std::string nonInteractiveReason;
     nlohmann::json lastStepObj;
 };
+
+struct LiveProviderSessionInfo {
+    pid_t ownerPid = 0;
+    std::string screenSession;
+    bool isIdeRendererSession = false;
+    bool hasCliStore = true;
+};
+
+struct SessionInteractivityInfo {
+    bool interactive = true;
+    std::string nonInteractiveReason;
+};
+
+static bool isClaudeIdeExtensionTranscript(const fs::path& jsonlPath);
+static bool hasCursorCliStoreForConversation(const fs::path& homeDir,
+                                             const std::string& conversationId);
+static LiveProviderSessionInfo discoverLiveProviderSession(
+    const std::string& targetProvider,
+    const std::string& cid,
+    const std::string& wsDir,
+    const std::string& existingTranscriptPath);
+static SessionInteractivityInfo evaluateSessionInteractivity(
+    const std::string& provider,
+    const std::string& conversationId,
+    const fs::path& homeDir,
+    const LiveProviderSessionInfo& liveInfo,
+    const fs::path& transcriptPath = fs::path());
 
 static std::string extractCompactionSummary(const std::string& rawSegment, size_t maxBytes = 12288) {
     std::string text = rawSegment;
@@ -2111,6 +2140,28 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     if (out.model.empty()) {
         out.model = (providerSource == "claude") ? "claude-sonnet-4-6" : "cursor-auto";
     }
+    if (filePath.parent_path().filename() != "subagents") {
+        std::string cid = filePath.stem().string();
+        if (providerSource == "cursor") {
+            if (!hasCursorCliStoreForConversation(fs::path(), cid)) {
+                LiveProviderSessionInfo liveInfo = discoverLiveProviderSession(
+                    providerSource, cid, out.workspacePath, filePath.string());
+                SessionInteractivityInfo inter = evaluateSessionInteractivity(
+                    providerSource, cid, fs::path(), liveInfo, filePath);
+                out.interactive = inter.interactive;
+                out.nonInteractiveReason = inter.nonInteractiveReason;
+            }
+        } else if (providerSource == "claude") {
+            if (isClaudeIdeExtensionTranscript(filePath)) {
+                LiveProviderSessionInfo liveInfo = discoverLiveProviderSession(
+                    providerSource, cid, out.workspacePath, filePath.string());
+                SessionInteractivityInfo inter = evaluateSessionInteractivity(
+                    providerSource, cid, fs::path(), liveInfo, filePath);
+                out.interactive = inter.interactive;
+                out.nonInteractiveReason = inter.nonInteractiveReason;
+            }
+        }
+    }
     return out;
 }
 
@@ -2201,12 +2252,118 @@ static std::string toLowerAscii(std::string s) {
     return s;
 }
 
-struct LiveProviderSessionInfo {
-    pid_t ownerPid = 0;
-    std::string screenSession;
-    bool isIdeRendererSession = false;
-    bool hasCliStore = true;
-};
+static bool isClaudeIdeExtensionTranscript(const fs::path& jsonlPath) {
+    if (jsonlPath.empty()) return false;
+    std::error_code ec;
+    if (!fs::exists(jsonlPath, ec) || !fs::is_regular_file(jsonlPath, ec)) {
+        return false;
+    }
+    std::ifstream f(jsonlPath);
+    if (!f.is_open()) return false;
+    std::string line;
+    int count = 0;
+    bool sawIdeMarker = false;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        ++count;
+        if (line.find("\"entrypoint\":\"cli\"") != std::string::npos ||
+            line.find("\"entrypoint\": \"cli\"") != std::string::npos) {
+            return false;
+        }
+        if (count <= 15) {
+            if (line.find("<ide_opened_file>") != std::string::npos ||
+                line.find("<ide_selection>") != std::string::npos ||
+                line.find("\"entrypoint\":\"ide\"") != std::string::npos ||
+                line.find("\"entrypoint\": \"ide\"") != std::string::npos ||
+                line.find("\"entrypoint\":\"claude-vscode\"") != std::string::npos ||
+                line.find("\"entrypoint\": \"claude-vscode\"") != std::string::npos ||
+                line.find("\"isIde\":true") != std::string::npos ||
+                line.find("\"isIde\": true") != std::string::npos) {
+                sawIdeMarker = true;
+            }
+        }
+    }
+    return sawIdeMarker;
+}
+
+static bool hasCursorCliStoreForConversation(const fs::path& homeDir,
+                                             const std::string& conversationId) {
+    if (conversationId.empty() || conversationId == "new") return true;
+    std::vector<fs::path> candidateDirs;
+    const char* envChatsDir = std::getenv("AIMON_CURSOR_CHATS_DIR");
+    if (envChatsDir && *envChatsDir) {
+        candidateDirs.emplace_back(envChatsDir);
+    }
+    std::string cProjDir = getCursorProjectsDir();
+    if (!cProjDir.empty()) {
+        candidateDirs.push_back(fs::path(cProjDir).parent_path() / "chats");
+    }
+    if (!homeDir.empty()) {
+        candidateDirs.push_back(homeDir / ".cursor" / "chats");
+    }
+    if (candidateDirs.empty()) {
+        candidateDirs.emplace_back(PathUtils::expandHome("~/.cursor/chats"));
+    }
+
+    for (const auto& chatsDir : candidateDirs) {
+        std::error_code ec;
+        if (!fs::exists(chatsDir, ec) || !fs::is_directory(chatsDir, ec)) continue;
+        for (const auto& wsEnt : fs::directory_iterator(chatsDir, ec)) {
+            if (ec || !wsEnt.is_directory()) continue;
+            fs::path histPath = wsEnt.path() / conversationId / "prompt_history.json";
+            fs::path storePath = wsEnt.path() / conversationId / "store.db";
+            if (fs::exists(histPath, ec) || fs::exists(storePath, ec)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static SessionInteractivityInfo evaluateSessionInteractivity(
+    const std::string& provider,
+    const std::string& conversationId,
+    const fs::path& homeDir,
+    const LiveProviderSessionInfo& liveInfo,
+    const fs::path& transcriptPath) {
+    SessionInteractivityInfo result;
+    if (conversationId.empty() || conversationId == "new") {
+        return result;
+    }
+    if (provider == "cursor") {
+        if (hasCursorCliStoreForConversation(homeDir, conversationId) ||
+            !liveInfo.screenSession.empty()) {
+            return result;
+        }
+        result.interactive = false;
+        result.nonInteractiveReason =
+            "Bi-directional communication is not possible with this Cursor IDE GUI agent "
+            "(Cursor IDE GUI session is read-only; no CLI chat store or screen session is attached). "
+            "Launch cursor-agent in a terminal/screen session to interact from mobile.";
+        return result;
+    }
+    if (provider == "claude") {
+        if (!liveInfo.screenSession.empty() || liveInfo.ownerPid > 0) {
+            return result;
+        }
+        fs::path resolvedPath = transcriptPath;
+        if (resolvedPath.empty()) {
+            std::string dummySrc;
+            std::string dummySlug;
+            resolvedPath = findProviderTranscriptById(conversationId, dummySrc, dummySlug);
+        }
+        if (!resolvedPath.empty() && isClaudeIdeExtensionTranscript(resolvedPath)) {
+            result.interactive = false;
+            result.nonInteractiveReason =
+                "Bi-directional communication is not possible with this Claude IDE extension agent "
+                "(Claude Code IDE extension session is read-only; no interactive Claude CLI session is attached). "
+                "Launch claude in a terminal/screen session to interact from mobile.";
+            return result;
+        }
+        return result;
+    }
+    return result;
+}
 
 static std::string readProcCmdline(pid_t pid) {
     if (pid <= 0) return "";
@@ -2308,6 +2465,20 @@ static bool isProcessInteractiveProvider(pid_t pid, const std::string& targetPro
             return true;
         }
     } else if (targetProvider == "claude") {
+        if (arg0Lower.find("/extensions/anthropic.claude-code-") != std::string::npos) {
+            return false;
+        }
+        for (const auto& tok : args) {
+            std::string tokLower = toLowerAscii(tok);
+            if (tokLower.find("/extensions/anthropic.claude-code-") != std::string::npos ||
+                tokLower == "--input-format" ||
+                tokLower == "--output-format" ||
+                tokLower == "stream-json" ||
+                tokLower.rfind("--input-format=", 0) == 0 ||
+                tokLower.rfind("--output-format=", 0) == 0) {
+                return false;
+            }
+        }
         if (commLower == "claude" ||
             exeBase == "claude" ||
             scriptBase == "claude" ||
@@ -2460,6 +2631,17 @@ static LiveProviderSessionInfo discoverLiveProviderSession(
         }
     }
 
+    bool hasCliStore = true;
+    if (targetProvider == "cursor" && !cid.empty() && cid != "new") {
+        hasCliStore = hasCursorCliStoreForConversation(fs::path(), cid);
+        info.hasCliStore = hasCliStore;
+        if (!hasCliStore) {
+            info.isIdeRendererSession = true;
+        }
+    }
+    bool isClaudeIdeTrans = (targetProvider == "claude" && !existingTranscriptPath.empty() &&
+                             isClaudeIdeExtensionTranscript(existingTranscriptPath));
+
     std::vector<pid_t> interactiveCandidates;
     if (info.ownerPid == 0 || info.screenSession.empty()) {
         std::error_code pEc;
@@ -2485,7 +2667,7 @@ static LiveProviderSessionInfo discoverLiveProviderSession(
             }
         }
 
-        if (info.ownerPid == 0 && !wsDir.empty()) {
+        if (info.ownerPid == 0 && !wsDir.empty() && hasCliStore && !isClaudeIdeTrans) {
             for (const auto& pid : interactiveCandidates) {
                 if (processCwdEquals(pid, wsDir) && !findScreenSessionForPid(pid).empty()) {
                     info.ownerPid = pid;
@@ -2497,47 +2679,6 @@ static LiveProviderSessionInfo discoverLiveProviderSession(
 
     if (info.ownerPid > 0 && info.screenSession.empty()) {
         info.screenSession = findScreenSessionForPid(info.ownerPid);
-    }
-
-    if (targetProvider == "cursor" && !cid.empty() && cid != "new") {
-        bool isAgentTrans = false;
-        if (!existingTranscriptPath.empty()) {
-            std::string pStr = existingTranscriptPath;
-            if (pStr.find("/agent-transcripts/" + cid + "/" + cid + ".jsonl") != std::string::npos) {
-                isAgentTrans = true;
-            }
-        }
-        if (isAgentTrans) {
-            bool hasCliStore = false;
-            const char* envChatsDir = std::getenv("AIMON_CURSOR_CHATS_DIR");
-            fs::path chatsDir;
-            if (envChatsDir && *envChatsDir) {
-                chatsDir = envChatsDir;
-            } else {
-                std::string cProjDir = getCursorProjectsDir();
-                if (!cProjDir.empty()) {
-                    chatsDir = fs::path(cProjDir).parent_path() / "chats";
-                } else {
-                    chatsDir = PathUtils::expandHome("~/.cursor/chats");
-                }
-            }
-            std::error_code ec;
-            if (fs::exists(chatsDir, ec) && fs::is_directory(chatsDir, ec)) {
-                for (const auto& wsEnt : fs::directory_iterator(chatsDir, ec)) {
-                    if (ec || !wsEnt.is_directory()) continue;
-                    fs::path histPath = wsEnt.path() / cid / "prompt_history.json";
-                    fs::path storePath = wsEnt.path() / cid / "store.db";
-                    if (fs::exists(histPath, ec) || fs::exists(storePath, ec)) {
-                        hasCliStore = true;
-                        break;
-                    }
-                }
-            }
-            info.hasCliStore = hasCliStore;
-            if (!hasCliStore) {
-                info.isIdeRendererSession = true;
-            }
-        }
     }
 
     return info;
@@ -4803,6 +4944,8 @@ void WebServer::setupRoutes() {
             nlohmann::json userPrompts = nlohmann::json::array();
             std::string matchedPrompt;
             int matchedStepIndex = -1;
+            bool interactive = true;
+            std::string nonInteractiveReason;
         };
 
         struct CandidateConv {
@@ -5120,6 +5263,8 @@ void WebServer::setupRoutes() {
                 ce.userPrompts = std::move(norm.userPrompts);
                 ce.matchedPrompt = matchedPrompt;
                 ce.matchedStepIndex = matchedStepIndex;
+                ce.interactive = norm.interactive;
+                ce.nonInteractiveReason = norm.nonInteractiveReason;
                 collected.push_back(std::move(ce));
                 return true;
             }
@@ -5455,7 +5600,9 @@ void WebServer::setupRoutes() {
                 {"lastPromptStepIndex", collected[i].lastPromptStepIndex},
                 {"userPrompts", collected[i].userPrompts},
                 {"matchedPrompt", collected[i].matchedPrompt},
-                {"matchedStepIndex", collected[i].matchedStepIndex}
+                {"matchedStepIndex", collected[i].matchedStepIndex},
+                {"interactive", collected[i].interactive},
+                {"nonInteractiveReason", collected[i].nonInteractiveReason}
             });
         }
 
@@ -5485,6 +5632,9 @@ void WebServer::setupRoutes() {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("X-Request-Id", reqId);
         std::string id = req.get_param_value("id");
+        if (id.empty()) {
+            id = req.get_param_value("conversationId");
+        }
         if (id.empty() || id.find("..") != std::string::npos || id.find('/') != std::string::npos) {
             res.status = 400;
             res.set_content("{\"error\":\"Missing or invalid conversation id\"}", "application/json");
@@ -5567,6 +5717,8 @@ void WebServer::setupRoutes() {
                 resp["workspacePath"] = parsed.workspacePath;
                 resp["stepCount"] = parsed.totalSteps;
                 resp["steps"] = std::move(parsed.steps);
+                resp["interactive"] = parsed.interactive;
+                resp["nonInteractiveReason"] = parsed.nonInteractiveReason;
                 res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
             }
@@ -5801,6 +5953,8 @@ void WebServer::setupRoutes() {
                 resp["model"] = liveModel;
                 resp["stepCount"] = liveTotalSteps;
                 resp["steps"] = liveSteps;
+                resp["interactive"] = true;
+                resp["nonInteractiveReason"] = "";
                 res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
             }
@@ -5840,6 +5994,8 @@ void WebServer::setupRoutes() {
                 resp["stepCount"] = static_cast<int>(fallbackSteps.size());
                 resp["steps"] = fallbackSteps;
                 resp["openInTerminal"] = isLockedByRunningAgy;
+                resp["interactive"] = true;
+                resp["nonInteractiveReason"] = "";
 
                 if (isLockedByRunningAgy) {
                     for (const auto& proc : discoverRunningAgyProcesses()) {
@@ -6116,7 +6272,24 @@ void WebServer::setupRoutes() {
         resp["modelId"] = !extractedLabel.empty() ? mapLabelToCliModelId(extractedLabel) : resolvedModel;
         resp["stepCount"] = totalStepCount;
         resp["steps"] = steps;
+        resp["interactive"] = true;
+        resp["nonInteractiveReason"] = "";
         res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+    });
+
+    _server->Get("/api/agent/diagnostics", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string cid = req.get_param_value("conversationId");
+        if (cid.empty()) {
+            cid = req.get_param_value("id");
+        }
+        nlohmann::json out;
+        if (!cid.empty()) {
+            out = inspectSession(cid);
+        } else {
+            out = diagnoseSessions(req.get_param_value("provider"));
+        }
+        res.set_content(out.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
     });
 
     _server->Post("/api/agent/prompt", [getWorkspaceRoot, getCliBrainDir, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc, extractConversationModelById, mapLabelToCliModelId, toLowerAscii](
@@ -6139,7 +6312,7 @@ void WebServer::setupRoutes() {
         std::string agentId = j.value("agentId", "antigravity");
         std::string cid = j.value("conversationId", "");
         std::string requestedModel = j.value("model", "");
-        std::string requestedSource = toLowerAscii(j.value("source", ""));
+        std::string requestedSource = toLowerAscii(j.value("source", j.value("provider", "")));
         bool autoApprove = j.value("autoApprove", true);
         bool hasQuestionResponses = j.contains("questionResponses") &&
                                     j["questionResponses"].is_array() &&
@@ -6680,6 +6853,43 @@ void WebServer::setupRoutes() {
             LiveProviderSessionInfo sessionInfo;
             if (!cid.empty() && cid != "new") {
                 sessionInfo = discoverLiveProviderSession(targetProvider, cid, wsDir, existingTranscriptPath.string());
+                const SessionInteractivityInfo interactivity = evaluateSessionInteractivity(
+                    targetProvider, cid, fs::path(), sessionInfo, existingTranscriptPath);
+                if (!interactivity.interactive) {
+                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - reqStart).count());
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "WARN", "router_decision", cid, targetProvider, "route_prompt",
+                        nlohmann::json({
+                            {"selected_route", "rejected_non_interactive_ide"},
+                            {"interactive", false},
+                            {"owner_pid", sessionInfo.ownerPid},
+                            {"has_cli_store", sessionInfo.hasCliStore},
+                            {"is_ide_renderer", sessionInfo.isIdeRendererSession},
+                            {"error", interactivity.nonInteractiveReason}
+                        }),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "WARN", "mobile_http", cid, targetProvider, "POST /api/agent/prompt",
+                        nlohmann::json({
+                            {"status_code", 409},
+                            {"duration_ms", totalMs},
+                            {"token_fp", tokenFp},
+                            {"client_meta", req.get_header_value("X-Client-Meta")},
+                            {"routed_via", "rejected_non_interactive_ide"},
+                            {"error", interactivity.nonInteractiveReason}
+                        }),
+                        reqId);
+                    res.status = 409;
+                    res.set_content(nlohmann::json({
+                        {"ok", false},
+                        {"status", "error"},
+                        {"error", interactivity.nonInteractiveReason},
+                        {"interactive", false},
+                        {"nonInteractiveReason", interactivity.nonInteractiveReason}
+                    }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                    return;
+                }
                 if (!sessionInfo.screenSession.empty()) {
                     AgentTelemetryDb::getInstance().logDiagnostic(
                         "INFO", "router_decision", cid, targetProvider, "route_prompt",
@@ -6762,55 +6972,23 @@ void WebServer::setupRoutes() {
                 }
             }
 
-            bool isOlderCursorWithoutStore = (targetProvider == "cursor" && !cid.empty() && cid != "new" && !sessionInfo.hasCliStore);
-            std::string selectedRoute = isOlderCursorWithoutStore ? "cli_resume_with_context" : "cli_print";
+            std::string selectedRoute = "cli_print";
             AgentTelemetryDb::getInstance().logDiagnostic(
                 "INFO", "router_decision", cid, targetProvider, "route_prompt",
                 nlohmann::json({
                     {"selected_route", selectedRoute},
+                    {"interactive", true},
                     {"owner_pid", sessionInfo.ownerPid},
                     {"has_cli_store", sessionInfo.hasCliStore},
                     {"is_ide_renderer", sessionInfo.isIdeRendererSession}
                 }),
                 reqId);
 
-            std::vector<std::string> priorCursorLines;
-            std::string cliPromptText = text;
-            if (isOlderCursorWithoutStore && !existingTranscriptPath.empty() && fs::exists(existingTranscriptPath)) {
-                {
-                    std::ifstream pf(existingTranscriptPath);
-                    std::string pl;
-                    while (std::getline(pf, pl)) {
-                        if (!pl.empty()) priorCursorLines.push_back(pl);
-                    }
-                }
-                auto parsedHistory = parseProviderTranscriptJsonl(
-                    existingTranscriptPath, "cursor", -1, existingSlug, false);
-                if (!parsedHistory.steps.empty()) {
-                    std::string ctxBlock = "[Prior Conversation Context in this Session]\n";
-                    size_t startStep = (parsedHistory.steps.size() > 8) ? (parsedHistory.steps.size() - 8) : 0;
-                    for (size_t si = startStep; si < parsedHistory.steps.size(); ++si) {
-                        const auto& stObj = parsedHistory.steps[si];
-                        std::string sType = stObj.value("type", "");
-                        std::string sTxt = stObj.value("text", stObj.value("content", ""));
-                        if (sTxt.empty()) continue;
-                        if (sTxt.size() > 1500) {
-                            sTxt = sTxt.substr(0, 1500) + "...";
-                        }
-                        std::string roleHdr = (sType == "USER_INPUT") ? "User: " : "Assistant: ";
-                        if (ctxBlock.size() + roleHdr.size() + sTxt.size() + 2 > 12288) break;
-                        ctxBlock += roleHdr + sTxt + "\n";
-                    }
-                    ctxBlock += "[End Prior Conversation Context]\n\nUser request:\n" + text;
-                    cliPromptText = ctxBlock;
-                }
-            }
-
             auto fwdStart = std::chrono::steady_clock::now();
             std::string rawOut;
             std::string replyText;
             std::string resolvedCid;
-            if (!runProviderCli(cliPromptText, cid, extraCliArgs, rawOut, replyText, resolvedCid)) {
+            if (!runProviderCli(text, cid, extraCliArgs, rawOut, replyText, resolvedCid)) {
                 int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - fwdStart).count());
                 AgentTelemetryDb::getInstance().logDiagnostic(
@@ -6820,66 +6998,6 @@ void WebServer::setupRoutes() {
                 res.status = 500;
                 res.set_content("{\"status\":\"error\",\"error\":\"Failed to fork provider CLI\"}", "application/json");
                 return;
-            }
-            if (isOlderCursorWithoutStore &&
-                (replyText.empty() ||
-                 rawOut.find("No chat found") != std::string::npos ||
-                 rawOut.find("not found") != std::string::npos)) {
-                runProviderCli(cliPromptText, "", extraCliArgs, rawOut, replyText, resolvedCid);
-                resolvedCid = cid;
-            }
-            if (isOlderCursorWithoutStore && !cid.empty() && cid != "new") {
-                resolvedCid = cid;
-                if (!existingTranscriptPath.empty()) {
-                    std::vector<std::string> curLines;
-                    if (fs::exists(existingTranscriptPath)) {
-                        std::ifstream cf(existingTranscriptPath);
-                        std::string cl;
-                        while (std::getline(cf, cl)) {
-                            if (!cl.empty()) curLines.push_back(cl);
-                        }
-                    }
-                    std::vector<std::string> mergedLines = priorCursorLines;
-                    bool prefixPreserved = (curLines.size() >= priorCursorLines.size());
-                    if (prefixPreserved) {
-                        for (size_t i = 0; i < priorCursorLines.size(); ++i) {
-                            if (curLines[i] != priorCursorLines[i]) {
-                                prefixPreserved = false;
-                                break;
-                            }
-                        }
-                    }
-                    if (prefixPreserved) {
-                        for (size_t i = priorCursorLines.size(); i < curLines.size(); ++i) {
-                            mergedLines.push_back(curLines[i]);
-                        }
-                    }
-                    if (mergedLines.size() == priorCursorLines.size()) {
-                        nlohmann::json uLine = {
-                            {"role", "user"},
-                            {"message", {{"content", nlohmann::json::array({{{"type", "text"}, {"text", "<user_query>\n" + text + "\n</user_query>"}}})}}}
-                        };
-                        mergedLines.push_back(uLine.dump());
-                        if (!replyText.empty()) {
-                            nlohmann::json aLine = {
-                                {"role", "assistant"},
-                                {"message", {{"model", activeModel}, {"content", nlohmann::json::array({{{"type", "text"}, {"text", replyText}}})}}}
-                            };
-                            mergedLines.push_back(aLine.dump());
-                            mergedLines.push_back("{\"type\":\"turn_ended\",\"status\":\"success\"}");
-                        }
-                    }
-                    std::string tmpPath = existingTranscriptPath.string() + ".tmp";
-                    {
-                        std::ofstream tf(tmpPath, std::ios::trunc);
-                        for (const auto& ml : mergedLines) {
-                            tf << ml << "\n";
-                        }
-                    }
-                    chmod(tmpPath.c_str(), 0600);
-                    std::error_code renEc;
-                    fs::rename(tmpPath, existingTranscriptPath, renEc);
-                }
             }
             if (resolvedCid.empty()) {
                 resolvedCid = (!cid.empty() && cid != "new") ? cid : "new";
@@ -7910,6 +8028,9 @@ void WebServer::setupRoutes() {
                                              const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string id = req.get_param_value("id");
+        if (id.empty()) {
+            id = req.get_param_value("conversationId");
+        }
         if (id.empty() || id.find("..") != std::string::npos || id.find('/') != std::string::npos) {
             res.status = 400;
             res.set_content("{\"error\":\"Missing or invalid conversation id\"}", "application/json");
@@ -9294,6 +9415,28 @@ nlohmann::json WebServer::inspectSession(const std::string& conversationId) {
         liveInfo = discoverLiveProviderSession(
             provSource, conversationId, parsed.workspacePath, provFile.string());
     }
+    SessionInteractivityInfo interactivity = evaluateSessionInteractivity(
+        provSource, conversationId, fs::path(), liveInfo, provFile);
+
+    std::string recommendedRoute = "cli_print";
+    if (!interactivity.interactive) {
+        recommendedRoute = "rejected_non_interactive_ide";
+    } else if (!liveInfo.screenSession.empty()) {
+        recommendedRoute = "screen";
+    }
+    std::string selectedRoute = recommendedRoute;
+    if (diagLogs.is_array()) {
+        for (const auto& entry : diagLogs) {
+            if (entry.is_object() && entry.value("category", "") == "router_decision" &&
+                entry.contains("details") && entry["details"].is_object()) {
+                std::string sr = entry["details"].value("selected_route", "");
+                if (!sr.empty()) {
+                    selectedRoute = sr;
+                    break;
+                }
+            }
+        }
+    }
 
     nlohmann::json subagentFiles = nlohmann::json::array();
     if (!provFile.empty()) {
@@ -9331,6 +9474,10 @@ nlohmann::json WebServer::inspectSession(const std::string& conversationId) {
         {"status", parsed.hasValidTurns ? parsed.status : sessionRec.value("status", "UNKNOWN")},
         {"workspace", !parsed.workspacePath.empty() ? parsed.workspacePath : sessionRec.value("workspace_path", sessionRec.value("workspace", ""))},
         {"model", !parsed.model.empty() ? parsed.model : sessionRec.value("model_name", sessionRec.value("model", ""))},
+        {"interactive", interactivity.interactive},
+        {"nonInteractiveReason", interactivity.nonInteractiveReason},
+        {"recommended_route", recommendedRoute},
+        {"selected_route", selectedRoute},
         {"parent_jsonl_path", provFile.string()},
         {"parent_jsonl_exists", parentJsonlExists},
         {"hook_state_exists", hookStateExists},
