@@ -56,6 +56,10 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                     <span class="subnav-indicator"></span>
                     <span class="subnav-title">tool bridges</span>
                 </button>
+                <button type="button" class="aimon-subnav-tab" data-subpanel="settings">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">settings</span>
+                </button>
             </div>
 
             <!-- Subpanel 1: AI Quotas (Antigravity, Cursor, MCP Clients) -->
@@ -729,6 +733,273 @@ inline const char* INDEX_HTML = R"raw_asset(<!DOCTYPE html>
                         </table>
                     </div>
                 </div>
+            </div>
+
+            <!-- Subpanel 6: Runtime Settings & Diagnostics (#subpanel-settings) -->
+            <div class="aimon-subpanel hidden" id="subpanel-settings">
+                <div class="settings-top-grid">
+                    <!-- Card 1: Mobile Gateway Routing & Session Discovery Policy Card -->
+                    <section class="glass-card settings-card" id="settings-gateway-card">
+                        <div class="card-header">
+                            <div class="provider-title">
+                                <span class="badge badge-cyan">Gateway Policy</span>
+                                <h2>Mobile Gateway Routing &amp; Session Discovery</h2>
+                            </div>
+                            <span class="badge badge-sub">Hot-Reloadable</span>
+                        </div>
+
+                        <div class="settings-toggle-list">
+                            <label class="settings-toggle-row" for="cfg-gw-locked-resume">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Allow Detached Resume on Terminal-Locked CLI Without CSRF (Fallback 5)</span>
+                                    <span class="settings-toggle-desc">Allow detached <code>agy --conversation &lt;cid&gt; -p</code> resume when a terminal-locked CLI session has no registered CSRF token (<code>allow_cli_locked_detached_resume</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-locked-resume" class="settings-checkbox" checked>
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-gw-new-spawn">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Allow New CLI Session Spawn in Workspace (Fallback 6)</span>
+                                    <span class="settings-toggle-desc">Allow spawning a new CLI session in the workspace when no live RPC endpoint or existing disk conversation is available (<code>allow_cli_new_session_spawn</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-new-spawn" class="settings-checkbox" checked>
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-gw-agentapi">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Enable <code>agy agentapi</code> Socket Fallback (Fallback 4)</span>
+                                    <span class="settings-toggle-desc">Permit Fallback 4 dispatch via <code>agy agentapi send-message</code> when direct ConnectRPC fails (<code>allow_agy_agentapi_fallback</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-agentapi" class="settings-checkbox" checked>
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-gw-strict-fd">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Strict Presence Lock File-Descriptor Check</span>
+                                    <span class="settings-toggle-desc">Require a live <code>/proc/&lt;pid&gt;/fd</code> lock holder from a running <code>agy</code> process before treating CLI <code>.lock</code> files as active (<code>strict_presence_fd_check</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-strict-fd" class="settings-checkbox" checked>
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-gw-auto-prune-locks">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Automatically Prune Orphaned Presence <code>.lock</code> Files</span>
+                                    <span class="settings-toggle-desc">Automatically unlink stale <code>~/.gemini/antigravity-cli/presence/*.lock</code> files not held open by any running <code>agy</code> process (<code>auto_prune_stale_presence_locks</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-auto-prune-locks" class="settings-checkbox" checked>
+                            </label>
+                        </div>
+
+                        <div class="settings-numeric-grid">
+                            <div class="eda-field">
+                                <label for="cfg-gw-recency-sec">Active Recency Window (sec, 10..3600)</label>
+                                <input type="number" id="cfg-gw-recency-sec" class="eda-input" min="10" max="3600" step="10" value="120">
+                            </div>
+                            <div class="eda-field">
+                                <label for="cfg-gw-presence-ttl-sec">Stale Presence Lock TTL (sec, 10..604800)</label>
+                                <input type="number" id="cfg-gw-presence-ttl-sec" class="eda-input" min="10" max="604800" step="60" value="3600">
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Card 2: Diagnostic Logging & Disk Hygiene Card (All Logging Switches Default OFF) -->
+                    <section class="glass-card settings-card" id="settings-diagnostics-card">
+                        <div class="card-header">
+                            <div class="provider-title">
+                                <span class="badge badge-magenta">Disk Hygiene</span>
+                                <h2>Diagnostic Logging &amp; Storage Hygiene</h2>
+                            </div>
+                            <div class="settings-quick-actions">
+                                <span id="cfg-diag-status-badge" class="status-pill completed">Logging: OFF (Default)</span>
+                                <button type="button" class="btn-frame-action" id="btn-cfg-diag-enable-all">Enable All Debug Switches</button>
+                                <button type="button" class="btn-frame-action" id="btn-cfg-diag-disable-all">Disable All Debug Switches</button>
+                            </div>
+                        </div>
+
+                        <div class="settings-toggle-list">
+                            <label class="settings-toggle-row settings-master-toggle" for="cfg-diag-enabled">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Master Diagnostic Logging Switch (Default: OFF)</span>
+                                    <span class="settings-toggle-desc">Write gateway diagnostic entries into <code>gateway_diagnostic_logs</code> in <code>telemetry.db</code> (<code>diagnostics.enabled</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-enabled" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-mobile-http">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log Mobile HTTP &amp; Transcript Requests</span>
+                                    <span class="settings-toggle-desc">Record mobile HTTP requests and transcript loads when master switch is ON (<code>diagnostics.log_mobile_http</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-mobile-http" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-router">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log Prompt Router &amp; Fallback Decisions</span>
+                                    <span class="settings-toggle-desc">Record prompt routing and fallback dispatch events (<code>router_decision</code>, <code>platform_forward</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-router" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-idle-polls">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log Idle <code>200 OK</code> Transcript Polls (<code>0</code> new steps)</span>
+                                    <span class="settings-toggle-desc">Record incremental <code>GET /api/agent/transcript?since=N</code> polls even when 0 new steps are returned (<code>diagnostics.log_idle_transcript_polls</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-idle-polls" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-discovery">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log <code>GET /api/agent/conversations</code> Discovery Polls</span>
+                                    <span class="settings-toggle-desc">Record periodic conversation discovery polls (<code>diagnostics.log_discovery_polls</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-discovery" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-hooks">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log IDE/CLI Hook Lifecycle Events</span>
+                                    <span class="settings-toggle-desc">Record Cursor / Claude / Antigravity hook lifecycle events in diagnostic logs (<code>diagnostics.log_hooks</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-hooks" class="settings-checkbox">
+                            </label>
+                        </div>
+
+                        <div class="settings-numeric-grid settings-numeric-grid-3">
+                            <div class="eda-field">
+                                <label for="cfg-diag-min-level">Minimum Severity Level</label>
+                                <select id="cfg-diag-min-level" class="eda-select">
+                                    <option value="INFO" selected>INFO</option>
+                                    <option value="WARN">WARN</option>
+                                    <option value="ERROR">ERROR</option>
+                                </select>
+                            </div>
+                            <div class="eda-field">
+                                <label for="cfg-diag-max-rows">Max Retained Log Rows (100..500000)</label>
+                                <input type="number" id="cfg-diag-max-rows" class="eda-input" min="100" max="500000" step="100" value="2000">
+                            </div>
+                            <div class="eda-field">
+                                <label for="cfg-diag-retention-days">Telemetry Retention (Days, 1..365)</label>
+                                <input type="number" id="cfg-diag-retention-days" class="eda-input" min="1" max="365" step="1" value="14">
+                            </div>
+                        </div>
+
+                        <!-- Live Disk Storage & Hygiene Strip -->
+                        <div class="settings-storage-strip">
+                            <div class="eda-counter-pill">
+                                <span>telemetry.db Size</span>
+                                <strong id="cfg-storage-db-size">--</strong>
+                            </div>
+                            <div class="eda-counter-pill">
+                                <span>Diagnostic Log Rows</span>
+                                <strong id="cfg-storage-diag-rows">0</strong>
+                            </div>
+                            <div class="eda-counter-pill">
+                                <span>Lifecycle Event Rows</span>
+                                <strong id="cfg-storage-event-rows">0</strong>
+                            </div>
+                            <div class="eda-counter-pill">
+                                <span>Recorded Sessions</span>
+                                <strong id="cfg-storage-session-rows">0</strong>
+                            </div>
+                            <div class="eda-counter-pill">
+                                <span>Stale Presence .lock Files</span>
+                                <strong id="cfg-storage-stale-locks">0</strong>
+                            </div>
+                        </div>
+
+                        <div class="settings-actions-bar">
+                            <button type="button" class="btn-refresh btn-primary-cyan" id="btn-cfg-save">Save &amp; Apply Runtime Config</button>
+                            <button type="button" class="btn-refresh btn-danger-coral" id="btn-cfg-purge-debug">Purge Debugging Data on Disk</button>
+                            <button type="button" class="btn-refresh" id="btn-cfg-prune-telemetry">Prune Expired Telemetry DB</button>
+                        </div>
+
+                        <div id="cfg-save-feedback" class="eda-feedback-banner hidden"></div>
+                    </section>
+                </div>
+
+                <!-- Card 3: Live Gateway Diagnostics & Session Route Inspector Card -->
+                <section class="glass-card settings-card" id="settings-inspector-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="badge badge-cyan">Live Probe</span>
+                            <h2>Live Gateway Diagnostics &amp; Session Route Inspector</h2>
+                        </div>
+                        <div class="diag-filter-bar">
+                            <select id="diag-filter-category" class="eda-select" aria-label="Filter by Category">
+                                <option value="">All Categories</option>
+                                <option value="mobile_http">mobile_http</option>
+                                <option value="router_decision">router_decision</option>
+                                <option value="platform_forward">platform_forward</option>
+                                <option value="discovery">discovery</option>
+                                <option value="transcript">transcript</option>
+                                <option value="hook">hook</option>
+                            </select>
+                            <select id="diag-filter-level" class="eda-select" aria-label="Filter by Minimum Level">
+                                <option value="">All Levels</option>
+                                <option value="INFO">INFO+</option>
+                                <option value="WARN">WARN+</option>
+                                <option value="ERROR">ERROR</option>
+                            </select>
+                            <input type="text" id="diag-filter-cid" class="eda-input" placeholder="Filter by Conversation ID..." aria-label="Filter by Conversation ID">
+                            <button type="button" class="btn-refresh" id="btn-diag-refresh">Refresh Inspector</button>
+                        </div>
+                    </div>
+
+                    <div class="diag-inspector-section">
+                        <div class="diag-subsection-header">
+                            <h3>Session Route Readiness (Live <code>/proc</code> &amp; Disk Inspection)</h3>
+                            <span class="badge badge-cyan" id="diag-sessions-count">0 Sessions</span>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="agents-table eda-calls-table diag-table">
+                                <thead>
+                                    <tr>
+                                        <th>Provider</th>
+                                        <th>Conversation ID</th>
+                                        <th>Source</th>
+                                        <th>PID / Port / CSRF</th>
+                                        <th>Recommended / Selected Route</th>
+                                        <th>Interactive Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="diag-sessions-body">
+                                    <tr>
+                                        <td colspan="6" class="eda-empty-row">Loading session route readiness...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div class="diag-inspector-section">
+                        <div class="diag-subsection-header">
+                            <h3>Gateway Diagnostic Logs (<code>gateway_diagnostic_logs</code>)</h3>
+                            <span class="badge badge-magenta" id="diag-logs-count">0 Entries</span>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="agents-table eda-calls-table diag-table">
+                                <thead>
+                                    <tr>
+                                        <th>Timestamp</th>
+                                        <th>Level</th>
+                                        <th>Category</th>
+                                        <th>Provider</th>
+                                        <th>Conversation / Request ID</th>
+                                        <th>Summary</th>
+                                        <th>Details JSON</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="diag-logs-body">
+                                    <tr>
+                                        <td colspan="7" class="eda-empty-row">Diagnostic logging is OFF by default (0 rows stored). Enable switches above when debugging.</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </section>
             </div>
         </main>
 
@@ -3966,6 +4237,238 @@ body {
     padding: 20px !important;
 }
 
+/* ==========================================================================
+   Subpanel 6: Runtime Settings & Diagnostics (#subpanel-settings)
+   ========================================================================== */
+
+#subpanel-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding-bottom: 24px;
+}
+
+#subpanel-settings.hidden {
+    display: none;
+}
+
+.settings-top-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+}
+
+@media (max-width: 1180px) {
+    .settings-top-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.settings-card {
+    padding: 18px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.settings-quick-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.settings-toggle-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.settings-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 10px 14px;
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.settings-toggle-row:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(56, 189, 248, 0.25);
+}
+
+.settings-master-toggle {
+    background: rgba(56, 189, 248, 0.07);
+    border-color: rgba(56, 189, 248, 0.28);
+}
+
+.settings-toggle-info {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+}
+
+.settings-toggle-title {
+    font-size: 0.84rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.settings-toggle-desc {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    line-height: 1.35;
+}
+
+.settings-toggle-info code {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: #38bdf8;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 1px 5px;
+    border-radius: 4px;
+}
+
+.settings-checkbox {
+    width: 18px;
+    height: 18px;
+    accent-color: #06b6d4;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.settings-numeric-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.settings-numeric-grid-3 {
+    grid-template-columns: repeat(3, 1fr);
+}
+
+@media (max-width: 720px) {
+    .settings-numeric-grid,
+    .settings-numeric-grid-3 {
+        grid-template-columns: 1fr;
+    }
+}
+
+.settings-storage-strip {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+}
+
+@media (max-width: 780px) {
+    .settings-storage-strip {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.settings-actions-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding-top: 4px;
+}
+
+.btn-primary-cyan {
+    background: rgba(6, 182, 212, 0.22);
+    border-color: rgba(56, 189, 248, 0.45);
+    color: #38bdf8;
+}
+
+.btn-primary-cyan:hover {
+    background: rgba(6, 182, 212, 0.34);
+    border-color: #38bdf8;
+    color: #ffffff;
+}
+
+.btn-danger-coral {
+    background: rgba(239, 68, 68, 0.16);
+    border-color: rgba(248, 113, 113, 0.42);
+    color: #f87171;
+}
+
+.btn-danger-coral:hover {
+    background: rgba(239, 68, 68, 0.28);
+    border-color: #f87171;
+    color: #ffffff;
+}
+
+.diag-filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.diag-filter-bar #diag-filter-cid {
+    min-width: 220px;
+}
+
+.diag-inspector-section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.diag-subsection-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.diag-subsection-header h3 {
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.diag-subsection-header code {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: #38bdf8;
+}
+
+.diag-table td {
+    font-size: 0.76rem;
+    vertical-align: top;
+}
+
+.diag-sub-id {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+.diag-details-code {
+    display: inline-block;
+    max-width: 420px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.72rem;
+    color: #cbd5e1;
+}
+
+
 )raw_asset";
 
 inline const char* APP_JS = R"raw_asset(//
@@ -5903,7 +6406,8 @@ function switchToSubpanel(subpanelId) {
         'telemetry': document.getElementById('subpanel-telemetry'),
         'approvals': document.getElementById('subpanel-approvals'),
         'insights': document.getElementById('subpanel-insights'),
-        'bridges': document.getElementById('subpanel-bridges')
+        'bridges': document.getElementById('subpanel-bridges'),
+        'settings': document.getElementById('subpanel-settings')
     };
     Object.keys(subpanels).forEach(key => {
         const el = subpanels[key];
@@ -5931,6 +6435,9 @@ function switchToSubpanel(subpanelId) {
         fetchInsightsTab();
     } else if (subpanelId === 'bridges') {
         fetchToolBridgesStatus(false);
+    } else if (subpanelId === 'settings') {
+        fetchRuntimeConfig(true);
+        fetchDiagnosticsInspector();
     }
 }
 
@@ -6200,6 +6707,348 @@ async function fetchInsightsTab() {
     }
 }
 
+// ==========================================================================
+// Runtime Configuration, Disk Hygiene & Live Gateway Diagnostics Controller
+// ==========================================================================
+
+function formatStorageBytes(bytes) {
+    const n = Number(bytes) || 0;
+    if (n <= 0) return '0 B';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function renderStorageStats(storageStats, staleLocksCount) {
+    if (!storageStats || typeof storageStats !== 'object') return;
+    const dbSizeEl = document.getElementById('cfg-storage-db-size');
+    const diagRowsEl = document.getElementById('cfg-storage-diag-rows');
+    const eventRowsEl = document.getElementById('cfg-storage-event-rows');
+    const sessRowsEl = document.getElementById('cfg-storage-session-rows');
+    const staleLocksEl = document.getElementById('cfg-storage-stale-locks');
+    const statusBadgeEl = document.getElementById('cfg-diag-status-badge');
+
+    const totalBytes = (Number(storageStats.db_size_bytes) || 0) + (Number(storageStats.wal_size_bytes) || 0);
+    if (dbSizeEl) dbSizeEl.textContent = formatStorageBytes(totalBytes);
+
+    const counts = storageStats.counts || {};
+    const diagCount = storageStats.diagnostic_logs_count !== undefined
+        ? storageStats.diagnostic_logs_count
+        : (counts.gateway_diagnostic_logs || 0);
+    const evCount = storageStats.lifecycle_events_count !== undefined
+        ? storageStats.lifecycle_events_count
+        : (counts.agent_lifecycle_events || 0);
+    const sessCount = storageStats.sessions_count !== undefined
+        ? storageStats.sessions_count
+        : (counts.agent_sessions || 0);
+
+    if (diagRowsEl) diagRowsEl.textContent = String(diagCount);
+    if (eventRowsEl) eventRowsEl.textContent = String(evCount);
+    if (sessRowsEl) sessRowsEl.textContent = String(sessCount);
+    if (staleLocksEl && staleLocksCount !== undefined) {
+        staleLocksEl.textContent = String(staleLocksCount);
+    }
+    if (statusBadgeEl && storageStats.diagnostics_enabled !== undefined) {
+        if (storageStats.diagnostics_enabled) {
+            statusBadgeEl.className = 'status-pill running';
+            statusBadgeEl.textContent = `Logging: ON (${storageStats.min_level || 'INFO'})`;
+        } else {
+            statusBadgeEl.className = 'status-pill completed';
+            statusBadgeEl.textContent = 'Logging: OFF (Default)';
+        }
+    }
+}
+
+async function fetchRuntimeConfig(populateInputs = true) {
+    try {
+        const res = await fetch('/api/config');
+        if (!res.ok) return;
+        const data = await res.json();
+        const cfg = data.config || data;
+        const gw = cfg.gateway || {};
+        const diag = cfg.diagnostics || {};
+
+        if (populateInputs) {
+            const setCheck = (id, val) => {
+                const el = document.getElementById(id);
+                if (el) el.checked = Boolean(val);
+            };
+            const setVal = (id, val) => {
+                const el = document.getElementById(id);
+                if (el && val !== undefined && val !== null) el.value = String(val);
+            };
+
+            setCheck('cfg-gw-locked-resume', gw.allow_cli_locked_detached_resume !== false);
+            setCheck('cfg-gw-new-spawn', gw.allow_cli_new_session_spawn !== false);
+            setCheck('cfg-gw-agentapi', gw.allow_agy_agentapi_fallback !== false);
+            setCheck('cfg-gw-strict-fd', gw.strict_presence_fd_check !== false);
+            setCheck('cfg-gw-auto-prune-locks', gw.auto_prune_stale_presence_locks !== false);
+            setVal('cfg-gw-recency-sec', gw.active_recency_window_sec !== undefined ? gw.active_recency_window_sec : 120);
+            setVal('cfg-gw-presence-ttl-sec', gw.presence_stale_ttl_sec !== undefined ? gw.presence_stale_ttl_sec : 3600);
+
+            // All diagnostic logging switches default strictly to OFF (false)
+            setCheck('cfg-diag-enabled', diag.enabled === true);
+            setCheck('cfg-diag-mobile-http', diag.log_mobile_http === true);
+            setCheck('cfg-diag-router', diag.log_router_decisions === true);
+            setCheck('cfg-diag-idle-polls', diag.log_idle_transcript_polls === true);
+            setCheck('cfg-diag-discovery', diag.log_discovery_polls === true);
+            setCheck('cfg-diag-hooks', diag.log_hooks === true);
+            setVal('cfg-diag-min-level', diag.min_level || 'INFO');
+            setVal('cfg-diag-max-rows', diag.max_retained_rows !== undefined ? diag.max_retained_rows : 2000);
+            setVal('cfg-diag-retention-days', diag.telemetry_retention_days !== undefined ? diag.telemetry_retention_days : 14);
+        }
+
+        renderStorageStats(data.storage_stats, data.stale_presence_locks_count);
+    } catch (err) {
+        console.warn('Failed to fetch runtime config:', err);
+    }
+}
+
+async function saveRuntimeConfig() {
+    const saveBtn = document.getElementById('btn-cfg-save');
+    const feedbackEl = document.getElementById('cfg-save-feedback');
+    if (saveBtn) saveBtn.textContent = 'Saving...';
+
+    const getCheck = (id, defVal = false) => {
+        const el = document.getElementById(id);
+        return el ? Boolean(el.checked) : defVal;
+    };
+    const getInt = (id, defVal) => {
+        const el = document.getElementById(id);
+        if (!el) return defVal;
+        const parsed = parseInt(el.value, 10);
+        return Number.isFinite(parsed) ? parsed : defVal;
+    };
+
+    const payload = {
+        gateway: {
+            allow_cli_locked_detached_resume: getCheck('cfg-gw-locked-resume', true),
+            allow_cli_new_session_spawn: getCheck('cfg-gw-new-spawn', true),
+            allow_agy_agentapi_fallback: getCheck('cfg-gw-agentapi', true),
+            strict_presence_fd_check: getCheck('cfg-gw-strict-fd', true),
+            auto_prune_stale_presence_locks: getCheck('cfg-gw-auto-prune-locks', true),
+            active_recency_window_sec: getInt('cfg-gw-recency-sec', 120),
+            presence_stale_ttl_sec: getInt('cfg-gw-presence-ttl-sec', 3600)
+        },
+        diagnostics: {
+            enabled: getCheck('cfg-diag-enabled', false),
+            log_mobile_http: getCheck('cfg-diag-mobile-http', false),
+            log_router_decisions: getCheck('cfg-diag-router', false),
+            log_idle_transcript_polls: getCheck('cfg-diag-idle-polls', false),
+            log_discovery_polls: getCheck('cfg-diag-discovery', false),
+            log_hooks: getCheck('cfg-diag-hooks', false),
+            min_level: (document.getElementById('cfg-diag-min-level')?.value || 'INFO'),
+            max_retained_rows: getInt('cfg-diag-max-rows', 2000),
+            telemetry_retention_days: getInt('cfg-diag-retention-days', 14)
+        }
+    };
+
+    try {
+        const res = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (res.ok && data.ok !== false) {
+            renderStorageStats(data.storage_stats, data.stale_presence_locks_count);
+            if (feedbackEl) {
+                feedbackEl.className = 'eda-feedback-banner';
+                feedbackEl.textContent = `Runtime config saved & applied immediately (Diagnostics logging: ${payload.diagnostics.enabled ? 'ENABLED' : 'OFF'}, Locked CLI Fallback 5: ${payload.gateway.allow_cli_locked_detached_resume ? 'ENABLED' : 'DISABLED'}).`;
+                feedbackEl.classList.remove('hidden');
+            }
+            fetchDiagnosticsInspector();
+        } else {
+            if (feedbackEl) {
+                feedbackEl.className = 'error-banner';
+                feedbackEl.textContent = `Config validation failed: ${data.error || res.statusText}`;
+                feedbackEl.classList.remove('hidden');
+            }
+        }
+    } catch (err) {
+        if (feedbackEl) {
+            feedbackEl.className = 'error-banner';
+            feedbackEl.textContent = `Failed to save runtime config: ${err.message || err}`;
+            feedbackEl.classList.remove('hidden');
+        }
+    } finally {
+        if (saveBtn) saveBtn.textContent = 'Save & Apply Runtime Config';
+    }
+}
+
+async function purgeDebugDataOnDisk(fullPurge = true) {
+    const btn = document.getElementById(fullPurge ? 'btn-cfg-purge-debug' : 'btn-cfg-prune-telemetry');
+    const feedbackEl = document.getElementById('cfg-save-feedback');
+    const origText = btn ? btn.textContent : '';
+    if (btn) btn.textContent = fullPurge ? 'Purging Debug Data...' : 'Pruning Telemetry...';
+
+    const reqBody = fullPurge
+        ? {
+            purge_debug_data: true,
+            clear_logs: true,
+            prune_telemetry: true,
+            prune_stale_locks: true,
+            vacuum: true
+        }
+        : {
+            clear_logs: false,
+            prune_telemetry: true,
+            prune_stale_locks: true,
+            vacuum: true
+        };
+
+    try {
+        const res = await fetch('/api/agent/diagnostics/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(reqBody)
+        });
+        const data = await res.json();
+        if (res.ok && data.ok !== false) {
+            const deletedLogs = data.deleted_diagnostic_logs !== undefined ? data.deleted_diagnostic_logs : (data.deleted || 0);
+            const prunedTelem = data.pruned_telemetry_rows || 0;
+            const prunedLocks = data.pruned_stale_locks || 0;
+            const reclaimed = data.reclaimed_bytes || 0;
+            const afterBytes = data.after_bytes !== undefined ? data.after_bytes : (data.size_after_bytes || 0);
+
+            if (feedbackEl) {
+                feedbackEl.className = 'eda-feedback-banner';
+                feedbackEl.textContent = fullPurge
+                    ? `Purged ${deletedLogs} diagnostic log rows, pruned ${prunedTelem} expired telemetry events & ${prunedLocks} stale .lock files. Reclaimed ${formatStorageBytes(reclaimed)} (telemetry.db now ${formatStorageBytes(afterBytes)}).`
+                    : `Pruned ${prunedTelem} expired telemetry events & ${prunedLocks} stale .lock files. Reclaimed ${formatStorageBytes(reclaimed)} (telemetry.db now ${formatStorageBytes(afterBytes)}).`;
+                feedbackEl.classList.remove('hidden');
+            }
+            await fetchRuntimeConfig(false);
+            await fetchDiagnosticsInspector();
+        } else if (feedbackEl) {
+            feedbackEl.className = 'error-banner';
+            feedbackEl.textContent = `Disk hygiene operation failed: ${data.error || res.statusText}`;
+            feedbackEl.classList.remove('hidden');
+        }
+    } catch (err) {
+        if (feedbackEl) {
+            feedbackEl.className = 'error-banner';
+            feedbackEl.textContent = `Disk hygiene request error: ${err.message || err}`;
+            feedbackEl.classList.remove('hidden');
+        }
+    } finally {
+        if (btn) btn.textContent = origText;
+    }
+}
+
+async function fetchDiagnosticsInspector() {
+    const category = document.getElementById('diag-filter-category')?.value || '';
+    const minLevel = document.getElementById('diag-filter-level')?.value || '';
+    const cid = (document.getElementById('diag-filter-cid')?.value || '').trim();
+
+    const diagUrl = cid
+        ? `/api/agent/diagnostics?id=${encodeURIComponent(cid)}`
+        : '/api/agent/diagnostics';
+
+    const logParams = new URLSearchParams();
+    logParams.set('limit', '100');
+    if (category) logParams.set('category', category);
+    if (minLevel) logParams.set('minLevel', minLevel);
+    if (cid) logParams.set('id', cid);
+    const logsUrl = `/api/agent/diagnostics/logs?${logParams.toString()}`;
+
+    try {
+        const [diagRes, logsRes] = await Promise.all([
+            fetch(diagUrl),
+            fetch(logsUrl)
+        ]);
+
+        if (diagRes.ok) {
+            const diagData = await diagRes.json();
+            const sessions = Array.isArray(diagData.sessions)
+                ? diagData.sessions
+                : (diagData.conversation_id ? [diagData] : []);
+
+            const countEl = document.getElementById('diag-sessions-count');
+            if (countEl) countEl.textContent = `${sessions.length} Sessions`;
+
+            const tbody = document.getElementById('diag-sessions-body');
+            if (tbody) {
+                if (sessions.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="eda-empty-row">No matching sessions found for inspection.</td></tr>';
+                } else {
+                    tbody.innerHTML = sessions.map(s => {
+                        const prov = s.provider || 'antigravity';
+                        const provBadge = prov === 'cursor' ? 'badge-magenta' : (prov === 'claude' ? 'badge-amber' : 'badge-cyan');
+                        const srcDesc = s.open_in_terminal
+                            ? `terminal (${s.terminal_pts || 'pts'})`
+                            : (s.screen_session
+                                ? `screen:${s.screen_session}`
+                                : (s.is_ide_renderer ? 'ide' : (s.has_cli_store ? 'cli' : 'disk')));
+                        const pidPortCsrf = `PID: ${s.owner_pid || '--'} | Port: ${s.http_port || '--'} | CSRF: ${s.has_registered_csrf ? 'Yes' : 'No'}${s.presence_lock_exists ? ' | .lock' : ''}`;
+                        const routeHtml = `<code>${escapeHtml(s.recommended_route || '--')}</code> &rarr; <code>${escapeHtml(s.selected_route || '--')}</code>`;
+                        const interHtml = s.interactive !== false
+                            ? '<span class="status-pill running">Interactive</span>'
+                            : `<span class="status-pill failed" title="${escapeHtml(s.nonInteractiveReason || '')}">Read-Only</span>`;
+
+                        return `
+                            <tr>
+                                <td><span class="badge ${provBadge}">${escapeHtml(prov)}</span></td>
+                                <td><code>${escapeHtml(s.conversation_id || '--')}</code></td>
+                                <td><code>${escapeHtml(srcDesc)}</code></td>
+                                <td class="duration-counter">${escapeHtml(pidPortCsrf)}</td>
+                                <td>${routeHtml}</td>
+                                <td>${interHtml}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+            }
+        }
+
+        if (logsRes.ok) {
+            const logsData = await logsRes.json();
+            if (logsData.storage_stats) {
+                renderStorageStats(logsData.storage_stats);
+            }
+            const logs = Array.isArray(logsData.logs) ? logsData.logs : [];
+            const logsCountEl = document.getElementById('diag-logs-count');
+            if (logsCountEl) logsCountEl.textContent = `${logs.length} Entries`;
+
+            const logsBody = document.getElementById('diag-logs-body');
+            if (logsBody) {
+                if (logs.length === 0) {
+                    const diagEnabled = logsData.diagnostics_config && logsData.diagnostics_config.enabled;
+                    const emptyMsg = diagEnabled
+                        ? 'No diagnostic log entries match the current filter.'
+                        : 'Diagnostic logging is OFF by default (0 rows stored). Enable switches above when debugging.';
+                    logsBody.innerHTML = `<tr><td colspan="7" class="eda-empty-row">${escapeHtml(emptyMsg)}</td></tr>`;
+                } else {
+                    logsBody.innerHTML = logs.map(l => {
+                        const tsSec = l.timestamp_ms ? Math.floor(l.timestamp_ms / 1000) : 0;
+                        const tsStr = tsSec > 0 ? formatFullDateTime(tsSec) : '--';
+                        const lvl = (l.level || 'INFO').toUpperCase();
+                        const lvlClass = lvl === 'ERROR' ? 'badge-magenta' : (lvl === 'WARN' ? 'badge-amber' : 'badge-cyan');
+                        const cidReq = `${l.conversation_id ? `<code>${escapeHtml(l.conversation_id)}</code>` : '--'}${l.request_id ? `<div class="diag-sub-id">req: ${escapeHtml(l.request_id)}</div>` : ''}`;
+                        const detailsStr = (l.details && typeof l.details === 'object')
+                            ? JSON.stringify(l.details)
+                            : String(l.details || '{}');
+
+                        return `
+                            <tr>
+                                <td class="duration-counter">${escapeHtml(tsStr)}</td>
+                                <td><span class="badge ${lvlClass}">${escapeHtml(lvl)}</span></td>
+                                <td><code>${escapeHtml(l.category || '')}</code></td>
+                                <td>${escapeHtml(l.provider || '')}</td>
+                                <td>${cidReq}</td>
+                                <td>${escapeHtml(l.summary || '')}</td>
+                                <td><code class="diag-details-code">${escapeHtml(detailsStr)}</code></td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+            }
+        }
+    } catch (err) {
+        console.warn('Failed to refresh diagnostics inspector:', err);
+    }
+}
+
 function switchToMonitor(monitorId) {
     if (!monitorId || monitorId === 'aimon') {
         switchToSubpanel(activeSubpanelId || 'quotas');
@@ -6246,7 +7095,7 @@ function switchToMonitor(monitorId) {
 function switchToTab(id) {
     if (!id || id === 'aimon') {
         switchToSubpanel(activeSubpanelId || 'quotas');
-    } else if (id === 'quotas' || id === 'telemetry' || id === 'approvals' || id === 'insights' || id === 'bridges') {
+    } else if (id === 'quotas' || id === 'telemetry' || id === 'approvals' || id === 'insights' || id === 'bridges' || id === 'settings') {
         switchToSubpanel(id);
     } else {
         switchToMonitor(id);
@@ -6258,7 +7107,7 @@ window.addEventListener('hashchange', () => {
     if (hash) {
         if (hash.startsWith('aimon/')) {
             switchToSubpanel(hash.split('/')[1]);
-        } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights' || hash === 'bridges') {
+        } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights' || hash === 'bridges' || hash === 'settings') {
             switchToSubpanel(hash);
         } else {
             switchToMonitor(hash);
@@ -6280,7 +7129,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (hash) {
             if (hash.startsWith('aimon/')) {
                 switchToSubpanel(hash.split('/')[1]);
-            } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights' || hash === 'bridges') {
+            } else if (hash === 'quotas' || hash === 'telemetry' || hash === 'approvals' || hash === 'insights' || hash === 'bridges' || hash === 'settings') {
                 switchToSubpanel(hash);
             } else {
                 switchToMonitor(hash);
@@ -6293,6 +7142,76 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnEdaProbe = document.getElementById('btn-eda-probe');
     if (btnEdaProbe) {
         btnEdaProbe.addEventListener('click', probeToolBridges);
+    }
+
+    const btnCfgSave = document.getElementById('btn-cfg-save');
+    if (btnCfgSave) {
+        btnCfgSave.addEventListener('click', saveRuntimeConfig);
+    }
+
+    const btnCfgPurgeDebug = document.getElementById('btn-cfg-purge-debug');
+    if (btnCfgPurgeDebug) {
+        btnCfgPurgeDebug.addEventListener('click', () => purgeDebugDataOnDisk(true));
+    }
+
+    const btnCfgPruneTelem = document.getElementById('btn-cfg-prune-telemetry');
+    if (btnCfgPruneTelem) {
+        btnCfgPruneTelem.addEventListener('click', () => purgeDebugDataOnDisk(false));
+    }
+
+    const diagToggleIds = [
+        'cfg-diag-enabled',
+        'cfg-diag-mobile-http',
+        'cfg-diag-router',
+        'cfg-diag-idle-polls',
+        'cfg-diag-discovery',
+        'cfg-diag-hooks'
+    ];
+
+    const btnDiagEnableAll = document.getElementById('btn-cfg-diag-enable-all');
+    if (btnDiagEnableAll) {
+        btnDiagEnableAll.addEventListener('click', () => {
+            diagToggleIds.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.checked = true;
+            });
+        });
+    }
+
+    const btnDiagDisableAll = document.getElementById('btn-cfg-diag-disable-all');
+    if (btnDiagDisableAll) {
+        btnDiagDisableAll.addEventListener('click', () => {
+            diagToggleIds.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.checked = false;
+            });
+        });
+    }
+
+    const btnDiagRefresh = document.getElementById('btn-diag-refresh');
+    if (btnDiagRefresh) {
+        btnDiagRefresh.addEventListener('click', fetchDiagnosticsInspector);
+    }
+
+    const diagCatSel = document.getElementById('diag-filter-category');
+    if (diagCatSel) {
+        diagCatSel.addEventListener('change', fetchDiagnosticsInspector);
+    }
+
+    const diagLvlSel = document.getElementById('diag-filter-level');
+    if (diagLvlSel) {
+        diagLvlSel.addEventListener('change', fetchDiagnosticsInspector);
+    }
+
+    const diagCidInp = document.getElementById('diag-filter-cid');
+    if (diagCidInp) {
+        diagCidInp.addEventListener('change', fetchDiagnosticsInspector);
+        diagCidInp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                fetchDiagnosticsInspector();
+            }
+        });
     }
 
     const btnRebuildInsights = document.getElementById('btn-insights-rebuild');
@@ -6402,7 +7321,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(fetchSessions, 10000);
     setInterval(fetchMonitors, 15000);
 
-    // Refresh telemetry, mobile pairing, insights & bridges periodically when respective subpanel is active
+    // Refresh telemetry, mobile pairing, insights, bridges & settings periodically when respective subpanel is active
     setInterval(() => {
         if (activeSubpanelId === 'telemetry') {
             fetchTelemetryOverview();
@@ -6415,6 +7334,9 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchInsightsTab();
         } else if (activeSubpanelId === 'bridges') {
             fetchToolBridgesStatus(false);
+        } else if (activeSubpanelId === 'settings') {
+            fetchRuntimeConfig(false);
+            fetchDiagnosticsInspector();
         }
     }, 8000);
 
@@ -8759,3 +9681,13 @@ var qrcode = function() {
 } // namespace aimon
 
 #endif // AIMON_WEB_ASSETS_HXX
+
+/*
+ * Local variables:
+ * mode: C++
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * tab-width: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

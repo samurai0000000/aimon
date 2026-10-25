@@ -355,6 +355,9 @@ static void testMultiRootBrainConversationDiscovery() {
     config.endpointsEnabled = false;
 
     WebServer server(stateStore, historyStore, config);
+    GatewayConfig gwCfg;
+    gwCfg.strictPresenceFdCheck = false;
+    server.setGatewayConfig(gwCfg);
     assert(server.start(true));
     int port = server.getPort();
 
@@ -390,9 +393,17 @@ static void testMultiRootBrainConversationDiscovery() {
 
     // conv-39 title should come from task.md "# Repair Antimatter Gateway Task"
     assert(convs[0].value("title", "") == "Repair Antimatter Gateway Task");
-    // conv-38 should have active == true from presence lock, and title from USER_INPUT
+    // conv-38 should have active == true from presence lock when strictPresenceFdCheck is false, and title from USER_INPUT
     assert(convs[1].value("title", "") == "Prompt for conversation 38");
     assert(convs[1].value("active", false) == true);
+
+    // With strictPresenceFdCheck = true (default), bare .lock without running process does not mark active
+    gwCfg.strictPresenceFdCheck = true;
+    server.setGatewayConfig(gwCfg);
+    auto resStrict = client.Get("/api/agent/conversations", headers);
+    assert(resStrict && resStrict->status == 200);
+    json bodyStrict = json::parse(resStrict->body);
+    assert(bodyStrict["conversations"][1].value("active", true) == false);
 
     server.stop();
     unsetenv("AIMON_IDE_BRAIN_DIR");
@@ -3613,6 +3624,17 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
 static void FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens() {
     std::cout << "[TestMobileGateway] Running FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens..." << std::endl;
 
+    {
+        DiagnosticsConfig d;
+        d.enabled = true;
+        d.logMobileHttp = true;
+        d.logRouterDecisions = true;
+        d.logIdleTranscriptPolls = true;
+        d.logDiscoveryPolls = true;
+        d.logHooks = true;
+        AgentTelemetryDb::getInstance().setDiagnosticsConfig(d);
+    }
+
     std::string baseDir = "/tmp/test_4hop_trace_" + std::to_string(getpid());
     fs::remove_all(baseDir);
     std::string ideBrain = baseDir + "/ide_brain";
@@ -3768,6 +3790,273 @@ static void FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens() {
     std::cout << "[TestMobileGateway] FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens passed!" << std::endl;
 }
 
+static void RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndPurge() {
+    std::cout << "[TestMobileGateway] Running RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndPurge..." << std::endl;
+
+    // Reset singleton DiagnosticsConfig to defaults (all switches OFF by default)
+    AgentTelemetryDb::getInstance().setDiagnosticsConfig(DiagnosticsConfig{});
+    AgentTelemetryDb::getInstance().clearDiagnostics();
+
+    std::string baseDir = "/tmp/test_runtime_cfg_diag_" + std::to_string(getpid());
+    fs::remove_all(baseDir);
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliBrain = baseDir + "/cli_brain";
+    std::string presenceDir = baseDir + "/presence";
+    std::string procsFile = baseDir + "/running_agy.json";
+    std::string epFile = baseDir + "/agy_ls_endpoints.json";
+    std::string wsRoot = baseDir + "/work/aimon";
+    std::string binDir = baseDir + "/bin";
+
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+    fs::create_directories(presenceDir);
+    fs::create_directories(wsRoot);
+    fs::create_directories(binDir);
+
+    std::string lockedCid = "410f5eb3-08b6-40c1-821a-b5ad5857d59b";
+    fs::path convDir = fs::path(cliBrain) / lockedCid / ".system_generated" / "logs";
+    fs::create_directories(convDir);
+    {
+        std::ofstream tf(convDir / "transcript.jsonl");
+        tf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"<USER_REQUEST>Initial CLI prompt</USER_REQUEST>\"}\n"
+           << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Initial CLI response\",\"tool_calls\":[]}\n";
+    }
+
+    // Create a live lock file for lockedCid and a stale lock file for a dead session
+    {
+        std::ofstream lf1(presenceDir + "/" + lockedCid + ".lock");
+        lf1 << "999888\n";
+        std::ofstream lf2(presenceDir + "/stale-dead-session.lock");
+        lf2 << "111222\n";
+    }
+
+    // Running agy process locking lockedCid on port 45231 with NO CSRF token in epFile
+    {
+        std::ofstream pf(procsFile);
+        json pj = {
+            {"processes", json::array({
+                {
+                    {"pid", 999888},
+                    {"cwd", wsRoot},
+                    {"lockedConversationId", lockedCid},
+                    {"terminalPts", "pts/19"},
+                    {"httpPort", 45231},
+                    {"httpsPort", 45232}
+                }
+            })}
+        };
+        pf << pj.dump(2);
+    }
+    {
+        std::ofstream ef(epFile);
+        ef << "{\"endpoints\":{}}\n";
+    }
+
+    std::string agyArgsFile = baseDir + "/agy_resume_args.txt";
+    std::string mockAgyBin = binDir + "/agy";
+    {
+        std::ofstream mf(mockAgyBin);
+        mf << "#!/bin/bash\n"
+           << "printf '%s\\n' \"$@\" > \"" << agyArgsFile << "\"\n"
+           << "echo \"Resumed locked CLI session ok\"\n"
+           << "exit 0\n";
+        mf.close();
+        chmod(mockAgyBin.c_str(), 0755);
+    }
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_CLI_PRESENCE_DIR", presenceDir.c_str(), 1);
+    setenv("AIMON_AGY_PROCESSES_FILE", procsFile.c_str(), 1);
+    setenv("AIMON_AGY_ENDPOINTS_FILE", epFile.c_str(), 1);
+    setenv("AIMON_WORKSPACE_ROOT", wsRoot.c_str(), 1);
+    setenv("AIMON_AGY_BIN", mockAgyBin.c_str(), 1);
+    unsetenv("AGY_LS_PORT");
+    unsetenv("AGY_LS_CSRF_TOKEN");
+
+    StateStore& stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 0;
+    cfg.endpointsEnabled = false;
+    WebServer server(stateStore, historyStore, cfg);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    MobileGateway& gw = MobileGateway::getInstance();
+    std::string mobileFile = baseDir + "/mobile.json";
+    assert(gw.init(mobileFile));
+    std::string secret = gw.createPairingSecret(120);
+    std::string token;
+    assert(gw.verifyPairingCode(secret, "dev-cfg-plane", "Pixel 9 Pro", token));
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", token}};
+
+    // 1. Verify GET /api/config returns defaults (all diagnostics switches OFF by default, Fallback 5 ON)
+    {
+        auto rCfg = client.Get("/api/config", headers);
+        assert(rCfg && rCfg->status == 200);
+        json cj = json::parse(rCfg->body);
+        assert(cj.value("ok", false) == true);
+        assert(cj.value("stale_presence_locks_count", 0) == 1);
+        const auto& gwJson = cj["config"]["gateway"];
+        const auto& dgJson = cj["config"]["diagnostics"];
+        assert(gwJson.value("allow_cli_locked_detached_resume", false) == true);
+        assert(gwJson.value("allow_cli_new_session_spawn", false) == true);
+        assert(gwJson.value("allow_agy_agentapi_fallback", false) == true);
+        assert(dgJson.value("enabled", true) == false);
+        assert(dgJson.value("log_mobile_http", true) == false);
+        assert(dgJson.value("log_router_decisions", true) == false);
+        assert(dgJson.value("log_idle_transcript_polls", true) == false);
+        assert(dgJson.value("log_discovery_polls", true) == false);
+        assert(dgJson.value("log_hooks", true) == false);
+    }
+
+    // 2. Verify GET /api/agent/diagnostics?id=<lockedCid> and GET /api/agent/diagnostics inspect the session and recommend agy_cli_resume
+    {
+        auto rDiag = client.Get(("/api/agent/diagnostics?id=" + lockedCid).c_str(), headers);
+        assert(rDiag && rDiag->status == 200);
+        json dj = json::parse(rDiag->body);
+        assert(dj.value("ok", false) == true);
+        assert(dj.value("conversation_id", "") == lockedCid);
+        assert(dj.value("provider", "") == "antigravity");
+        assert(dj.value("source", "") == "cli");
+        assert(dj.value("open_in_terminal", false) == true);
+        assert(dj.value("locked_by_running_agy", false) == true);
+        assert(dj.value("http_port", 0) == 45231);
+        assert(dj.value("has_registered_csrf", true) == false);
+        assert(dj.value("recommended_route", "") == "agy_cli_resume");
+        assert(dj.value("interactive", false) == true);
+
+        auto rDiagAll = client.Get("/api/agent/diagnostics", headers);
+        assert(rDiagAll && rDiagAll->status == 200);
+        json djAll = json::parse(rDiagAll->body);
+        assert(djAll.value("ok", false) == true);
+        assert(djAll.contains("sessions") && djAll["sessions"].is_array() && !djAll["sessions"].empty());
+    }
+
+    // 3. Dynamically disable allow_cli_locked_detached_resume via POST /api/config and verify 503 block
+    {
+        json disablePatch = {
+            {"gateway", {
+                {"allow_cli_locked_detached_resume", false}
+            }}
+        };
+        auto rPostCfg = client.Post("/api/config", headers, disablePatch.dump(), "application/json");
+        assert(rPostCfg && rPostCfg->status == 200);
+
+        auto rDiagBlocked = client.Get(("/api/agent/diagnostics?id=" + lockedCid).c_str(), headers);
+        assert(rDiagBlocked && rDiagBlocked->status == 200);
+        json djBlocked = json::parse(rDiagBlocked->body);
+        assert(djBlocked.value("recommended_route", "") == "blocked_cli_locked_no_csrf");
+        assert(djBlocked.value("interactive", true) == false);
+
+        json promptReq = {
+            {"agentId", "antigravity"},
+            {"conversationId", lockedCid},
+            {"text", "Should be blocked while Fallback 5 is disabled"}
+        };
+        auto rPromptBlocked = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
+        assert(rPromptBlocked && rPromptBlocked->status == 503);
+        json pbj = json::parse(rPromptBlocked->body);
+        assert(pbj.value("error", "").find("allow_cli_locked_detached_resume is disabled") != std::string::npos);
+    }
+
+    // 4. Re-enable allow_cli_locked_detached_resume + enable diagnostic logging via POST /api/config
+    {
+        json enablePatch = {
+            {"gateway", {
+                {"allow_cli_locked_detached_resume", true}
+            }},
+            {"diagnostics", {
+                {"enabled", true},
+                {"min_level", "INFO"},
+                {"log_mobile_http", true},
+                {"log_router_decisions", true}
+            }}
+        };
+        auto rPostCfg = client.Post("/api/config", headers, enablePatch.dump(), "application/json");
+        assert(rPostCfg && rPostCfg->status == 200);
+
+        json promptReq = {
+            {"agentId", "antigravity"},
+            {"conversationId", lockedCid},
+            {"text", "Resume locked terminal session via Fallback 5"}
+        };
+        auto rPromptOk = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
+        assert(rPromptOk && rPromptOk->status == 200);
+        json poj = json::parse(rPromptOk->body);
+        assert(poj.value("status", "") == "dispatched");
+        assert(poj.value("routedVia", "") == "agy_cli_resume");
+
+        // Verify mockAgyBin was invoked with --conversation <lockedCid> --dangerously-skip-permissions -p <text>
+        std::ifstream af(agyArgsFile);
+        std::string loggedArgs((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
+        assert(loggedArgs.find("--conversation\n" + lockedCid) != std::string::npos);
+        assert(loggedArgs.find("--dangerously-skip-permissions") != std::string::npos);
+        assert(loggedArgs.find("Resume locked terminal session via Fallback 5") != std::string::npos);
+    }
+
+    // 5. Verify GET /api/agent/diagnostics/logs returns captured router_decision & platform_forward rows
+    {
+        auto rLogs = client.Get(("/api/agent/diagnostics/logs?id=" + lockedCid).c_str(), headers);
+        assert(rLogs && rLogs->status == 200);
+        json lj = json::parse(rLogs->body);
+        assert(lj.value("ok", false) == true);
+        assert(lj.contains("logs") && lj["logs"].is_array() && !lj["logs"].empty());
+        bool sawRouter = false;
+        bool sawForward = false;
+        for (const auto& row : lj["logs"]) {
+            std::string cat = row.value("category", "");
+            if (cat == "router_decision") sawRouter = true;
+            if (cat == "platform_forward") sawForward = true;
+        }
+        assert(sawRouter);
+        assert(sawForward);
+    }
+
+    // 6. Verify POST /api/agent/diagnostics/clear purges debug logs and prunes stale presence lock files
+    {
+        assert(fs::exists(presenceDir + "/stale-dead-session.lock"));
+        json clearReq = {
+            {"purge_debug_data", true},
+            {"clear_logs", true},
+            {"prune_telemetry", true},
+            {"prune_stale_locks", true},
+            {"vacuum", true}
+        };
+        auto rClear = client.Post("/api/agent/diagnostics/clear", headers, clearReq.dump(), "application/json");
+        assert(rClear && rClear->status == 200);
+        json cj = json::parse(rClear->body);
+        assert(cj.value("ok", false) == true);
+        assert(cj.value("deleted_diagnostic_logs", 0) > 0);
+        assert(cj.value("pruned_stale_locks", 0) == 1);
+        assert(!fs::exists(presenceDir + "/stale-dead-session.lock"));
+        assert(fs::exists(presenceDir + "/" + lockedCid + ".lock"));
+
+        auto rLogsAfter = client.Get("/api/agent/diagnostics/logs", headers);
+        assert(rLogsAfter && rLogsAfter->status == 200);
+        json ljAfter = json::parse(rLogsAfter->body);
+        assert(ljAfter["logs"].is_array() && ljAfter["logs"].empty());
+    }
+
+    // Restore DiagnosticsConfig defaults
+    AgentTelemetryDb::getInstance().setDiagnosticsConfig(DiagnosticsConfig{});
+
+    server.stop();
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_CLI_PRESENCE_DIR");
+    unsetenv("AIMON_AGY_PROCESSES_FILE");
+    unsetenv("AIMON_AGY_ENDPOINTS_FILE");
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    unsetenv("AIMON_AGY_BIN");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndPurge passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -3789,6 +4078,7 @@ int main() {
     Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversationsAndTranscript();
     NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndRejectedOnPromptWith409();
     FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens();
+    RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndPurge();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;

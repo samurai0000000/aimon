@@ -44,6 +44,10 @@
                     <span class="subnav-indicator"></span>
                     <span class="subnav-title">tool bridges</span>
                 </button>
+                <button type="button" class="aimon-subnav-tab" data-subpanel="settings">
+                    <span class="subnav-indicator"></span>
+                    <span class="subnav-title">settings</span>
+                </button>
             </div>
 
             <!-- Subpanel 1: AI Quotas (Antigravity, Cursor, MCP Clients) -->
@@ -717,6 +721,273 @@
                         </table>
                     </div>
                 </div>
+            </div>
+
+            <!-- Subpanel 6: Runtime Settings & Diagnostics (#subpanel-settings) -->
+            <div class="aimon-subpanel hidden" id="subpanel-settings">
+                <div class="settings-top-grid">
+                    <!-- Card 1: Mobile Gateway Routing & Session Discovery Policy Card -->
+                    <section class="glass-card settings-card" id="settings-gateway-card">
+                        <div class="card-header">
+                            <div class="provider-title">
+                                <span class="badge badge-cyan">Gateway Policy</span>
+                                <h2>Mobile Gateway Routing &amp; Session Discovery</h2>
+                            </div>
+                            <span class="badge badge-sub">Hot-Reloadable</span>
+                        </div>
+
+                        <div class="settings-toggle-list">
+                            <label class="settings-toggle-row" for="cfg-gw-locked-resume">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Allow Detached Resume on Terminal-Locked CLI Without CSRF (Fallback 5)</span>
+                                    <span class="settings-toggle-desc">Allow detached <code>agy --conversation &lt;cid&gt; -p</code> resume when a terminal-locked CLI session has no registered CSRF token (<code>allow_cli_locked_detached_resume</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-locked-resume" class="settings-checkbox" checked>
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-gw-new-spawn">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Allow New CLI Session Spawn in Workspace (Fallback 6)</span>
+                                    <span class="settings-toggle-desc">Allow spawning a new CLI session in the workspace when no live RPC endpoint or existing disk conversation is available (<code>allow_cli_new_session_spawn</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-new-spawn" class="settings-checkbox" checked>
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-gw-agentapi">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Enable <code>agy agentapi</code> Socket Fallback (Fallback 4)</span>
+                                    <span class="settings-toggle-desc">Permit Fallback 4 dispatch via <code>agy agentapi send-message</code> when direct ConnectRPC fails (<code>allow_agy_agentapi_fallback</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-agentapi" class="settings-checkbox" checked>
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-gw-strict-fd">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Strict Presence Lock File-Descriptor Check</span>
+                                    <span class="settings-toggle-desc">Require a live <code>/proc/&lt;pid&gt;/fd</code> lock holder from a running <code>agy</code> process before treating CLI <code>.lock</code> files as active (<code>strict_presence_fd_check</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-strict-fd" class="settings-checkbox" checked>
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-gw-auto-prune-locks">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Automatically Prune Orphaned Presence <code>.lock</code> Files</span>
+                                    <span class="settings-toggle-desc">Automatically unlink stale <code>~/.gemini/antigravity-cli/presence/*.lock</code> files not held open by any running <code>agy</code> process (<code>auto_prune_stale_presence_locks</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-gw-auto-prune-locks" class="settings-checkbox" checked>
+                            </label>
+                        </div>
+
+                        <div class="settings-numeric-grid">
+                            <div class="eda-field">
+                                <label for="cfg-gw-recency-sec">Active Recency Window (sec, 10..3600)</label>
+                                <input type="number" id="cfg-gw-recency-sec" class="eda-input" min="10" max="3600" step="10" value="120">
+                            </div>
+                            <div class="eda-field">
+                                <label for="cfg-gw-presence-ttl-sec">Stale Presence Lock TTL (sec, 10..604800)</label>
+                                <input type="number" id="cfg-gw-presence-ttl-sec" class="eda-input" min="10" max="604800" step="60" value="3600">
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Card 2: Diagnostic Logging & Disk Hygiene Card (All Logging Switches Default OFF) -->
+                    <section class="glass-card settings-card" id="settings-diagnostics-card">
+                        <div class="card-header">
+                            <div class="provider-title">
+                                <span class="badge badge-magenta">Disk Hygiene</span>
+                                <h2>Diagnostic Logging &amp; Storage Hygiene</h2>
+                            </div>
+                            <div class="settings-quick-actions">
+                                <span id="cfg-diag-status-badge" class="status-pill completed">Logging: OFF (Default)</span>
+                                <button type="button" class="btn-frame-action" id="btn-cfg-diag-enable-all">Enable All Debug Switches</button>
+                                <button type="button" class="btn-frame-action" id="btn-cfg-diag-disable-all">Disable All Debug Switches</button>
+                            </div>
+                        </div>
+
+                        <div class="settings-toggle-list">
+                            <label class="settings-toggle-row settings-master-toggle" for="cfg-diag-enabled">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Master Diagnostic Logging Switch (Default: OFF)</span>
+                                    <span class="settings-toggle-desc">Write gateway diagnostic entries into <code>gateway_diagnostic_logs</code> in <code>telemetry.db</code> (<code>diagnostics.enabled</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-enabled" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-mobile-http">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log Mobile HTTP &amp; Transcript Requests</span>
+                                    <span class="settings-toggle-desc">Record mobile HTTP requests and transcript loads when master switch is ON (<code>diagnostics.log_mobile_http</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-mobile-http" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-router">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log Prompt Router &amp; Fallback Decisions</span>
+                                    <span class="settings-toggle-desc">Record prompt routing and fallback dispatch events (<code>router_decision</code>, <code>platform_forward</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-router" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-idle-polls">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log Idle <code>200 OK</code> Transcript Polls (<code>0</code> new steps)</span>
+                                    <span class="settings-toggle-desc">Record incremental <code>GET /api/agent/transcript?since=N</code> polls even when 0 new steps are returned (<code>diagnostics.log_idle_transcript_polls</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-idle-polls" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-discovery">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log <code>GET /api/agent/conversations</code> Discovery Polls</span>
+                                    <span class="settings-toggle-desc">Record periodic conversation discovery polls (<code>diagnostics.log_discovery_polls</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-discovery" class="settings-checkbox">
+                            </label>
+
+                            <label class="settings-toggle-row" for="cfg-diag-hooks">
+                                <div class="settings-toggle-info">
+                                    <span class="settings-toggle-title">Log IDE/CLI Hook Lifecycle Events</span>
+                                    <span class="settings-toggle-desc">Record Cursor / Claude / Antigravity hook lifecycle events in diagnostic logs (<code>diagnostics.log_hooks</code>)</span>
+                                </div>
+                                <input type="checkbox" id="cfg-diag-hooks" class="settings-checkbox">
+                            </label>
+                        </div>
+
+                        <div class="settings-numeric-grid settings-numeric-grid-3">
+                            <div class="eda-field">
+                                <label for="cfg-diag-min-level">Minimum Severity Level</label>
+                                <select id="cfg-diag-min-level" class="eda-select">
+                                    <option value="INFO" selected>INFO</option>
+                                    <option value="WARN">WARN</option>
+                                    <option value="ERROR">ERROR</option>
+                                </select>
+                            </div>
+                            <div class="eda-field">
+                                <label for="cfg-diag-max-rows">Max Retained Log Rows (100..500000)</label>
+                                <input type="number" id="cfg-diag-max-rows" class="eda-input" min="100" max="500000" step="100" value="2000">
+                            </div>
+                            <div class="eda-field">
+                                <label for="cfg-diag-retention-days">Telemetry Retention (Days, 1..365)</label>
+                                <input type="number" id="cfg-diag-retention-days" class="eda-input" min="1" max="365" step="1" value="14">
+                            </div>
+                        </div>
+
+                        <!-- Live Disk Storage & Hygiene Strip -->
+                        <div class="settings-storage-strip">
+                            <div class="eda-counter-pill">
+                                <span>telemetry.db Size</span>
+                                <strong id="cfg-storage-db-size">--</strong>
+                            </div>
+                            <div class="eda-counter-pill">
+                                <span>Diagnostic Log Rows</span>
+                                <strong id="cfg-storage-diag-rows">0</strong>
+                            </div>
+                            <div class="eda-counter-pill">
+                                <span>Lifecycle Event Rows</span>
+                                <strong id="cfg-storage-event-rows">0</strong>
+                            </div>
+                            <div class="eda-counter-pill">
+                                <span>Recorded Sessions</span>
+                                <strong id="cfg-storage-session-rows">0</strong>
+                            </div>
+                            <div class="eda-counter-pill">
+                                <span>Stale Presence .lock Files</span>
+                                <strong id="cfg-storage-stale-locks">0</strong>
+                            </div>
+                        </div>
+
+                        <div class="settings-actions-bar">
+                            <button type="button" class="btn-refresh btn-primary-cyan" id="btn-cfg-save">Save &amp; Apply Runtime Config</button>
+                            <button type="button" class="btn-refresh btn-danger-coral" id="btn-cfg-purge-debug">Purge Debugging Data on Disk</button>
+                            <button type="button" class="btn-refresh" id="btn-cfg-prune-telemetry">Prune Expired Telemetry DB</button>
+                        </div>
+
+                        <div id="cfg-save-feedback" class="eda-feedback-banner hidden"></div>
+                    </section>
+                </div>
+
+                <!-- Card 3: Live Gateway Diagnostics & Session Route Inspector Card -->
+                <section class="glass-card settings-card" id="settings-inspector-card">
+                    <div class="card-header">
+                        <div class="provider-title">
+                            <span class="badge badge-cyan">Live Probe</span>
+                            <h2>Live Gateway Diagnostics &amp; Session Route Inspector</h2>
+                        </div>
+                        <div class="diag-filter-bar">
+                            <select id="diag-filter-category" class="eda-select" aria-label="Filter by Category">
+                                <option value="">All Categories</option>
+                                <option value="mobile_http">mobile_http</option>
+                                <option value="router_decision">router_decision</option>
+                                <option value="platform_forward">platform_forward</option>
+                                <option value="discovery">discovery</option>
+                                <option value="transcript">transcript</option>
+                                <option value="hook">hook</option>
+                            </select>
+                            <select id="diag-filter-level" class="eda-select" aria-label="Filter by Minimum Level">
+                                <option value="">All Levels</option>
+                                <option value="INFO">INFO+</option>
+                                <option value="WARN">WARN+</option>
+                                <option value="ERROR">ERROR</option>
+                            </select>
+                            <input type="text" id="diag-filter-cid" class="eda-input" placeholder="Filter by Conversation ID..." aria-label="Filter by Conversation ID">
+                            <button type="button" class="btn-refresh" id="btn-diag-refresh">Refresh Inspector</button>
+                        </div>
+                    </div>
+
+                    <div class="diag-inspector-section">
+                        <div class="diag-subsection-header">
+                            <h3>Session Route Readiness (Live <code>/proc</code> &amp; Disk Inspection)</h3>
+                            <span class="badge badge-cyan" id="diag-sessions-count">0 Sessions</span>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="agents-table eda-calls-table diag-table">
+                                <thead>
+                                    <tr>
+                                        <th>Provider</th>
+                                        <th>Conversation ID</th>
+                                        <th>Source</th>
+                                        <th>PID / Port / CSRF</th>
+                                        <th>Recommended / Selected Route</th>
+                                        <th>Interactive Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="diag-sessions-body">
+                                    <tr>
+                                        <td colspan="6" class="eda-empty-row">Loading session route readiness...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div class="diag-inspector-section">
+                        <div class="diag-subsection-header">
+                            <h3>Gateway Diagnostic Logs (<code>gateway_diagnostic_logs</code>)</h3>
+                            <span class="badge badge-magenta" id="diag-logs-count">0 Entries</span>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="agents-table eda-calls-table diag-table">
+                                <thead>
+                                    <tr>
+                                        <th>Timestamp</th>
+                                        <th>Level</th>
+                                        <th>Category</th>
+                                        <th>Provider</th>
+                                        <th>Conversation / Request ID</th>
+                                        <th>Summary</th>
+                                        <th>Details JSON</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="diag-logs-body">
+                                    <tr>
+                                        <td colspan="7" class="eda-empty-row">Diagnostic logging is OFF by default (0 rows stored). Enable switches above when debugging.</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </section>
             </div>
         </main>
 

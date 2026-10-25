@@ -100,11 +100,8 @@ nlohmann::json AimonConfig::toJson() const {
             {"db_path", cursor.dbPath},
             {"access_token", cursor.accessToken}
         }},
-        {"gateway", {
-            {"enabled", gateway.enabled},
-            {"host", gateway.host},
-            {"port", gateway.port}
-        }}
+        {"gateway", gateway.toJson()},
+        {"diagnostics", diagnostics.toJson()}
     };
 
     nlohmann::json claudeAccounts = nlohmann::json::array();
@@ -367,11 +364,12 @@ void AimonConfig::fromJson(const nlohmann::json& j) {
         }
     }
 
-    if (j.contains("gateway")) {
-        const auto& g = j["gateway"];
-        if (g.contains("enabled")) gateway.enabled = g["enabled"];
-        if (g.contains("host")) gateway.host = g["host"];
-        if (g.contains("port")) gateway.port = g["port"];
+    if (j.contains("gateway") && j["gateway"].is_object()) {
+        gateway.fromJson(j["gateway"]);
+    }
+
+    if (j.contains("diagnostics") && j["diagnostics"].is_object()) {
+        diagnostics.fromJson(j["diagnostics"]);
     }
 
     if (j.contains("insights") && j["insights"].is_object()) {
@@ -400,6 +398,35 @@ void AimonConfig::fromJson(const nlohmann::json& j) {
     if (j.contains("eda") && j["eda"].is_object()) {
         eda.fromJson(j["eda"]);
     }
+}
+
+bool AimonConfig::validate(std::string& error) const {
+    if (polling.baseIntervalSec < 10 || polling.baseIntervalSec > 86400) {
+        error = "polling.base_interval_sec must be between 10 and 86400";
+        return false;
+    }
+    if (polling.idleIntervalSec < 10 || polling.idleIntervalSec > 86400) {
+        error = "polling.idle_interval_sec must be between 10 and 86400";
+        return false;
+    }
+    if (polling.activeIntervalSec < 5 || polling.activeIntervalSec > 86400) {
+        error = "polling.active_interval_sec must be between 5 and 86400";
+        return false;
+    }
+    if (web.port < 1 || web.port > 65535) {
+        error = "web.port must be between 1 and 65535";
+        return false;
+    }
+    if (mqtt.port < 1 || mqtt.port > 65535) {
+        error = "mqtt.port must be between 1 and 65535";
+        return false;
+    }
+    if (!claude.validate(error)) return false;
+    if (!gateway.validate(error)) return false;
+    if (!diagnostics.validate(error)) return false;
+    if (!eda.validate(error)) return false;
+    error.clear();
+    return true;
 }
 
 std::vector<ClaudeAccountConfig> ClaudeConfig::resolvedAccounts() const {
@@ -593,6 +620,37 @@ bool ConfigManager::loadLibConfig(const std::string& customPath) {
             readSetting(gw, "enabled", _config.gateway.enabled);
             readSetting(gw, "host", _config.gateway.host);
             readSetting(gw, "port", _config.gateway.port);
+            readSetting(gw, "allow_cli_locked_detached_resume", _config.gateway.allowCliLockedDetachedResume);
+            readSetting(gw, "allow_cli_new_session_spawn", _config.gateway.allowCliNewSessionSpawn);
+            readSetting(gw, "allow_agy_agentapi_fallback", _config.gateway.allowAgyAgentApiFallback);
+            readSetting(gw, "strict_presence_fd_check", _config.gateway.strictPresenceFdCheck);
+            if (readSetting(gw, "prune_stale_presence_locks", _config.gateway.pruneStalePresenceLocks)) {
+                _config.gateway.autoPruneStalePresenceLocks = _config.gateway.pruneStalePresenceLocks;
+            }
+            if (readSetting(gw, "auto_prune_stale_presence_locks", _config.gateway.autoPruneStalePresenceLocks)) {
+                _config.gateway.pruneStalePresenceLocks = _config.gateway.autoPruneStalePresenceLocks;
+            }
+            if (readSetting(gw, "stale_presence_lock_max_age_sec", _config.gateway.stalePresenceLockMaxAgeSec)) {
+                _config.gateway.presenceStaleTtlSec = _config.gateway.stalePresenceLockMaxAgeSec;
+            }
+            if (readSetting(gw, "presence_stale_ttl_sec", _config.gateway.presenceStaleTtlSec)) {
+                _config.gateway.stalePresenceLockMaxAgeSec = _config.gateway.presenceStaleTtlSec;
+            }
+            readSetting(gw, "active_recency_window_sec", _config.gateway.activeRecencyWindowSec);
+        }
+
+        if (root.exists("diagnostics")) {
+            const libconfig::Setting& dg = root["diagnostics"];
+            readSetting(dg, "enabled", _config.diagnostics.enabled);
+            readSetting(dg, "min_level", _config.diagnostics.minLevel);
+            readSetting(dg, "log_mobile_http", _config.diagnostics.logMobileHttp);
+            readSetting(dg, "log_router_decisions", _config.diagnostics.logRouterDecisions);
+            readSetting(dg, "log_idle_transcript_polls", _config.diagnostics.logIdleTranscriptPolls);
+            readSetting(dg, "log_discovery_polls", _config.diagnostics.logDiscoveryPolls);
+            readSetting(dg, "log_hooks", _config.diagnostics.logHooks);
+            readSetting(dg, "max_retained_rows", _config.diagnostics.maxRetainedRows);
+            readSetting(dg, "retention_hours", _config.diagnostics.retentionHours);
+            readSetting(dg, "telemetry_retention_days", _config.diagnostics.telemetryRetentionDays);
         }
 
         if (root.exists("insights")) {
@@ -745,6 +803,37 @@ bool ConfigManager::saveLibConfig(const std::string& customPath) const {
         gw.add("enabled", libconfig::Setting::TypeBoolean) = _config.gateway.enabled;
         gw.add("host", libconfig::Setting::TypeString) = _config.gateway.host;
         gw.add("port", libconfig::Setting::TypeInt) = _config.gateway.port;
+        gw.add("allow_cli_locked_detached_resume", libconfig::Setting::TypeBoolean) =
+            _config.gateway.allowCliLockedDetachedResume;
+        gw.add("allow_cli_new_session_spawn", libconfig::Setting::TypeBoolean) =
+            _config.gateway.allowCliNewSessionSpawn;
+        gw.add("allow_agy_agentapi_fallback", libconfig::Setting::TypeBoolean) =
+            _config.gateway.allowAgyAgentApiFallback;
+        gw.add("strict_presence_fd_check", libconfig::Setting::TypeBoolean) =
+            _config.gateway.strictPresenceFdCheck;
+        gw.add("auto_prune_stale_presence_locks", libconfig::Setting::TypeBoolean) =
+            _config.gateway.autoPruneStalePresenceLocks;
+        gw.add("prune_stale_presence_locks", libconfig::Setting::TypeBoolean) =
+            _config.gateway.autoPruneStalePresenceLocks;
+        gw.add("presence_stale_ttl_sec", libconfig::Setting::TypeInt) =
+            _config.gateway.presenceStaleTtlSec;
+        gw.add("stale_presence_lock_max_age_sec", libconfig::Setting::TypeInt) =
+            _config.gateway.presenceStaleTtlSec;
+        gw.add("active_recency_window_sec", libconfig::Setting::TypeInt) =
+            _config.gateway.activeRecencyWindowSec;
+
+        // diagnostics
+        libconfig::Setting& dg = root.add("diagnostics", libconfig::Setting::TypeGroup);
+        dg.add("enabled", libconfig::Setting::TypeBoolean) = _config.diagnostics.enabled;
+        dg.add("min_level", libconfig::Setting::TypeString) = _config.diagnostics.minLevel;
+        dg.add("log_mobile_http", libconfig::Setting::TypeBoolean) = _config.diagnostics.logMobileHttp;
+        dg.add("log_router_decisions", libconfig::Setting::TypeBoolean) = _config.diagnostics.logRouterDecisions;
+        dg.add("log_idle_transcript_polls", libconfig::Setting::TypeBoolean) = _config.diagnostics.logIdleTranscriptPolls;
+        dg.add("log_discovery_polls", libconfig::Setting::TypeBoolean) = _config.diagnostics.logDiscoveryPolls;
+        dg.add("log_hooks", libconfig::Setting::TypeBoolean) = _config.diagnostics.logHooks;
+        dg.add("max_retained_rows", libconfig::Setting::TypeInt) = _config.diagnostics.maxRetainedRows;
+        dg.add("retention_hours", libconfig::Setting::TypeInt) = _config.diagnostics.retentionHours;
+        dg.add("telemetry_retention_days", libconfig::Setting::TypeInt) = _config.diagnostics.telemetryRetentionDays;
 
         // insights
         libconfig::Setting& ins = root.add("insights", libconfig::Setting::TypeGroup);
@@ -919,6 +1008,29 @@ void ConfigManager::applyEnvironmentOverrides() {
             _config.eda.port = parsed;
         }
     }
+}
+
+AimonConfig ConfigManager::getConfigSnapshot() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _config;
+}
+
+bool ConfigManager::updateFromJson(const nlohmann::json& patch, std::string& error) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    AimonConfig candidate = _config;
+    candidate.fromJson(patch);
+    if (!candidate.validate(error)) {
+        _lastErrorMessage = error;
+        return false;
+    }
+    _config = candidate;
+    if (!save()) {
+        error = "Failed to persist configuration to " + _configFilePath;
+        _lastErrorMessage = error;
+        return false;
+    }
+    error.clear();
+    return true;
 }
 
 } // namespace aimon

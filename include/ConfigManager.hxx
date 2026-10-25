@@ -9,6 +9,7 @@
 
 #include <string>
 #include <vector>
+#include <mutex>
 #include <nlohmann/json.hpp>
 
 namespace aimon {
@@ -79,6 +80,170 @@ struct GatewayConfig {
     bool enabled = true;
     std::string host = "0.0.0.0";
     int port = 3885;
+    bool allowCliLockedDetachedResume = true;
+    bool allowCliNewSessionSpawn = true;
+    bool allowAgyAgentApiFallback = true;
+    bool strictPresenceFdCheck = true;
+    bool autoPruneStalePresenceLocks = true;
+    bool pruneStalePresenceLocks = true;
+    int presenceStaleTtlSec = 3600;
+    int stalePresenceLockMaxAgeSec = 3600;
+    int activeRecencyWindowSec = 120;
+
+    nlohmann::json toJson() const {
+        return {
+            {"enabled", enabled},
+            {"host", host},
+            {"port", port},
+            {"allow_cli_locked_detached_resume", allowCliLockedDetachedResume},
+            {"allow_cli_new_session_spawn", allowCliNewSessionSpawn},
+            {"allow_agy_agentapi_fallback", allowAgyAgentApiFallback},
+            {"strict_presence_fd_check", strictPresenceFdCheck},
+            {"auto_prune_stale_presence_locks", autoPruneStalePresenceLocks},
+            {"prune_stale_presence_locks", autoPruneStalePresenceLocks},
+            {"presence_stale_ttl_sec", presenceStaleTtlSec},
+            {"stale_presence_lock_max_age_sec", presenceStaleTtlSec},
+            {"active_recency_window_sec", activeRecencyWindowSec}
+        };
+    }
+
+    void fromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return;
+        if (j.contains("enabled") && j["enabled"].is_boolean()) enabled = j["enabled"];
+        if (j.contains("host") && j["host"].is_string()) host = j["host"];
+        if (j.contains("port") && j["port"].is_number_integer()) port = j["port"];
+        if (j.contains("allow_cli_locked_detached_resume") && j["allow_cli_locked_detached_resume"].is_boolean()) {
+            allowCliLockedDetachedResume = j["allow_cli_locked_detached_resume"];
+        }
+        if (j.contains("allow_cli_new_session_spawn") && j["allow_cli_new_session_spawn"].is_boolean()) {
+            allowCliNewSessionSpawn = j["allow_cli_new_session_spawn"];
+        }
+        if (j.contains("allow_agy_agentapi_fallback") && j["allow_agy_agentapi_fallback"].is_boolean()) {
+            allowAgyAgentApiFallback = j["allow_agy_agentapi_fallback"];
+        }
+        if (j.contains("strict_presence_fd_check") && j["strict_presence_fd_check"].is_boolean()) {
+            strictPresenceFdCheck = j["strict_presence_fd_check"];
+        }
+        if (j.contains("prune_stale_presence_locks") && j["prune_stale_presence_locks"].is_boolean()) {
+            pruneStalePresenceLocks = j["prune_stale_presence_locks"];
+            autoPruneStalePresenceLocks = pruneStalePresenceLocks;
+        }
+        if (j.contains("auto_prune_stale_presence_locks") && j["auto_prune_stale_presence_locks"].is_boolean()) {
+            autoPruneStalePresenceLocks = j["auto_prune_stale_presence_locks"];
+            pruneStalePresenceLocks = autoPruneStalePresenceLocks;
+        }
+        if (j.contains("stale_presence_lock_max_age_sec") && j["stale_presence_lock_max_age_sec"].is_number_integer()) {
+            stalePresenceLockMaxAgeSec = j["stale_presence_lock_max_age_sec"];
+            presenceStaleTtlSec = stalePresenceLockMaxAgeSec;
+        }
+        if (j.contains("presence_stale_ttl_sec") && j["presence_stale_ttl_sec"].is_number_integer()) {
+            presenceStaleTtlSec = j["presence_stale_ttl_sec"];
+            stalePresenceLockMaxAgeSec = presenceStaleTtlSec;
+        }
+        if (j.contains("active_recency_window_sec") && j["active_recency_window_sec"].is_number_integer()) {
+            activeRecencyWindowSec = j["active_recency_window_sec"];
+        }
+    }
+
+    bool validate(std::string& error) const {
+        if (port < 1 || port > 65535) {
+            error = "gateway.port must be between 1 and 65535";
+            return false;
+        }
+        if (presenceStaleTtlSec < 10 || presenceStaleTtlSec > 604800) {
+            error = "gateway.presence_stale_ttl_sec must be between 10 and 604800";
+            return false;
+        }
+        if (stalePresenceLockMaxAgeSec < 10 || stalePresenceLockMaxAgeSec > 604800) {
+            error = "gateway.stale_presence_lock_max_age_sec must be between 10 and 604800";
+            return false;
+        }
+        if (activeRecencyWindowSec < 10 || activeRecencyWindowSec > 3600) {
+            error = "gateway.active_recency_window_sec must be between 10 and 3600";
+            return false;
+        }
+        return true;
+    }
+};
+
+struct DiagnosticsConfig {
+    bool enabled = false;
+    std::string minLevel = "INFO";
+    bool logMobileHttp = false;
+    bool logRouterDecisions = false;
+    bool logIdleTranscriptPolls = false;
+    bool logDiscoveryPolls = false;
+    bool logHooks = false;
+    int maxRetainedRows = 2000;
+    int retentionHours = 48;
+    int telemetryRetentionDays = 14;
+
+    nlohmann::json toJson() const {
+        return {
+            {"enabled", enabled},
+            {"min_level", minLevel},
+            {"log_mobile_http", logMobileHttp},
+            {"log_router_decisions", logRouterDecisions},
+            {"log_idle_transcript_polls", logIdleTranscriptPolls},
+            {"log_discovery_polls", logDiscoveryPolls},
+            {"log_hooks", logHooks},
+            {"max_retained_rows", maxRetainedRows},
+            {"retention_hours", retentionHours},
+            {"telemetry_retention_days", telemetryRetentionDays}
+        };
+    }
+
+    void fromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return;
+        if (j.contains("enabled") && j["enabled"].is_boolean()) enabled = j["enabled"];
+        if (j.contains("min_level") && j["min_level"].is_string()) {
+            minLevel = j["min_level"];
+        }
+        if (j.contains("log_mobile_http") && j["log_mobile_http"].is_boolean()) {
+            logMobileHttp = j["log_mobile_http"];
+        }
+        if (j.contains("log_router_decisions") && j["log_router_decisions"].is_boolean()) {
+            logRouterDecisions = j["log_router_decisions"];
+        }
+        if (j.contains("log_idle_transcript_polls") && j["log_idle_transcript_polls"].is_boolean()) {
+            logIdleTranscriptPolls = j["log_idle_transcript_polls"];
+        }
+        if (j.contains("log_discovery_polls") && j["log_discovery_polls"].is_boolean()) {
+            logDiscoveryPolls = j["log_discovery_polls"];
+        }
+        if (j.contains("log_hooks") && j["log_hooks"].is_boolean()) {
+            logHooks = j["log_hooks"];
+        }
+        if (j.contains("max_retained_rows") && j["max_retained_rows"].is_number_integer()) {
+            maxRetainedRows = j["max_retained_rows"];
+        }
+        if (j.contains("retention_hours") && j["retention_hours"].is_number_integer()) {
+            retentionHours = j["retention_hours"];
+        }
+        if (j.contains("telemetry_retention_days") && j["telemetry_retention_days"].is_number_integer()) {
+            telemetryRetentionDays = j["telemetry_retention_days"];
+        }
+    }
+
+    bool validate(std::string& error) const {
+        if (minLevel != "INFO" && minLevel != "WARN" && minLevel != "ERROR") {
+            error = "diagnostics.min_level must be INFO, WARN, or ERROR";
+            return false;
+        }
+        if (maxRetainedRows < 100 || maxRetainedRows > 500000) {
+            error = "diagnostics.max_retained_rows must be between 100 and 500000";
+            return false;
+        }
+        if (retentionHours < 1 || retentionHours > 8760) {
+            error = "diagnostics.retention_hours must be between 1 and 8760";
+            return false;
+        }
+        if (telemetryRetentionDays < 1 || telemetryRetentionDays > 365) {
+            error = "diagnostics.telemetry_retention_days must be between 1 and 365";
+            return false;
+        }
+        return true;
+    }
 };
 
 struct InsightsConfig {
@@ -155,11 +320,13 @@ struct AimonConfig {
     CursorConfig cursor;
     ClaudeConfig claude;
     GatewayConfig gateway;
+    DiagnosticsConfig diagnostics;
     InsightsConfig insights;
     EdaBridgeConfig eda;
 
     nlohmann::json toJson() const;
     void fromJson(const nlohmann::json& j);
+    bool validate(std::string& error) const;
 };
 
 class ConfigManager {
@@ -180,6 +347,9 @@ public:
         return _config;
     }
 
+    AimonConfig getConfigSnapshot() const;
+    bool updateFromJson(const nlohmann::json& patch, std::string& error);
+
     const std::string& getLastErrorMessage() const {
         return _lastErrorMessage;
     }
@@ -187,6 +357,7 @@ public:
     void applyEnvironmentOverrides();
 
 private:
+    mutable std::mutex _mutex;
     AimonConfig _config;
     std::string _configFilePath;
     std::string _lastErrorMessage;

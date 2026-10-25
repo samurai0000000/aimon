@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
+#include "ConfigManager.hxx"
 
 namespace aimon {
 
@@ -80,6 +81,9 @@ public:
     bool isOpen() const;
 
     // Diagnostics & Security-Redacted Trace Logging
+    void setDiagnosticsConfig(const DiagnosticsConfig &cfg);
+    DiagnosticsConfig getDiagnosticsConfig() const;
+
     bool logDiagnostic(const std::string &level,
                        const std::string &category,
                        const std::string &conversationId,
@@ -87,7 +91,14 @@ public:
                        const std::string &summary,
                        const nlohmann::json &details = nlohmann::json::object(),
                        const std::string &requestId = "",
-                       int maxRetainedRows = 10000);
+                       int maxRetainedRows = -1);
+
+    size_t clearDiagnostics(const std::string &conversationId = "",
+                            const std::string &category = "",
+                            int olderThanHours = 0);
+
+    nlohmann::json getStorageStats() const;
+    nlohmann::json purgeDebugData(bool vacuum = true);
 
     nlohmann::json queryDiagnostics(int limit = 100,
                                     const std::string &conversationId = "",
@@ -156,6 +167,7 @@ private:
     std::string   _dbPath;
     sqlite3      *_db;
     mutable std::mutex _mutex;
+    DiagnosticsConfig _diagConfig;
 
     // Prepared statements
     sqlite3_stmt *_stmtInsertEvent;

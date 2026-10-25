@@ -1309,6 +1309,30 @@ size_t AgentTelemetryDb::rollupAndPrune(int rawRetentionDays) {
         sqlite3_finalize(stmt);
     }
 
+    int diagHours = (_diagConfig.retentionHours > 0) ? _diagConfig.retentionHours : 48;
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    int64_t diagCutoffMs = nowMs - (static_cast<int64_t>(diagHours) * 3600LL * 1000LL);
+    const char *sqlPruneDiagAge = "DELETE FROM gateway_diagnostic_logs WHERE timestamp_ms < ?;";
+    if (sqlite3_prepare_v2(_db, sqlPruneDiagAge, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, diagCutoffMs);
+        sqlite3_step(stmt);
+        deletedRows += sqlite3_changes(_db);
+        sqlite3_finalize(stmt);
+    }
+
+    if (_diagConfig.maxRetainedRows > 0) {
+        const char *sqlPruneDiagCap =
+            "DELETE FROM gateway_diagnostic_logs "
+            "WHERE id <= (SELECT MAX(id) - ? FROM gateway_diagnostic_logs);";
+        if (sqlite3_prepare_v2(_db, sqlPruneDiagCap, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, _diagConfig.maxRetainedRows);
+            sqlite3_step(stmt);
+            deletedRows += sqlite3_changes(_db);
+            sqlite3_finalize(stmt);
+        }
+    }
+
     return deletedRows;
 }
 
@@ -1322,6 +1346,27 @@ int64_t AgentTelemetryDb::getDatabaseSizeBytes() const {
     return 0;
 }
 
+void AgentTelemetryDb::setDiagnosticsConfig(const DiagnosticsConfig &cfg) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _diagConfig = cfg;
+    if (_db && _diagConfig.maxRetainedRows > 0) {
+        const char *sqlPrune =
+            "DELETE FROM gateway_diagnostic_logs "
+            "WHERE id <= (SELECT MAX(id) - ? FROM gateway_diagnostic_logs);";
+        sqlite3_stmt *pruneStmt = nullptr;
+        if (sqlite3_prepare_v2(_db, sqlPrune, -1, &pruneStmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int(pruneStmt, 1, _diagConfig.maxRetainedRows);
+            sqlite3_step(pruneStmt);
+            sqlite3_finalize(pruneStmt);
+        }
+    }
+}
+
+DiagnosticsConfig AgentTelemetryDb::getDiagnosticsConfig() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _diagConfig;
+}
+
 bool AgentTelemetryDb::logDiagnostic(const std::string &level,
                                      const std::string &category,
                                      const std::string &conversationId,
@@ -1332,6 +1377,20 @@ bool AgentTelemetryDb::logDiagnostic(const std::string &level,
                                      int maxRetainedRows) {
     std::lock_guard<std::mutex> lock(_mutex);
     if (!_db) return false;
+    if (!_diagConfig.enabled) return true;
+
+    auto levelRank = [](const std::string &lvl) -> int {
+        if (lvl == "ERROR") return 3;
+        if (lvl == "WARN") return 2;
+        return 1;
+    };
+    if (levelRank(level) < levelRank(_diagConfig.minLevel)) return true;
+
+    if ((category == "mobile_http" || category == "prompt") && !_diagConfig.logMobileHttp) return true;
+    if ((category == "router_decision" || category == "platform_forward") && !_diagConfig.logRouterDecisions) return true;
+    if (category == "transcript" && !_diagConfig.logIdleTranscriptPolls && !_diagConfig.logMobileHttp) return true;
+    if (category == "discovery" && !_diagConfig.logDiscoveryPolls) return true;
+    if (category == "hook" && !_diagConfig.logHooks) return true;
 
     int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1365,19 +1424,169 @@ bool AgentTelemetryDb::logDiagnostic(const std::string &level,
         return false;
     }
 
-    if (maxRetainedRows > 0) {
+    int effectiveMaxRows = (maxRetainedRows > 0) ? maxRetainedRows : _diagConfig.maxRetainedRows;
+    if (effectiveMaxRows > 0) {
         const char *sqlPrune =
             "DELETE FROM gateway_diagnostic_logs "
             "WHERE id <= (SELECT MAX(id) - ? FROM gateway_diagnostic_logs);";
         sqlite3_stmt *pruneStmt = nullptr;
         if (sqlite3_prepare_v2(_db, sqlPrune, -1, &pruneStmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int(pruneStmt, 1, maxRetainedRows);
+            sqlite3_bind_int(pruneStmt, 1, effectiveMaxRows);
             sqlite3_step(pruneStmt);
             sqlite3_finalize(pruneStmt);
         }
     }
 
+    if (_diagConfig.retentionHours > 0) {
+        int64_t cutoffMs = nowMs - (static_cast<int64_t>(_diagConfig.retentionHours) * 3600LL * 1000LL);
+        const char *sqlAge = "DELETE FROM gateway_diagnostic_logs WHERE timestamp_ms < ?;";
+        sqlite3_stmt *ageStmt = nullptr;
+        if (sqlite3_prepare_v2(_db, sqlAge, -1, &ageStmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(ageStmt, 1, cutoffMs);
+            sqlite3_step(ageStmt);
+            sqlite3_finalize(ageStmt);
+        }
+    }
+
     return true;
+}
+
+size_t AgentTelemetryDb::clearDiagnostics(const std::string &conversationId,
+                                          const std::string &category,
+                                          int olderThanHours) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (!_db) return 0;
+
+    std::string sql = "DELETE FROM gateway_diagnostic_logs WHERE 1=1 ";
+    if (!conversationId.empty()) sql += "AND conversation_id = ? ";
+    if (!category.empty()) sql += "AND category = ? ";
+    if (olderThanHours > 0) sql += "AND timestamp_ms < ? ";
+    sql += ";";
+
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        return 0;
+    }
+
+    int bindIdx = 1;
+    if (!conversationId.empty()) {
+        sqlite3_bind_text(stmt, bindIdx++, conversationId.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    if (!category.empty()) {
+        sqlite3_bind_text(stmt, bindIdx++, category.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    if (olderThanHours > 0) {
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        int64_t cutoffMs = nowMs - (static_cast<int64_t>(olderThanHours) * 3600LL * 1000LL);
+        sqlite3_bind_int64(stmt, bindIdx++, cutoffMs);
+    }
+
+    sqlite3_step(stmt);
+    size_t deleted = static_cast<size_t>(sqlite3_changes(_db));
+    sqlite3_finalize(stmt);
+
+    if (deleted >= 500) {
+        sqlite3_exec(_db, "PRAGMA wal_checkpoint(TRUNCATE);", nullptr, nullptr, nullptr);
+    }
+    return deleted;
+}
+
+nlohmann::json AgentTelemetryDb::getStorageStats() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    json out = json::object();
+    out["db_path"] = _dbPath;
+    out["db_size_bytes"] = getDatabaseSizeBytes();
+
+    int64_t walBytes = 0;
+    if (!_dbPath.empty()) {
+        try {
+            std::string walPath = _dbPath + "-wal";
+            if (fs::exists(walPath)) {
+                walBytes = static_cast<int64_t>(fs::file_size(walPath));
+            }
+        } catch (...) {}
+    }
+    out["wal_size_bytes"] = walBytes;
+    out["diagnostics_enabled"] = _diagConfig.enabled;
+    out["min_level"] = _diagConfig.minLevel;
+    out["max_retained_rows"] = _diagConfig.maxRetainedRows;
+    out["retention_hours"] = _diagConfig.retentionHours;
+    out["telemetry_retention_days"] = _diagConfig.telemetryRetentionDays;
+
+    auto countRows = [this](const char *table) -> int64_t {
+        if (!_db) return 0;
+        std::string q = std::string("SELECT COUNT(*) FROM ") + table + ";";
+        sqlite3_stmt *s = nullptr;
+        int64_t c = 0;
+        if (sqlite3_prepare_v2(_db, q.c_str(), -1, &s, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(s) == SQLITE_ROW) {
+                c = sqlite3_column_int64(s, 0);
+            }
+            sqlite3_finalize(s);
+        }
+        return c;
+    };
+
+    int64_t diagCount = countRows("gateway_diagnostic_logs");
+    int64_t eventsCount = countRows("agent_lifecycle_events");
+    int64_t sessionsCount = countRows("agent_sessions");
+    int64_t samplesCount = countRows("agent_telemetry_samples");
+    int64_t rollupsCount = countRows("agent_hourly_rollups");
+
+    out["diagnostic_logs_count"] = diagCount;
+    out["lifecycle_events_count"] = eventsCount;
+    out["sessions_count"] = sessionsCount;
+    out["counts"] = {
+        {"gateway_diagnostic_logs", diagCount},
+        {"agent_lifecycle_events", eventsCount},
+        {"agent_sessions", sessionsCount},
+        {"agent_telemetry_samples", samplesCount},
+        {"agent_hourly_rollups", rollupsCount}
+    };
+    return out;
+}
+
+nlohmann::json AgentTelemetryDb::purgeDebugData(bool vacuum) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    json out = json::object();
+    if (!_db) {
+        out["ok"] = false;
+        out["error"] = "Database not open";
+        return out;
+    }
+
+    int64_t sizeBefore = getDatabaseSizeBytes();
+
+    sqlite3_exec(_db, "DELETE FROM gateway_diagnostic_logs;", nullptr, nullptr, nullptr);
+    int64_t deletedDiag = sqlite3_changes(_db);
+
+    sqlite3_exec(_db,
+        "DELETE FROM agent_lifecycle_events "
+        "WHERE session_id IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default');",
+        nullptr, nullptr, nullptr);
+    int64_t deletedTestEvents = sqlite3_changes(_db);
+
+    sqlite3_exec(_db,
+        "DELETE FROM agent_sessions "
+        "WHERE session_id IN ('hook-selftest', 't1', 's1', 'default_session', 'test-cursor-1', 'default');",
+        nullptr, nullptr, nullptr);
+    int64_t deletedTestSessions = sqlite3_changes(_db);
+
+    sqlite3_exec(_db, "PRAGMA wal_checkpoint(TRUNCATE);", nullptr, nullptr, nullptr);
+    if (vacuum) {
+        sqlite3_exec(_db, "VACUUM;", nullptr, nullptr, nullptr);
+        sqlite3_exec(_db, "PRAGMA wal_checkpoint(TRUNCATE);", nullptr, nullptr, nullptr);
+    }
+
+    int64_t sizeAfter = getDatabaseSizeBytes();
+    out["ok"] = true;
+    out["deleted_diagnostic_logs"] = deletedDiag;
+    out["deleted_test_events"] = deletedTestEvents;
+    out["deleted_test_sessions"] = deletedTestSessions;
+    out["size_before_bytes"] = sizeBefore;
+    out["size_after_bytes"] = sizeAfter;
+    return out;
 }
 
 json AgentTelemetryDb::queryDiagnostics(int limit,

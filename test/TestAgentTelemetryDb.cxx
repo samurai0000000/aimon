@@ -229,6 +229,21 @@ static void DiagnosticLog_InsertQueryAndFilterByRequestIdAndCategory() {
     auto &db = AgentTelemetryDb::getInstance();
     assert(db.open(testDbPath));
 
+    // Verify default DiagnosticsConfig (enabled = false) writes 0 rows
+    db.setDiagnosticsConfig(DiagnosticsConfig{});
+    assert(db.logDiagnostic("INFO", "mobile_http", "cid-default-off", "cursor",
+                            "Should be suppressed", {{"status", 200}}, "req-off"));
+    assert(db.queryDiagnostics(100).empty());
+
+    DiagnosticsConfig d;
+    d.enabled = true;
+    d.logMobileHttp = true;
+    d.logRouterDecisions = true;
+    d.logIdleTranscriptPolls = true;
+    d.logDiscoveryPolls = true;
+    d.logHooks = true;
+    db.setDiagnosticsConfig(d);
+
     assert(db.logDiagnostic("INFO", "mobile_http", "cid-alpha-01", "cursor",
                             "GET /api/agent/conversations", {{"status", 200}}, "req-1001"));
     assert(db.logDiagnostic("INFO", "router_decision", "cid-alpha-01", "cursor",
@@ -283,6 +298,15 @@ static void DiagnosticLog_EnforcesRingBufferCap() {
     auto &db = AgentTelemetryDb::getInstance();
     assert(db.open(testDbPath));
 
+    DiagnosticsConfig d;
+    d.enabled = true;
+    d.logMobileHttp = true;
+    d.logRouterDecisions = true;
+    d.logIdleTranscriptPolls = true;
+    d.logDiscoveryPolls = true;
+    d.logHooks = true;
+    db.setDiagnosticsConfig(d);
+
     for (int i = 1; i <= 25; ++i) {
         assert(db.logDiagnostic("INFO", "hook", "cid-cap", "cursor",
                                 "Entry " + std::to_string(i),
@@ -308,6 +332,17 @@ static void AgentHookHandler_CursorTurn1LifecycleAndPermissions() {
     fs::remove_all(testDir);
 
     const std::string cid = "0da2a96a-621c-4b59-8e9a-9ece09bfe723";
+
+    {
+        DiagnosticsConfig d;
+        d.enabled = true;
+        d.logMobileHttp = true;
+        d.logRouterDecisions = true;
+        d.logIdleTranscriptPolls = true;
+        d.logDiscoveryPolls = true;
+        d.logHooks = true;
+        AgentTelemetryDb::getInstance().setDiagnosticsConfig(d);
+    }
 
     // 1. sessionStart
     assert(AgentHookHandler::processPayload({
@@ -462,6 +497,17 @@ static void AgentHookHandler_RejectsPathTraversalAndMalformedJson() {
     assert(!AgentTelemetryDb::isValidSessionId("abc/def"));
     assert(!AgentTelemetryDb::isValidSessionId("abc\\def"));
     assert(AgentTelemetryDb::isValidSessionId("0da2a96a-621c-4b59-8e9a-9ece09bfe723"));
+
+    {
+        DiagnosticsConfig d;
+        d.enabled = true;
+        d.logMobileHttp = true;
+        d.logRouterDecisions = true;
+        d.logIdleTranscriptPolls = true;
+        d.logDiscoveryPolls = true;
+        d.logHooks = true;
+        AgentTelemetryDb::getInstance().setDiagnosticsConfig(d);
+    }
 
     // 1. Path traversal attempt must return false and create zero state files
     bool ok = AgentHookHandler::processPayload({

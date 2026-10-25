@@ -72,6 +72,27 @@ public:
 
     void setConfigManager(ConfigManager* configManager) {
         _configManager = configManager;
+        if (_configManager) {
+            std::lock_guard<std::mutex> lock(_gatewayConfigMutex);
+            _runtimeGatewayConfig = _configManager->getConfigSnapshot().gateway;
+        }
+    }
+
+    void setGatewayConfig(const GatewayConfig& cfg) {
+        std::lock_guard<std::mutex> lock(_gatewayConfigMutex);
+        _runtimeGatewayConfig = cfg;
+        _hasExplicitGatewayConfig = true;
+    }
+
+    GatewayConfig getGatewayConfig() const {
+        std::lock_guard<std::mutex> lock(_gatewayConfigMutex);
+        if (_hasExplicitGatewayConfig) {
+            return _runtimeGatewayConfig;
+        }
+        if (_configManager) {
+            return _configManager->getConfigSnapshot().gateway;
+        }
+        return _runtimeGatewayConfig;
     }
 
     int getPort() const {
@@ -102,6 +123,9 @@ private:
     MobileGateway* _mobileGateway = nullptr;
     EdaBridge* _edaBridge = nullptr;
     ConfigManager* _configManager = nullptr;
+    mutable std::mutex _gatewayConfigMutex;
+    GatewayConfig _runtimeGatewayConfig;
+    bool _hasExplicitGatewayConfig = false;
 
     bool _endpointsEnabled = false;
     mutable std::mutex _sessionMutex;

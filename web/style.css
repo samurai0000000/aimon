@@ -3217,3 +3217,235 @@ body {
     padding: 20px !important;
 }
 
+/* ==========================================================================
+   Subpanel 6: Runtime Settings & Diagnostics (#subpanel-settings)
+   ========================================================================== */
+
+#subpanel-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding-bottom: 24px;
+}
+
+#subpanel-settings.hidden {
+    display: none;
+}
+
+.settings-top-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+}
+
+@media (max-width: 1180px) {
+    .settings-top-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.settings-card {
+    padding: 18px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.settings-quick-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.settings-toggle-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.settings-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 10px 14px;
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.settings-toggle-row:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(56, 189, 248, 0.25);
+}
+
+.settings-master-toggle {
+    background: rgba(56, 189, 248, 0.07);
+    border-color: rgba(56, 189, 248, 0.28);
+}
+
+.settings-toggle-info {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+}
+
+.settings-toggle-title {
+    font-size: 0.84rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.settings-toggle-desc {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    line-height: 1.35;
+}
+
+.settings-toggle-info code {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: #38bdf8;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 1px 5px;
+    border-radius: 4px;
+}
+
+.settings-checkbox {
+    width: 18px;
+    height: 18px;
+    accent-color: #06b6d4;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.settings-numeric-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.settings-numeric-grid-3 {
+    grid-template-columns: repeat(3, 1fr);
+}
+
+@media (max-width: 720px) {
+    .settings-numeric-grid,
+    .settings-numeric-grid-3 {
+        grid-template-columns: 1fr;
+    }
+}
+
+.settings-storage-strip {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+}
+
+@media (max-width: 780px) {
+    .settings-storage-strip {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.settings-actions-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding-top: 4px;
+}
+
+.btn-primary-cyan {
+    background: rgba(6, 182, 212, 0.22);
+    border-color: rgba(56, 189, 248, 0.45);
+    color: #38bdf8;
+}
+
+.btn-primary-cyan:hover {
+    background: rgba(6, 182, 212, 0.34);
+    border-color: #38bdf8;
+    color: #ffffff;
+}
+
+.btn-danger-coral {
+    background: rgba(239, 68, 68, 0.16);
+    border-color: rgba(248, 113, 113, 0.42);
+    color: #f87171;
+}
+
+.btn-danger-coral:hover {
+    background: rgba(239, 68, 68, 0.28);
+    border-color: #f87171;
+    color: #ffffff;
+}
+
+.diag-filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.diag-filter-bar #diag-filter-cid {
+    min-width: 220px;
+}
+
+.diag-inspector-section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.diag-subsection-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.diag-subsection-header h3 {
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.diag-subsection-header code {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: #38bdf8;
+}
+
+.diag-table td {
+    font-size: 0.76rem;
+    vertical-align: top;
+}
+
+.diag-sub-id {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+.diag-details-code {
+    display: inline-block;
+    max-width: 420px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.72rem;
+    color: #cbd5e1;
+}
+
+

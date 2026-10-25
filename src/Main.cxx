@@ -384,6 +384,10 @@ int main(int argc, char* argv[]) {
     int64_t lastInsightRebuildEpoch = 0;
 
     AgentTelemetryDb::getInstance().open();
+    AgentTelemetryDb::getInstance().setDiagnosticsConfig(cfg.diagnostics);
+    AgentTelemetryDb::getInstance().rollupAndPrune(
+        cfg.diagnostics.telemetryRetentionDays > 0 ? cfg.diagnostics.telemetryRetentionDays : 14);
+    int64_t lastTelemetryPruneEpoch = static_cast<int64_t>(std::time(nullptr));
     MobileGateway::getInstance().init(PathUtils::getAimonConfigDir() + "/mobile_devices.json");
 
 
@@ -454,6 +458,12 @@ int main(int argc, char* argv[]) {
 
         stateStore.update(status);
         agCollector.syncTranscriptTelemetry();
+
+        if (nowEpoch - lastTelemetryPruneEpoch >= 21600) {
+            lastTelemetryPruneEpoch = nowEpoch;
+            int retDays = AgentTelemetryDb::getInstance().getDiagnosticsConfig().telemetryRetentionDays;
+            AgentTelemetryDb::getInstance().rollupAndPrune(retDays > 0 ? retDays : 14);
+        }
 
         if (cfg.history.enabled) {
             historyStore.recordSnapshot(status);
@@ -544,6 +554,7 @@ int main(int argc, char* argv[]) {
     }, &mcpServer, &tcpGateway);
     webServer.setEdaBridge(&edaBridge);
     webServer.setConfigManager(&configMgr);
+    webServer.setGatewayConfig(cfg.gateway);
     if (cfg.insights.enabled) {
         webServer.setInsightEngine(&insightEngine);
     }

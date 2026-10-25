@@ -283,6 +283,11 @@ static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
                 if (!fs::is_symlink(fdEntry.path(), linkEc) || linkEc) continue;
                 std::string target = fs::read_symlink(fdEntry.path(), linkEc).string();
                 if (linkEc || target.empty()) continue;
+                const std::string deletedSuffix = " (deleted)";
+                if (target.size() > deletedSuffix.size() &&
+                    target.compare(target.size() - deletedSuffix.size(), deletedSuffix.size(), deletedSuffix) == 0) {
+                    target.resize(target.size() - deletedSuffix.size());
+                }
 
                 auto presPos = target.find("/presence/");
                 if (presPos != std::string::npos && target.size() > presPos + 15 &&
@@ -3720,6 +3725,7 @@ void WebServer::setupRoutes() {
             req.path.rfind("/api/agent/", 0) == 0 ||
             req.path == "/api/workspace" ||
             req.path.rfind("/api/workspace/", 0) == 0 ||
+            req.path == "/api/config" ||
             req.path == "/api/eda/config" ||
             req.path == "/api/eda/probe") {
             if (!isValidMobileOrUiRequest(req)) {
@@ -5349,7 +5355,7 @@ void WebServer::setupRoutes() {
         return cascadeConfig;
     };
 
-    auto handleAgentConversations = [getIdeBrainDir, getCliBrainDir, getCliPresenceDir, stripUserRequestTags,
+    auto handleAgentConversations = [this, getIdeBrainDir, getCliBrainDir, getCliPresenceDir, stripUserRequestTags,
                                      toLowerAscii, mapModelToHumanLabel, extractConversationModelById, discoverLsEndpoints](
                                         const httplib::Request& req, httplib::Response& res) {
         auto reqStart = std::chrono::steady_clock::now();
@@ -5540,6 +5546,36 @@ void WebServer::setupRoutes() {
         std::set<std::string> seenIds;
         std::string presenceDir = getCliPresenceDir();
         uint64_t nowSec = static_cast<uint64_t>(std::time(nullptr));
+        GatewayConfig gatewayCfg = this->getGatewayConfig();
+
+        if ((gatewayCfg.autoPruneStalePresenceLocks || gatewayCfg.pruneStalePresenceLocks) && !presenceDir.empty()) {
+            std::error_code pEc;
+            if (fs::exists(presenceDir, pEc) && fs::is_directory(presenceDir, pEc)) {
+                int ttlSec = (gatewayCfg.presenceStaleTtlSec > 0)
+                    ? gatewayCfg.presenceStaleTtlSec
+                    : gatewayCfg.stalePresenceLockMaxAgeSec;
+                for (const auto& lockEntry : fs::directory_iterator(presenceDir, pEc)) {
+                    if (pEc || !lockEntry.is_regular_file()) continue;
+                    if (lockEntry.path().extension() != ".lock") continue;
+                    std::string lockId = lockEntry.path().stem().string();
+                    if (runningAgyByConvId.find(lockId) == runningAgyByConvId.end()) {
+                        std::error_code mEc;
+                        auto ftime = fs::last_write_time(lockEntry.path(), mEc);
+                        if (!mEc) {
+                            auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                                ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+                            );
+                            auto lockSec = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
+                            int64_t ageSec = static_cast<int64_t>(nowSec) - lockSec;
+                            if (ageSec >= ttlSec) {
+                                std::error_code rmEc;
+                                fs::remove(lockEntry.path(), rmEc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         auto addCandidate = [&](const std::string& id, const fs::path& cdir, const std::string& sourceLabel) {
             if (id.empty() || id[0] == '.' || id == "tempmediaStorage") return;
@@ -5826,7 +5862,9 @@ void WebServer::setupRoutes() {
                 ce.source = sourceLabel;
                 ce.status = norm.status;
                 ce.timestamp = ts;
-                ce.active = (norm.status == "RUNNING") || (ts > 0 && nowSec >= ts && (nowSec - ts) < 120);
+                int recWin = (gatewayCfg.activeRecencyWindowSec > 0) ? gatewayCfg.activeRecencyWindowSec : 120;
+                ce.active = (norm.status == "RUNNING") ||
+                            (ts > 0 && nowSec >= ts && (nowSec - ts) < static_cast<uint64_t>(recWin));
                 ce.openInTerminal = false;
                 ce.terminalPts = "";
                 ce.workspace = norm.workspaceShort;
@@ -6073,13 +6111,19 @@ void WebServer::setupRoutes() {
                 title = title.substr(0, 77) + "...";
             }
 
+            int recWin = (gatewayCfg.activeRecencyWindowSec > 0) ? gatewayCfg.activeRecencyWindowSec : 120;
             bool isActive = openInTerminal;
             if (!presenceDir.empty() && fs::exists(fs::path(presenceDir) / (id + ".lock"))) {
-                isActive = true;
-            } else if (hasDbSummary && sumIt->second.status == "CASCADE_RUN_STATUS_RUNNING") {
-                isActive = true;
-            } else if (ts > 0 && nowSec >= ts && (nowSec - ts) < 120) {
-                isActive = true;
+                if (!gatewayCfg.strictPresenceFdCheck || openInTerminal) {
+                    isActive = true;
+                }
+            }
+            if (!isActive) {
+                if (hasDbSummary && sumIt->second.status == "CASCADE_RUN_STATUS_RUNNING") {
+                    isActive = true;
+                } else if (ts > 0 && nowSec >= ts && (nowSec - ts) < static_cast<uint64_t>(recWin)) {
+                    isActive = true;
+                }
             }
 
             std::string modelLabel = !inlineTranscriptModel.empty()
@@ -6275,14 +6319,18 @@ void WebServer::setupRoutes() {
                 auto parsed = parseProviderTranscriptJsonl(providerPath, providerSource, sinceIndex, providerSlug);
                 auto latMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - reqStart).count());
-                AgentTelemetryDb::getInstance().logDiagnostic(
-                    "INFO", "mobile_http", id, providerSource, "GET /api/agent/transcript",
-                    nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"since", sinceIndex}}),
-                    reqId);
-                AgentTelemetryDb::getInstance().logDiagnostic(
-                    "INFO", "transcript", id, providerSource, "load_transcript",
-                    nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"source", providerSource}, {"status", parsed.status}, {"step_count", parsed.totalSteps}}),
-                    reqId);
+                bool isIdlePoll = (sinceIndex >= 0 && parsed.steps.empty());
+                DiagnosticsConfig diagCfg = AgentTelemetryDb::getInstance().getDiagnosticsConfig();
+                if (!isIdlePoll || diagCfg.logIdleTranscriptPolls) {
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "mobile_http", id, providerSource, "GET /api/agent/transcript",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"since", sinceIndex}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "transcript", id, providerSource, "load_transcript",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"source", providerSource}, {"status", parsed.status}, {"step_count", parsed.totalSteps}}),
+                        reqId);
+                }
                 nlohmann::json resp;
                 resp["conversationId"] = id;
                 resp["source"] = providerSource;
@@ -6888,14 +6936,18 @@ void WebServer::setupRoutes() {
 
         auto latMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - reqStart).count());
-        AgentTelemetryDb::getInstance().logDiagnostic(
-            "INFO", "mobile_http", id, source, "GET /api/agent/transcript",
-            nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"since", sinceIndex}}),
-            reqId);
-        AgentTelemetryDb::getInstance().logDiagnostic(
-            "INFO", "transcript", id, source, "load_transcript",
-            nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"source", source}, {"step_count", totalStepCount}}),
-            reqId);
+        bool isIdlePoll = (sinceIndex >= 0 && steps.empty());
+        DiagnosticsConfig diagCfg = AgentTelemetryDb::getInstance().getDiagnosticsConfig();
+        if (!isIdlePoll || diagCfg.logIdleTranscriptPolls) {
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "INFO", "mobile_http", id, source, "GET /api/agent/transcript",
+                nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"since", sinceIndex}}),
+                reqId);
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "INFO", "transcript", id, source, "load_transcript",
+                nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"source", source}, {"step_count", totalStepCount}}),
+                reqId);
+        }
 
         nlohmann::json resp;
         resp["conversationId"] = id;
@@ -6915,16 +6967,35 @@ void WebServer::setupRoutes() {
         if (cid.empty()) {
             cid = req.get_param_value("id");
         }
+        GatewayConfig gwCfg = this->getGatewayConfig();
+        auto applyPolicyToSession = [&gwCfg](nlohmann::json& sObj) {
+            if (!sObj.is_object()) return;
+            if (sObj.value("provider", "") == "antigravity" &&
+                sObj.value("open_in_terminal", false) &&
+                !sObj.value("has_registered_csrf", false) &&
+                !gwCfg.allowCliLockedDetachedResume) {
+                sObj["recommended_route"] = "blocked_cli_locked_no_csrf";
+                sObj["interactive"] = false;
+                sObj["nonInteractiveReason"] =
+                    "Conversation is locked in terminal without a registered ConnectRPC CSRF token and allow_cli_locked_detached_resume is disabled";
+            }
+        };
         nlohmann::json out;
         if (!cid.empty()) {
             out = inspectSession(cid);
+            applyPolicyToSession(out);
         } else {
             out = diagnoseSessions(req.get_param_value("provider"));
+            if (out.contains("sessions") && out["sessions"].is_array()) {
+                for (auto& sObj : out["sessions"]) {
+                    applyPolicyToSession(sObj);
+                }
+            }
         }
         res.set_content(out.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
     });
 
-    _server->Post("/api/agent/prompt", [getWorkspaceRoot, getCliBrainDir, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc, extractConversationModelById, mapLabelToCliModelId, toLowerAscii](
+    _server->Post("/api/agent/prompt", [this, getWorkspaceRoot, getCliBrainDir, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc, extractConversationModelById, mapLabelToCliModelId, toLowerAscii](
                                            const httplib::Request& req, httplib::Response& res) {
         auto reqStart = std::chrono::steady_clock::now();
         std::string reqId = extractOrGenerateRequestId(req);
@@ -6935,6 +7006,10 @@ void WebServer::setupRoutes() {
         try {
             j = nlohmann::json::parse(req.body);
         } catch (const std::exception& e) {
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "WARN", "mobile_http", "", "all", "POST /api/agent/prompt",
+                nlohmann::json({{"status_code", 400}, {"error", e.what()}, {"token_fp", tokenFp}}),
+                reqId);
             res.status = 400;
             res.set_content(nlohmann::json({{"status", "error"}, {"error", e.what()}}).dump(), "application/json");
             return;
@@ -6980,6 +7055,10 @@ void WebServer::setupRoutes() {
             }
         }
         if (text.empty()) {
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "WARN", "mobile_http", cid, agentId, "POST /api/agent/prompt",
+                nlohmann::json({{"status_code", 400}, {"error", "Prompt text cannot be empty"}, {"token_fp", tokenFp}}),
+                reqId);
             res.status = 400;
             res.set_content("{\"status\":\"error\",\"error\":\"Prompt text cannot be empty\"}", "application/json");
             return;
@@ -7762,6 +7841,14 @@ void WebServer::setupRoutes() {
         }
 
         if (!fs::exists(agyBin) || access(agyBin.c_str(), X_OK) != 0) {
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "ERROR", "router_decision", cid, "antigravity", "route_prompt",
+                nlohmann::json({{"selected_route", "agy_missing"}, {"agy_bin", agyBin}}),
+                reqId);
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "ERROR", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
+                nlohmann::json({{"status_code", 503}, {"error", "agy binary not executable"}, {"token_fp", tokenFp}}),
+                reqId);
             res.status = 503;
             res.set_content(nlohmann::json({
                 {"status", "error"},
@@ -7847,7 +7934,56 @@ void WebServer::setupRoutes() {
             return a.isPreferredWorkspace > b.isPreferredWorkspace;
         });
 
-        if (endpoints.empty() && (!hasCliDiskConversation || isLockedByRunningAgy)) {
+        GatewayConfig gatewayCfg = this->getGatewayConfig();
+        bool lockedHasRegisteredCsrf = false;
+        if (isLockedByRunningAgy) {
+            for (const auto& ep : endpoints) {
+                if (!ep.isCli) continue;
+                if (lockedHttpPort > 0 && ep.port == lockedHttpPort) {
+                    lockedHasRegisteredCsrf = true;
+                    break;
+                }
+                if (lockedHttpPort <= 0 && !cid.empty() && ep.lockedConversationId == cid) {
+                    lockedHasRegisteredCsrf = true;
+                    break;
+                }
+            }
+        }
+
+        if (isLockedByRunningAgy && !lockedHasRegisteredCsrf &&
+            hasCliDiskConversation && !gatewayCfg.allowCliLockedDetachedResume) {
+            std::string locDesc = !lockedTerminalPts.empty()
+                ? lockedTerminalPts
+                : (lockedHttpPort > 0 ? ("port " + std::to_string(lockedHttpPort)) : "active terminal");
+            std::string errMsg = "Conversation is open in terminal (" + locDesc +
+                                 ") without a registered CSRF token and allow_cli_locked_detached_resume is disabled";
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "ERROR", "router_decision", cid, "antigravity", "route_prompt",
+                nlohmann::json({{"selected_route", "rejected_locked_cli_no_csrf"}, {"locked_http_port", lockedHttpPort}}),
+                reqId);
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "ERROR", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
+                nlohmann::json({{"status_code", 503}, {"error", errMsg}, {"token_fp", tokenFp}}),
+                reqId);
+            res.status = 503;
+            res.set_content(nlohmann::json({
+                {"status", "error"},
+                {"error", errMsg}
+            }).dump(2), "application/json");
+            return;
+        }
+
+        if (endpoints.empty() &&
+            (!hasCliDiskConversation || (isLockedByRunningAgy && !gatewayCfg.allowCliLockedDetachedResume)) &&
+            !(isLockedByRunningAgy && gatewayCfg.allowCliNewSessionSpawn && !wsPath.empty())) {
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "ERROR", "router_decision", cid, "antigravity", "route_prompt",
+                nlohmann::json({{"selected_route", "no_endpoint"}, {"has_cli_disk", hasCliDiskConversation}, {"is_locked", isLockedByRunningAgy}}),
+                reqId);
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "ERROR", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
+                nlohmann::json({{"status_code", 503}, {"error", "No active Antigravity language server or agy agent session found"}, {"token_fp", tokenFp}}),
+                reqId);
             res.status = 503;
             res.set_content(nlohmann::json({
                 {"status", "error"},
@@ -8487,167 +8623,264 @@ void WebServer::setupRoutes() {
             lastError = "Conversation is open in terminal (" + locDesc +
                         "), but its language server CSRF token is not yet registered";
         }
-        for (const auto& ep : endpoints) {
-            if (isCliConv && !ep.isCli) {
-                continue;
-            }
-            if (isLockedByRunningAgy) {
-                if (lockedHttpPort > 0 && ep.port != lockedHttpPort) {
+        if (gatewayCfg.allowAgyAgentApiFallback) {
+            for (const auto& ep : endpoints) {
+                if (isCliConv && !ep.isCli) {
                     continue;
                 }
-                if (lockedHttpPort <= 0 && ep.lockedConversationId != cid) {
+                if (isLockedByRunningAgy) {
+                    if (lockedHttpPort > 0 && ep.port != lockedHttpPort) {
+                        continue;
+                    }
+                    if (lockedHttpPort <= 0 && ep.lockedConversationId != cid) {
+                        continue;
+                    }
+                }
+                int exitCode = -1;
+                std::string output;
+                if (!runAgyCommand(ep, exitCode, output)) {
+                    lastError = "agy agentapi execution timed out or failed to spawn";
                     continue;
                 }
-            }
-            int exitCode = -1;
-            std::string output;
-            if (!runAgyCommand(ep, exitCode, output)) {
-                lastError = "agy agentapi execution timed out or failed to spawn";
-                continue;
-            }
 
-            nlohmann::json parsedOut = nlohmann::json::parse(output, nullptr, false);
-            bool hasJsonError = (!parsedOut.is_discarded() && parsedOut.is_object() &&
-                                 parsedOut.contains("error") && !parsedOut["error"].is_null() &&
-                                 (!parsedOut["error"].is_string() || !parsedOut["error"].get<std::string>().empty()));
+                nlohmann::json parsedOut = nlohmann::json::parse(output, nullptr, false);
+                bool hasJsonError = (!parsedOut.is_discarded() && parsedOut.is_object() &&
+                                     parsedOut.contains("error") && !parsedOut["error"].is_null() &&
+                                     (!parsedOut["error"].is_string() || !parsedOut["error"].get<std::string>().empty()));
 
-            if (exitCode == 0 && !hasJsonError) {
-                std::string resolvedCid = (cid == "new") ? "" : cid;
-                if (!parsedOut.is_discarded() && parsedOut.is_object()) {
-                    if (parsedOut.contains("conversationId") && parsedOut["conversationId"].is_string()) {
-                        resolvedCid = parsedOut["conversationId"].get<std::string>();
-                    } else if (parsedOut.contains("response") && parsedOut["response"].is_object()) {
-                        const auto& rObj = parsedOut["response"];
-                        if (rObj.contains("conversationId") && rObj["conversationId"].is_string()) {
-                            resolvedCid = rObj["conversationId"].get<std::string>();
-                        } else if (rObj.contains("cascadeId") && rObj["cascadeId"].is_string()) {
-                            resolvedCid = rObj["cascadeId"].get<std::string>();
-                        } else if (rObj.contains("newConversation") && rObj["newConversation"].is_object()) {
-                            const auto& nc = rObj["newConversation"];
-                            if (nc.contains("conversationId") && nc["conversationId"].is_string()) {
-                                resolvedCid = nc["conversationId"].get<std::string>();
+                if (exitCode == 0 && !hasJsonError) {
+                    std::string resolvedCid = (cid == "new") ? "" : cid;
+                    if (!parsedOut.is_discarded() && parsedOut.is_object()) {
+                        if (parsedOut.contains("conversationId") && parsedOut["conversationId"].is_string()) {
+                            resolvedCid = parsedOut["conversationId"].get<std::string>();
+                        } else if (parsedOut.contains("response") && parsedOut["response"].is_object()) {
+                            const auto& rObj = parsedOut["response"];
+                            if (rObj.contains("conversationId") && rObj["conversationId"].is_string()) {
+                                resolvedCid = rObj["conversationId"].get<std::string>();
+                            } else if (rObj.contains("cascadeId") && rObj["cascadeId"].is_string()) {
+                                resolvedCid = rObj["cascadeId"].get<std::string>();
+                            } else if (rObj.contains("newConversation") && rObj["newConversation"].is_object()) {
+                                const auto& nc = rObj["newConversation"];
+                                if (nc.contains("conversationId") && nc["conversationId"].is_string()) {
+                                    resolvedCid = nc["conversationId"].get<std::string>();
+                                }
                             }
                         }
                     }
+
+                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - reqStart).count());
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "router_decision", resolvedCid, "antigravity", "route_prompt",
+                        nlohmann::json({{"selected_route", "agy_agentapi"}, {"port", ep.port}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "platform_forward", resolvedCid, "antigravity", "agy_agentapi",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "agy_agentapi"}, {"port", ep.port}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "mobile_http", resolvedCid, "antigravity", "POST /api/agent/prompt",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"routed_via", "agy_agentapi"}}),
+                        reqId);
+
+                    nlohmann::json resp;
+                    resp["status"] = "dispatched";
+                    resp["agentId"] = agentId;
+                    resp["conversationId"] = resolvedCid;
+                    resp["routedVia"] = "agy_agentapi";
+                    resp["output"] = output;
+                    res.set_content(resp.dump(2), "application/json");
+                    return;
                 }
 
-                nlohmann::json resp;
-                resp["status"] = "dispatched";
-                resp["agentId"] = agentId;
-                resp["conversationId"] = resolvedCid;
-                resp["output"] = output;
-                res.set_content(resp.dump(2), "application/json");
-                return;
-            }
-
-            if (hasJsonError && parsedOut["error"].is_string()) {
-                lastError = parsedOut["error"].get<std::string>();
-            } else if (!output.empty()) {
-                lastError = output;
-            } else {
-                lastError = "agy exited with code " + std::to_string(exitCode);
+                if (hasJsonError && parsedOut["error"].is_string()) {
+                    lastError = parsedOut["error"].get<std::string>();
+                } else if (!output.empty()) {
+                    lastError = output;
+                } else {
+                    lastError = "agy exited with code " + std::to_string(exitCode);
+                }
             }
         }
 
-        // 5. Fallback for unlocked CLI conversations on disk: resume directly via detached `agy --conversation <cid> -p <prompt>`
-        if (hasCliDiskConversation && !isLockedByRunningAgy && !cid.empty() && cid != "new") {
+        // 5. Fallback for CLI conversations on disk (unlocked, or locked without a registered CSRF token when allowCliLockedDetachedResume is enabled):
+        // resume directly via detached `agy --conversation <cid> -p <prompt>`
+        if (hasCliDiskConversation && (!isLockedByRunningAgy || gatewayCfg.allowCliLockedDetachedResume) &&
+            !cid.empty() && cid != "new") {
             std::string cliModelId = mapLabelToCliModelId(desiredModel);
-            std::thread([agyBin, cid, text, wsPath, cliModelId]() {
-                pid_t child = fork();
-                if (child == 0) {
-                    setsid();
-                    if (!wsPath.empty()) {
-                        if (chdir(wsPath.c_str()) != 0) {}
-                    }
-                    int devNull = open("/dev/null", O_RDWR);
-                    if (devNull >= 0) {
-                        dup2(devNull, STDIN_FILENO);
-                        dup2(devNull, STDOUT_FILENO);
-                        dup2(devNull, STDERR_FILENO);
-                        if (devNull > 2) close(devNull);
-                    }
-                    unsetenv("ANTIGRAVITY_CONVERSATION_ID");
-                    unsetenv("AGY_LS_PORT");
-                    unsetenv("AGY_LS_CSRF_TOKEN");
-                    unsetenv("ANTIGRAVITY_LS_ADDRESS");
-                    unsetenv("ANTIGRAVITY_CSRF_TOKEN");
-                    std::string modelArg = "--model=" + cliModelId;
-                    std::vector<char*> argv;
-                    argv.push_back(const_cast<char*>(agyBin.c_str()));
-                    argv.push_back(const_cast<char*>("--conversation"));
-                    argv.push_back(const_cast<char*>(cid.c_str()));
-                    argv.push_back(const_cast<char*>("--dangerously-skip-permissions"));
-                    if (!cliModelId.empty()) {
-                        argv.push_back(const_cast<char*>(modelArg.c_str()));
-                    }
-                    argv.push_back(const_cast<char*>("-p"));
-                    argv.push_back(const_cast<char*>(text.c_str()));
-                    argv.push_back(nullptr);
-                    execv(agyBin.c_str(), argv.data());
-                    _exit(127);
-                } else if (child > 0) {
-                    int status = 0;
-                    waitpid(child, &status, 0);
+            pid_t child = fork();
+            if (child == 0) {
+                setsid();
+                if (!wsPath.empty()) {
+                    if (chdir(wsPath.c_str()) != 0) {}
                 }
-            }).detach();
+                int devNull = open("/dev/null", O_RDWR);
+                if (devNull >= 0) {
+                    dup2(devNull, STDIN_FILENO);
+                    dup2(devNull, STDOUT_FILENO);
+                    dup2(devNull, STDERR_FILENO);
+                    if (devNull > 2) close(devNull);
+                }
+                unsetenv("ANTIGRAVITY_CONVERSATION_ID");
+                unsetenv("AGY_LS_PORT");
+                unsetenv("AGY_LS_CSRF_TOKEN");
+                unsetenv("ANTIGRAVITY_LS_ADDRESS");
+                unsetenv("ANTIGRAVITY_CSRF_TOKEN");
+                std::string modelArg = "--model=" + cliModelId;
+                std::vector<char*> argv;
+                argv.push_back(const_cast<char*>(agyBin.c_str()));
+                argv.push_back(const_cast<char*>("--conversation"));
+                argv.push_back(const_cast<char*>(cid.c_str()));
+                argv.push_back(const_cast<char*>("--dangerously-skip-permissions"));
+                if (!cliModelId.empty()) {
+                    argv.push_back(const_cast<char*>(modelArg.c_str()));
+                }
+                argv.push_back(const_cast<char*>("-p"));
+                argv.push_back(const_cast<char*>(text.c_str()));
+                argv.push_back(nullptr);
+                execv(agyBin.c_str(), argv.data());
+                _exit(127);
+            } else if (child > 0) {
+                bool spawnOk = true;
+                int status = 0;
+                for (int waitedMs = 0; waitedMs < 150; waitedMs += 15) {
+                    pid_t w = waitpid(child, &status, WNOHANG);
+                    if (w == child) {
+                        int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                        if (code != 0) {
+                            spawnOk = false;
+                        }
+                        child = -1;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                }
+                if (child > 0) {
+                    std::thread([child]() {
+                        int st = 0;
+                        waitpid(child, &st, 0);
+                    }).detach();
+                }
+                if (spawnOk) {
+                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - reqStart).count());
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "router_decision", cid, "antigravity", "route_prompt",
+                        nlohmann::json({{"selected_route", "agy_cli_resume"}, {"is_locked_by_running_agy", isLockedByRunningAgy}, {"locked_http_port", lockedHttpPort}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "platform_forward", cid, "antigravity", "agy_cli_resume",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "agy_cli_resume"}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"routed_via", "agy_cli_resume"}}),
+                        reqId);
 
-            nlohmann::json resp;
-            resp["status"] = "dispatched";
-            resp["agentId"] = agentId;
-            resp["conversationId"] = cid;
-            resp["output"] = "{\"status\":\"resumed_cli_conversation\"}";
-            res.set_content(resp.dump(2), "application/json");
-            return;
+                    nlohmann::json resp;
+                    resp["status"] = "dispatched";
+                    resp["agentId"] = agentId;
+                    resp["conversationId"] = cid;
+                    resp["routedVia"] = "agy_cli_resume";
+                    resp["output"] = "{\"status\":\"resumed_cli_conversation\"}";
+                    res.set_content(resp.dump(2), "application/json");
+                    return;
+                }
+            }
         }
 
         // 6. Fallback for 0-step locked CLI conversations without CSRF token in workspace: start new detached prompt in wsPath
-        if (isLockedByRunningAgy && !hasCliDiskConversation && !wsPath.empty()) {
+        if (gatewayCfg.allowCliNewSessionSpawn && isLockedByRunningAgy && !hasCliDiskConversation && !wsPath.empty()) {
             std::string cliModelId = mapLabelToCliModelId(desiredModel);
-            std::thread([agyBin, text, wsPath, cliModelId]() {
-                pid_t child = fork();
-                if (child == 0) {
-                    setsid();
-                    if (!wsPath.empty()) {
-                        if (chdir(wsPath.c_str()) != 0) {}
-                    }
-                    int devNull = open("/dev/null", O_RDWR);
-                    if (devNull >= 0) {
-                        dup2(devNull, STDIN_FILENO);
-                        dup2(devNull, STDOUT_FILENO);
-                        dup2(devNull, STDERR_FILENO);
-                        if (devNull > 2) close(devNull);
-                    }
-                    unsetenv("ANTIGRAVITY_CONVERSATION_ID");
-                    unsetenv("AGY_LS_PORT");
-                    unsetenv("AGY_LS_CSRF_TOKEN");
-                    unsetenv("ANTIGRAVITY_LS_ADDRESS");
-                    unsetenv("ANTIGRAVITY_CSRF_TOKEN");
-                    std::string modelArg = "--model=" + cliModelId;
-                    std::vector<char*> argv;
-                    argv.push_back(const_cast<char*>(agyBin.c_str()));
-                    argv.push_back(const_cast<char*>("--dangerously-skip-permissions"));
-                    if (!cliModelId.empty()) {
-                        argv.push_back(const_cast<char*>(modelArg.c_str()));
-                    }
-                    argv.push_back(const_cast<char*>("-p"));
-                    argv.push_back(const_cast<char*>(text.c_str()));
-                    argv.push_back(nullptr);
-                    execv(agyBin.c_str(), argv.data());
-                    _exit(127);
-                } else if (child > 0) {
-                    int status = 0;
-                    waitpid(child, &status, 0);
+            pid_t child = fork();
+            if (child == 0) {
+                setsid();
+                if (!wsPath.empty()) {
+                    if (chdir(wsPath.c_str()) != 0) {}
                 }
-            }).detach();
+                int devNull = open("/dev/null", O_RDWR);
+                if (devNull >= 0) {
+                    dup2(devNull, STDIN_FILENO);
+                    dup2(devNull, STDOUT_FILENO);
+                    dup2(devNull, STDERR_FILENO);
+                    if (devNull > 2) close(devNull);
+                }
+                unsetenv("ANTIGRAVITY_CONVERSATION_ID");
+                unsetenv("AGY_LS_PORT");
+                unsetenv("AGY_LS_CSRF_TOKEN");
+                unsetenv("ANTIGRAVITY_LS_ADDRESS");
+                unsetenv("ANTIGRAVITY_CSRF_TOKEN");
+                std::string modelArg = "--model=" + cliModelId;
+                std::vector<char*> argv;
+                argv.push_back(const_cast<char*>(agyBin.c_str()));
+                argv.push_back(const_cast<char*>("--dangerously-skip-permissions"));
+                if (!cliModelId.empty()) {
+                    argv.push_back(const_cast<char*>(modelArg.c_str()));
+                }
+                argv.push_back(const_cast<char*>("-p"));
+                argv.push_back(const_cast<char*>(text.c_str()));
+                argv.push_back(nullptr);
+                execv(agyBin.c_str(), argv.data());
+                _exit(127);
+            } else if (child > 0) {
+                bool spawnOk = true;
+                int status = 0;
+                for (int waitedMs = 0; waitedMs < 150; waitedMs += 15) {
+                    pid_t w = waitpid(child, &status, WNOHANG);
+                    if (w == child) {
+                        int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                        if (code != 0) {
+                            spawnOk = false;
+                        }
+                        child = -1;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                }
+                if (child > 0) {
+                    std::thread([child]() {
+                        int st = 0;
+                        waitpid(child, &st, 0);
+                    }).detach();
+                }
+                if (spawnOk) {
+                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - reqStart).count());
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "router_decision", cid, "antigravity", "route_prompt",
+                        nlohmann::json({{"selected_route", "agy_cli_new"}, {"workspace", wsPath}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "platform_forward", cid, "antigravity", "agy_cli_new",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "agy_cli_new"}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"routed_via", "agy_cli_new"}}),
+                        reqId);
 
-            nlohmann::json resp;
-            resp["status"] = "dispatched";
-            resp["agentId"] = agentId;
-            resp["conversationId"] = cid;
-            resp["output"] = "{\"status\":\"started_cli_conversation_in_workspace\"}";
-            res.set_content(resp.dump(2), "application/json");
-            return;
+                    nlohmann::json resp;
+                    resp["status"] = "dispatched";
+                    resp["agentId"] = agentId;
+                    resp["conversationId"] = cid;
+                    resp["routedVia"] = "agy_cli_new";
+                    resp["output"] = "{\"status\":\"started_cli_conversation_in_workspace\"}";
+                    res.set_content(resp.dump(2), "application/json");
+                    return;
+                }
+            }
         }
+
+        int failMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - reqStart).count());
+        AgentTelemetryDb::getInstance().logDiagnostic(
+            "ERROR", "router_decision", cid, "antigravity", "route_prompt",
+            nlohmann::json({{"selected_route", "all_fallbacks_failed"}, {"error", lastError}}),
+            reqId);
+        AgentTelemetryDb::getInstance().logDiagnostic(
+            "ERROR", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
+            nlohmann::json({{"status_code", 503}, {"duration_ms", failMs}, {"error", lastError}, {"token_fp", tokenFp}}),
+            reqId);
 
         res.status = 503;
         res.set_content(nlohmann::json({
@@ -9243,6 +9476,235 @@ void WebServer::setupRoutes() {
 
         nlohmann::json out = st.toJson();
         out["ok"] = st.connected;
+        res.set_content(out.dump(2), "application/json");
+    });
+
+    // --- Unified Runtime Configuration & Diagnostics Management Endpoints ---
+
+    auto countStalePresenceLocks = [getCliPresenceDir]() -> int {
+        std::string presDir = getCliPresenceDir();
+        if (presDir.empty()) return 0;
+        std::error_code ec;
+        if (!fs::exists(presDir, ec) || !fs::is_directory(presDir, ec)) return 0;
+        std::set<std::string> liveLockedIds;
+        for (const auto& proc : discoverRunningAgyProcesses()) {
+            if (!proc.lockedConversationId.empty()) {
+                liveLockedIds.insert(proc.lockedConversationId);
+            }
+        }
+        int staleCount = 0;
+        for (const auto& entry : fs::directory_iterator(presDir, ec)) {
+            if (ec || !entry.is_regular_file()) continue;
+            if (entry.path().extension() != ".lock") continue;
+            std::string cid = entry.path().stem().string();
+            if (liveLockedIds.find(cid) == liveLockedIds.end()) {
+                ++staleCount;
+            }
+        }
+        return staleCount;
+    };
+
+    _server->Get("/api/config", [this, countStalePresenceLocks](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        AimonConfig snap;
+        if (this->_configManager) {
+            snap = this->_configManager->getConfigSnapshot();
+        } else {
+            snap.gateway = this->getGatewayConfig();
+            snap.diagnostics = AgentTelemetryDb::getInstance().getDiagnosticsConfig();
+        }
+        nlohmann::json cfgJson = snap.toJson();
+        if (cfgJson.contains("eda") && cfgJson["eda"].is_object()) {
+            cfgJson["eda"] = snap.eda.toJson(true);
+        }
+        if (cfgJson.contains("mqtt") && cfgJson["mqtt"].is_object() &&
+            !snap.mqtt.password.empty()) {
+            cfgJson["mqtt"]["password"] = "***";
+        }
+        nlohmann::json out = cfgJson;
+        out["ok"] = true;
+        out["config"] = cfgJson;
+        out["storage_stats"] = AgentTelemetryDb::getInstance().getStorageStats();
+        out["stale_presence_locks_count"] = countStalePresenceLocks();
+        res.set_content(out.dump(2), "application/json");
+    });
+
+    _server->Post("/api/config", [this, countStalePresenceLocks](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        nlohmann::json body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"ok", false}, {"error", "Malformed JSON body"}}).dump(2),
+                            "application/json");
+            return;
+        }
+        const nlohmann::json& patch = (body.contains("config") && body["config"].is_object())
+            ? body["config"]
+            : body;
+
+        AimonConfig snap;
+        std::string err;
+        if (this->_configManager) {
+            if (!this->_configManager->updateFromJson(patch, err)) {
+                res.status = 400;
+                res.set_content(nlohmann::json({{"ok", false}, {"error", err}}).dump(2), "application/json");
+                return;
+            }
+            snap = this->_configManager->getConfigSnapshot();
+        } else {
+            snap.gateway = this->getGatewayConfig();
+            snap.diagnostics = AgentTelemetryDb::getInstance().getDiagnosticsConfig();
+            snap.fromJson(patch);
+            if (!snap.validate(err)) {
+                res.status = 400;
+                res.set_content(nlohmann::json({{"ok", false}, {"error", err}}).dump(2), "application/json");
+                return;
+            }
+        }
+
+        AgentTelemetryDb::getInstance().setDiagnosticsConfig(snap.diagnostics);
+        this->setGatewayConfig(snap.gateway);
+
+        nlohmann::json cfgJson = snap.toJson();
+        if (cfgJson.contains("eda") && cfgJson["eda"].is_object()) {
+            cfgJson["eda"] = snap.eda.toJson(true);
+        }
+        nlohmann::json out = cfgJson;
+        out["ok"] = true;
+        out["config"] = cfgJson;
+        out["storage_stats"] = AgentTelemetryDb::getInstance().getStorageStats();
+        out["stale_presence_locks_count"] = countStalePresenceLocks();
+        res.set_content(out.dump(2), "application/json");
+    });
+
+    _server->Get("/api/agent/diagnostics/logs", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        int limit = 100;
+        if (req.has_param("limit")) {
+            try { limit = std::clamp(std::stoi(req.get_param_value("limit")), 1, 2000); } catch (...) {}
+        }
+        std::string cid = req.get_param_value("conversationId");
+        if (cid.empty()) cid = req.get_param_value("id");
+        std::string category = req.get_param_value("category");
+        std::string minLevel = req.get_param_value("minLevel");
+        if (minLevel.empty()) minLevel = req.get_param_value("level");
+        std::string reqId = req.get_param_value("requestId");
+
+        auto& db = AgentTelemetryDb::getInstance();
+        nlohmann::json logs = db.queryDiagnostics(limit, cid, category, minLevel, reqId);
+        nlohmann::json out = {
+            {"ok", true},
+            {"count", logs.size()},
+            {"logs", std::move(logs)},
+            {"diagnostics_config", db.getDiagnosticsConfig().toJson()},
+            {"storage_stats", db.getStorageStats()}
+        };
+        res.set_content(out.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+    });
+
+    _server->Post("/api/agent/diagnostics/clear", [this, getCliPresenceDir](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!isValidMobileOrUiRequest(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+            return;
+        }
+        nlohmann::json body = nlohmann::json::object();
+        if (!req.body.empty()) {
+            auto parsed = nlohmann::json::parse(req.body, nullptr, false);
+            if (!parsed.is_discarded() && parsed.is_object()) {
+                body = std::move(parsed);
+            }
+        }
+        auto& db = AgentTelemetryDb::getInstance();
+        int64_t sizeBefore = db.getDatabaseSizeBytes();
+
+        bool purgeAllDebug = body.value("purge_debug_data", false);
+        bool clearLogs = body.value("clear_logs", true);
+        bool pruneTelemetry = body.value("prune_telemetry", false);
+        bool pruneStaleLocks = body.value("prune_stale_locks", false);
+        bool vacuum = body.value("vacuum", true);
+
+        std::string cid = body.value("conversation_id", body.value("conversationId", ""));
+        std::string category = body.value("category", "");
+        int olderThanHours = body.value("older_than_hours", 0);
+
+        size_t deletedLogs = 0;
+        size_t prunedTelemetryRows = 0;
+        int prunedStaleLocks = 0;
+
+        if (pruneTelemetry) {
+            int retDays = db.getDiagnosticsConfig().telemetryRetentionDays;
+            prunedTelemetryRows = db.rollupAndPrune(retDays > 0 ? retDays : 14);
+        }
+
+        if (purgeAllDebug) {
+            nlohmann::json out = db.purgeDebugData(vacuum);
+            deletedLogs = static_cast<size_t>(out.value("deleted_diagnostic_logs", int64_t(0)));
+            pruneStaleLocks = true;
+        } else {
+            if (clearLogs) {
+                deletedLogs = db.clearDiagnostics(cid, category, olderThanHours);
+            }
+            if (clearLogs && cid.empty() && category.empty() && olderThanHours <= 0 && vacuum) {
+                db.purgeDebugData(true);
+            }
+        }
+
+        if (pruneStaleLocks) {
+            std::string presDir = getCliPresenceDir();
+            std::error_code ec;
+            if (!presDir.empty() && fs::exists(presDir, ec) && fs::is_directory(presDir, ec)) {
+                std::set<std::string> liveLockedIds;
+                for (const auto& proc : discoverRunningAgyProcesses()) {
+                    if (!proc.lockedConversationId.empty()) {
+                        liveLockedIds.insert(proc.lockedConversationId);
+                    }
+                }
+                for (const auto& entry : fs::directory_iterator(presDir, ec)) {
+                    if (ec || !entry.is_regular_file()) continue;
+                    if (entry.path().extension() != ".lock") continue;
+                    std::string lockId = entry.path().stem().string();
+                    if (liveLockedIds.find(lockId) == liveLockedIds.end()) {
+                        std::error_code rmEc;
+                        if (fs::remove(entry.path(), rmEc) && !rmEc) {
+                            ++prunedStaleLocks;
+                        }
+                    }
+                }
+            }
+        }
+
+        int64_t sizeAfter = db.getDatabaseSizeBytes();
+        int64_t reclaimed = (sizeBefore > sizeAfter) ? (sizeBefore - sizeAfter) : 0;
+        nlohmann::json out = {
+            {"ok", true},
+            {"deleted", deletedLogs},
+            {"deleted_diagnostic_logs", deletedLogs},
+            {"pruned_telemetry_rows", prunedTelemetryRows},
+            {"pruned_stale_locks", prunedStaleLocks},
+            {"before_bytes", sizeBefore},
+            {"after_bytes", sizeAfter},
+            {"reclaimed_bytes", reclaimed},
+            {"size_before_bytes", sizeBefore},
+            {"size_after_bytes", sizeAfter},
+            {"storage_stats", db.getStorageStats()}
+        };
         res.set_content(out.dump(2), "application/json");
     });
 }
@@ -9988,10 +10450,40 @@ nlohmann::json WebServer::diagnoseSessions(const std::string& providerFilter) {
         }
     }
 
+    if (providerFilter.empty() || providerFilter == "antigravity" ||
+        providerFilter == "cli" || providerFilter == "ide") {
+        for (const auto& proc : discoverRunningAgyProcesses()) {
+            if (!proc.lockedConversationId.empty() &&
+                AgentTelemetryDb::isValidSessionId(proc.lockedConversationId)) {
+                candidateIds.insert(proc.lockedConversationId);
+            }
+        }
+        auto scanBrainIds = [&](const std::string& rootDir) {
+            std::error_code ec;
+            if (rootDir.empty() || !fs::exists(rootDir, ec) || !fs::is_directory(rootDir, ec)) return;
+            for (const auto& entry : fs::directory_iterator(rootDir, ec)) {
+                if (ec || !entry.is_directory()) continue;
+                std::string id = entry.path().filename().string();
+                if (!id.empty() && id[0] != '.' && id != "tempmediaStorage" &&
+                    AgentTelemetryDb::isValidSessionId(id)) {
+                    fs::path tPath = entry.path() / ".system_generated" / "logs" / "transcript.jsonl";
+                    if (fs::exists(tPath, ec) || fs::exists(entry.path() / "task.md", ec)) {
+                        candidateIds.insert(id);
+                    }
+                }
+            }
+        };
+        if (providerFilter != "ide") scanBrainIds(getCliBrainDir());
+        if (providerFilter != "cli") scanBrainIds(getIdeBrainDir());
+    }
+
     nlohmann::json inspected = nlohmann::json::array();
     for (const auto& cid : candidateIds) {
         auto item = inspectSession(cid);
-        if (!providerFilter.empty() && item.value("provider", "") != providerFilter) {
+        if (!providerFilter.empty() &&
+            item.value("provider", "") != providerFilter &&
+            !(providerFilter == "antigravity" &&
+              (item.value("provider", "") == "cli" || item.value("provider", "") == "ide"))) {
             continue;
         }
         inspected.push_back(std::move(item));
@@ -10042,20 +10534,104 @@ nlohmann::json WebServer::inspectSession(const std::string& conversationId) {
         parsed = parseProviderTranscriptJsonl(provFile, provSource, -1, provSlug, false);
     }
 
+    bool openInTerminal = false;
+    std::string terminalPts;
+    int lockedHttpPort = 0;
+    bool hasRegisteredCsrf = false;
+    bool presenceLockExists = false;
+
     LiveProviderSessionInfo liveInfo;
+    SessionInteractivityInfo interactivity;
+    std::string recommendedRoute = "cli_print";
+    std::string sessionSource = provSource;
+
     if (provSource == "cursor" || provSource == "claude") {
         liveInfo = discoverLiveProviderSession(
             provSource, conversationId, parsed.workspacePath, provFile.string());
-    }
-    SessionInteractivityInfo interactivity = evaluateSessionInteractivity(
-        provSource, conversationId, fs::path(), liveInfo, provFile);
+        interactivity = evaluateSessionInteractivity(
+            provSource, conversationId, fs::path(), liveInfo, provFile);
+        if (!interactivity.interactive) {
+            recommendedRoute = "rejected_non_interactive_ide";
+        } else if (!liveInfo.screenSession.empty()) {
+            recommendedRoute = "screen";
+        }
+    } else {
+        if (provSource == "cli" || provSource == "ide") {
+            provSource = "antigravity";
+        }
+        fs::path cliBrainDir = fs::path(getCliBrainDir());
+        fs::path ideBrainDir = fs::path(getIdeBrainDir());
+        fs::path cliRootDir = cliBrainDir.parent_path();
+        fs::path cliTrans = cliBrainDir / conversationId / ".system_generated" / "logs" / "transcript.jsonl";
+        fs::path ideTrans = ideBrainDir / conversationId / ".system_generated" / "logs" / "transcript.jsonl";
+        bool hasCliDisk = fs::exists(cliBrainDir / conversationId, ec) ||
+                          fs::exists(cliRootDir / "conversations" / (conversationId + ".db"), ec);
+        bool hasIdeDisk = fs::exists(ideBrainDir / conversationId, ec);
 
-    std::string recommendedRoute = "cli_print";
-    if (!interactivity.interactive) {
-        recommendedRoute = "rejected_non_interactive_ide";
-    } else if (!liveInfo.screenSession.empty()) {
-        recommendedRoute = "screen";
+        if (fs::exists(cliTrans, ec)) {
+            provFile = cliTrans;
+            parentJsonlExists = fs::file_size(cliTrans, ec) > 0;
+        } else if (fs::exists(ideTrans, ec)) {
+            provFile = ideTrans;
+            parentJsonlExists = fs::file_size(ideTrans, ec) > 0;
+        }
+        if (parentJsonlExists) {
+            std::ifstream tf(provFile);
+            std::string line;
+            int steps = 0;
+            while (std::getline(tf, line)) {
+                if (!line.empty()) ++steps;
+            }
+            parsed.totalSteps = steps;
+            parsed.hasValidTurns = (steps > 0);
+        }
+
+        const char* envPres = std::getenv("AIMON_CLI_PRESENCE_DIR");
+        std::string presDir = (envPres && *envPres)
+            ? std::string(envPres)
+            : PathUtils::expandHome("~/.gemini/antigravity-cli/presence");
+        presenceLockExists = !presDir.empty() && fs::exists(fs::path(presDir) / (conversationId + ".lock"), ec);
+
+        auto agyProcs = discoverRunningAgyProcesses();
+        auto liveEnvEndpoints = syncAndPruneCliEndpointsState(agyProcs, false);
+        for (const auto& proc : agyProcs) {
+            if (proc.lockedConversationId == conversationId) {
+                openInTerminal = true;
+                terminalPts = proc.terminalPts;
+                lockedHttpPort = proc.httpPort;
+                try { liveInfo.ownerPid = std::stoi(proc.pidStr); } catch (...) {}
+                if (parsed.workspacePath.empty() && !proc.cwd.empty()) {
+                    parsed.workspacePath = proc.cwd;
+                }
+                if (lockedHttpPort > 0) {
+                    {
+                        std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
+                        if (s_cachedCliTokens.count(lockedHttpPort)) {
+                            hasRegisteredCsrf = true;
+                        }
+                    }
+                    if (!hasRegisteredCsrf && liveEnvEndpoints.count(lockedHttpPort)) {
+                        hasRegisteredCsrf = true;
+                    }
+                }
+                break;
+            }
+        }
+        sessionSource = (hasCliDisk || openInTerminal) ? "cli" : (hasIdeDisk ? "ide" : "antigravity");
+        liveInfo.hasCliStore = hasCliDisk;
+        liveInfo.isIdeRendererSession = hasIdeDisk && !hasCliDisk && !openInTerminal;
+        parsed.status = openInTerminal ? "RUNNING" : (parsed.hasValidTurns ? "DONE" : "UNKNOWN");
+        interactivity.interactive = true;
+
+        if (openInTerminal && hasRegisteredCsrf) {
+            recommendedRoute = "connect_rpc";
+        } else if (hasCliDisk || openInTerminal) {
+            recommendedRoute = "agy_cli_resume";
+        } else {
+            recommendedRoute = "agy_cli_new";
+        }
     }
+
     std::string selectedRoute = recommendedRoute;
     if (diagLogs.is_array()) {
         for (const auto& entry : diagLogs) {
@@ -10103,6 +10679,7 @@ nlohmann::json WebServer::inspectSession(const std::string& conversationId) {
         {"ok", true},
         {"conversation_id", conversationId},
         {"provider", provSource},
+        {"source", sessionSource},
         {"status", parsed.hasValidTurns ? parsed.status : sessionRec.value("status", "UNKNOWN")},
         {"workspace", !parsed.workspacePath.empty() ? parsed.workspacePath : sessionRec.value("workspace_path", sessionRec.value("workspace", ""))},
         {"model", !parsed.model.empty() ? parsed.model : sessionRec.value("model_name", sessionRec.value("model", ""))},
@@ -10116,6 +10693,12 @@ nlohmann::json WebServer::inspectSession(const std::string& conversationId) {
         {"has_cli_store", liveInfo.hasCliStore},
         {"is_ide_renderer", liveInfo.isIdeRendererSession},
         {"owner_pid", liveInfo.ownerPid},
+        {"open_in_terminal", openInTerminal},
+        {"locked_by_running_agy", openInTerminal},
+        {"terminal_pts", terminalPts},
+        {"http_port", lockedHttpPort},
+        {"has_registered_csrf", hasRegisteredCsrf},
+        {"presence_lock_exists", presenceLockExists},
         {"screen_session", liveInfo.screenSession},
         {"step_count", parsed.totalSteps},
         {"subagent_files", subagentFiles},
