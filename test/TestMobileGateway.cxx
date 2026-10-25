@@ -27,6 +27,29 @@ namespace fs = std::filesystem;
 using namespace aimon;
 using json = nlohmann::json;
 
+static void pbEncodeVarint(std::vector<uint8_t>& buf, uint64_t val) {
+    while (val >= 0x80) {
+        buf.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
+        val >>= 7;
+    }
+    buf.push_back(static_cast<uint8_t>(val & 0x7F));
+}
+
+static void pbEncodeTag(std::vector<uint8_t>& buf, uint32_t fieldNum, uint32_t wireType) {
+    pbEncodeVarint(buf, (static_cast<uint64_t>(fieldNum) << 3) | wireType);
+}
+
+static void pbEncodeVarintField(std::vector<uint8_t>& buf, uint32_t fieldNum, uint64_t val) {
+    pbEncodeTag(buf, fieldNum, 0);
+    pbEncodeVarint(buf, val);
+}
+
+static void pbEncodeLengthDelimitedField(std::vector<uint8_t>& buf, uint32_t fieldNum, const std::vector<uint8_t>& sub) {
+    pbEncodeTag(buf, fieldNum, 2);
+    pbEncodeVarint(buf, sub.size());
+    buf.insert(buf.end(), sub.begin(), sub.end());
+}
+
 static void testPairingAndAuth() {
     std::cout << "[TestMobileGateway] Running testPairingAndAuth..." << std::endl;
     auto &gw = MobileGateway::getInstance();
@@ -2049,7 +2072,7 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         cf << "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Old turn before compact\"}}\n";
         cf << "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"Old assistant turn\"}}\n";
         cf << "{\"type\":\"user\",\"entrypoint\":\"sdk-cli\",\"origin\":{\"kind\":\"task-notification\"},\"promptSource\":\"system\",\"queueTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"<task-notification>\\n<status>stopped</status>\\n</task-notification>\\nRead the output file to retrieve the result: /tmp/out\"}}\n";
-        cf << "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n";
+        cf << "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"preTokens\":96400,\"postTokens\":2300,\"durationMs\":26000}}\n";
         cf << "{\"type\":\"user\",\"isCompactSummary\":true,\"message\":{\"role\":\"user\",\"content\":\"This session is being continued from a previous conversation. Summary: Envelope 1 done.\"}}\n";
         cf << "{\"type\":\"user\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"<local-command-caveat>Caveat</local-command-caveat>\"}}\n";
         cf << "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<command-name>/compact</command-name>\\n<command-message>compact</command-message>\\n<command-args></command-args>\"}}\n";
@@ -2065,8 +2088,8 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         assert(compTrans["steps"][1].value("type", "") == "PLANNER_RESPONSE");
         assert(compTrans["steps"][1].value("text", "") == "Old assistant turn");
         assert(compTrans["steps"][2].value("type", "") == "PLANNER_RESPONSE");
-        assert(compTrans["steps"][2].value("text", "").find("Context Compacted") != std::string::npos);
-        assert(compTrans["steps"][2].value("text", "").find("Summary: Envelope 1 done.") != std::string::npos);
+        assert(compTrans["steps"][2].value("text", "") == "2 steps summarized · context 96.4k → ~2.3k (2.3k summary) · took 26s");
+        assert(compTrans["steps"][2].value("text", "").find("Summary: Envelope 1 done.") == std::string::npos);
 
         for (const auto& step : compTrans["steps"]) {
             std::string content = step.value("content", "") + " " + step.value("text", "");
@@ -2083,6 +2106,7 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         {
             std::ofstream seg(cursorBugDir / "compaction" / "segment_000.md");
             seg << "---\nworkspace: /tmp\n---\n";
+            seg << "- Turns: 299\n- Verbose-render size estimate: 705,771 B\n";
             seg << "## Summary (curated by compaction step)\nCurated compaction summary point 1.\n";
             seg << "## Verbatim turns\n";
             seg << std::string(200000, 'X');
@@ -2106,7 +2130,8 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         // Step 0: compaction summary
         assert(steps[0].value("type", "") == "PLANNER_RESPONSE");
         std::string s0Text = steps[0].value("text", "");
-        assert(s0Text.find("Curated compaction summary point 1.") != std::string::npos);
+        assert(s0Text.rfind("299 steps summarized · context ", 0) == 0);
+        assert(s0Text.find("Curated compaction summary point 1.") == std::string::npos);
         assert(s0Text.find("Verbatim turns") == std::string::npos);
         assert(s0Text.find("XXXX") == std::string::npos);
         assert(steps[0]["text"].get<std::string>().size() < 13000);
@@ -2439,7 +2464,7 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         fs::last_write_time(mainTranscript, fs::file_time_type::clock::now());
     }
 
-    // Fetch GET /api/agent/transcript?id=<mainCid>
+    // Fetch GET /api/agent/transcript?id=<mainCid> (transcript.jsonl fallback without .db)
     {
         auto tRes = client.Get(("/api/agent/transcript?id=" + mainCid).c_str(), headers);
         assert(tRes && tRes->status == 200);
@@ -2450,8 +2475,9 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         assert(lastStep.value("stepIndex", -1) == 8);
         assert(lastStep.value("type", "") == "PLANNER_RESPONSE");
         std::string txt = lastStep.value("text", "");
-        assert(txt.rfind("📦 **Context Compacted**", 0) == 0);
-        assert(txt.find("Compacted Antigravity context.") != std::string::npos);
+        assert(txt.find("steps summarized") != std::string::npos);
+        assert(txt.find("summary") != std::string::npos);
+        assert(txt.find("Compacted Antigravity context.") == std::string::npos);
     }
 
     // Run server.scanTranscriptsForNotifications(false) (with a 35ms sleep + second scan) and verify prompt_answered event
@@ -2471,6 +2497,168 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
             }
         }
         assert(foundCompactedEvent);
+    }
+
+    // Next, create SQLite database <cliRootDir>/conversations/<mainCid>.db and qualify protobuf checkpoint decoding
+    {
+        fs::path cliRootDir = fs::path(cliBrain).parent_path();
+        fs::path convDbDir = cliRootDir / "conversations";
+        fs::create_directories(convDbDir);
+        fs::path convDbPath = convDbDir / (mainCid + ".db");
+
+        sqlite3* convDb = nullptr;
+        assert(sqlite3_open_v2(convDbPath.c_str(), &convDb, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK && convDb);
+        char* zErr = nullptr;
+        assert(sqlite3_exec(convDb, "CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER);", nullptr, nullptr, &zErr) == SQLITE_OK);
+        assert(sqlite3_exec(convDb, "CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, has_subtrajectory INTEGER, metadata BLOB, error_details BLOB, permissions BLOB, task_details BLOB, render_info BLOB, step_payload BLOB, step_format INTEGER);", nullptr, nullptr, &zErr) == SQLITE_OK);
+
+        auto makeTimestamp = [](int64_t sec, int32_t nanos) {
+            std::vector<uint8_t> b;
+            pbEncodeVarintField(b, 1, static_cast<uint64_t>(sec));
+            if (nanos != 0) pbEncodeVarintField(b, 2, static_cast<uint64_t>(nanos));
+            return b;
+        };
+
+        auto makeSection = [](uint64_t sType, uint64_t sTokens) {
+            std::vector<uint8_t> s;
+            pbEncodeVarintField(s, 2, sType);
+            pbEncodeVarintField(s, 4, sTokens);
+            return s;
+        };
+
+        // gen_metadata: overheadTokens = 16280 (System Prompt 11575 + Tools 4705)
+        std::vector<uint8_t> genBlob;
+        {
+            auto s1 = makeSection(1, 11575);
+            auto s2 = makeSection(2, 4705);
+
+            std::vector<uint8_t> f3;
+            pbEncodeLengthDelimitedField(f3, 1, s1);
+            pbEncodeLengthDelimitedField(f3, 1, s2);
+
+            std::vector<uint8_t> f10;
+            pbEncodeLengthDelimitedField(f10, 3, f3);
+
+            std::vector<uint8_t> f9;
+            pbEncodeLengthDelimitedField(f9, 10, f10);
+
+            std::vector<uint8_t> usage;
+            pbEncodeVarintField(usage, 2, 16280);
+
+            std::vector<uint8_t> cs;
+            pbEncodeLengthDelimitedField(cs, 9, f9);
+            pbEncodeLengthDelimitedField(cs, 4, usage);
+
+            pbEncodeLengthDelimitedField(genBlob, 1, cs);
+        }
+
+        {
+            sqlite3_stmt* gStmt = nullptr;
+            assert(sqlite3_prepare_v2(convDb, "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)", -1, &gStmt, nullptr) == SQLITE_OK);
+            sqlite3_bind_blob(gStmt, 1, genBlob.data(), static_cast<int>(genBlob.size()), SQLITE_STATIC);
+            sqlite3_bind_int(gStmt, 2, static_cast<int>(genBlob.size()));
+            assert(sqlite3_step(gStmt) == SQLITE_DONE);
+            sqlite3_finalize(gStmt);
+        }
+
+        // Step 1206: step_type = 14 (USER_INPUT, created_at = 1792927140)
+        {
+            std::vector<uint8_t> meta14;
+            pbEncodeLengthDelimitedField(meta14, 1, makeTimestamp(1792927140, 0));
+
+            sqlite3_stmt* sStmt = nullptr;
+            assert(sqlite3_prepare_v2(convDb, "INSERT INTO steps (idx, step_type, status, has_subtrajectory, metadata, step_payload, step_format) VALUES (1206, 14, 1, 0, ?, NULL, 0)", -1, &sStmt, nullptr) == SQLITE_OK);
+            sqlite3_bind_blob(sStmt, 1, meta14.data(), static_cast<int>(meta14.size()), SQLITE_STATIC);
+            assert(sqlite3_step(sStmt) == SQLITE_DONE);
+            sqlite3_finalize(sStmt);
+        }
+
+        // Step 1207: step_type = 23 (CHECKPOINT)
+        {
+            std::vector<uint8_t> cp;
+            pbEncodeVarintField(cp, 11, 1110);
+            pbEncodeVarintField(cp, 12, 1207);
+
+            std::vector<uint8_t> payload23;
+            pbEncodeLengthDelimitedField(payload23, 30, cp);
+
+            std::vector<uint8_t> usage;
+            pbEncodeVarintField(usage, 2, 96423); // input_tokens
+            pbEncodeVarintField(usage, 10, 2326); // response_output_tokens
+
+            std::vector<uint8_t> chatModelMeta;
+            pbEncodeLengthDelimitedField(chatModelMeta, 2, usage);
+
+            std::vector<uint8_t> genMeta;
+            pbEncodeLengthDelimitedField(genMeta, 2, chatModelMeta);
+
+            std::vector<uint8_t> meta23;
+            pbEncodeLengthDelimitedField(meta23, 1, makeTimestamp(1792927140, 0));
+            pbEncodeLengthDelimitedField(meta23, 8, makeTimestamp(1792927166, 0));
+            pbEncodeLengthDelimitedField(meta23, 28, genMeta);
+
+            sqlite3_stmt* sStmt = nullptr;
+            assert(sqlite3_prepare_v2(convDb, "INSERT INTO steps (idx, step_type, status, has_subtrajectory, metadata, step_payload, step_format) VALUES (1207, 23, 1, 0, ?, ?, 0)", -1, &sStmt, nullptr) == SQLITE_OK);
+            sqlite3_bind_blob(sStmt, 1, meta23.data(), static_cast<int>(meta23.size()), SQLITE_STATIC);
+            sqlite3_bind_blob(sStmt, 2, payload23.data(), static_cast<int>(payload23.size()), SQLITE_STATIC);
+            assert(sqlite3_step(sStmt) == SQLITE_DONE);
+            sqlite3_finalize(sStmt);
+        }
+
+        // Step 1208: step_type = 23 (Fault injection with truncated / corrupted protobuf)
+        {
+            const uint8_t corruptBytes[] = {0xff, 0xff, 0xff, 0xff, 0xfe, 0xed};
+            sqlite3_stmt* sStmt = nullptr;
+            assert(sqlite3_prepare_v2(convDb, "INSERT INTO steps (idx, step_type, status, has_subtrajectory, metadata, step_payload, step_format) VALUES (1208, 23, 1, 0, ?, ?, 0)", -1, &sStmt, nullptr) == SQLITE_OK);
+            sqlite3_bind_blob(sStmt, 1, corruptBytes, sizeof(corruptBytes), SQLITE_STATIC);
+            sqlite3_bind_blob(sStmt, 2, corruptBytes, sizeof(corruptBytes), SQLITE_STATIC);
+            assert(sqlite3_step(sStmt) == SQLITE_DONE);
+            sqlite3_finalize(sStmt);
+        }
+
+        sqlite3_close(convDb);
+    }
+
+    // Append CHECKPOINT step (step_index: 1207) to mainTranscript
+    {
+        std::ofstream tf(mainTranscript, std::ios::app);
+        tf << "{\"step_index\":1207,\"source\":\"SYSTEM\",\"type\":\"CHECKPOINT\",\"status\":\"DONE\",\"content\":\"# Resuming from a compaction\\n\\n<summary>\\nCompacted.\\n</summary>\"}\n";
+        fs::last_write_time(mainTranscript, fs::file_time_type::clock::now());
+    }
+
+    // Fetch GET /api/agent/transcript?id=<mainCid> and assert step 1207 exact text
+    {
+        auto tRes = client.Get(("/api/agent/transcript?id=" + mainCid).c_str(), headers);
+        assert(tRes && tRes->status == 200);
+        json tj = json::parse(tRes->body);
+        assert(tj.contains("steps") && tj["steps"].is_array());
+        assert(!tj["steps"].empty());
+        const auto& lastStep = tj["steps"].back();
+        assert(lastStep.value("stepIndex", -1) == 1207);
+        assert(lastStep.value("type", "") == "PLANNER_RESPONSE");
+        std::string txt = lastStep.value("text", "");
+        assert(txt == "97 steps summarized · context 96.4k → ~18.6k (2.3k summary) · took 26s");
+    }
+
+    // Fault injection: append CHECKPOINT step (step_index: 1208) to mainTranscript
+    {
+        std::ofstream tf(mainTranscript, std::ios::app);
+        tf << "{\"step_index\":1208,\"source\":\"SYSTEM\",\"type\":\"CHECKPOINT\",\"status\":\"DONE\",\"content\":\"Fault injected step\"}\n";
+        fs::last_write_time(mainTranscript, fs::file_time_type::clock::now());
+    }
+
+    // Fetch GET /api/agent/transcript?id=<mainCid> and assert step 1208 graceful fallback
+    {
+        auto tRes = client.Get(("/api/agent/transcript?id=" + mainCid).c_str(), headers);
+        assert(tRes && tRes->status == 200);
+        json tj = json::parse(tRes->body);
+        assert(tj.contains("steps") && tj["steps"].is_array());
+        assert(!tj["steps"].empty());
+        const auto& lastStep = tj["steps"].back();
+        assert(lastStep.value("stepIndex", -1) == 1208);
+        assert(lastStep.value("type", "") == "PLANNER_RESPONSE");
+        std::string txt = lastStep.value("text", "");
+        assert(txt.find("step summarized") != std::string::npos);
     }
 
     server.stop();

@@ -1074,6 +1074,527 @@ static SessionInteractivityInfo evaluateSessionInteractivity(
     const LiveProviderSessionInfo& liveInfo,
     const fs::path& transcriptPath = fs::path());
 
+static std::string getCliBrainDir() {
+    const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
+    if (envCli && *envCli) {
+        return std::string(envCli);
+    }
+    return PathUtils::expandHome("~/.gemini/antigravity-cli/brain");
+}
+
+static std::string getIdeBrainDir() {
+    const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
+    if (envIde && *envIde) {
+        return std::string(envIde);
+    }
+    return PathUtils::expandHome("~/.gemini/antigravity-ide/brain");
+}
+
+static std::string formatCompactionTokens(uint64_t tokens) {
+    char buf[64];
+    if (tokens >= 1000000) {
+        std::snprintf(buf, sizeof(buf), "%.1fM", static_cast<double>(tokens) / 1000000.0);
+        return std::string(buf);
+    } else if (tokens >= 1000) {
+        std::snprintf(buf, sizeof(buf), "%.1fk", static_cast<double>(tokens) / 1000.0);
+        return std::string(buf);
+    }
+    return std::to_string(tokens);
+}
+
+static std::string formatCompactionDuration(int64_t seconds) {
+    if (seconds >= 60) {
+        return std::to_string(seconds / 60) + "m " + std::to_string(seconds % 60) + "s";
+    }
+    return std::to_string(std::max<int64_t>(0, seconds)) + "s";
+}
+
+static std::string joinCompactionStatsParts(int64_t stepsSummarized, uint64_t beforeTokens, uint64_t afterTokens, uint64_t summaryTokens, int64_t durationSec) {
+    std::vector<std::string> parts;
+    if (stepsSummarized > 0) {
+        parts.push_back(std::to_string(stepsSummarized) + (stepsSummarized == 1 ? " step summarized" : " steps summarized"));
+    }
+    if (summaryTokens > 0) {
+        if (beforeTokens > 0 && afterTokens > 0) {
+            parts.push_back("context " + formatCompactionTokens(beforeTokens) + " → ~" + formatCompactionTokens(afterTokens) + " (" + formatCompactionTokens(summaryTokens) + " summary)");
+        } else {
+            parts.push_back("~" + formatCompactionTokens(summaryTokens) + " summary");
+        }
+    } else if (beforeTokens > 0 && afterTokens > 0) {
+        parts.push_back("context " + formatCompactionTokens(beforeTokens) + " → ~" + formatCompactionTokens(afterTokens));
+    }
+    if (durationSec >= 0) {
+        parts.push_back("took " + formatCompactionDuration(durationSec));
+    }
+    if (parts.empty()) {
+        return "Context compacted";
+    }
+    std::string res;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) res += " · ";
+        res += parts[i];
+    }
+    return res;
+}
+
+struct AntigravityCheckpointStats {
+    int64_t stepsSummarized = 0;
+    uint64_t beforeTokens = 0;
+    uint64_t afterTokens = 0;
+    uint64_t summaryTokens = 0;
+    int64_t durationSec = -1;
+};
+
+static bool pbReadVarint(const uint8_t*& ptr, const uint8_t* end, uint64_t& val) {
+    val = 0;
+    int shift = 0;
+    while (ptr < end && shift < 64) {
+        uint8_t byte = *ptr++;
+        val |= static_cast<uint64_t>(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) {
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
+}
+
+static bool pbSkipField(const uint8_t*& ptr, const uint8_t* end, uint32_t wireType) {
+    if (wireType == 0) { // Varint
+        uint64_t dummy = 0;
+        return pbReadVarint(ptr, end, dummy);
+    } else if (wireType == 1) { // 64-bit
+        if (end - ptr < 8) return false;
+        ptr += 8;
+        return true;
+    } else if (wireType == 2) { // Length-delimited
+        uint64_t len = 0;
+        if (!pbReadVarint(ptr, end, len)) return false;
+        if (len > static_cast<uint64_t>(end - ptr)) return false;
+        ptr += len;
+        return true;
+    } else if (wireType == 5) { // 32-bit
+        if (end - ptr < 4) return false;
+        ptr += 4;
+        return true;
+    }
+    return false;
+}
+
+static bool pbDecodeTimestamp(const uint8_t* ptr, const uint8_t* end, double& tsSec) {
+    int64_t seconds = 0;
+    int32_t nanos = 0;
+    while (ptr < end) {
+        uint64_t tag = 0;
+        if (!pbReadVarint(ptr, end, tag)) return false;
+        uint32_t fieldNum = static_cast<uint32_t>(tag >> 3);
+        uint32_t wireType = static_cast<uint32_t>(tag & 0x07);
+        if (fieldNum == 1 && wireType == 0) {
+            uint64_t v = 0;
+            if (!pbReadVarint(ptr, end, v)) return false;
+            seconds = static_cast<int64_t>(v);
+        } else if (fieldNum == 2 && wireType == 0) {
+            uint64_t v = 0;
+            if (!pbReadVarint(ptr, end, v)) return false;
+            nanos = static_cast<int32_t>(v);
+        } else {
+            if (!pbSkipField(ptr, end, wireType)) return false;
+        }
+    }
+    tsSec = static_cast<double>(seconds) + static_cast<double>(nanos) / 1e9;
+    return true;
+}
+
+static bool loadAntigravityCheckpointStatsFromDb(const std::string& cid, std::map<int, AntigravityCheckpointStats>& outByStepIndex) {
+    if (cid.empty()) return false;
+    fs::path p1 = fs::path(getCliBrainDir()).parent_path() / "conversations" / (cid + ".db");
+    fs::path p2 = fs::path(getIdeBrainDir()).parent_path() / "conversations" / (cid + ".db");
+    std::string dbPath;
+    std::error_code ec;
+    if (fs::exists(p1, ec)) {
+        dbPath = p1.string();
+    } else if (fs::exists(p2, ec)) {
+        dbPath = p2.string();
+    } else {
+        return false;
+    }
+
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(dbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK || !db) {
+        if (db) sqlite3_close(db);
+        return false;
+    }
+    sqlite3_busy_timeout(db, 100);
+
+    struct DbCloser {
+        sqlite3* d;
+        ~DbCloser() { if (d) sqlite3_close(d); }
+    } closer{db};
+
+    uint64_t overheadTokens = 0;
+    uint64_t chatMessagesTokens = 0;
+    uint64_t usageInput = 0;
+    uint64_t usageCacheRead = 0;
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sqlGen = "SELECT data FROM gen_metadata ORDER BY size DESC LIMIT 1";
+    if (sqlite3_prepare_v2(db, sqlGen, -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlGen = "SELECT data FROM gen_metadata ORDER BY length(data) DESC LIMIT 1";
+        sqlite3_prepare_v2(db, sqlGen, -1, &stmt, nullptr);
+    }
+
+    if (stmt) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const void* rawBlob = sqlite3_column_blob(stmt, 0);
+            int blobBytes = sqlite3_column_bytes(stmt, 0);
+            if (rawBlob && blobBytes > 0) {
+                const uint8_t* ptr = static_cast<const uint8_t*>(rawBlob);
+                const uint8_t* end = ptr + blobBytes;
+                while (ptr < end) {
+                    uint64_t tag = 0;
+                    if (!pbReadVarint(ptr, end, tag)) break;
+                    uint32_t fn = static_cast<uint32_t>(tag >> 3);
+                    uint32_t wt = static_cast<uint32_t>(tag & 7);
+                    if (fn == 1 && wt == 2) {
+                        uint64_t csLen = 0;
+                        if (!pbReadVarint(ptr, end, csLen)) break;
+                        if (csLen > static_cast<uint64_t>(end - ptr)) break;
+                        const uint8_t* csPtr = ptr;
+                        const uint8_t* csEnd = ptr + csLen;
+                        ptr += csLen;
+
+                        while (csPtr < csEnd) {
+                            uint64_t csTag = 0;
+                            if (!pbReadVarint(csPtr, csEnd, csTag)) break;
+                            uint32_t csFn = static_cast<uint32_t>(csTag >> 3);
+                            uint32_t csWt = static_cast<uint32_t>(csTag & 7);
+                            if (csFn == 4 && csWt == 2) {
+                                uint64_t uLen = 0;
+                                if (!pbReadVarint(csPtr, csEnd, uLen)) break;
+                                if (uLen > static_cast<uint64_t>(csEnd - csPtr)) break;
+                                const uint8_t* uPtr = csPtr;
+                                const uint8_t* uEnd = csPtr + uLen;
+                                csPtr += uLen;
+                                while (uPtr < uEnd) {
+                                    uint64_t uTag = 0;
+                                    if (!pbReadVarint(uPtr, uEnd, uTag)) break;
+                                    uint32_t uFn = static_cast<uint32_t>(uTag >> 3);
+                                    uint32_t uWt = static_cast<uint32_t>(uTag & 7);
+                                    if (uFn == 2 && uWt == 0) {
+                                        pbReadVarint(uPtr, uEnd, usageInput);
+                                    } else if (uFn == 5 && uWt == 0) {
+                                        pbReadVarint(uPtr, uEnd, usageCacheRead);
+                                    } else {
+                                        if (!pbSkipField(uPtr, uEnd, uWt)) break;
+                                    }
+                                }
+                            } else if (csFn == 9 && csWt == 2) {
+                                uint64_t cwLen = 0;
+                                if (!pbReadVarint(csPtr, csEnd, cwLen)) break;
+                                if (cwLen > static_cast<uint64_t>(csEnd - csPtr)) break;
+                                const uint8_t* cwPtr = csPtr;
+                                const uint8_t* cwEnd = csPtr + cwLen;
+                                csPtr += cwLen;
+
+                                while (cwPtr < cwEnd) {
+                                    uint64_t cwTag = 0;
+                                    if (!pbReadVarint(cwPtr, cwEnd, cwTag)) break;
+                                    uint32_t cwFn = static_cast<uint32_t>(cwTag >> 3);
+                                    uint32_t cwWt = static_cast<uint32_t>(cwTag & 7);
+                                    if (cwFn == 10 && cwWt == 2) {
+                                        uint64_t f10Len = 0;
+                                        if (!pbReadVarint(cwPtr, cwEnd, f10Len)) break;
+                                        if (f10Len > static_cast<uint64_t>(cwEnd - cwPtr)) break;
+                                        const uint8_t* f10Ptr = cwPtr;
+                                        const uint8_t* f10End = cwPtr + f10Len;
+                                        cwPtr += f10Len;
+
+                                        while (f10Ptr < f10End) {
+                                            uint64_t f10Tag = 0;
+                                            if (!pbReadVarint(f10Ptr, f10End, f10Tag)) break;
+                                            uint32_t f10Fn = static_cast<uint32_t>(f10Tag >> 3);
+                                            uint32_t f10Wt = static_cast<uint32_t>(f10Tag & 7);
+                                            if (f10Fn == 3 && f10Wt == 2) {
+                                                uint64_t f3Len = 0;
+                                                if (!pbReadVarint(f10Ptr, f10End, f3Len)) break;
+                                                if (f3Len > static_cast<uint64_t>(f10End - f10Ptr)) break;
+                                                const uint8_t* f3Ptr = f10Ptr;
+                                                const uint8_t* f3End = f10Ptr + f3Len;
+                                                f10Ptr += f3Len;
+
+                                                while (f3Ptr < f3End) {
+                                                    uint64_t f3Tag = 0;
+                                                    if (!pbReadVarint(f3Ptr, f3End, f3Tag)) break;
+                                                    uint32_t f3Fn = static_cast<uint32_t>(f3Tag >> 3);
+                                                    uint32_t f3Wt = static_cast<uint32_t>(f3Tag & 7);
+                                                    if (f3Fn == 1 && f3Wt == 2) {
+                                                        uint64_t sLen = 0;
+                                                        if (!pbReadVarint(f3Ptr, f3End, sLen)) break;
+                                                        if (sLen > static_cast<uint64_t>(f3End - f3Ptr)) break;
+                                                        const uint8_t* sPtr = f3Ptr;
+                                                        const uint8_t* sEnd = f3Ptr + sLen;
+                                                        f3Ptr += sLen;
+
+                                                        uint64_t sType = 0;
+                                                        uint64_t sTokens = 0;
+                                                        while (sPtr < sEnd) {
+                                                            uint64_t sTag = 0;
+                                                            if (!pbReadVarint(sPtr, sEnd, sTag)) break;
+                                                            uint32_t sF = static_cast<uint32_t>(sTag >> 3);
+                                                            uint32_t sW = static_cast<uint32_t>(sTag & 7);
+                                                            if (sF == 2 && sW == 0) {
+                                                                pbReadVarint(sPtr, sEnd, sType);
+                                                            } else if (sF == 4 && sW == 0) {
+                                                                pbReadVarint(sPtr, sEnd, sTokens);
+                                                            } else {
+                                                                if (!pbSkipField(sPtr, sEnd, sW)) break;
+                                                            }
+                                                        }
+                                                        if (sType == 7) {
+                                                            chatMessagesTokens += sTokens;
+                                                        } else {
+                                                            overheadTokens += sTokens;
+                                                        }
+                                                    } else {
+                                                        if (!pbSkipField(f3Ptr, f3End, f3Wt)) break;
+                                                    }
+                                                }
+                                            } else {
+                                                if (!pbSkipField(f10Ptr, f10End, f10Wt)) break;
+                                            }
+                                        }
+                                    } else {
+                                        if (!pbSkipField(cwPtr, cwEnd, cwWt)) break;
+                                    }
+                                }
+                            } else {
+                                if (!pbSkipField(csPtr, csEnd, csWt)) break;
+                            }
+                        }
+                    } else {
+                        if (!pbSkipField(ptr, end, wt)) break;
+                    }
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+        stmt = nullptr;
+    }
+
+    if (overheadTokens == 0 && chatMessagesTokens > 0 && (usageInput + usageCacheRead) > chatMessagesTokens) {
+        overheadTokens = (usageInput + usageCacheRead) - chatMessagesTokens;
+    }
+
+    const char* sqlSteps = "SELECT idx, step_type, metadata, step_payload FROM steps WHERE step_type IN (14, 23) ORDER BY idx";
+    if (sqlite3_prepare_v2(db, sqlSteps, -1, &stmt, nullptr) == SQLITE_OK && stmt) {
+        int lastStep14Idx = -999;
+        double lastStep14CreatedSec = 0.0;
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int idx = sqlite3_column_int(stmt, 0);
+            int stepType = sqlite3_column_int(stmt, 1);
+            const void* metaBlob = sqlite3_column_blob(stmt, 2);
+            int metaBytes = sqlite3_column_bytes(stmt, 2);
+            const void* payloadBlob = sqlite3_column_blob(stmt, 3);
+            int payloadBytes = sqlite3_column_bytes(stmt, 3);
+
+            if (stepType == 14) {
+                if (metaBlob && metaBytes > 0) {
+                    const uint8_t* mPtr = static_cast<const uint8_t*>(metaBlob);
+                    const uint8_t* mEnd = mPtr + metaBytes;
+                    while (mPtr < mEnd) {
+                        uint64_t mTag = 0;
+                        if (!pbReadVarint(mPtr, mEnd, mTag)) break;
+                        uint32_t mFn = static_cast<uint32_t>(mTag >> 3);
+                        uint32_t mWt = static_cast<uint32_t>(mTag & 7);
+                        if (mFn == 1 && mWt == 2) {
+                            uint64_t tsLen = 0;
+                            if (!pbReadVarint(mPtr, mEnd, tsLen)) break;
+                            if (tsLen > static_cast<uint64_t>(mEnd - mPtr)) break;
+                            double tsSec = 0.0;
+                            if (pbDecodeTimestamp(mPtr, mPtr + tsLen, tsSec)) {
+                                lastStep14Idx = idx;
+                                lastStep14CreatedSec = tsSec;
+                            }
+                            mPtr += tsLen;
+                        } else {
+                            if (!pbSkipField(mPtr, mEnd, mWt)) break;
+                        }
+                    }
+                }
+            } else if (stepType == 23) {
+                AntigravityCheckpointStats st;
+
+                if (payloadBlob && payloadBytes > 0) {
+                    const uint8_t* pPtr = static_cast<const uint8_t*>(payloadBlob);
+                    const uint8_t* pEnd = pPtr + payloadBytes;
+                    while (pPtr < pEnd) {
+                        uint64_t pTag = 0;
+                        if (!pbReadVarint(pPtr, pEnd, pTag)) break;
+                        uint32_t pFn = static_cast<uint32_t>(pTag >> 3);
+                        uint32_t pWt = static_cast<uint32_t>(pTag & 7);
+                        if (pFn == 30 && pWt == 2) {
+                            uint64_t cpLen = 0;
+                            if (!pbReadVarint(pPtr, pEnd, cpLen)) break;
+                            if (cpLen > static_cast<uint64_t>(pEnd - pPtr)) break;
+                            const uint8_t* cpPtr = pPtr;
+                            const uint8_t* cpEnd = pPtr + cpLen;
+                            pPtr += cpLen;
+
+                            uint64_t startIdx = 0;
+                            uint64_t endIdx = 0;
+                            while (cpPtr < cpEnd) {
+                                uint64_t cpTag = 0;
+                                if (!pbReadVarint(cpPtr, cpEnd, cpTag)) break;
+                                uint32_t cpFn = static_cast<uint32_t>(cpTag >> 3);
+                                uint32_t cpWt = static_cast<uint32_t>(cpTag & 7);
+                                if (cpFn == 11 && cpWt == 0) {
+                                    pbReadVarint(cpPtr, cpEnd, startIdx);
+                                } else if (cpFn == 12 && cpWt == 0) {
+                                    pbReadVarint(cpPtr, cpEnd, endIdx);
+                                } else {
+                                    if (!pbSkipField(cpPtr, cpEnd, cpWt)) break;
+                                }
+                            }
+                            if (endIdx > startIdx) {
+                                st.stepsSummarized = static_cast<int64_t>(endIdx - startIdx);
+                            }
+                        } else {
+                            if (!pbSkipField(pPtr, pEnd, pWt)) break;
+                        }
+                    }
+                }
+
+                if (metaBlob && metaBytes > 0) {
+                    const uint8_t* mPtr = static_cast<const uint8_t*>(metaBlob);
+                    const uint8_t* mEnd = mPtr + metaBytes;
+                    double createdSec = 0.0;
+                    double completedSec = 0.0;
+
+                    while (mPtr < mEnd) {
+                        uint64_t mTag = 0;
+                        if (!pbReadVarint(mPtr, mEnd, mTag)) break;
+                        uint32_t mFn = static_cast<uint32_t>(mTag >> 3);
+                        uint32_t mWt = static_cast<uint32_t>(mTag & 7);
+                        if (mFn == 1 && mWt == 2) {
+                            uint64_t tsLen = 0;
+                            if (!pbReadVarint(mPtr, mEnd, tsLen)) break;
+                            if (tsLen > static_cast<uint64_t>(mEnd - mPtr)) break;
+                            pbDecodeTimestamp(mPtr, mPtr + tsLen, createdSec);
+                            mPtr += tsLen;
+                        } else if (mFn == 8 && mWt == 2) {
+                            uint64_t tsLen = 0;
+                            if (!pbReadVarint(mPtr, mEnd, tsLen)) break;
+                            if (tsLen > static_cast<uint64_t>(mEnd - mPtr)) break;
+                            pbDecodeTimestamp(mPtr, mPtr + tsLen, completedSec);
+                            mPtr += tsLen;
+                        } else if (mFn == 28 && mWt == 2) {
+                            uint64_t gLen = 0;
+                            if (!pbReadVarint(mPtr, mEnd, gLen)) break;
+                            if (gLen > static_cast<uint64_t>(mEnd - mPtr)) break;
+                            const uint8_t* gPtr = mPtr;
+                            const uint8_t* gEnd = mPtr + gLen;
+                            mPtr += gLen;
+
+                            while (gPtr < gEnd) {
+                                uint64_t gTag = 0;
+                                if (!pbReadVarint(gPtr, gEnd, gTag)) break;
+                                uint32_t gFn = static_cast<uint32_t>(gTag >> 3);
+                                uint32_t gWt = static_cast<uint32_t>(gTag & 7);
+                                if (gFn == 2 && gWt == 2) {
+                                    uint64_t f2Len = 0;
+                                    if (!pbReadVarint(gPtr, gEnd, f2Len)) break;
+                                    if (f2Len > static_cast<uint64_t>(gEnd - gPtr)) break;
+                                    const uint8_t* f2Ptr = gPtr;
+                                    const uint8_t* f2End = gPtr + f2Len;
+                                    gPtr += f2Len;
+
+                                    uint64_t inTok = 0;
+                                    uint64_t outTok = 0;
+                                    uint64_t cacheTok = 0;
+                                    uint64_t thinkTok = 0;
+                                    uint64_t respTok = 0;
+
+                                    auto parseUsageFields = [&](const uint8_t* uP, const uint8_t* uE) {
+                                        while (uP < uE) {
+                                            uint64_t uTag = 0;
+                                            if (!pbReadVarint(uP, uE, uTag)) break;
+                                            uint32_t uFn = static_cast<uint32_t>(uTag >> 3);
+                                            uint32_t uWt = static_cast<uint32_t>(uTag & 7);
+                                            if (uFn == 2 && uWt == 0) {
+                                                pbReadVarint(uP, uE, inTok);
+                                            } else if (uFn == 3 && uWt == 0) {
+                                                pbReadVarint(uP, uE, outTok);
+                                            } else if (uFn == 5 && uWt == 0) {
+                                                pbReadVarint(uP, uE, cacheTok);
+                                            } else if (uFn == 9 && uWt == 0) {
+                                                pbReadVarint(uP, uE, thinkTok);
+                                            } else if (uFn == 10 && uWt == 0) {
+                                                pbReadVarint(uP, uE, respTok);
+                                            } else {
+                                                if (!pbSkipField(uP, uE, uWt)) break;
+                                            }
+                                        }
+                                    };
+
+                                    const uint8_t* checkPtr = f2Ptr;
+                                    bool hasNestedField2Usage = false;
+                                    while (checkPtr < f2End) {
+                                        uint64_t cTag = 0;
+                                        if (!pbReadVarint(checkPtr, f2End, cTag)) break;
+                                        uint32_t cFn = static_cast<uint32_t>(cTag >> 3);
+                                        uint32_t cWt = static_cast<uint32_t>(cTag & 7);
+                                        if (cFn == 2 && cWt == 2) {
+                                            hasNestedField2Usage = true;
+                                            uint64_t subLen = 0;
+                                            if (pbReadVarint(checkPtr, f2End, subLen) && subLen <= static_cast<uint64_t>(f2End - checkPtr)) {
+                                                parseUsageFields(checkPtr, checkPtr + subLen);
+                                            }
+                                            break;
+                                        } else {
+                                            if (!pbSkipField(checkPtr, f2End, cWt)) break;
+                                        }
+                                    }
+                                    if (!hasNestedField2Usage) {
+                                        parseUsageFields(f2Ptr, f2End);
+                                    }
+
+                                    uint64_t totalIn = inTok + cacheTok;
+                                    uint64_t totalSum = respTok;
+                                    if (totalSum == 0 && outTok > thinkTok) {
+                                        totalSum = outTok - thinkTok;
+                                    }
+                                    if (totalIn > 0 || totalSum > 0) {
+                                        st.beforeTokens = totalIn;
+                                        st.summaryTokens = totalSum;
+                                    }
+                                } else {
+                                    if (!pbSkipField(gPtr, gEnd, gWt)) break;
+                                }
+                            }
+                        } else {
+                            if (!pbSkipField(mPtr, mEnd, mWt)) break;
+                        }
+                    }
+
+                    double startSec = (lastStep14Idx == idx - 1 && lastStep14CreatedSec > 0.0)
+                        ? lastStep14CreatedSec : createdSec;
+                    if (completedSec >= startSec && startSec > 0.0) {
+                        st.durationSec = static_cast<int64_t>(std::llround(completedSec - startSec));
+                    }
+                }
+
+                if (st.summaryTokens > 0 && st.beforeTokens > 0 && overheadTokens > 0) {
+                    st.afterTokens = overheadTokens + st.summaryTokens;
+                }
+                outByStepIndex[idx] = st;
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    return true;
+}
+
 static std::string extractCompactionSummary(const std::string& rawSegment, size_t maxBytes = 12288) {
     std::string text = rawSegment;
     if (text.rfind("---", 0) == 0) {
@@ -1299,13 +1820,52 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 if (segFile.is_open()) {
                     std::stringstream buffer;
                     buffer << segFile.rdbuf();
-                    std::string summaryBody = extractCompactionSummary(buffer.str());
-                    if (!summaryBody.empty()) {
+                    std::string rawSeg = buffer.str();
+                    std::string summaryBody = extractCompactionSummary(rawSeg);
+                    if (!summaryBody.empty() || rawSeg.find("- Turns:") != std::string::npos) {
                         int curIdx = stepIdx++;
                         out.totalSteps = curIdx + 1;
                         out.hasValidTurns = true;
                         if (!summaryOnly) {
-                            std::string compactDisplay = "📦 **Context Compacted**\n\n" + summaryBody;
+                            int64_t cursorTurns = 0;
+                            auto findTurns = [&](const std::string& prefix) -> int64_t {
+                                auto p = rawSeg.find(prefix);
+                                if (p == std::string::npos) return 0;
+                                p += prefix.size();
+                                while (p < rawSeg.size() && (rawSeg[p] == ' ' || rawSeg[p] == '\t')) p++;
+                                int64_t val = 0;
+                                while (p < rawSeg.size() && std::isdigit(static_cast<unsigned char>(rawSeg[p]))) {
+                                    val = val * 10 + (rawSeg[p] - '0');
+                                    p++;
+                                }
+                                return val;
+                            };
+                            cursorTurns = findTurns("- Turns:");
+                            if (cursorTurns == 0) {
+                                cursorTurns = findTurns("- Turn count:");
+                            }
+
+                            uint64_t verboseBytes = 0;
+                            const std::string vPrefix = "- Verbose-render size estimate:";
+                            auto vp = rawSeg.find(vPrefix);
+                            if (vp != std::string::npos) {
+                                vp += vPrefix.size();
+                                while (vp < rawSeg.size() && (rawSeg[vp] == ' ' || rawSeg[vp] == '\t')) vp++;
+                                uint64_t bVal = 0;
+                                while (vp < rawSeg.size() && (std::isdigit(static_cast<unsigned char>(rawSeg[vp])) || rawSeg[vp] == ',')) {
+                                    if (rawSeg[vp] != ',') {
+                                        bVal = bVal * 10 + (rawSeg[vp] - '0');
+                                    }
+                                    vp++;
+                                }
+                                verboseBytes = bVal;
+                            }
+
+                            uint64_t summaryTokens = summaryBody.empty() ? 0 : std::max<uint64_t>(1, summaryBody.size() / 4);
+                            uint64_t beforeTokens = (verboseBytes > 0) ? (verboseBytes / 4) : 0;
+                            uint64_t afterTokens = (beforeTokens > 0 && summaryTokens > 0) ? summaryTokens : 0;
+                            std::string compactDisplay = joinCompactionStatsParts(cursorTurns, beforeTokens, afterTokens, summaryTokens, -1);
+
                             nlohmann::json stepJson = {
                                 {"index", curIdx},
                                 {"stepIndex", curIdx},
@@ -1335,6 +1895,12 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     std::string lastConsecutiveUserPrompt;
     bool parentTurnEnded = false;
     std::set<std::string> pendingSubagentToolUseIds;
+    int lastClaudeCompactStepIdx = 0;
+    uint64_t pendingClaudePreTokens = 0;
+    uint64_t pendingClaudePostTokens = 0;
+    int64_t pendingClaudeDurationSec = -1;
+    bool hasPendingClaudeBoundary = false;
+    (void)hasPendingClaudeBoundary;
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         // Fast skip non-turn metadata records before invoking full JSON parser
@@ -1392,6 +1958,15 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
 
         std::string role = j.value("type", "");
         if (role == "system" && j.value("subtype", "") == "compact_boundary") {
+            hasPendingClaudeBoundary = true;
+            if (j.contains("compactMetadata") && j["compactMetadata"].is_object()) {
+                const auto& cm = j["compactMetadata"];
+                pendingClaudePreTokens = cm.value("preTokens", static_cast<uint64_t>(0));
+                pendingClaudePostTokens = cm.value("postTokens", static_cast<uint64_t>(0));
+                if (cm.contains("durationMs") && cm["durationMs"].is_number()) {
+                    pendingClaudeDurationSec = static_cast<int64_t>(std::llround(cm["durationMs"].get<double>() / 1000.0));
+                }
+            }
             continue;
         }
         if (role != "user" && role != "assistant") {
@@ -1515,7 +2090,11 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                     out.firstPrompt = "Compacted Claude Code Session";
                 }
                 if (!summaryOnly) {
-                    std::string compactDisplay = "📦 **Context Compacted**\n\n" + rawUserText;
+                    int64_t stepsSum = (curIdx > lastClaudeCompactStepIdx) ? (curIdx - lastClaudeCompactStepIdx) : 0;
+                    uint64_t sumTok = (pendingClaudePostTokens > 0) ? pendingClaudePostTokens : (rawUserText.empty() ? 0 : std::max<uint64_t>(1, rawUserText.size() / 4));
+                    uint64_t befTok = pendingClaudePreTokens;
+                    uint64_t aftTok = (befTok > 0 && sumTok > 0) ? sumTok : 0;
+                    std::string compactDisplay = joinCompactionStatsParts(stepsSum, befTok, aftTok, sumTok, pendingClaudeDurationSec);
                     nlohmann::json stepJson = {
                         {"index", curIdx},
                         {"stepIndex", curIdx},
@@ -1535,6 +2114,11 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                         out.steps.push_back(std::move(stepJson));
                     }
                 }
+                hasPendingClaudeBoundary = false;
+                pendingClaudePreTokens = 0;
+                pendingClaudePostTokens = 0;
+                pendingClaudeDurationSec = -1;
+                lastClaudeCompactStepIdx = curIdx + 1;
                 continue;
             }
 
@@ -3828,19 +4412,11 @@ void WebServer::setupRoutes() {
     };
 
     auto getIdeBrainDir = []() -> std::string {
-        const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
-        if (envIde && *envIde) {
-            return std::string(envIde);
-        }
-        return PathUtils::expandHome("~/.gemini/antigravity-ide/brain");
+        return aimon::getIdeBrainDir();
     };
 
     auto getCliBrainDir = []() -> std::string {
-        const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
-        if (envCli && *envCli) {
-            return std::string(envCli);
-        }
-        return PathUtils::expandHome("~/.gemini/antigravity-cli/brain");
+        return aimon::getCliBrainDir();
     };
 
     auto getCliPresenceDir = []() -> std::string {
@@ -5862,11 +6438,26 @@ void WebServer::setupRoutes() {
                                     });
                                 } else if (stType == "CORTEX_STEP_TYPE_CHECKPOINT") {
                                     std::string rawSummary;
+                                    int64_t rpcStepsSum = 0;
                                     if (rs.contains("checkpoint") && rs["checkpoint"].is_object()) {
-                                        rawSummary = rs["checkpoint"].value("sessionSummary",
-                                                     rs["checkpoint"].value("userIntent", ""));
+                                        const auto& cp = rs["checkpoint"];
+                                        rawSummary = cp.value("sessionSummary",
+                                                     cp.value("userIntent", ""));
+                                        int64_t startIdx = cp.value("includedStepIndexStart", static_cast<int64_t>(0));
+                                        int64_t endIdx = cp.value("includedStepIndexEnd", static_cast<int64_t>(0));
+                                        if (endIdx > startIdx) rpcStepsSum = endIdx - startIdx;
                                     }
-                                    std::string compactDisplay = extractAntigravityCheckpointSummary(rawSummary);
+                                    std::map<int, AntigravityCheckpointStats> rpcDbStats;
+                                    loadAntigravityCheckpointStatsFromDb(id, rpcDbStats);
+                                    std::string compactDisplay;
+                                    if (rpcDbStats.count(stepIdx)) {
+                                        const auto& cs = rpcDbStats[stepIdx];
+                                        int64_t sSum = (cs.stepsSummarized > 0) ? cs.stepsSummarized : rpcStepsSum;
+                                        compactDisplay = joinCompactionStatsParts(sSum, cs.beforeTokens, cs.afterTokens, cs.summaryTokens, cs.durationSec);
+                                    } else {
+                                        uint64_t sumTok = rawSummary.empty() ? 0 : std::max<uint64_t>(1, rawSummary.size() / 4);
+                                        compactDisplay = joinCompactionStatsParts(rpcStepsSum, 0, 0, sumTok, -1);
+                                    }
                                     parsedLiveSteps.push_back({
                                         {"index", stepIdx},
                                         {"stepIndex", stepIdx},
@@ -6018,11 +6609,17 @@ void WebServer::setupRoutes() {
             return;
         }
 
+        std::map<int, AntigravityCheckpointStats> dbCheckpointStats;
+        loadAntigravityCheckpointStatsFromDb(id, dbCheckpointStats);
+
         std::ifstream f(transcriptPath);
         std::string line;
         nlohmann::json steps = nlohmann::json::array();
         int lineNum = 0;
         int totalStepCount = 0;
+        int prevCheckpointStepIdx = 0;
+        uint64_t lastPlannerContextTokens = 0;
+        uint64_t prevStepEpochSec = 0;
 
         while (std::getline(f, line)) {
             if (line.empty()) continue;
@@ -6033,6 +6630,39 @@ void WebServer::setupRoutes() {
                 int stepIdx = j.value("step_index", lineNum);
                 ++lineNum;
                 totalStepCount = std::max(totalStepCount, stepIdx + 1);
+
+                std::string lineType = j.value("type", "");
+                std::string lineCreatedAt = j.value("created_at", "");
+                uint64_t curEpochSec = lineCreatedAt.empty() ? 0 : parseIso8601ToEpochSec(lineCreatedAt);
+
+                if (lineType == "PLANNER_RESPONSE") {
+                    uint64_t inT = j.value("input_tokens", static_cast<uint64_t>(0)) +
+                                   j.value("cache_read_tokens", static_cast<uint64_t>(0)) +
+                                   j.value("output_tokens", static_cast<uint64_t>(0));
+                    if (inT > 0) lastPlannerContextTokens = inT;
+                }
+
+                std::string checkpointCompactDisplay;
+                if (lineType == "CHECKPOINT") {
+                    if (dbCheckpointStats.count(stepIdx)) {
+                        const auto& cs = dbCheckpointStats[stepIdx];
+                        int64_t stepsSum = (cs.stepsSummarized > 0) ? cs.stepsSummarized : std::max<int64_t>(0, stepIdx - prevCheckpointStepIdx);
+                        checkpointCompactDisplay = joinCompactionStatsParts(stepsSum, cs.beforeTokens, cs.afterTokens, cs.summaryTokens, cs.durationSec);
+                    } else {
+                        int64_t stepsSum = (stepIdx > prevCheckpointStepIdx) ? (stepIdx - prevCheckpointStepIdx) : stepIdx;
+                        std::string rawContent = j.value("content", "");
+                        uint64_t sumTok = rawContent.empty() ? 0 : std::max<uint64_t>(1, rawContent.size() / 4);
+                        uint64_t befTok = lastPlannerContextTokens;
+                        uint64_t aftTok = (befTok > 0 && sumTok > 0) ? (16280 + sumTok) : 0;
+                        int64_t durSec = (curEpochSec > 0 && prevStepEpochSec > 0 && curEpochSec >= prevStepEpochSec)
+                            ? static_cast<int64_t>(curEpochSec - prevStepEpochSec) : -1;
+                        checkpointCompactDisplay = joinCompactionStatsParts(stepsSum, befTok, aftTok, sumTok, durSec);
+                    }
+                    prevCheckpointStepIdx = stepIdx;
+                }
+                if (curEpochSec > 0) {
+                    prevStepEpochSec = curEpochSec;
+                }
 
                 if (sinceIndex >= 0 && stepIdx <= sinceIndex) {
                     continue;
@@ -6204,7 +6834,9 @@ void WebServer::setupRoutes() {
                         }}
                     });
                 } else if (type == "CHECKPOINT") {
-                    std::string compactDisplay = extractAntigravityCheckpointSummary(content);
+                    std::string compactDisplay = !checkpointCompactDisplay.empty()
+                        ? checkpointCompactDisplay
+                        : extractAntigravityCheckpointSummary(content);
                     steps.push_back({
                         {"index", stepIdx},
                         {"stepIndex", stepIdx},
