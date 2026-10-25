@@ -56,13 +56,47 @@ struct AgentSessionRecord {
     double      avgTurnMs = 0.0;
 };
 
+struct GatewayDiagnosticLog {
+    int64_t     id = 0;
+    int64_t     timestampMs = 0;
+    std::string requestId;
+    std::string level;          // "INFO", "WARN", "ERROR"
+    std::string category;       // "mobile_http", "router_decision", "platform_forward", "discovery", "transcript", "prompt", "hook"
+    std::string conversationId;
+    std::string provider;
+    std::string summary;
+    nlohmann::json detailsJson;
+};
+
 class AgentTelemetryDb {
 public:
     static AgentTelemetryDb &getInstance();
 
+    static std::string scrubSecrets(const std::string &input);
+    static bool isValidSessionId(const std::string &id);
+
     bool open(const std::string &dbPath = "");
     void close();
     bool isOpen() const;
+
+    // Diagnostics & Security-Redacted Trace Logging
+    bool logDiagnostic(const std::string &level,
+                       const std::string &category,
+                       const std::string &conversationId,
+                       const std::string &provider,
+                       const std::string &summary,
+                       const nlohmann::json &details = nlohmann::json::object(),
+                       const std::string &requestId = "",
+                       int maxRetainedRows = 10000);
+
+    nlohmann::json queryDiagnostics(int limit = 100,
+                                    const std::string &conversationId = "",
+                                    const std::string &category = "",
+                                    const std::string &minLevel = "",
+                                    const std::string &requestId = "");
+
+    nlohmann::json querySessionRecord(const std::string &sessionId);
+    nlohmann::json queryTrace(const std::string &targetId, int limit = 500);
 
     // Session Management
     bool recordSessionStart(const std::string &sessionId,

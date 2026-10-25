@@ -28,6 +28,7 @@
 #define CPPHTTPLIB_THREAD_POOL_COUNT 8
 #endif
 #include <httplib.h>
+#include <openssl/sha.h>
 
 #include <ifaddrs.h>
 #include <netinet/in.h>
@@ -49,6 +50,47 @@
 namespace fs = std::filesystem;
 
 namespace aimon {
+
+static std::string extractOrGenerateRequestId(const httplib::Request& req) {
+    std::string reqId = req.get_header_value("X-Request-Id");
+    if (!reqId.empty()) {
+        std::string sanitized;
+        sanitized.reserve(reqId.size());
+        for (char c : reqId) {
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') {
+                sanitized.push_back(c);
+            }
+            if (sanitized.size() >= 64) break;
+        }
+        if (!sanitized.empty()) return sanitized;
+    }
+    static std::atomic<uint64_t> s_reqCounter{1};
+    uint64_t seq = s_reqCounter.fetch_add(1);
+    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::ostringstream oss;
+    oss << "srv-" << std::hex << nowMs << "-" << seq;
+    return oss.str();
+}
+
+static std::string computeTokenFingerprint(const httplib::Request& req) {
+    std::string rawToken = req.get_header_value("X-Mobile-Token");
+    if (rawToken.empty()) {
+        std::string authHeader = req.get_header_value("Authorization");
+        if (authHeader.rfind("Bearer ", 0) == 0 && authHeader.size() > 7) {
+            rawToken = authHeader.substr(7);
+        }
+    }
+    if (rawToken.empty()) return "ui-or-local";
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(rawToken.data()), rawToken.size(), digest);
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (int i = 0; i < 6; ++i) {
+        oss << std::setw(2) << static_cast<int>(digest[i]);
+    }
+    return oss.str();
+}
 
 static std::mutex s_cachedCliTokensMutex;
 static std::map<int, std::string> s_cachedCliTokens;
@@ -199,10 +241,14 @@ static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
         }
         if (pid <= 0) continue;
 
-        std::ifstream commFile("/proc/" + dname + "/comm");
-        if (!commFile.is_open()) continue;
         std::string comm;
-        std::getline(commFile, comm);
+        try {
+            std::ifstream commFile("/proc/" + dname + "/comm");
+            if (!commFile.is_open()) continue;
+            std::getline(commFile, comm);
+        } catch (...) {
+            continue;
+        }
         while (!comm.empty() && (comm.back() == '\r' || comm.back() == '\n' || comm.back() == ' ')) {
             comm.pop_back();
         }
@@ -347,14 +393,16 @@ static std::map<int, std::pair<std::string, std::string>> syncAndPruneCliEndpoin
             if (!fs::exists(taskPath, ec)) return cPids;
             for (const auto& tentry : fs::directory_iterator(taskPath, ec)) {
                 if (ec || !tentry.is_directory()) continue;
-                std::ifstream cf(tentry.path() / "children");
-                if (!cf.is_open()) continue;
-                std::string word;
-                while (cf >> word) {
-                    if (!word.empty() && std::all_of(word.begin(), word.end(), ::isdigit)) {
-                        try { cPids.push_back(std::stoi(word)); } catch (...) {}
+                try {
+                    std::ifstream cf(tentry.path() / "children");
+                    if (!cf.is_open()) continue;
+                    std::string word;
+                    while (cf >> word) {
+                        if (!word.empty() && std::all_of(word.begin(), word.end(), ::isdigit)) {
+                            try { cPids.push_back(std::stoi(word)); } catch (...) {}
+                        }
                     }
-                }
+                } catch (...) {}
             }
             return cPids;
         };
@@ -396,10 +444,15 @@ static std::map<int, std::pair<std::string, std::string>> syncAndPruneCliEndpoin
         procPids.insert(procPids.end(), generalPids.begin(), generalPids.end());
 
         for (pid_t pid : procPids) {
-            std::ifstream envFile("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
-            if (!envFile.is_open()) continue;
-            std::string envContent((std::istreambuf_iterator<char>(envFile)),
-                                   std::istreambuf_iterator<char>());
+            std::string envContent;
+            try {
+                std::ifstream envFile("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
+                if (!envFile.is_open()) continue;
+                envContent.assign((std::istreambuf_iterator<char>(envFile)),
+                                  std::istreambuf_iterator<char>());
+            } catch (...) {
+                continue;
+            }
             if (envContent.find("ANTIGRAVITY_LS_ADDRESS=") == std::string::npos) continue;
             std::string lsAddr;
             std::string lsCsrf;
@@ -784,18 +837,42 @@ static void inferWorkspaceFromProjectSlug(const std::string& slug,
     }
 }
 
-static bool readCursorHookStateMetadata(const std::string& cid,
-                                        std::string& outModel,
-                                        std::string& outWorkspace,
-                                        int* outTurns = nullptr,
-                                        int* outStep = nullptr) {
+static std::string getCursorHookStateDir() {
+    const char* envHook = std::getenv("AIMON_CURSOR_HOOK_STATE_DIR");
+    if (envHook && *envHook) {
+        return std::string(envHook);
+    }
+    const char* envState = std::getenv("AIMON_CURSOR_STATE_DIR");
+    if (envState && *envState) {
+        return std::string(envState);
+    }
+    std::string cursorProjects = getCursorProjectsDir();
+    if (!cursorProjects.empty()) {
+        return (fs::path(cursorProjects).parent_path() / "hooks" / "state").string();
+    }
+    const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
+    const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
+    if ((envCli && *envCli) || (envIde && *envIde)) {
+        return "";
+    }
+    return PathUtils::expandHome("~/.cursor/hooks/state");
+}
+
+static bool readCursorHookStateJson(const std::string& cid, nlohmann::json& outJson) {
     if (cid.empty() || cid.find("..") != std::string::npos || cid.find('/') != std::string::npos) {
         return false;
     }
     std::vector<fs::path> candidates;
+    std::string hookDir = getCursorHookStateDir();
+    if (!hookDir.empty()) {
+        candidates.push_back(fs::path(hookDir) / (cid + ".json"));
+    }
     std::string cursorProjects = getCursorProjectsDir();
     if (!cursorProjects.empty()) {
-        candidates.push_back(fs::path(cursorProjects).parent_path() / "hooks" / "state" / (cid + ".json"));
+        fs::path alt = fs::path(cursorProjects).parent_path() / "hooks" / "state" / (cid + ".json");
+        if (candidates.empty() || candidates.front() != alt) {
+            candidates.push_back(alt);
+        }
     }
     const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
     const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
@@ -809,20 +886,7 @@ static bool readCursorHookStateMetadata(const std::string& cid,
         if (!f.is_open()) continue;
         auto j = nlohmann::json::parse(f, nullptr, false);
         if (j.is_discarded() || !j.is_object()) continue;
-        std::string m = j.value("model", "");
-        if (!m.empty() && m != "Cursor") {
-            outModel = m;
-        }
-        std::string ws = j.value("workspace", "");
-        if (!ws.empty()) {
-            outWorkspace = ws;
-        }
-        if (outTurns) {
-            *outTurns = j.value("turns", -1);
-        }
-        if (outStep) {
-            *outStep = j.value("step", 0);
-        }
+        outJson = std::move(j);
         return true;
     }
     return false;
@@ -888,23 +952,33 @@ static void collectCursorSubagentIdsAndParentMtimes(
                     outParentMaxSubagentTs[spIt->second] = topSec;
                 }
             }
-            std::string dummyModel, dummyWs;
-            int hTurns = -1, hStep = 0;
-            if (readCursorHookStateMetadata(cid, dummyModel, dummyWs, &hTurns, &hStep)) {
-                if (hTurns == 0 && hStep > 0) {
-                    bool hasAssistant = false;
-                    std::ifstream tjf(topJsonl);
-                    if (tjf.is_open()) {
-                        std::string line;
-                        while (std::getline(tjf, line)) {
-                            if (line.find("\"assistant\"") != std::string::npos) {
-                                hasAssistant = true;
-                                break;
+            nlohmann::json hookJson;
+            std::error_code topEc;
+            bool topExists = fs::exists(topJsonl, topEc) && fs::is_regular_file(topJsonl, topEc);
+            bool hasSubagentsDir = fs::exists(convEntry.path() / "subagents", topEc) &&
+                                   fs::is_directory(convEntry.path() / "subagents", topEc);
+            if (readCursorHookStateJson(cid, hookJson)) {
+                if (!hasSubagentsDir &&
+                    (hookJson.value("is_subagent", false) || !hookJson.value("parent_session_id", "").empty())) {
+                    outSubagentIds.insert(cid);
+                } else if (topExists && !hasSubagentsDir && hookJson.value("status", "") != "RUNNING") {
+                    int hTurns = hookJson.value("turns", -1);
+                    int hStep = hookJson.value("step", 0);
+                    if (hTurns == 0 && hStep > 0) {
+                        bool hasAssistant = false;
+                        std::ifstream tjf(topJsonl);
+                        if (tjf.is_open()) {
+                            std::string line;
+                            while (std::getline(tjf, line)) {
+                                if (line.find("\"assistant\"") != std::string::npos) {
+                                    hasAssistant = true;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if (!hasAssistant) {
-                        outSubagentIds.insert(cid);
+                        if (!hasAssistant) {
+                            outSubagentIds.insert(cid);
+                        }
                     }
                 }
             }
@@ -966,6 +1040,7 @@ struct NormalizedProviderTranscript {
     std::string workspacePath;
     std::string workspaceShort;
     std::string model;
+    std::string status = "DONE";
     bool hasValidTurns = false;
     nlohmann::json lastStepObj;
 };
@@ -1042,20 +1117,42 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     bool summaryOnly = false) {
     NormalizedProviderTranscript out;
     inferWorkspaceFromProjectSlug(projectSlug, out.workspacePath, out.workspaceShort);
-    if (providerSource == "cursor") {
+    std::string hookFirstPrompt;
+    std::string hookStatus;
+    bool hookIsSubagent = false;
+    bool hasHookState = false;
+    if (providerSource == "cursor" && filePath.parent_path().filename() != "subagents") {
         std::string cid = filePath.stem().string();
-        std::string hookModel, hookWorkspace;
-        if (readCursorHookStateMetadata(cid, hookModel, hookWorkspace)) {
-            if (!hookModel.empty()) out.model = hookModel;
+        nlohmann::json hookJson;
+        if (readCursorHookStateJson(cid, hookJson)) {
+            hasHookState = true;
+            hookIsSubagent = hookJson.value("is_subagent", false) ||
+                             !hookJson.value("parent_session_id", "").empty();
+            hookStatus = hookJson.value("status", "");
+            std::string hookModel = hookJson.value("model", "");
+            if (!hookModel.empty() && hookModel != "Cursor") {
+                out.model = hookModel;
+            }
+            std::string hookWorkspace = hookJson.value("workspace", hookJson.value("workspace_path", ""));
             if (!hookWorkspace.empty()) {
                 out.workspacePath = hookWorkspace;
                 out.workspaceShort = fs::path(hookWorkspace).filename().string();
+            }
+            hookFirstPrompt = cleanProviderUserPrompt(
+                hookJson.value("first_prompt", hookJson.value("prompt_preview", "")));
+            if (hookStatus == "RUNNING") {
+                out.status = "RUNNING";
+            }
+            uint64_t upd = static_cast<uint64_t>(
+                hookJson.value("updated_ts", hookJson.value("updated_at", hookJson.value("updated_epoch", hookJson.value("start_ts", static_cast<int64_t>(0))))));
+            if (upd > out.lastActivitySec) {
+                out.lastActivitySec = upd;
             }
         }
     }
 
     std::set<std::string> activeClaudeUuids;
-    if (providerSource == "claude") {
+    if (providerSource == "claude" && !summaryOnly) {
         std::ifstream preIn(filePath);
         if (preIn.is_open()) {
             std::map<std::string, std::string> parentMap;
@@ -1115,9 +1212,28 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         }
     }
 
+    std::error_code fileExistEc;
+    bool parentFileExists = fs::exists(filePath, fileExistEc) &&
+                            fs::is_regular_file(filePath, fileExistEc) &&
+                            fs::file_size(filePath, fileExistEc) > 0;
     std::ifstream in(filePath);
-    if (!in.is_open()) {
-        return out;
+    if (!in.is_open() || !parentFileExists) {
+        if (providerSource == "cursor" && filePath.parent_path().filename() != "subagents") {
+            std::string cid = filePath.stem().string();
+            std::string hookDir = getCursorHookStateDir();
+            if (!hookDir.empty()) {
+                fs::path hookJsonl = fs::path(hookDir) / (cid + ".jsonl");
+                std::error_code hEc;
+                if (fs::exists(hookJsonl, hEc) && fs::is_regular_file(hookJsonl, hEc) &&
+                    fs::file_size(hookJsonl, hEc) > 0) {
+                    in.close();
+                    in.clear();
+                    in.open(hookJsonl);
+                }
+            }
+        } else if (!in.is_open()) {
+            return out;
+        }
     }
 
     auto extractFastTimestamp = [](const std::string& rawLine) -> uint64_t {
@@ -1266,7 +1382,19 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
 
         parentTurnEnded = false;
 
-        std::string tsStr = j.value("timestamp", j.value("created_at", ""));
+        std::string tsStr;
+        uint64_t parsedSec = 0;
+        if (j.contains("timestamp")) {
+            if (j["timestamp"].is_string()) {
+                tsStr = j["timestamp"].get<std::string>();
+            } else if (j["timestamp"].is_number_integer()) {
+                int64_t rawTs = j["timestamp"].get<int64_t>();
+                if (rawTs > 9999999999LL) rawTs /= 1000;
+                if (rawTs > 0) parsedSec = static_cast<uint64_t>(rawTs);
+            }
+        } else if (j.contains("created_at") && j["created_at"].is_string()) {
+            tsStr = j["created_at"].get<std::string>();
+        }
         if (tsStr.empty()) {
             auto tsTagStart = line.find("<timestamp>");
             auto tsTagEnd = line.find("</timestamp>");
@@ -1274,7 +1402,9 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 tsStr = line.substr(tsTagStart + 11, tsTagEnd - (tsTagStart + 11));
             }
         }
-        uint64_t parsedSec = parseIso8601ToEpochSec(tsStr);
+        if (parsedSec == 0 && !tsStr.empty()) {
+            parsedSec = parseIso8601ToEpochSec(tsStr);
+        }
         if (parsedSec > out.lastActivitySec) {
             out.lastActivitySec = parsedSec;
         }
@@ -1645,13 +1775,161 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         }
     }
 
+    if (providerSource == "cursor" && !parentFileExists && filePath.parent_path().filename() != "subagents") {
+        std::string cid = filePath.stem().string();
+        nlohmann::json sessionRec = AgentTelemetryDb::getInstance().querySessionRecord(cid);
+        bool hasDbRec = !sessionRec.empty() && !sessionRec.value("session_id", "").empty();
+        if (hasDbRec) {
+            if (out.workspacePath.empty()) {
+                std::string dbWs = sessionRec.value("workspace_path", sessionRec.value("workspace", ""));
+                if (!dbWs.empty()) {
+                    out.workspacePath = dbWs;
+                    out.workspaceShort = fs::path(dbWs).filename().string();
+                }
+            }
+            if (out.model.empty()) {
+                std::string dbModel = sessionRec.value("model_name", sessionRec.value("model", ""));
+                if (!dbModel.empty() && dbModel != "Cursor") {
+                    out.model = dbModel;
+                }
+            }
+            uint64_t dbUpd = static_cast<uint64_t>(
+                sessionRec.value("end_timestamp", sessionRec.value("start_timestamp", static_cast<int64_t>(0))));
+            if (dbUpd > out.lastActivitySec) {
+                out.lastActivitySec = dbUpd;
+            }
+        }
+
+        fs::path candidateSubDir = filePath.parent_path() / "subagents";
+        std::error_code sdEc;
+        bool hasSubagentJsonl = false;
+        if (fs::exists(candidateSubDir, sdEc) && fs::is_directory(candidateSubDir, sdEc)) {
+            for (const auto& se : fs::directory_iterator(candidateSubDir, sdEc)) {
+                if (!sdEc && se.is_regular_file() && se.path().extension() == ".jsonl") {
+                    hasSubagentJsonl = true;
+                    break;
+                }
+            }
+        }
+
+        if (hookIsSubagent && !hasSubagentJsonl) {
+            return out;
+        }
+
+        if (hasHookState || hasDbRec || hasSubagentJsonl) {
+            if (hookStatus == "RUNNING" || hasSubagentJsonl) {
+                out.status = "RUNNING";
+            }
+            if (out.userPrompts.empty() && !hookFirstPrompt.empty()) {
+                int curIdx = stepIdx++;
+                out.totalSteps = curIdx + 1;
+                out.hasValidTurns = true;
+                out.firstPrompt = hookFirstPrompt;
+                out.lastPrompt = hookFirstPrompt;
+                out.lastPromptStepIndex = curIdx;
+                out.userPrompts.push_back({
+                    {"stepIndex", curIdx},
+                    {"filteredStepIndex", curIdx},
+                    {"text", hookFirstPrompt},
+                    {"timestamp", ""}
+                });
+                if (!summaryOnly) {
+                    nlohmann::json uStep = {
+                        {"index", curIdx},
+                        {"stepIndex", curIdx},
+                        {"step_index", curIdx},
+                        {"type", "USER_INPUT"},
+                        {"status", "DONE"},
+                        {"content", hookFirstPrompt},
+                        {"text", hookFirstPrompt},
+                        {"userInput", hookFirstPrompt},
+                        {"createdAt", ""},
+                        {"step", {{"case", "userInput"}, {"value", hookFirstPrompt}}}
+                    };
+                    out.lastStepObj = uStep;
+                    if (sinceIndex < 0 || curIdx > sinceIndex) {
+                        out.steps.push_back(std::move(uStep));
+                    }
+                }
+            }
+
+            bool hasAssistantToolSteps = false;
+            for (const auto& st : out.steps) {
+                if (st.value("type", "") == "PLANNER_RESPONSE" &&
+                    st.contains("tool_calls") && st["tool_calls"].is_array() && !st["tool_calls"].empty()) {
+                    hasAssistantToolSteps = true;
+                    break;
+                }
+            }
+            if (!hasAssistantToolSteps && (out.hasValidTurns || hasSubagentJsonl)) {
+                nlohmann::json evArr = AgentTelemetryDb::getInstance().querySessionEvents(cid);
+                nlohmann::json synthTools = nlohmann::json::array();
+                if (evArr.is_array()) {
+                    for (const auto& ev : evArr) {
+                        if (!ev.is_object() || ev.value("event_type", "") != "TOOL_CALL") continue;
+                        std::string tName = ev.value("tool_name", "Tool");
+                        nlohmann::json metaObj = nlohmann::json::parse(ev.value("metadata_json", "{}"), nullptr, false);
+                        if (metaObj.is_discarded() || !metaObj.is_object()) {
+                            metaObj = nlohmann::json::object();
+                        }
+                        std::string cmd = metaObj.value("command", "");
+                        std::string summary = metaObj.value("description", metaObj.value("file_path", cmd));
+                        synthTools.push_back({
+                            {"name", tName},
+                            {"command", cmd},
+                            {"toolSummary", summary},
+                            {"args", metaObj},
+                            {"arguments", metaObj}
+                        });
+                    }
+                }
+                if (!synthTools.empty()) {
+                    int curIdx = stepIdx++;
+                    out.totalSteps = curIdx + 1;
+                    out.hasValidTurns = true;
+                    if (!summaryOnly) {
+                        nlohmann::json tStep = {
+                            {"index", curIdx},
+                            {"stepIndex", curIdx},
+                            {"step_index", curIdx},
+                            {"type", "PLANNER_RESPONSE"},
+                            {"status", "RUNNING"},
+                            {"content", ""},
+                            {"thinking", "Executing tool calls..."},
+                            {"plannerResponse", "Executing tool calls..."},
+                            {"text", ""},
+                            {"tool_calls", std::move(synthTools)},
+                            {"createdAt", ""},
+                            {"step", {{"case", "plannerResponse"}, {"value", "Executing tool calls..."}}}
+                        };
+                        out.lastStepObj = tStep;
+                        if (sinceIndex < 0 || curIdx > sinceIndex) {
+                            out.steps.push_back(std::move(tStep));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (providerSource == "cursor" && !parentTurnEnded) {
+        if (parentFileExists ? (!out.steps.empty() &&
+                                out.steps.back().contains("tool_calls") &&
+                                out.steps.back()["tool_calls"].is_array() &&
+                                !out.steps.back()["tool_calls"].empty())
+                             : (hookStatus == "RUNNING" || out.hasValidTurns)) {
+            out.status = "RUNNING";
+        }
+    }
+
     bool cursorCanMerge = (providerSource == "cursor" &&
                            filePath.parent_path().filename() != "subagents" &&
                            !parentTurnEnded &&
-                           !out.steps.empty() &&
-                           out.steps.back().contains("tool_calls") &&
-                           out.steps.back()["tool_calls"].is_array() &&
-                           !out.steps.back()["tool_calls"].empty());
+                           (!parentFileExists ||
+                            (!out.steps.empty() &&
+                             out.steps.back().contains("tool_calls") &&
+                             out.steps.back()["tool_calls"].is_array() &&
+                             !out.steps.back()["tool_calls"].empty())));
 
     bool claudeCanMerge = (providerSource == "claude" &&
                            filePath.parent_path().filename() != "subagents" &&
@@ -1660,6 +1938,22 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     fs::path subDir;
     if (cursorCanMerge) {
         subDir = filePath.parent_path() / "subagents";
+        std::error_code sdEc;
+        if (!fs::exists(subDir, sdEc) || !fs::is_directory(subDir, sdEc)) {
+            std::string cid = filePath.stem().string();
+            std::string cursorRoot = getCursorProjectsDir();
+            if (!cursorRoot.empty() && fs::exists(cursorRoot, sdEc) && fs::is_directory(cursorRoot, sdEc)) {
+                for (const auto& projEntry : fs::directory_iterator(cursorRoot, sdEc)) {
+                    if (sdEc || !projEntry.is_directory()) continue;
+                    fs::path altSub = projEntry.path() / "agent-transcripts" / cid / "subagents";
+                    std::error_code aEc;
+                    if (fs::exists(altSub, aEc) && fs::is_directory(altSub, aEc)) {
+                        subDir = altSub;
+                        break;
+                    }
+                }
+            }
+        }
     } else if (claudeCanMerge) {
         subDir = filePath.parent_path() / filePath.stem() / "subagents";
     }
@@ -1681,7 +1975,7 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             };
             std::error_code pEc;
             auto parentFtime = fs::last_write_time(filePath, pEc);
-            uint64_t parentMtimeSec = fileMtimeSec(filePath);
+            uint64_t parentMtimeSec = parentFileExists ? fileMtimeSec(filePath) : 0;
             struct ActiveSubagentFile {
                 fs::path path;
                 std::string subId;
@@ -1693,9 +1987,9 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 if (subEc || !subEntry.is_regular_file() || subEntry.path().extension() != ".jsonl") continue;
                 std::error_code sEc;
                 auto subFtime = fs::last_write_time(subEntry.path(), sEc);
-                if (sEc || (!pEc && subFtime < parentFtime)) continue;
+                if (sEc || (parentFileExists && !pEc && subFtime < parentFtime)) continue;
                 uint64_t subMtimeSec = fileMtimeSec(subEntry.path());
-                if (subMtimeSec == 0 || subMtimeSec < parentMtimeSec) continue;
+                if (subMtimeSec == 0 || (parentFileExists && subMtimeSec < parentMtimeSec)) continue;
                 std::string subId = subEntry.path().stem().string();
                 uint64_t startSec = 0;
                 std::ifstream sf(subEntry.path());
@@ -1722,7 +2016,7 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             for (const auto& subInfo : activeSubs) {
                 NormalizedProviderTranscript subParsed = parseProviderTranscriptJsonl(
                     subInfo.path, providerSource, -1, projectSlug, false);
-                if (subParsed.steps.size() < 2) {
+                if (parentFileExists ? (subParsed.steps.size() < 2) : subParsed.steps.empty()) {
                     continue;
                 }
                 if (subInfo.mtimeSec > out.lastActivitySec) {
@@ -1741,9 +2035,25 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                     int curIdx = stepIdx++;
                     out.totalSteps = curIdx + 1;
                     out.hasValidTurns = true;
+                    std::string stType = subStep.value("type", "");
+                    if (stType == "USER_INPUT" && !parentFileExists && out.firstPrompt.empty()) {
+                        std::string rawTask = cleanProviderUserPrompt(subStep.value("text", ""));
+                        if (!rawTask.empty()) {
+                            out.firstPrompt = rawTask;
+                            out.lastPrompt = rawTask;
+                            out.lastPromptStepIndex = curIdx;
+                            if (out.userPrompts.empty()) {
+                                out.userPrompts.push_back({
+                                    {"stepIndex", curIdx},
+                                    {"filteredStepIndex", curIdx},
+                                    {"text", rawTask},
+                                    {"timestamp", subStep.value("createdAt", "")}
+                                });
+                            }
+                        }
+                    }
                     if (summaryOnly) continue;
 
-                    std::string stType = subStep.value("type", "");
                     if (stType == "USER_INPUT") {
                         std::string rawTask = subStep.value("text", "");
                         std::string firstLine = rawTask;
@@ -1769,6 +2079,8 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                             {"tool_calls", nlohmann::json::array()},
                             {"createdAt", subStep.value("createdAt", "")},
                             {"isSubagentStep", true},
+                            {"isSubagent", true},
+                            {"subagentId", subInfo.subId},
                             {"step", {{"case", "text"}, {"value", banner}}}
                         };
                         out.lastStepObj = bannerStep;
@@ -1780,6 +2092,8 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                         subStep["stepIndex"] = curIdx;
                         subStep["step_index"] = curIdx;
                         subStep["isSubagentStep"] = true;
+                        subStep["isSubagent"] = true;
+                        subStep["subagentId"] = subInfo.subId;
                         out.lastStepObj = subStep;
                         if (sinceIndex < 0 || curIdx > sinceIndex) {
                             out.steps.push_back(std::move(subStep));
@@ -1820,17 +2134,52 @@ static fs::path findProviderTranscriptById(const std::string& id,
         }
     }
     std::string cursorRoot = getCursorProjectsDir();
+    fs::path fallbackCursorDirCandidate;
+    std::string fallbackCursorSlug;
     if (!cursorRoot.empty() && fs::exists(cursorRoot, ec) && fs::is_directory(cursorRoot, ec)) {
         for (const auto& projEntry : fs::directory_iterator(cursorRoot, ec)) {
             if (ec || !projEntry.is_directory()) continue;
-            fs::path candidate = projEntry.path() / "agent-transcripts" / id / (id + ".jsonl");
+            fs::path convDir = projEntry.path() / "agent-transcripts" / id;
+            fs::path candidate = convDir / (id + ".jsonl");
             if (fs::exists(candidate, ec) && fs::is_regular_file(candidate, ec)) {
                 outSource = "cursor";
                 outProjectSlug = projEntry.path().filename().string();
                 return candidate;
             }
+            if (fallbackCursorDirCandidate.empty() && fs::exists(convDir, ec) && fs::is_directory(convDir, ec)) {
+                fallbackCursorDirCandidate = candidate;
+                fallbackCursorSlug = projEntry.path().filename().string();
+            }
         }
     }
+    if (!fallbackCursorDirCandidate.empty()) {
+        outSource = "cursor";
+        outProjectSlug = fallbackCursorSlug;
+        return fallbackCursorDirCandidate;
+    }
+
+    nlohmann::json hookJson;
+    if (readCursorHookStateJson(id, hookJson)) {
+        outSource = "cursor";
+        std::string ws = hookJson.value("workspace", hookJson.value("workspace_path", ""));
+        if (!ws.empty()) {
+            outProjectSlug = fs::path(ws).filename().string();
+        }
+        std::string hookDir = getCursorHookStateDir();
+        return fs::path(hookDir.empty() ? "/tmp" : hookDir) / (id + ".jsonl");
+    }
+
+    nlohmann::json sessionRec = AgentTelemetryDb::getInstance().querySessionRecord(id);
+    if (!sessionRec.empty() && sessionRec.value("agent_type", "") == "cursor") {
+        outSource = "cursor";
+        std::string ws = sessionRec.value("workspace_path", sessionRec.value("workspace", ""));
+        if (!ws.empty()) {
+            outProjectSlug = fs::path(ws).filename().string();
+        }
+        std::string hookDir = getCursorHookStateDir();
+        return fs::path(hookDir.empty() ? "/tmp" : hookDir) / (id + ".jsonl");
+    }
+
     return {};
 }
 
@@ -1856,14 +2205,36 @@ struct LiveProviderSessionInfo {
     pid_t ownerPid = 0;
     std::string screenSession;
     bool isIdeRendererSession = false;
+    bool hasCliStore = true;
 };
 
 static std::string readProcCmdline(pid_t pid) {
     if (pid <= 0) return "";
-    std::string path = "/proc/" + std::to_string(pid) + "/cmdline";
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) return "";
-    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    try {
+        std::string path = "/proc/" + std::to_string(pid) + "/cmdline";
+        std::ifstream f(path, std::ios::binary);
+        if (!f.is_open()) return "";
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    } catch (...) {
+        return "";
+    }
+}
+
+static std::string readProcComm(pid_t pid) {
+    if (pid <= 0) return "";
+    try {
+        std::string commPath = "/proc/" + std::to_string(pid) + "/comm";
+        std::ifstream commF(commPath);
+        if (!commF.is_open()) return "";
+        std::string comm;
+        std::getline(commF, comm);
+        while (!comm.empty() && (comm.back() == '\r' || comm.back() == '\n' || comm.back() == ' ')) {
+            comm.pop_back();
+        }
+        return comm;
+    } catch (...) {
+        return "";
+    }
 }
 
 static bool isOneShotCmdline(const std::string& rawCmdline) {
@@ -1884,29 +2255,63 @@ static bool isProcessInteractiveProvider(pid_t pid, const std::string& targetPro
     std::string cmdline = readProcCmdline(pid);
     if (cmdline.empty() || isOneShotCmdline(cmdline)) return false;
 
-    std::string commPath = "/proc/" + std::to_string(pid) + "/comm";
-    std::ifstream commF(commPath);
-    std::string comm;
-    if (commF.is_open()) {
-        std::getline(commF, comm);
-        while (!comm.empty() && (comm.back() == '\r' || comm.back() == '\n' || comm.back() == ' ')) {
-            comm.pop_back();
+    std::vector<std::string> args;
+    size_t start = 0;
+    while (start < cmdline.size()) {
+        size_t end = cmdline.find('\0', start);
+        if (end == std::string::npos) end = cmdline.size();
+        if (end > start) {
+            args.push_back(cmdline.substr(start, end - start));
+        }
+        start = end + 1;
+    }
+    if (args.empty()) return false;
+
+    for (const auto& tok : args) {
+        if (tok == "-p" || tok == "--print" || tok.rfind("--type=", 0) == 0) {
+            return false;
         }
     }
-    std::string commLower = toLowerAscii(comm);
-    std::string cmdLower = toLowerAscii(cmdline);
+
+    auto baseNameOf = [](const std::string& p) -> std::string {
+        auto sl = p.rfind('/');
+        return (sl != std::string::npos) ? p.substr(sl + 1) : p;
+    };
+
+    std::string arg0Lower = toLowerAscii(args[0]);
+    std::string exeBase = baseNameOf(arg0Lower);
+    std::string scriptBase;
+    if (exeBase == "node" || exeBase == "nodejs" || exeBase == "bash" ||
+        exeBase == "sh" || exeBase == "env") {
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (!args[i].empty() && args[i][0] != '-' && args[i].find('=') == std::string::npos) {
+                scriptBase = baseNameOf(toLowerAscii(args[i]));
+                break;
+            }
+        }
+    }
+
+    std::string commLower = toLowerAscii(readProcComm(pid));
+
+    auto endsWith = [](const std::string& s, const std::string& suffix) -> bool {
+        return s.size() >= suffix.size() &&
+               s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
 
     if (targetProvider == "cursor") {
-        if (commLower.find("cursor-agent") != std::string::npos ||
-            commLower == "agent" ||
-            cmdLower.find("cursor-agent") != std::string::npos ||
-            cmdLower.find("/agent\0") != std::string::npos ||
-            cmdLower.find("agent") != std::string::npos) {
+        if (commLower == "cursor-agent" ||
+            exeBase == "cursor-agent" ||
+            scriptBase == "cursor-agent" ||
+            endsWith(arg0Lower, "/.local/bin/cursor-agent") ||
+            endsWith(arg0Lower, "/cursor-agent") ||
+            (arg0Lower.find("/.cursor-server/") != std::string::npos && exeBase == "cursor-agent")) {
             return true;
         }
     } else if (targetProvider == "claude") {
-        if (commLower.find("claude") != std::string::npos ||
-            cmdLower.find("claude") != std::string::npos) {
+        if (commLower == "claude" ||
+            exeBase == "claude" ||
+            scriptBase == "claude" ||
+            endsWith(arg0Lower, "/claude")) {
             return true;
         }
     }
@@ -1915,11 +2320,15 @@ static bool isProcessInteractiveProvider(pid_t pid, const std::string& targetPro
 
 static pid_t getParentPid(pid_t pid) {
     if (pid <= 1) return 0;
-    std::string statPath = "/proc/" + std::to_string(pid) + "/stat";
-    std::ifstream f(statPath);
-    if (!f.is_open()) return 0;
     std::string line;
-    std::getline(f, line);
+    try {
+        std::string statPath = "/proc/" + std::to_string(pid) + "/stat";
+        std::ifstream f(statPath);
+        if (!f.is_open()) return 0;
+        std::getline(f, line);
+    } catch (...) {
+        return 0;
+    }
     size_t lastParen = line.rfind(')');
     if (lastParen == std::string::npos || lastParen + 2 >= line.size()) return 0;
     std::istringstream ss(line.substr(lastParen + 2));
@@ -1935,15 +2344,7 @@ static std::string findScreenSessionForPid(pid_t pid) {
     pid_t cur = pid;
     pid_t screenPid = 0;
     for (int depth = 0; depth < 30 && cur > 1; ++depth) {
-        std::string commPath = "/proc/" + std::to_string(cur) + "/comm";
-        std::ifstream commF(commPath);
-        std::string comm;
-        if (commF.is_open()) {
-            std::getline(commF, comm);
-            while (!comm.empty() && (comm.back() == '\r' || comm.back() == '\n' || comm.back() == ' ')) {
-                comm.pop_back();
-            }
-        }
+        std::string comm = readProcComm(cur);
         std::string cmd = readProcCmdline(cur);
         std::string commUpper = comm;
         for (auto& c : commUpper) c = toupper(static_cast<unsigned char>(c));
@@ -2132,6 +2533,7 @@ static LiveProviderSessionInfo discoverLiveProviderSession(
                     }
                 }
             }
+            info.hasCliStore = hasCliStore;
             if (!hasCliStore) {
                 info.isIdeRendererSession = true;
             }
@@ -2533,14 +2935,6 @@ bool WebServer::isValidUiSession(const httplib::Request& req) const {
     // 2. Allow requests with valid paired mobile authentication tokens
     if (isValidMobileToken(req)) {
         return true;
-    }
-
-    // 3. Allow internal telemetry hook
-    if (req.has_header("User-Agent")) {
-        std::string ua = req.get_header_value("User-Agent");
-        if (ua.find("aimon-hook") != std::string::npos && isLoopbackRequest(req)) {
-            return true;
-        }
     }
 
     return false;
@@ -3766,31 +4160,34 @@ void WebServer::setupRoutes() {
     };
 
     auto extractConversationModelById = [getCliBrainDir, getIdeBrainDir, mapModelToHumanLabel](
-                                            const std::string& conversationId) -> std::string {
+                                            const std::string& conversationId,
+                                            bool skipTranscriptScan = false) -> std::string {
         if (conversationId.empty() || conversationId == "new") {
             return "";
         }
 
         // 1. Check transcript.jsonl for explicit <USER_SETTINGS_CHANGE> Model Selection lines
-        std::string lastTranscriptModel;
-        for (const std::string& rootDir : {getCliBrainDir(), getIdeBrainDir()}) {
-            if (rootDir.empty()) continue;
-            fs::path tPath = fs::path(rootDir) / conversationId / ".system_generated" / "logs" / "transcript.jsonl";
-            if (!fs::exists(tPath)) continue;
-            std::ifstream tf(tPath);
-            std::string line;
-            while (std::getline(tf, line)) {
-                if (line.find("USER_SETTINGS_CHANGE") == std::string::npos &&
-                    line.find("Model Selection") == std::string::npos) {
-                    continue;
+        if (!skipTranscriptScan) {
+            std::string lastTranscriptModel;
+            for (const std::string& rootDir : {getCliBrainDir(), getIdeBrainDir()}) {
+                if (rootDir.empty()) continue;
+                fs::path tPath = fs::path(rootDir) / conversationId / ".system_generated" / "logs" / "transcript.jsonl";
+                if (!fs::exists(tPath)) continue;
+                std::ifstream tf(tPath);
+                std::string line;
+                while (std::getline(tf, line)) {
+                    if (line.find("USER_SETTINGS_CHANGE") == std::string::npos &&
+                        line.find("Model Selection") == std::string::npos) {
+                        continue;
+                    }
+                    std::string matched = mapModelToHumanLabel(line);
+                    if (!matched.empty()) {
+                        lastTranscriptModel = matched;
+                    }
                 }
-                std::string matched = mapModelToHumanLabel(line);
-                if (!matched.empty()) {
-                    lastTranscriptModel = matched;
+                if (!lastTranscriptModel.empty()) {
+                    return lastTranscriptModel;
                 }
-            }
-            if (!lastTranscriptModel.empty()) {
-                return lastTranscriptModel;
             }
         }
 
@@ -4236,9 +4633,13 @@ void WebServer::setupRoutes() {
     };
 
     auto handleAgentConversations = [getIdeBrainDir, getCliBrainDir, getCliPresenceDir, stripUserRequestTags,
-                                     toLowerAscii, extractConversationModelById, discoverLsEndpoints](
+                                     toLowerAscii, mapModelToHumanLabel, extractConversationModelById, discoverLsEndpoints](
                                         const httplib::Request& req, httplib::Response& res) {
+        auto reqStart = std::chrono::steady_clock::now();
+        std::string reqId = extractOrGenerateRequestId(req);
+        std::string tokenFp = computeTokenFingerprint(req);
         res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("X-Request-Id", reqId);
         size_t limit = 50;
         if (req.has_param("limit")) {
             try {
@@ -4387,6 +4788,7 @@ void WebServer::setupRoutes() {
             std::string id;
             std::string title;
             std::string source;
+            std::string status = "DONE";
             uint64_t timestamp = 0;
             bool active = false;
             bool openInTerminal = false;
@@ -4478,23 +4880,50 @@ void WebServer::setupRoutes() {
             if (seenIds.count(id)) return;
             if (!includeSubagents && subagentIds.count(id)) return;
             std::error_code ec;
-            if (!fs::exists(jsonlPath, ec) || !fs::is_regular_file(jsonlPath, ec)) return;
-            if (fs::file_size(jsonlPath, ec) == 0 || ec) return;
-
+            bool fileReady = fs::exists(jsonlPath, ec) &&
+                             fs::is_regular_file(jsonlPath, ec) &&
+                             fs::file_size(jsonlPath, ec) > 0 && !ec;
             uint64_t ts = 0;
-            try {
-                auto ftime = fs::last_write_time(jsonlPath);
-                auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                    ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
-                );
-                auto secs = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
-                if (secs > 0) ts = static_cast<uint64_t>(secs);
-            } catch (...) {}
+            if (fileReady) {
+                try {
+                    auto ftime = fs::last_write_time(jsonlPath);
+                    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+                    );
+                    auto secs = std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
+                    if (secs > 0) ts = static_cast<uint64_t>(secs);
+                } catch (...) {}
+            } else if (sourceLabel == "cursor") {
+                bool hasLiveSubagents = (cursorParentMaxSubagentTs.find(id) != cursorParentMaxSubagentTs.end());
+                nlohmann::json hookJ;
+                bool hasHook = readCursorHookStateJson(id, hookJ);
+                bool hookRunningWithPrompt = false;
+                if (hasHook && !hookJ.value("is_subagent", false) &&
+                    hookJ.value("parent_session_id", "").empty() &&
+                    hookJ.value("status", "") == "RUNNING") {
+                    std::string fp = cleanProviderUserPrompt(
+                        hookJ.value("first_prompt", hookJ.value("prompt_preview", "")));
+                    hookRunningWithPrompt = !fp.empty();
+                }
+                if (!hasLiveSubagents && !hookRunningWithPrompt) {
+                    return;
+                }
+                if (hasHook) {
+                    uint64_t upd = static_cast<uint64_t>(
+                        hookJ.value("updated_ts", hookJ.value("updated_at", hookJ.value("updated_epoch", hookJ.value("start_ts", static_cast<int64_t>(0))))));
+                    if (upd > ts) ts = upd;
+                }
+            } else {
+                return;
+            }
 
             if (sourceLabel == "cursor") {
                 auto pIt = cursorParentMaxSubagentTs.find(id);
                 if (pIt != cursorParentMaxSubagentTs.end() && pIt->second > ts) {
                     ts = pIt->second;
+                }
+                if (ts == 0) {
+                    return;
                 }
             }
 
@@ -4571,6 +5000,37 @@ void WebServer::setupRoutes() {
                     }
                 }
             }
+            // Also scan Cursor hook state dir for Turn-1 active sessions without a transcript dir yet
+            std::string hookDir = getCursorHookStateDir();
+            std::error_code hEc;
+            if (!hookDir.empty() && fs::exists(hookDir, hEc) && fs::is_directory(hookDir, hEc)) {
+                for (const auto& hEntry : fs::directory_iterator(hookDir, hEc)) {
+                    if (hEc || !hEntry.is_regular_file() || hEntry.path().extension() != ".json") continue;
+                    std::string id = hEntry.path().stem().string();
+                    if (id.empty() || id[0] == '.' || id == "agy_ls_endpoints" ||
+                        id == "current" || id == "cursor-telemetry-probe" ||
+                        id.rfind("sess-", 0) == 0 || id.rfind("agent-", 0) == 0) continue;
+                    if (seenIds.count(id)) continue;
+                    if (!includeSubagents && subagentIds.count(id)) continue;
+                    nlohmann::json hj;
+                    if (!readCursorHookStateJson(id, hj)) continue;
+                    if (hj.value("is_subagent", false) || !hj.value("parent_session_id", "").empty()) {
+                        continue;
+                    }
+                    if (hj.value("status", "") != "RUNNING") continue;
+                    std::string fp = cleanProviderUserPrompt(
+                        hj.value("first_prompt", hj.value("prompt_preview", "")));
+                    bool hasLiveSubagents = (cursorParentMaxSubagentTs.find(id) != cursorParentMaxSubagentTs.end());
+                    if (fp.empty() && !hasLiveSubagents) continue;
+                    uint64_t upd = static_cast<uint64_t>(
+                        hj.value("updated_ts", hj.value("updated_at", hj.value("updated_epoch", hj.value("start_ts", static_cast<int64_t>(0))))));
+                    if (upd == 0 || (nowSec > upd && (nowSec - upd) > 86400)) continue;
+                    std::string ws = hj.value("workspace", hj.value("workspace_path", ""));
+                    std::string slug = ws.empty() ? "" : fs::path(ws).filename().string();
+                    fs::path synthJsonl = fs::path(hookDir) / (id + ".jsonl");
+                    addProviderFileCandidate(id, synthJsonl, "cursor", slug);
+                }
+            }
         }
 
         std::sort(candidates.begin(), candidates.end(), [](const CandidateConv& a, const CandidateConv& b) {
@@ -4645,8 +5105,9 @@ void WebServer::setupRoutes() {
                 ce.id = id;
                 ce.title = title;
                 ce.source = sourceLabel;
+                ce.status = norm.status;
                 ce.timestamp = ts;
-                ce.active = (ts > 0 && nowSec >= ts && (nowSec - ts) < 120);
+                ce.active = (norm.status == "RUNNING") || (ts > 0 && nowSec >= ts && (nowSec - ts) < 120);
                 ce.openInTerminal = false;
                 ce.terminalPts = "";
                 ce.workspace = norm.workspaceShort;
@@ -4710,6 +5171,7 @@ void WebServer::setupRoutes() {
             int assistantMatchedStepIndex = -1;
             int totalStepsInTranscript = 0;
             bool isInternalSubagent = false;
+            std::string inlineTranscriptModel;
 
             if (hasTranscript) {
                 std::ifstream f(transcriptPath);
@@ -4718,6 +5180,53 @@ void WebServer::setupRoutes() {
                 int filteredIdx = 0;
                 while (std::getline(f, line)) {
                     if (line.empty()) continue;
+                    if (line.find("USER_SETTINGS_CHANGE") != std::string::npos ||
+                        line.find("Model Selection") != std::string::npos) {
+                        std::string matched = mapModelToHumanLabel(line);
+                        if (!matched.empty()) {
+                            inlineTranscriptModel = matched;
+                        }
+                    }
+                    if (queryLower.empty() && lineNum > 0 &&
+                        line.find("\"USER_INPUT\"") == std::string::npos) {
+                        int stepIdx = lineNum;
+                        auto siPos = line.find("\"step_index\"");
+                        if (siPos != std::string::npos) {
+                            auto colonPos = line.find(':', siPos + 12);
+                            if (colonPos != std::string::npos) {
+                                size_t numPos = line.find_first_of("0123456789", colonPos + 1);
+                                if (numPos != std::string::npos && numPos - colonPos <= 4) {
+                                    try {
+                                        stepIdx = std::stoi(line.substr(numPos, 10));
+                                    } catch (...) {}
+                                }
+                            }
+                        }
+                        ++lineNum;
+                        totalStepsInTranscript = std::max(totalStepsInTranscript, stepIdx + 1);
+                        auto caPos = line.find("\"created_at\"");
+                        if (caPos != std::string::npos) {
+                            auto q1 = line.find('"', caPos + 12);
+                            if (q1 != std::string::npos) {
+                                auto q2 = line.find('"', q1 + 1);
+                                if (q2 != std::string::npos && q2 > q1 + 1 && (q2 - q1) < 40) {
+                                    int64_t stepEpoch = parseIso8601ToEpochSec(line.substr(q1 + 1, q2 - q1 - 1));
+                                    if (stepEpoch > 0 && static_cast<uint64_t>(stepEpoch) > ts) {
+                                        ts = static_cast<uint64_t>(stepEpoch);
+                                    }
+                                }
+                            }
+                        }
+                        bool hasToolsFast = line.find("\"tool_calls\"") != std::string::npos &&
+                                            line.find("\"tool_calls\":[]") == std::string::npos &&
+                                            line.find("\"tool_calls\": []") == std::string::npos;
+                        if (line.find("\"PLANNER_RESPONSE\"") != std::string::npos ||
+                            line.find("\"ERROR_MESSAGE\"") != std::string::npos ||
+                            hasToolsFast) {
+                            ++filteredIdx;
+                        }
+                        continue;
+                    }
                     try {
                         auto j = nlohmann::json::parse(line, nullptr, false);
                         if (j.is_discarded() || !j.is_object()) continue;
@@ -4852,7 +5361,9 @@ void WebServer::setupRoutes() {
                 isActive = true;
             }
 
-            std::string modelLabel = extractConversationModelById(id);
+            std::string modelLabel = !inlineTranscriptModel.empty()
+                ? inlineTranscriptModel
+                : extractConversationModelById(id, hasTranscript);
             if (modelLabel.empty()) {
                 modelLabel = (sourceLabel == "cli") ? "Gemini 4 Argon (High)" : "Claude Sonnet 5.5 (High)";
             }
@@ -4891,6 +5402,7 @@ void WebServer::setupRoutes() {
             ce.id = id;
             ce.title = title;
             ce.source = sourceLabel;
+            ce.status = isActive ? "RUNNING" : "DONE";
             ce.timestamp = ts;
             ce.active = isActive;
             ce.openInTerminal = openInTerminal;
@@ -4929,6 +5441,7 @@ void WebServer::setupRoutes() {
                 {"id", collected[i].id},
                 {"title", collected[i].title},
                 {"source", collected[i].source},
+                {"status", collected[i].status},
                 {"timestamp", collected[i].timestamp},
                 {"active", collected[i].active},
                 {"openInTerminal", collected[i].openInTerminal},
@@ -4946,6 +5459,17 @@ void WebServer::setupRoutes() {
             });
         }
 
+        auto latMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - reqStart).count());
+        AgentTelemetryDb::getInstance().logDiagnostic(
+            "INFO", "mobile_http", "", "all", req.method + " " + req.path,
+            nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"remote_addr", req.remote_addr}}),
+            reqId);
+        AgentTelemetryDb::getInstance().logDiagnostic(
+            "INFO", "discovery", "", "all", "list_conversations",
+            nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"total_returned", conversations.size()}, {"include_subagents", includeSubagents}}),
+            reqId);
+
         nlohmann::json resp;
         resp["conversations"] = conversations;
         res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
@@ -4955,7 +5479,11 @@ void WebServer::setupRoutes() {
 
     _server->Get("/api/agent/transcript", [getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName, extractConversationModelById, mapLabelToCliModelId](
                                               const httplib::Request& req, httplib::Response& res) {
+        auto reqStart = std::chrono::steady_clock::now();
+        std::string reqId = extractOrGenerateRequestId(req);
+        std::string tokenFp = computeTokenFingerprint(req);
         res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("X-Request-Id", reqId);
         std::string id = req.get_param_value("id");
         if (id.empty() || id.find("..") != std::string::npos || id.find('/') != std::string::npos) {
             res.status = 400;
@@ -5017,11 +5545,22 @@ void WebServer::setupRoutes() {
             std::string providerSource;
             std::string providerSlug;
             fs::path providerPath = findProviderTranscriptById(id, providerSource, providerSlug);
-            if (!providerPath.empty() && fs::exists(providerPath)) {
+            if (!providerPath.empty()) {
                 auto parsed = parseProviderTranscriptJsonl(providerPath, providerSource, sinceIndex, providerSlug);
+                auto latMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - reqStart).count());
+                AgentTelemetryDb::getInstance().logDiagnostic(
+                    "INFO", "mobile_http", id, providerSource, "GET /api/agent/transcript",
+                    nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"since", sinceIndex}}),
+                    reqId);
+                AgentTelemetryDb::getInstance().logDiagnostic(
+                    "INFO", "transcript", id, providerSource, "load_transcript",
+                    nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"source", providerSource}, {"status", parsed.status}, {"step_count", parsed.totalSteps}}),
+                    reqId);
                 nlohmann::json resp;
                 resp["conversationId"] = id;
                 resp["source"] = providerSource;
+                resp["status"] = parsed.status;
                 resp["model"] = parsed.model;
                 resp["modelId"] = parsed.model;
                 resp["workspace"] = parsed.workspaceShort;
@@ -5559,6 +6098,17 @@ void WebServer::setupRoutes() {
             resolvedModel = extractedLabel;
         }
 
+        auto latMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - reqStart).count());
+        AgentTelemetryDb::getInstance().logDiagnostic(
+            "INFO", "mobile_http", id, source, "GET /api/agent/transcript",
+            nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"since", sinceIndex}}),
+            reqId);
+        AgentTelemetryDb::getInstance().logDiagnostic(
+            "INFO", "transcript", id, source, "load_transcript",
+            nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"source", source}, {"step_count", totalStepCount}}),
+            reqId);
+
         nlohmann::json resp;
         resp["conversationId"] = id;
         resp["source"] = source;
@@ -5571,7 +6121,11 @@ void WebServer::setupRoutes() {
 
     _server->Post("/api/agent/prompt", [getWorkspaceRoot, getCliBrainDir, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc, extractConversationModelById, mapLabelToCliModelId, toLowerAscii](
                                            const httplib::Request& req, httplib::Response& res) {
+        auto reqStart = std::chrono::steady_clock::now();
+        std::string reqId = extractOrGenerateRequestId(req);
+        std::string tokenFp = computeTokenFingerprint(req);
         res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("X-Request-Id", reqId);
         nlohmann::json j;
         try {
             j = nlohmann::json::parse(req.body);
@@ -6123,11 +6677,29 @@ void WebServer::setupRoutes() {
                 }
             }
 
+            LiveProviderSessionInfo sessionInfo;
             if (!cid.empty() && cid != "new") {
-                auto sessionInfo = discoverLiveProviderSession(targetProvider, cid, wsDir, existingTranscriptPath.string());
+                sessionInfo = discoverLiveProviderSession(targetProvider, cid, wsDir, existingTranscriptPath.string());
                 if (!sessionInfo.screenSession.empty()) {
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "router_decision", cid, targetProvider, "route_prompt",
+                        nlohmann::json({{"selected_route", "screen"}, {"owner_pid", sessionInfo.ownerPid}, {"screen_session", sessionInfo.screenSession}, {"has_cli_store", sessionInfo.hasCliStore}}),
+                        reqId);
+                    auto fwdStart = std::chrono::steady_clock::now();
                     std::string screenReply;
                     if (routePromptViaScreen(sessionInfo.screenSession, targetProvider, cid, text, existingTranscriptPath.string(), existingSlug, screenReply)) {
+                        int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - fwdStart).count());
+                        int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - reqStart).count());
+                        AgentTelemetryDb::getInstance().logDiagnostic(
+                            "INFO", "platform_forward", cid, targetProvider, "screen",
+                            nlohmann::json({{"status_code", 200}, {"duration_ms", fwdMs}, {"route", "screen"}, {"screen_session", sessionInfo.screenSession}}),
+                            reqId);
+                        AgentTelemetryDb::getInstance().logDiagnostic(
+                            "INFO", "mobile_http", cid, targetProvider, "POST /api/agent/prompt",
+                            nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "screen"}}),
+                            reqId);
                         res.set_content(nlohmann::json({
                             {"status", "ok"},
                             {"agentId", targetProvider},
@@ -6140,6 +6712,12 @@ void WebServer::setupRoutes() {
                         }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                         return;
                     } else {
+                        int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - fwdStart).count());
+                        AgentTelemetryDb::getInstance().logDiagnostic(
+                            "ERROR", "platform_forward", cid, targetProvider, "screen",
+                            nlohmann::json({{"status_code", 504}, {"duration_ms", fwdMs}, {"route", "screen"}, {"screen_session", sessionInfo.screenSession}, {"error", "timeout"}}),
+                            reqId);
                         res.status = 504;
                         res.set_content(nlohmann::json({
                             {"status", "error"},
@@ -6151,8 +6729,25 @@ void WebServer::setupRoutes() {
                 }
 
                 if (targetProvider == "cursor") {
+                    auto fwdStart = std::chrono::steady_clock::now();
                     std::string bridgeReply;
                     if (routePromptViaIdeBridge(cid, text, existingTranscriptPath.string(), existingSlug, bridgeReply)) {
+                        int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - fwdStart).count());
+                        int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - reqStart).count());
+                        AgentTelemetryDb::getInstance().logDiagnostic(
+                            "INFO", "router_decision", cid, "cursor", "route_prompt",
+                            nlohmann::json({{"selected_route", "ide_bridge"}, {"has_cli_store", sessionInfo.hasCliStore}}),
+                            reqId);
+                        AgentTelemetryDb::getInstance().logDiagnostic(
+                            "INFO", "platform_forward", cid, "cursor", "ide_bridge",
+                            nlohmann::json({{"status_code", 200}, {"duration_ms", fwdMs}, {"route", "ide_bridge"}}),
+                            reqId);
+                        AgentTelemetryDb::getInstance().logDiagnostic(
+                            "INFO", "mobile_http", cid, "cursor", "POST /api/agent/prompt",
+                            nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "ide_bridge"}}),
+                            reqId);
                         res.set_content(nlohmann::json({
                             {"status", "ok"},
                             {"agentId", "cursor"},
@@ -6164,45 +6759,149 @@ void WebServer::setupRoutes() {
                         }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                         return;
                     }
-
-                    if (sessionInfo.isIdeRendererSession) {
-                        res.status = 409;
-                        res.set_content(nlohmann::json({
-                            {"status", "error"},
-                            {"error", "Session is currently active in a desktop IDE or non-screen terminal that does not allow headless CLI --resume injection without forking conversation state. Start the CLI agent inside GNU screen for live bidirectional routing."},
-                            {"conversationId", cid}
-                        }).dump(2), "application/json");
-                        return;
-                    }
-                }
-
-                if (sessionInfo.ownerPid > 0) {
-                    res.status = 409;
-                    res.set_content(nlohmann::json({
-                        {"status", "error"},
-                        {"error", "Session is currently active in a desktop IDE or non-screen terminal that does not allow headless CLI --resume injection without forking conversation state. Start the CLI agent inside GNU screen for live bidirectional routing."},
-                        {"conversationId", cid}
-                    }).dump(2), "application/json");
-                    return;
                 }
             }
 
+            bool isOlderCursorWithoutStore = (targetProvider == "cursor" && !cid.empty() && cid != "new" && !sessionInfo.hasCliStore);
+            std::string selectedRoute = isOlderCursorWithoutStore ? "cli_resume_with_context" : "cli_print";
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "INFO", "router_decision", cid, targetProvider, "route_prompt",
+                nlohmann::json({
+                    {"selected_route", selectedRoute},
+                    {"owner_pid", sessionInfo.ownerPid},
+                    {"has_cli_store", sessionInfo.hasCliStore},
+                    {"is_ide_renderer", sessionInfo.isIdeRendererSession}
+                }),
+                reqId);
+
+            std::vector<std::string> priorCursorLines;
+            std::string cliPromptText = text;
+            if (isOlderCursorWithoutStore && !existingTranscriptPath.empty() && fs::exists(existingTranscriptPath)) {
+                {
+                    std::ifstream pf(existingTranscriptPath);
+                    std::string pl;
+                    while (std::getline(pf, pl)) {
+                        if (!pl.empty()) priorCursorLines.push_back(pl);
+                    }
+                }
+                auto parsedHistory = parseProviderTranscriptJsonl(
+                    existingTranscriptPath, "cursor", -1, existingSlug, false);
+                if (!parsedHistory.steps.empty()) {
+                    std::string ctxBlock = "[Prior Conversation Context in this Session]\n";
+                    size_t startStep = (parsedHistory.steps.size() > 8) ? (parsedHistory.steps.size() - 8) : 0;
+                    for (size_t si = startStep; si < parsedHistory.steps.size(); ++si) {
+                        const auto& stObj = parsedHistory.steps[si];
+                        std::string sType = stObj.value("type", "");
+                        std::string sTxt = stObj.value("text", stObj.value("content", ""));
+                        if (sTxt.empty()) continue;
+                        if (sTxt.size() > 1500) {
+                            sTxt = sTxt.substr(0, 1500) + "...";
+                        }
+                        std::string roleHdr = (sType == "USER_INPUT") ? "User: " : "Assistant: ";
+                        if (ctxBlock.size() + roleHdr.size() + sTxt.size() + 2 > 12288) break;
+                        ctxBlock += roleHdr + sTxt + "\n";
+                    }
+                    ctxBlock += "[End Prior Conversation Context]\n\nUser request:\n" + text;
+                    cliPromptText = ctxBlock;
+                }
+            }
+
+            auto fwdStart = std::chrono::steady_clock::now();
             std::string rawOut;
             std::string replyText;
             std::string resolvedCid;
-            if (!runProviderCli(text, cid, extraCliArgs, rawOut, replyText, resolvedCid)) {
+            if (!runProviderCli(cliPromptText, cid, extraCliArgs, rawOut, replyText, resolvedCid)) {
+                int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - fwdStart).count());
+                AgentTelemetryDb::getInstance().logDiagnostic(
+                    "ERROR", "platform_forward", cid, targetProvider, selectedRoute,
+                    nlohmann::json({{"status_code", 500}, {"duration_ms", fwdMs}, {"route", selectedRoute}, {"error", "fork_failed"}}),
+                    reqId);
                 res.status = 500;
                 res.set_content("{\"status\":\"error\",\"error\":\"Failed to fork provider CLI\"}", "application/json");
                 return;
             }
-            if (resolvedCid.empty()) {
-                resolvedCid = "new";
+            if (isOlderCursorWithoutStore &&
+                (replyText.empty() ||
+                 rawOut.find("No chat found") != std::string::npos ||
+                 rawOut.find("not found") != std::string::npos)) {
+                runProviderCli(cliPromptText, "", extraCliArgs, rawOut, replyText, resolvedCid);
+                resolvedCid = cid;
             }
+            if (isOlderCursorWithoutStore && !cid.empty() && cid != "new") {
+                resolvedCid = cid;
+                if (!existingTranscriptPath.empty()) {
+                    std::vector<std::string> curLines;
+                    if (fs::exists(existingTranscriptPath)) {
+                        std::ifstream cf(existingTranscriptPath);
+                        std::string cl;
+                        while (std::getline(cf, cl)) {
+                            if (!cl.empty()) curLines.push_back(cl);
+                        }
+                    }
+                    std::vector<std::string> mergedLines = priorCursorLines;
+                    bool prefixPreserved = (curLines.size() >= priorCursorLines.size());
+                    if (prefixPreserved) {
+                        for (size_t i = 0; i < priorCursorLines.size(); ++i) {
+                            if (curLines[i] != priorCursorLines[i]) {
+                                prefixPreserved = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (prefixPreserved) {
+                        for (size_t i = priorCursorLines.size(); i < curLines.size(); ++i) {
+                            mergedLines.push_back(curLines[i]);
+                        }
+                    }
+                    if (mergedLines.size() == priorCursorLines.size()) {
+                        nlohmann::json uLine = {
+                            {"role", "user"},
+                            {"message", {{"content", nlohmann::json::array({{{"type", "text"}, {"text", "<user_query>\n" + text + "\n</user_query>"}}})}}}
+                        };
+                        mergedLines.push_back(uLine.dump());
+                        if (!replyText.empty()) {
+                            nlohmann::json aLine = {
+                                {"role", "assistant"},
+                                {"message", {{"model", activeModel}, {"content", nlohmann::json::array({{{"type", "text"}, {"text", replyText}}})}}}
+                            };
+                            mergedLines.push_back(aLine.dump());
+                            mergedLines.push_back("{\"type\":\"turn_ended\",\"status\":\"success\"}");
+                        }
+                    }
+                    std::string tmpPath = existingTranscriptPath.string() + ".tmp";
+                    {
+                        std::ofstream tf(tmpPath, std::ios::trunc);
+                        for (const auto& ml : mergedLines) {
+                            tf << ml << "\n";
+                        }
+                    }
+                    chmod(tmpPath.c_str(), 0600);
+                    std::error_code renEc;
+                    fs::rename(tmpPath, existingTranscriptPath, renEc);
+                }
+            }
+            if (resolvedCid.empty()) {
+                resolvedCid = (!cid.empty() && cid != "new") ? cid : "new";
+            }
+            int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - fwdStart).count());
+            int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - reqStart).count());
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "INFO", "platform_forward", resolvedCid, targetProvider, selectedRoute,
+                nlohmann::json({{"status_code", 200}, {"duration_ms", fwdMs}, {"route", selectedRoute}, {"conversation_id", resolvedCid}}),
+                reqId);
+            AgentTelemetryDb::getInstance().logDiagnostic(
+                "INFO", "mobile_http", resolvedCid, targetProvider, "POST /api/agent/prompt",
+                nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", selectedRoute}}),
+                reqId);
             res.set_content(nlohmann::json({
                 {"status", "ok"},
                 {"agentId", targetProvider},
                 {"source", targetProvider},
                 {"conversationId", resolvedCid},
+                {"routedVia", selectedRoute},
                 {"autoApprove", autoApprove},
                 {"response", replyText}
             }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
@@ -6826,6 +7525,20 @@ void WebServer::setupRoutes() {
                 }
                 std::string interactionOut;
                 if (tryHandleWaitingAskQuestion(ep, cid, interactionOut)) {
+                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - reqStart).count());
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "router_decision", cid, "antigravity", "route_prompt",
+                        nlohmann::json({{"selected_route", "connect_rpc_interaction"}, {"port", ep.port}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "platform_forward", cid, "antigravity", "connect_rpc_interaction",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "connect_rpc_interaction"}, {"port", ep.port}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "connect_rpc_interaction"}}),
+                        reqId);
                     nlohmann::json resp;
                     resp["status"] = "dispatched";
                     resp["interactionHandled"] = true;
@@ -6840,6 +7553,20 @@ void WebServer::setupRoutes() {
                 if (isLockedByRunningAgy || endpointOwnsConversation(ep, cid, reachable)) {
                     std::string rpcOut;
                     if (sendRpcCascadeMessage(ep, cid, rpcOut)) {
+                        int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - reqStart).count());
+                        AgentTelemetryDb::getInstance().logDiagnostic(
+                            "INFO", "router_decision", cid, "antigravity", "route_prompt",
+                            nlohmann::json({{"selected_route", "connect_rpc"}, {"port", ep.port}}),
+                            reqId);
+                        AgentTelemetryDb::getInstance().logDiagnostic(
+                            "INFO", "platform_forward", cid, "antigravity", "connect_rpc",
+                            nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "connect_rpc"}, {"port", ep.port}}),
+                            reqId);
+                        AgentTelemetryDb::getInstance().logDiagnostic(
+                            "INFO", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
+                            nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "connect_rpc"}}),
+                            reqId);
                         nlohmann::json resp;
                         resp["status"] = "dispatched";
                         resp["agentId"] = agentId;
@@ -6860,6 +7587,20 @@ void WebServer::setupRoutes() {
                 std::string rpcOut;
                 if (startRpcNewCascade(*firstReachableEp, newCid) &&
                     sendRpcCascadeMessage(*firstReachableEp, newCid, rpcOut)) {
+                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - reqStart).count());
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "router_decision", newCid, "antigravity", "route_prompt",
+                        nlohmann::json({{"selected_route", "connect_rpc_new"}, {"port", firstReachableEp->port}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "platform_forward", newCid, "antigravity", "connect_rpc_new",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "connect_rpc_new"}, {"port", firstReachableEp->port}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "mobile_http", newCid, "antigravity", "POST /api/agent/prompt",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "connect_rpc_new"}}),
+                        reqId);
                     nlohmann::json resp;
                     resp["status"] = "dispatched";
                     resp["agentId"] = agentId;
@@ -6877,6 +7618,20 @@ void WebServer::setupRoutes() {
                 std::string newCid;
                 std::string rpcOut;
                 if (startRpcNewCascade(ep, newCid) && sendRpcCascadeMessage(ep, newCid, rpcOut)) {
+                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - reqStart).count());
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "router_decision", newCid, "antigravity", "route_prompt",
+                        nlohmann::json({{"selected_route", "connect_rpc_new"}, {"port", ep.port}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "platform_forward", newCid, "antigravity", "connect_rpc_new",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "connect_rpc_new"}, {"port", ep.port}}),
+                        reqId);
+                    AgentTelemetryDb::getInstance().logDiagnostic(
+                        "INFO", "mobile_http", newCid, "antigravity", "POST /api/agent/prompt",
+                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "connect_rpc_new"}}),
+                        reqId);
                     nlohmann::json resp;
                     resp["status"] = "dispatched";
                     resp["agentId"] = agentId;
@@ -8414,6 +9169,187 @@ void WebServer::stop() {
         _thread->join();
         _thread.reset();
     }
+}
+
+nlohmann::json WebServer::diagnoseSessions(const std::string& providerFilter) {
+    auto& db = AgentTelemetryDb::getInstance();
+    nlohmann::json dbSessions = db.querySessions(50);
+    std::set<std::string> candidateIds;
+    if (dbSessions.is_array()) {
+        for (const auto& s : dbSessions) {
+            if (!s.is_object()) continue;
+            std::string cid = s.value("conversation_id", "");
+            std::string prov = s.value("agent_type", "");
+            if (!providerFilter.empty() && prov != providerFilter) continue;
+            if (!cid.empty()) candidateIds.insert(cid);
+        }
+    }
+
+    if (providerFilter.empty() || providerFilter == "cursor") {
+        std::string cursorRoot = getCursorProjectsDir();
+        std::error_code ec;
+        if (!cursorRoot.empty() && fs::exists(cursorRoot, ec) && fs::is_directory(cursorRoot, ec)) {
+            for (const auto& projEntry : fs::directory_iterator(cursorRoot, ec)) {
+                if (ec || !projEntry.is_directory()) continue;
+                fs::path transDir = projEntry.path() / "agent-transcripts";
+                std::error_code tEc;
+                if (!fs::exists(transDir, tEc) || !fs::is_directory(transDir, tEc)) continue;
+                for (const auto& convEntry : fs::directory_iterator(transDir, tEc)) {
+                    if (tEc || !convEntry.is_directory()) continue;
+                    std::string id = convEntry.path().filename().string();
+                    if (!id.empty() && id[0] != '.' && id != "subagents") {
+                        candidateIds.insert(id);
+                    }
+                }
+            }
+        }
+        std::string hookDir = getCursorHookStateDir();
+        if (!hookDir.empty() && fs::exists(hookDir, ec) && fs::is_directory(hookDir, ec)) {
+            for (const auto& hEntry : fs::directory_iterator(hookDir, ec)) {
+                if (ec || !hEntry.is_regular_file() || hEntry.path().extension() != ".json") continue;
+                std::string id = hEntry.path().stem().string();
+                if (!id.empty() && id[0] != '.' && id != "agy_ls_endpoints" &&
+                    id != "current" && id != "cursor-telemetry-probe" &&
+                    id.rfind("sess-", 0) != 0 && id.rfind("agent-", 0) != 0) {
+                    candidateIds.insert(id);
+                }
+            }
+        }
+    }
+
+    if (providerFilter.empty() || providerFilter == "claude") {
+        std::string claudeRoot = getClaudeProjectsDir();
+        std::error_code ec;
+        if (!claudeRoot.empty() && fs::exists(claudeRoot, ec) && fs::is_directory(claudeRoot, ec)) {
+            for (const auto& projEntry : fs::directory_iterator(claudeRoot, ec)) {
+                if (ec || !projEntry.is_directory()) continue;
+                std::error_code fEc;
+                for (const auto& fEntry : fs::directory_iterator(projEntry.path(), fEc)) {
+                    if (fEc || !fEntry.is_regular_file() || fEntry.path().extension() != ".jsonl") continue;
+                    std::string id = fEntry.path().stem().string();
+                    if (!id.empty() && id[0] != '.') {
+                        candidateIds.insert(id);
+                    }
+                }
+            }
+        }
+    }
+
+    nlohmann::json inspected = nlohmann::json::array();
+    for (const auto& cid : candidateIds) {
+        auto item = inspectSession(cid);
+        if (!providerFilter.empty() && item.value("provider", "") != providerFilter) {
+            continue;
+        }
+        inspected.push_back(std::move(item));
+        if (inspected.size() >= 50) break;
+    }
+
+    return nlohmann::json({
+        {"ok", true},
+        {"provider_filter", providerFilter},
+        {"count", inspected.size()},
+        {"sessions", std::move(inspected)}
+    });
+}
+
+nlohmann::json WebServer::inspectSession(const std::string& conversationId) {
+    if (!AgentTelemetryDb::isValidSessionId(conversationId)) {
+        return nlohmann::json({
+            {"ok", false},
+            {"error", "Invalid conversation ID"},
+            {"conversation_id", conversationId}
+        });
+    }
+
+    auto& db = AgentTelemetryDb::getInstance();
+    nlohmann::json sessionRec = db.querySessionRecord(conversationId);
+    nlohmann::json events = db.querySessionEvents(conversationId);
+    nlohmann::json diagLogs = db.queryDiagnostics(50, conversationId);
+
+    std::string provSource;
+    std::string provSlug;
+    fs::path provFile = findProviderTranscriptById(conversationId, provSource, provSlug);
+    if (provSource.empty() && !sessionRec.empty()) {
+        provSource = sessionRec.value("agent_type", "antigravity");
+    }
+    if (provSource.empty()) {
+        provSource = "antigravity";
+    }
+
+    std::error_code ec;
+    bool parentJsonlExists = !provFile.empty() && fs::exists(provFile, ec) &&
+                             fs::is_regular_file(provFile, ec) &&
+                             fs::file_size(provFile, ec) > 0;
+    nlohmann::json hookJson;
+    bool hookStateExists = readCursorHookStateJson(conversationId, hookJson);
+
+    NormalizedProviderTranscript parsed;
+    if (!provFile.empty() && (provSource == "cursor" || provSource == "claude")) {
+        parsed = parseProviderTranscriptJsonl(provFile, provSource, -1, provSlug, false);
+    }
+
+    LiveProviderSessionInfo liveInfo;
+    if (provSource == "cursor" || provSource == "claude") {
+        liveInfo = discoverLiveProviderSession(
+            provSource, conversationId, parsed.workspacePath, provFile.string());
+    }
+
+    nlohmann::json subagentFiles = nlohmann::json::array();
+    if (!provFile.empty()) {
+        fs::path subDir = (provSource == "cursor")
+            ? (provFile.parent_path() / "subagents")
+            : (provFile.parent_path() / provFile.stem() / "subagents");
+        std::error_code sEc;
+        if (!fs::exists(subDir, sEc) && provSource == "cursor") {
+            std::string cursorRoot = getCursorProjectsDir();
+            if (!cursorRoot.empty() && fs::exists(cursorRoot, sEc) && fs::is_directory(cursorRoot, sEc)) {
+                for (const auto& projEntry : fs::directory_iterator(cursorRoot, sEc)) {
+                    if (sEc || !projEntry.is_directory()) continue;
+                    fs::path altSub = projEntry.path() / "agent-transcripts" / conversationId / "subagents";
+                    if (fs::exists(altSub, sEc) && fs::is_directory(altSub, sEc)) {
+                        subDir = altSub;
+                        break;
+                    }
+                }
+            }
+        }
+        if (fs::exists(subDir, sEc) && fs::is_directory(subDir, sEc)) {
+            for (const auto& se : fs::directory_iterator(subDir, sEc)) {
+                if (!sEc && se.is_regular_file() && se.path().extension() == ".jsonl") {
+                    subagentFiles.push_back(se.path().filename().string());
+                }
+            }
+        }
+    }
+
+    size_t subCount = subagentFiles.size();
+    return nlohmann::json({
+        {"ok", true},
+        {"conversation_id", conversationId},
+        {"provider", provSource},
+        {"status", parsed.hasValidTurns ? parsed.status : sessionRec.value("status", "UNKNOWN")},
+        {"workspace", !parsed.workspacePath.empty() ? parsed.workspacePath : sessionRec.value("workspace_path", sessionRec.value("workspace", ""))},
+        {"model", !parsed.model.empty() ? parsed.model : sessionRec.value("model_name", sessionRec.value("model", ""))},
+        {"parent_jsonl_path", provFile.string()},
+        {"parent_jsonl_exists", parentJsonlExists},
+        {"hook_state_exists", hookStateExists},
+        {"has_cli_store", liveInfo.hasCliStore},
+        {"is_ide_renderer", liveInfo.isIdeRendererSession},
+        {"owner_pid", liveInfo.ownerPid},
+        {"screen_session", liveInfo.screenSession},
+        {"step_count", parsed.totalSteps},
+        {"subagent_files", subagentFiles},
+        {"transcript", {
+            {"step_count", parsed.totalSteps},
+            {"subagent_file_count", subCount},
+            {"parent_jsonl_path", provFile.string()},
+            {"parent_jsonl_exists", parentJsonlExists}
+        }},
+        {"session_record", std::move(sessionRec)},
+        {"lifecycle_events", std::move(events)},
+        {"diagnostic_logs", std::move(diagLogs)}
+    });
 }
 
 } // namespace aimon

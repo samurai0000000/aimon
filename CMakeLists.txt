@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aimon VERSION 1.3.5 LANGUAGES CXX)
+project(aimon VERSION 1.3.6 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,6 +71,7 @@ set(LIB_SOURCES
     src/ConfigManager.cxx
     src/HistoryStore.cxx
     src/AgentTelemetryDb.cxx
+    src/AgentHookHandler.cxx
     src/MobileGateway.cxx
     src/StateStore.cxx
     src/AntigravityCollector.cxx
@@ -147,6 +148,7 @@ target_link_libraries(test_gateway_timeout PRIVATE
 add_executable(test_agent_telemetry_db
     test/TestAgentTelemetryDb.cxx
     src/AgentTelemetryDb.cxx
+    src/AgentHookHandler.cxx
     src/PathUtils.cxx
 )
 

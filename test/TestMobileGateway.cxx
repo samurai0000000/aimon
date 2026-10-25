@@ -2720,14 +2720,18 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
     std::string mockAgentBin = binDir + "/agent";
     {
         std::ofstream af(mockAgentBin);
-        af << "#!/bin/bash\nexit 0\n";
+        af << "#!/bin/bash\n"
+           << "echo '{\"type\":\"result\",\"result\":\"ACK-CLI-CURSOR-OK\",\"session_id\":\"ba472c97-57a4-4264-9d8f-6065fd61e174\"}'\n"
+           << "exit 0\n";
         af.close();
         chmod(mockAgentBin.c_str(), 0755);
     }
     std::string mockClaudeBin = binDir + "/claude";
     {
         std::ofstream cf(mockClaudeBin);
-        cf << "#!/bin/bash\nexit 0\n";
+        cf << "#!/bin/bash\n"
+           << "echo '{\"type\":\"result\",\"result\":\"ACK-CLI-CLAUDE-OK\",\"session_id\":\"d0001111-2222-3333-4444-555566667777\"}'\n"
+           << "exit 0\n";
         cf.close();
         chmod(mockClaudeBin.c_str(), 0755);
     }
@@ -2818,7 +2822,7 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
         assert(rj.value("response", "").find("ACK-SCREEN-CLAUDE-OK") != std::string::npos);
     }
 
-    // 3. Boundary / Fault test: Renderer-owned Cursor IDE session refuses --resume (returns 409)
+    // 3. Renderer-owned Cursor IDE session without store.db succeeds via CLI with preserved prior transcript
     unsetenv("AIMON_SCREEN_SESSION_OVERRIDE");
     std::string ideCid = "ba472c97-57a4-4264-9d8f-6065fd61e174";
     std::string ideTransDir = cursorProjects + "/amba-virt/agent-transcripts/" + ideCid;
@@ -2840,30 +2844,32 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
             {"text", "Do not corrupt me"}
         };
         auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
-        assert(res && res->status == 409);
+        assert(res && res->status == 200);
         json rj = json::parse(res->body);
-        assert(rj.value("status", "") == "error");
-        assert(rj.value("error", "").find("desktop IDE or non-screen terminal") != std::string::npos);
+        assert(rj.value("status", "") == "ok");
+        assert(rj.value("response", "").find("ACK-CLI-CURSOR-OK") != std::string::npos);
 
         std::ifstream checkIn(ideJsonl);
         std::string curContent((std::istreambuf_iterator<char>(checkIn)),
                                 std::istreambuf_iterator<char>());
-        assert(curContent == origIdeContent);
+        assert(curContent.find(origIdeContent) == 0);
+        assert(curContent.find("Do not corrupt me") != std::string::npos);
+        assert(curContent.find("ACK-CLI-CURSOR-OK") != std::string::npos);
     }
 
-    // 4. Fault test: Live non-screen owning process (ownerPid > 0) returns 409
+    // 4. Live non-screen owning process (ownerPid > 0) falls back to CLI --resume without 409 block
     setenv("AIMON_LIVE_OWNER_PID_OVERRIDE", "999999", 1);
     {
         json req = {
             {"agentId", "claude"},
             {"conversationId", claudeCid},
-            {"text", "Live process refusal"}
+            {"text", "Live process fallback"}
         };
         auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
-        assert(res && res->status == 409);
+        assert(res && res->status == 200);
         json rj = json::parse(res->body);
-        assert(rj.value("status", "") == "error");
-        assert(rj.value("error", "").find("desktop IDE or non-screen terminal") != std::string::npos);
+        assert(rj.value("status", "") == "ok");
+        assert(rj.value("response", "").find("ACK-CLI-CLAUDE-OK") != std::string::npos);
     }
     unsetenv("AIMON_LIVE_OWNER_PID_OVERRIDE");
 
@@ -2885,6 +2891,506 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
     std::cout << "[TestMobileGateway] testLiveScreenSessionRoutingAndIdeSessionProtection passed!" << std::endl;
 }
 
+static void Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversationsAndTranscript() {
+    std::cout << "[TestMobileGateway] Running Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversationsAndTranscript..." << std::endl;
+
+    std::string baseDir = "/tmp/test_turn1_cursor_" + std::to_string(getpid());
+    fs::remove_all(baseDir);
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliBrain = baseDir + "/cli_brain";
+    std::string claudeProjects = baseDir + "/claude_projects";
+    std::string cursorProjects = baseDir + "/cursor_projects";
+    std::string cursorChats = baseDir + "/cursor_chats";
+    std::string cursorHookState = baseDir + "/cursor_hook_state";
+    std::string wsRoot = baseDir + "/work";
+
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+    fs::create_directories(claudeProjects);
+    fs::create_directories(cursorProjects);
+    fs::create_directories(cursorChats);
+    fs::create_directories(cursorHookState);
+    fs::create_directories(wsRoot + "/aimon");
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_CLAUDE_PROJECTS_DIR", claudeProjects.c_str(), 1);
+    setenv("AIMON_CURSOR_PROJECTS_DIR", cursorProjects.c_str(), 1);
+    setenv("AIMON_CURSOR_CHATS_DIR", cursorChats.c_str(), 1);
+    setenv("AIMON_CURSOR_HOOK_STATE_DIR", cursorHookState.c_str(), 1);
+    setenv("AIMON_WORKSPACE_ROOT", wsRoot.c_str(), 1);
+
+    // Parent Turn-1 Cursor session: directory exists with subagents/*.jsonl, NO parent <cid>.jsonl
+    std::string turn1Cid = "c0ffee11-2222-3333-4444-555566667777";
+    std::string subDir = cursorProjects + "/home-samurai-work-aimon/agent-transcripts/" + turn1Cid + "/subagents";
+    fs::create_directories(subDir);
+
+    std::string subAId = "subagent-a111-2222-3333-444455556666";
+    {
+        std::ofstream sf(subDir + "/" + subAId + ".jsonl");
+        sf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Subagent A task\"}]}}\n"
+           << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Subagent A findings\"}]}}\n";
+    }
+    std::string subBId = "subagent-b111-2222-3333-444455556666";
+    {
+        std::ofstream sf(subDir + "/" + subBId + ".jsonl");
+        sf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Subagent B task\"}]}}\n"
+           << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Subagent B findings\"}]}}\n";
+    }
+
+    // Hook state for Turn-1 parent session (note: even if is_subagent was polluted true by subagentStart,
+    // presence of subagents/ and RUNNING status must keep it as a main session)
+    int64_t nowEpoch = static_cast<int64_t>(std::time(nullptr));
+    {
+        std::ofstream hf(cursorHookState + "/" + turn1Cid + ".json");
+        json hj = {
+            {"conversation_id", turn1Cid},
+            {"status", "RUNNING"},
+            {"is_subagent", true},
+            {"model", "claude-4.6-opus-max-thinking"},
+            {"workspace_path", wsRoot + "/aimon"},
+            {"first_prompt", "Turn 1 live prompt"},
+            {"last_prompt", "Turn 1 live prompt"},
+            {"updated_epoch", nowEpoch}
+        };
+        hf << hj.dump(2);
+    }
+    {
+        std::ofstream hjf(cursorHookState + "/" + turn1Cid + ".jsonl");
+        hjf << "{\"role\":\"user\",\"timestamp\":" << nowEpoch
+            << ",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Turn 1 live prompt\"}]}}\n";
+    }
+
+    // Record in AgentTelemetryDb as well
+    auto& db = AgentTelemetryDb::getInstance();
+    db.recordSessionStart(
+        turn1Cid, turn1Cid, "cursor",
+        wsRoot + "/aimon", "claude-4.6-opus-max-thinking",
+        nowEpoch
+    );
+
+    // Also create a real standalone subagent session and orphan hook state files that MUST remain excluded
+    std::string realSubCid = "deadbeef-0000-1111-2222-333344445555";
+    {
+        std::ofstream hf(cursorHookState + "/" + realSubCid + ".json");
+        json hj = {
+            {"conversation_id", realSubCid},
+            {"status", "DONE"},
+            {"is_subagent", true},
+            {"updated_epoch", nowEpoch}
+        };
+        hf << hj.dump(2);
+    }
+    std::string orphanHookCid = "0c9cb9a0-0be5-43c2-8c99-60ad38f6dbfe";
+    {
+        std::ofstream hf(cursorHookState + "/" + orphanHookCid + ".json");
+        json hj = {
+            {"session_id", orphanHookCid},
+            {"workspace", wsRoot + "/aimon"},
+            {"model", "unknown"},
+            {"start_ts", nowEpoch},
+            {"step", 6},
+            {"tools", 1},
+            {"turns", 5}
+        };
+        hf << hj.dump(2);
+    }
+    {
+        std::ofstream hf(cursorHookState + "/sess-probeagy.json");
+        json hj = {
+            {"session_id", "sess-probeagy"},
+            {"workspace", wsRoot + "/aimon"},
+            {"status", "RUNNING"},
+            {"start_ts", nowEpoch}
+        };
+        hf << hj.dump(2);
+    }
+
+    StateStore& stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 0;
+    cfg.endpointsEnabled = false;
+    WebServer server(stateStore, historyStore, cfg);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    MobileGateway& gw = MobileGateway::getInstance();
+    std::string mobileFile = baseDir + "/mobile.json";
+    assert(gw.init(mobileFile));
+    std::string secret = gw.createPairingSecret(120);
+    std::string token;
+    assert(gw.verifyPairingCode(secret, "dev-turn1", "Pixel 9", token));
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", token}};
+
+    // 1. Verify GET /api/agent/conversations?agent=cursor includes turn1Cid and excludes realSubCid
+    {
+        auto res = client.Get("/api/agent/conversations?agent=cursor", headers);
+        assert(res && res->status == 200);
+        json rj = json::parse(res->body);
+        assert(rj.contains("conversations") && rj["conversations"].is_array());
+        bool foundTurn1 = false;
+        bool foundRealSub = false;
+        for (const auto& c : rj["conversations"]) {
+            std::string cid = c.value("id", "");
+            if (cid == turn1Cid) {
+                foundTurn1 = true;
+                assert(c.value("active", false) == true);
+                assert(c.value("status", "") == "RUNNING");
+                assert(c.value("stepCount", 0) >= 3);
+                assert(c.value("firstPrompt", "") == "Turn 1 live prompt");
+            }
+            if (cid == realSubCid || cid == subAId || cid == subBId ||
+                cid == orphanHookCid || cid == "sess-probeagy") {
+                foundRealSub = true;
+            }
+            assert(c.value("title", "").find("Active Cursor IDE session in ") == std::string::npos);
+        }
+        assert(foundTurn1);
+        assert(!foundRealSub);
+    }
+
+    // 2. Verify GET /api/agent/transcript?id=<turn1Cid>&agent=cursor returns synthesized parent + subagent steps
+    {
+        auto res = client.Get(("/api/agent/transcript?id=" + turn1Cid + "&agent=cursor").c_str(), headers);
+        assert(res && res->status == 200);
+        json rj = json::parse(res->body);
+        assert(rj.value("conversationId", "") == turn1Cid);
+        assert(rj.value("status", "") == "RUNNING");
+        assert(rj.value("stepCount", 0) >= 3);
+        const auto& steps = rj["steps"];
+        assert(steps.is_array() && steps.size() >= 3);
+        assert(steps[0].value("type", "") == "USER_INPUT");
+        assert(steps[0].value("text", "") == "Turn 1 live prompt");
+        bool sawSubagentStep = false;
+        for (size_t i = 1; i < steps.size(); ++i) {
+            if (steps[i].value("isSubagentStep", false)) {
+                sawSubagentStep = true;
+                assert(!steps[i].value("subagentId", "").empty());
+            }
+        }
+        assert(sawSubagentStep);
+    }
+
+    // 3. Verify WebServer::diagnoseSessions and WebServer::inspectSession
+    {
+        json diagList = WebServer::diagnoseSessions("cursor");
+        assert(diagList.value("ok", false) == true);
+        assert(diagList["sessions"].is_array() && !diagList["sessions"].empty());
+
+        json inspected = WebServer::inspectSession(turn1Cid);
+        assert(inspected.value("ok", false) == true);
+        assert(inspected.value("provider", "") == "cursor");
+        assert(inspected["transcript"].value("step_count", 0) >= 3);
+        assert(inspected["transcript"].value("subagent_file_count", 0) == 2);
+    }
+
+    server.stop();
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_CLAUDE_PROJECTS_DIR");
+    unsetenv("AIMON_CURSOR_PROJECTS_DIR");
+    unsetenv("AIMON_CURSOR_CHATS_DIR");
+    unsetenv("AIMON_CURSOR_HOOK_STATE_DIR");
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversationsAndTranscript passed!" << std::endl;
+}
+
+static void OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorTranscript() {
+    std::cout << "[TestMobileGateway] Running OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorTranscript..." << std::endl;
+
+    std::string baseDir = "/tmp/test_older_cursor_" + std::to_string(getpid());
+    fs::remove_all(baseDir);
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliBrain = baseDir + "/cli_brain";
+    std::string claudeProjects = baseDir + "/claude_projects";
+    std::string cursorProjects = baseDir + "/cursor_projects";
+    std::string cursorChats = baseDir + "/cursor_chats";
+    std::string cursorHookState = baseDir + "/cursor_hook_state";
+    std::string wsRoot = baseDir + "/work";
+    std::string binDir = baseDir + "/bin";
+
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+    fs::create_directories(claudeProjects);
+    fs::create_directories(cursorProjects);
+    fs::create_directories(cursorChats);
+    fs::create_directories(cursorHookState);
+    fs::create_directories(wsRoot + "/aimon");
+    fs::create_directories(binDir);
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_CLAUDE_PROJECTS_DIR", claudeProjects.c_str(), 1);
+    setenv("AIMON_CURSOR_PROJECTS_DIR", cursorProjects.c_str(), 1);
+    setenv("AIMON_CURSOR_CHATS_DIR", cursorChats.c_str(), 1);
+    setenv("AIMON_CURSOR_HOOK_STATE_DIR", cursorHookState.c_str(), 1);
+    setenv("AIMON_WORKSPACE_ROOT", wsRoot.c_str(), 1);
+
+    std::string oldCid = "a1b2c3d4-e5f6-4789-abcd-ef0123456789";
+    std::string transDir = cursorProjects + "/home-samurai-work-aimon/agent-transcripts/" + oldCid;
+    fs::create_directories(transDir);
+    std::string transPath = transDir + "/" + oldCid + ".jsonl";
+    std::string line1 = "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"First historic user question\"}]}}";
+    std::string line2 = "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"First historic assistant answer\"}]}}";
+    {
+        std::ofstream tf(transPath);
+        tf << line1 << "\n" << line2 << "\n";
+    }
+
+    // Mock Cursor CLI binary that records all args to captured_args.txt and simulates
+    // overwriting transPath during --resume to verify WebServer restores priorCursorLines!
+    std::string capturedArgsFile = baseDir + "/captured_args.txt";
+    std::string mockCursorBin = binDir + "/agent";
+    {
+        std::ofstream mf(mockCursorBin);
+        mf << "#!/bin/bash\n"
+           << "printf '%s\\n' \"$@\" > \"" << capturedArgsFile << "\"\n"
+           << "# Simulate CLI truncating/overwriting JSONL when store.db is absent\n"
+           << "echo '{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Follow-up from mobile\"}]}}' > \"" << transPath << "\"\n"
+           << "echo '{\"type\":\"result\",\"result\":\"Continued reply from CLI\",\"session_id\":\"" << oldCid << "\"}'\n"
+           << "exit 0\n";
+        mf.close();
+        chmod(mockCursorBin.c_str(), 0755);
+    }
+    setenv("AIMON_CURSOR_BIN", mockCursorBin.c_str(), 1);
+
+    StateStore& stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 0;
+    cfg.endpointsEnabled = false;
+    WebServer server(stateStore, historyStore, cfg);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    MobileGateway& gw = MobileGateway::getInstance();
+    std::string mobileFile = baseDir + "/mobile.json";
+    assert(gw.init(mobileFile));
+    std::string secret = gw.createPairingSecret(120);
+    std::string token;
+    assert(gw.verifyPairingCode(secret, "dev-older", "Pixel 9", token));
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", token}};
+
+    json req = {
+        {"agentId", "cursor"},
+        {"conversationId", oldCid},
+        {"text", "Follow-up from mobile"}
+    };
+    auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
+    assert(res && res->status == 200);
+    json rj = json::parse(res->body);
+    assert(rj.value("status", "") == "ok");
+    assert(rj.value("conversationId", "") == oldCid);
+    assert(rj.value("response", "").find("Continued reply from CLI") != std::string::npos);
+
+    // Verify the mock CLI received injected [Prior Conversation Context in this Session]
+    {
+        std::ifstream cf(capturedArgsFile);
+        std::string captured((std::istreambuf_iterator<char>(cf)),
+                             std::istreambuf_iterator<char>());
+        assert(captured.find("[Prior Conversation Context in this Session]") != std::string::npos);
+        assert(captured.find("First historic user question") != std::string::npos);
+        assert(captured.find("First historic assistant answer") != std::string::npos);
+        assert(captured.find("Follow-up from mobile") != std::string::npos);
+    }
+
+    // Verify transPath on disk still starts with line1 and line2, followed by the new turn
+    {
+        std::ifstream tf(transPath);
+        std::vector<std::string> lines;
+        std::string l;
+        while (std::getline(tf, l)) {
+            if (!l.empty()) lines.push_back(l);
+        }
+        assert(lines.size() >= 4);
+        assert(lines[0] == line1);
+        assert(lines[1] == line2);
+    }
+
+    // Verify GET /api/agent/transcript returns all 4 steps
+    {
+        auto tres = client.Get(("/api/agent/transcript?id=" + oldCid + "&agent=cursor").c_str(), headers);
+        assert(tres && tres->status == 200);
+        json tj = json::parse(tres->body);
+        assert(tj.value("stepCount", 0) >= 4);
+    }
+
+    server.stop();
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_CLAUDE_PROJECTS_DIR");
+    unsetenv("AIMON_CURSOR_PROJECTS_DIR");
+    unsetenv("AIMON_CURSOR_CHATS_DIR");
+    unsetenv("AIMON_CURSOR_HOOK_STATE_DIR");
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    unsetenv("AIMON_CURSOR_BIN");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorTranscript passed!" << std::endl;
+}
+
+static void FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens() {
+    std::cout << "[TestMobileGateway] Running FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens..." << std::endl;
+
+    std::string baseDir = "/tmp/test_4hop_trace_" + std::to_string(getpid());
+    fs::remove_all(baseDir);
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliBrain = baseDir + "/cli_brain";
+    std::string claudeProjects = baseDir + "/claude_projects";
+    std::string cursorProjects = baseDir + "/cursor_projects";
+    std::string cursorChats = baseDir + "/cursor_chats";
+    std::string cursorHookState = baseDir + "/cursor_hook_state";
+    std::string wsRoot = baseDir + "/work";
+    std::string binDir = baseDir + "/bin";
+
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+    fs::create_directories(claudeProjects);
+    fs::create_directories(cursorProjects);
+    fs::create_directories(cursorChats);
+    fs::create_directories(cursorHookState);
+    fs::create_directories(wsRoot + "/aimon");
+    fs::create_directories(binDir);
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_CLAUDE_PROJECTS_DIR", claudeProjects.c_str(), 1);
+    setenv("AIMON_CURSOR_PROJECTS_DIR", cursorProjects.c_str(), 1);
+    setenv("AIMON_CURSOR_CHATS_DIR", cursorChats.c_str(), 1);
+    setenv("AIMON_CURSOR_HOOK_STATE_DIR", cursorHookState.c_str(), 1);
+    setenv("AIMON_WORKSPACE_ROOT", wsRoot.c_str(), 1);
+
+    std::string traceCid = "f00dbabe-1111-2222-3333-444455556666";
+    std::string transDir = cursorProjects + "/home-samurai-work-aimon/agent-transcripts/" + traceCid;
+    fs::create_directories(transDir);
+    {
+        std::ofstream tf(transDir + "/" + traceCid + ".jsonl");
+        tf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Initial trace prompt\"}]}}\n"
+           << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Initial trace reply\"}]}}\n";
+    }
+
+    std::string mockCursorBin = binDir + "/agent";
+    {
+        std::ofstream mf(mockCursorBin);
+        mf << "#!/bin/bash\n"
+           << "echo '{\"type\":\"result\",\"result\":\"Trace reply OK\",\"session_id\":\"" << traceCid << "\"}'\n"
+           << "exit 0\n";
+        mf.close();
+        chmod(mockCursorBin.c_str(), 0755);
+    }
+    setenv("AIMON_CURSOR_BIN", mockCursorBin.c_str(), 1);
+
+    StateStore& stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 0;
+    cfg.endpointsEnabled = false;
+    WebServer server(stateStore, historyStore, cfg);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    MobileGateway& gw = MobileGateway::getInstance();
+    std::string mobileFile = baseDir + "/mobile.json";
+    assert(gw.init(mobileFile));
+    std::string secret = gw.createPairingSecret(120);
+    std::string token;
+    assert(gw.verifyPairingCode(secret, "dev-trace", "Pixel 9", token));
+    assert(!token.empty());
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+
+    // Verify User-Agent: aimon-hook without valid auth token is rejected with 401
+    {
+        httplib::Headers spoofHeaders = {{"User-Agent", "aimon-hook"}};
+        auto unauthRes = client.Get("/api/agent/conversations?agent=cursor", spoofHeaders);
+        assert(unauthRes && unauthRes->status == 401);
+    }
+
+    std::string reqId = "req-trace-4hop-01";
+    httplib::Headers headers = {
+        {"X-Mobile-Token", token},
+        {"Authorization", "Bearer " + token},
+        {"X-Request-Id", reqId},
+        {"X-Client-Meta", "android"}
+    };
+
+    auto r1 = client.Get("/api/agent/conversations?agent=cursor", headers);
+    assert(r1 && r1->status == 200);
+
+    auto r2 = client.Get(("/api/agent/transcript?id=" + traceCid + "&agent=cursor").c_str(), headers);
+    assert(r2 && r2->status == 200);
+
+    json promptReq = {
+        {"agentId", "cursor"},
+        {"conversationId", traceCid},
+        {"text", "Trace hop prompt"}
+    };
+    auto r3 = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
+    assert(r3 && r3->status == 200);
+
+    json traceResult = AgentTelemetryDb::getInstance().queryTrace(reqId, 500);
+    std::string rawTraceDump = traceResult.dump();
+
+    // Token must never appear in raw form in diagnostic logs
+    assert(rawTraceDump.find(token) == std::string::npos);
+
+    const auto& logs = traceResult["trace_events"];
+    assert(logs.is_array() && !logs.empty());
+
+    bool sawMobileHttp = false;
+    bool sawDiscovery = false;
+    bool sawTranscript = false;
+    bool sawRouterDecision = false;
+    bool sawPlatformForward = false;
+
+    for (const auto& entry : logs) {
+        assert(entry.value("request_id", "") == reqId);
+        std::string cat = entry.value("category", "");
+        if (cat == "mobile_http") {
+            sawMobileHttp = true;
+            if (entry.contains("details") && entry["details"].is_object()) {
+                std::string fp = entry["details"].value("token_fp", "");
+                assert(fp.size() == 12);
+                assert(fp != token);
+            }
+        } else if (cat == "discovery") {
+            sawDiscovery = true;
+        } else if (cat == "transcript") {
+            sawTranscript = true;
+        } else if (cat == "router_decision") {
+            sawRouterDecision = true;
+        } else if (cat == "platform_forward") {
+            sawPlatformForward = true;
+        }
+    }
+
+    assert(sawMobileHttp);
+    assert(sawDiscovery);
+    assert(sawTranscript);
+    assert(sawRouterDecision);
+    assert(sawPlatformForward);
+
+    server.stop();
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_CLAUDE_PROJECTS_DIR");
+    unsetenv("AIMON_CURSOR_PROJECTS_DIR");
+    unsetenv("AIMON_CURSOR_CHATS_DIR");
+    unsetenv("AIMON_CURSOR_HOOK_STATE_DIR");
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    unsetenv("AIMON_CURSOR_BIN");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -2903,6 +3409,9 @@ int main() {
     testSubagentFilterAskQuestionAndProviderSlashCommands();
     testOrphanSummaryFilteringAndZeroStepTerminalSession();
     testLiveScreenSessionRoutingAndIdeSessionProtection();
+    Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversationsAndTranscript();
+    OlderCursorIdeSessionWithoutStoreDb_PromptSucceedsAndPreservesPriorTranscript();
+    FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;

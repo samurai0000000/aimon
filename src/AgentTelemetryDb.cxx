@@ -12,6 +12,8 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <regex>
+#include <sys/stat.h>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -21,6 +23,117 @@ namespace aimon {
 AgentTelemetryDb &AgentTelemetryDb::getInstance() {
     static AgentTelemetryDb instance;
     return instance;
+}
+
+bool AgentTelemetryDb::isValidSessionId(const std::string &id) {
+    if (id.empty() || id.size() > 128) {
+        return false;
+    }
+    for (unsigned char c : id) {
+        bool ok = (c >= 'A' && c <= 'Z') ||
+                  (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') ||
+                  c == '_' || c == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string AgentTelemetryDb::scrubSecrets(const std::string &input) {
+    if (input.empty()) {
+        return input;
+    }
+
+    std::string out = input;
+
+    // 1. Deterministic O(N) redaction of PEM private key blocks (multi-line & escaped)
+    const std::string beginMarker = "-----BEGIN ";
+    const std::string privKeyMarker = "PRIVATE KEY-----";
+    const std::string endMarker = "-----END ";
+    size_t searchPos = 0;
+    while (searchPos < out.size()) {
+        size_t bPos = out.find(beginMarker, searchPos);
+        if (bPos == std::string::npos) {
+            break;
+        }
+        size_t pkPos = out.find(privKeyMarker, bPos + beginMarker.size());
+        if (pkPos == std::string::npos || (pkPos - bPos) > 64) {
+            searchPos = bPos + beginMarker.size();
+            continue;
+        }
+        size_t ePos = out.find(endMarker, pkPos + privKeyMarker.size());
+        if (ePos != std::string::npos) {
+            size_t ePkPos = out.find(privKeyMarker, ePos + endMarker.size());
+            if (ePkPos != std::string::npos && (ePkPos - ePos) <= 64) {
+                size_t replaceLen = (ePkPos + privKeyMarker.size()) - bPos;
+                out.replace(bPos, replaceLen, "[REDACTED]");
+                searchPos = bPos + 10;
+                continue;
+            }
+        }
+        // Unterminated PEM private key header: redact to end of string
+        out.replace(bPos, out.size() - bPos, "[REDACTED]");
+        break;
+    }
+
+    // 2. Token and credential regex redactions
+    try {
+        static const std::regex reBearer(R"(Bearer\s+[A-Za-z0-9._~+/=-]+)", std::regex::icase);
+        static const std::regex reSk(R"(sk-[A-Za-z0-9_-]+)");
+        static const std::regex reAiza(R"(AIza[A-Za-z0-9_-]+)");
+        static const std::regex reGhp(R"(ghp_[A-Za-z0-9_]+)");
+        static const std::regex reGlpat(R"(glpat-[A-Za-z0-9_-]+)");
+        static const std::regex reKv(
+            R"((password|token|secret|api_key|csrf_token)\s*[:=]\s*[^\s"',}]+)",
+            std::regex::icase);
+
+        out = std::regex_replace(out, reBearer, "[REDACTED]");
+        out = std::regex_replace(out, reSk, "[REDACTED]");
+        out = std::regex_replace(out, reAiza, "[REDACTED]");
+        out = std::regex_replace(out, reGhp, "[REDACTED]");
+        out = std::regex_replace(out, reGlpat, "[REDACTED]");
+        out = std::regex_replace(out, reKv, "[REDACTED]");
+    } catch (...) {
+        // Never throw from secret scrubbing
+    }
+
+    return out;
+}
+
+static json scrubJsonObject(const json &node) {
+    if (node.is_string()) {
+        return AgentTelemetryDb::scrubSecrets(node.get<std::string>());
+    }
+    if (node.is_array()) {
+        json arr = json::array();
+        for (const auto &item : node) {
+            arr.push_back(scrubJsonObject(item));
+        }
+        return arr;
+    }
+    if (node.is_object()) {
+        json obj = json::object();
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            const std::string &k = it.key();
+            std::string kLower = k;
+            std::transform(kLower.begin(), kLower.end(), kLower.begin(), ::tolower);
+            if (kLower == "tool_output") {
+                continue;
+            }
+            if ((kLower == "password" || kLower == "token" || kLower == "secret" ||
+                 kLower == "api_key" || kLower == "csrf_token" ||
+                 kLower == "x-codeium-csrf-token" || kLower == "authorization") &&
+                it.value().is_string()) {
+                obj[k] = "[REDACTED]";
+            } else {
+                obj[k] = scrubJsonObject(it.value());
+            }
+        }
+        return obj;
+    }
+    return node;
 }
 
 AgentTelemetryDb::AgentTelemetryDb()
@@ -39,20 +152,29 @@ AgentTelemetryDb::~AgentTelemetryDb() {
 
 bool AgentTelemetryDb::open(const std::string &dbPath) {
     std::lock_guard<std::mutex> lock(_mutex);
+    std::string targetPath = !dbPath.empty()
+        ? PathUtils::expandHome(dbPath)
+        : PathUtils::expandHome("~/.config/aimon/telemetry.db");
+
     if (_db != nullptr) {
-        return true;
+        if (dbPath.empty() || targetPath == _dbPath) {
+            return true;
+        }
+        finalizeStatements();
+        sqlite3_close(_db);
+        _db = nullptr;
     }
 
-    if (!dbPath.empty()) {
-        _dbPath = PathUtils::expandHome(dbPath);
-    } else {
-        _dbPath = PathUtils::expandHome("~/.config/aimon/telemetry.db");
-    }
+    _dbPath = targetPath;
 
     try {
         fs::path p(_dbPath);
         if (p.has_parent_path()) {
-            PathUtils::ensureDirectoryExists(p.parent_path().string());
+            std::string parentStr = p.parent_path().string();
+            PathUtils::ensureDirectoryExists(parentStr);
+            if (parentStr != "/tmp" && parentStr != "/var/tmp" && parentStr != "/") {
+                ::chmod(parentStr.c_str(), 0700);
+            }
         }
     } catch (const std::exception &ex) {
         std::cerr << "AgentTelemetryDb: Failed to create directory: " << ex.what() << std::endl;
@@ -68,6 +190,9 @@ bool AgentTelemetryDb::open(const std::string &dbPath) {
         }
         return false;
     }
+
+    sqlite3_busy_timeout(_db, 500);
+    ::chmod(_dbPath.c_str(), 0600);
 
     char *err = nullptr;
     sqlite3_exec(_db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, &err);
@@ -173,6 +298,23 @@ bool AgentTelemetryDb::initSchema() {
         "  PRIMARY KEY (hour_timestamp, agent_type, model_name)"
         ");";
 
+    const char *ddlDiagnostics =
+        "CREATE TABLE IF NOT EXISTS gateway_diagnostic_logs ("
+        "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  timestamp_ms    INTEGER NOT NULL,"
+        "  request_id      TEXT DEFAULT '',"
+        "  level           TEXT NOT NULL,"
+        "  category        TEXT NOT NULL,"
+        "  conversation_id TEXT DEFAULT '',"
+        "  provider        TEXT DEFAULT '',"
+        "  summary         TEXT NOT NULL,"
+        "  details_json    TEXT DEFAULT '{}'"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_diag_ts ON gateway_diagnostic_logs(timestamp_ms DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_diag_req ON gateway_diagnostic_logs(request_id, timestamp_ms ASC);"
+        "CREATE INDEX IF NOT EXISTS idx_diag_cid ON gateway_diagnostic_logs(conversation_id, timestamp_ms DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_diag_cat ON gateway_diagnostic_logs(category, timestamp_ms DESC);";
+
     char *err = nullptr;
     if (sqlite3_exec(_db, ddlSessions, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "AgentTelemetryDb: DDL error (sessions): " << (err ? err : "") << std::endl;
@@ -194,6 +336,12 @@ bool AgentTelemetryDb::initSchema() {
 
     if (sqlite3_exec(_db, ddlRollups, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "AgentTelemetryDb: DDL error (rollups): " << (err ? err : "") << std::endl;
+        if (err) sqlite3_free(err);
+        return false;
+    }
+
+    if (sqlite3_exec(_db, ddlDiagnostics, nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "AgentTelemetryDb: DDL error (diagnostics): " << (err ? err : "") << std::endl;
         if (err) sqlite3_free(err);
         return false;
     }
@@ -1172,6 +1320,255 @@ int64_t AgentTelemetryDb::getDatabaseSizeBytes() const {
         }
     } catch (...) {}
     return 0;
+}
+
+bool AgentTelemetryDb::logDiagnostic(const std::string &level,
+                                     const std::string &category,
+                                     const std::string &conversationId,
+                                     const std::string &provider,
+                                     const std::string &summary,
+                                     const nlohmann::json &details,
+                                     const std::string &requestId,
+                                     int maxRetainedRows) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (!_db) return false;
+
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::string cleanSummary = scrubSecrets(summary);
+    json cleanDetails = details.is_null() ? json::object() : scrubJsonObject(details);
+    std::string detailsStr = scrubSecrets(cleanDetails.dump());
+
+    const char *sqlInsert =
+        "INSERT INTO gateway_diagnostic_logs ("
+        "  timestamp_ms, request_id, level, category, conversation_id, provider, summary, details_json"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sqlInsert, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+
+    sqlite3_bind_int64(stmt, 1, nowMs);
+    sqlite3_bind_text(stmt, 2, requestId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, level.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, category.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, conversationId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, provider.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, cleanSummary.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, detailsStr.c_str(), -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return false;
+    }
+
+    if (maxRetainedRows > 0) {
+        const char *sqlPrune =
+            "DELETE FROM gateway_diagnostic_logs "
+            "WHERE id <= (SELECT MAX(id) - ? FROM gateway_diagnostic_logs);";
+        sqlite3_stmt *pruneStmt = nullptr;
+        if (sqlite3_prepare_v2(_db, sqlPrune, -1, &pruneStmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int(pruneStmt, 1, maxRetainedRows);
+            sqlite3_step(pruneStmt);
+            sqlite3_finalize(pruneStmt);
+        }
+    }
+
+    return true;
+}
+
+json AgentTelemetryDb::queryDiagnostics(int limit,
+                                        const std::string &conversationId,
+                                        const std::string &category,
+                                        const std::string &minLevel,
+                                        const std::string &requestId) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    json rows = json::array();
+    if (!_db) return rows;
+
+    std::string sql =
+        "SELECT id, timestamp_ms, request_id, level, category, conversation_id,"
+        "       provider, summary, details_json "
+        "FROM gateway_diagnostic_logs WHERE 1=1 ";
+
+    if (!conversationId.empty()) {
+        sql += "AND conversation_id = ? ";
+    }
+    if (!category.empty()) {
+        sql += "AND category = ? ";
+    }
+    if (!requestId.empty()) {
+        sql += "AND request_id = ? ";
+    }
+
+    std::string lvlUpper = minLevel;
+    std::transform(lvlUpper.begin(), lvlUpper.end(), lvlUpper.begin(), ::toupper);
+    if (lvlUpper == "ERROR") {
+        sql += "AND level = 'ERROR' ";
+    } else if (lvlUpper == "WARN") {
+        sql += "AND level IN ('WARN', 'ERROR') ";
+    }
+
+    sql += "ORDER BY timestamp_ms DESC, id DESC LIMIT ?;";
+
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        int bindIdx = 1;
+        if (!conversationId.empty()) {
+            sqlite3_bind_text(stmt, bindIdx++, conversationId.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        if (!category.empty()) {
+            sqlite3_bind_text(stmt, bindIdx++, category.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        if (!requestId.empty()) {
+            sqlite3_bind_text(stmt, bindIdx++, requestId.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        sqlite3_bind_int(stmt, bindIdx, limit > 0 ? limit : 100);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            json r = json::object();
+            r["id"] = sqlite3_column_int64(stmt, 0);
+            r["timestamp_ms"] = sqlite3_column_int64(stmt, 1);
+            const char *reqTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            const char *lvlTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            const char *catTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+            const char *cidTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+            const char *prvTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+            const char *sumTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            const char *detTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+
+            r["request_id"] = reqTxt ? reqTxt : "";
+            r["level"] = lvlTxt ? lvlTxt : "";
+            r["category"] = catTxt ? catTxt : "";
+            r["conversation_id"] = cidTxt ? cidTxt : "";
+            r["provider"] = prvTxt ? prvTxt : "";
+            r["summary"] = sumTxt ? sumTxt : "";
+            if (detTxt && detTxt[0] != '\0') {
+                try {
+                    r["details"] = json::parse(detTxt);
+                } catch (...) {
+                    r["details"] = json::object();
+                }
+            } else {
+                r["details"] = json::object();
+            }
+            rows.push_back(r);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    return rows;
+}
+
+json AgentTelemetryDb::querySessionRecord(const std::string &sessionId) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    json s = json::object();
+    if (!_db || sessionId.empty()) return s;
+
+    const char *sql =
+        "SELECT session_id, conversation_id, agent_type, workspace_path, model_name,"
+        "       start_timestamp, end_timestamp, status, total_turns, total_prompt_tokens,"
+        "       total_comp_tokens, total_tool_calls, total_errors, avg_turn_ms "
+        "FROM agent_sessions "
+        "WHERE session_id = ? OR conversation_id = ? "
+        "ORDER BY start_timestamp DESC LIMIT 1;";
+
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, sessionId.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, sessionId.c_str(), -1, SQLITE_TRANSIENT);
+
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *sidTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            const char *cidTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            const char *agtTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            const char *wspTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            const char *mdlTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+            const char *stsTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+
+            s["session_id"] = sidTxt ? sidTxt : "";
+            s["conversation_id"] = cidTxt ? cidTxt : "";
+            s["agent_type"] = agtTxt ? agtTxt : "";
+            s["workspace_path"] = wspTxt ? wspTxt : "";
+            s["model_name"] = mdlTxt ? mdlTxt : "";
+            s["start_timestamp"] = sqlite3_column_int64(stmt, 5);
+            s["end_timestamp"] = sqlite3_column_int64(stmt, 6);
+            s["status"] = stsTxt ? stsTxt : "";
+            s["total_turns"] = sqlite3_column_int(stmt, 8);
+            s["total_prompt_tokens"] = sqlite3_column_int64(stmt, 9);
+            s["total_comp_tokens"] = sqlite3_column_int64(stmt, 10);
+            s["total_tool_calls"] = sqlite3_column_int(stmt, 11);
+            s["total_errors"] = sqlite3_column_int(stmt, 12);
+            s["avg_turn_ms"] = sqlite3_column_double(stmt, 13);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    return s;
+}
+
+json AgentTelemetryDb::queryTrace(const std::string &targetId, int limit) {
+    json trace = json::object();
+    trace["target_id"] = targetId;
+    trace["session"] = querySessionRecord(targetId);
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    json events = json::array();
+    if (!_db || targetId.empty()) {
+        trace["trace_events"] = events;
+        return trace;
+    }
+
+    const char *sql =
+        "SELECT id, timestamp_ms, request_id, level, category, conversation_id,"
+        "       provider, summary, details_json "
+        "FROM gateway_diagnostic_logs "
+        "WHERE request_id = ? OR conversation_id = ? "
+        "ORDER BY timestamp_ms ASC, id ASC LIMIT ?;";
+
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, targetId.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, targetId.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 3, limit > 0 ? limit : 500);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            json r = json::object();
+            r["id"] = sqlite3_column_int64(stmt, 0);
+            r["timestamp_ms"] = sqlite3_column_int64(stmt, 1);
+            const char *reqTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            const char *lvlTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            const char *catTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+            const char *cidTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+            const char *prvTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+            const char *sumTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            const char *detTxt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+
+            r["request_id"] = reqTxt ? reqTxt : "";
+            r["level"] = lvlTxt ? lvlTxt : "";
+            r["category"] = catTxt ? catTxt : "";
+            r["conversation_id"] = cidTxt ? cidTxt : "";
+            r["provider"] = prvTxt ? prvTxt : "";
+            r["summary"] = sumTxt ? sumTxt : "";
+            if (detTxt && detTxt[0] != '\0') {
+                try {
+                    r["details"] = json::parse(detTxt);
+                } catch (...) {
+                    r["details"] = json::object();
+                }
+            } else {
+                r["details"] = json::object();
+            }
+            events.push_back(r);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    trace["trace_events"] = events;
+    return trace;
 }
 
 } // namespace aimon
