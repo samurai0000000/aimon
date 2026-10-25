@@ -41,6 +41,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <pwd.h>
 #include <signal.h>
 
 namespace fs = std::filesystem;
@@ -889,7 +892,20 @@ static void collectCursorSubagentIdsAndParentMtimes(
             int hTurns = -1, hStep = 0;
             if (readCursorHookStateMetadata(cid, dummyModel, dummyWs, &hTurns, &hStep)) {
                 if (hTurns == 0 && hStep > 0) {
-                    outSubagentIds.insert(cid);
+                    bool hasAssistant = false;
+                    std::ifstream tjf(topJsonl);
+                    if (tjf.is_open()) {
+                        std::string line;
+                        while (std::getline(tjf, line)) {
+                            if (line.find("\"assistant\"") != std::string::npos) {
+                                hasAssistant = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!hasAssistant) {
+                        outSubagentIds.insert(cid);
+                    }
                 }
             }
         }
@@ -1037,6 +1053,68 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             }
         }
     }
+
+    std::set<std::string> activeClaudeUuids;
+    if (providerSource == "claude") {
+        std::ifstream preIn(filePath);
+        if (preIn.is_open()) {
+            std::map<std::string, std::string> parentMap;
+            std::string lastUuid;
+            bool hasNonEmptyParentUuid = false;
+            std::string preLine;
+            while (std::getline(preIn, preLine)) {
+                if (preLine.empty()) continue;
+                if (preLine.find("\"uuid\"") == std::string::npos) continue;
+                auto pj = nlohmann::json::parse(preLine, nullptr, false);
+                if (pj.is_discarded() || !pj.is_object()) continue;
+                std::string u = pj.value("uuid", "");
+                if (u.empty()) continue;
+                std::string pu;
+                if (pj.contains("parentUuid") && pj["parentUuid"].is_string()) {
+                    pu = pj["parentUuid"].get<std::string>();
+                }
+                parentMap[u] = pu;
+                if (!pu.empty()) {
+                    hasNonEmptyParentUuid = true;
+                }
+                std::string ptype = pj.value("type", "");
+                if (ptype != "user" && ptype != "assistant") {
+                    ptype = pj.value("role", "");
+                }
+                if ((ptype == "user" || ptype == "assistant") &&
+                    !pj.value("isSidechain", false) &&
+                    !pj.value("isMeta", false) &&
+                    !pj.value("queueTranscriptOnly", false)) {
+                    bool isTaskNotif = (pj.value("turnOrigin", "") == "task_notification");
+                    if (!isTaskNotif && pj.contains("origin") && pj["origin"].is_object()) {
+                        if (pj["origin"].value("kind", "") == "task-notification") {
+                            isTaskNotif = true;
+                        }
+                    }
+                    if (!isTaskNotif && preLine.find("<task-notification>") != std::string::npos) {
+                        isTaskNotif = true;
+                    }
+                    if (!isTaskNotif) {
+                        lastUuid = u;
+                    }
+                }
+            }
+            if (!lastUuid.empty() && hasNonEmptyParentUuid) {
+                std::string cur = lastUuid;
+                std::set<std::string> visited;
+                while (!cur.empty() && visited.insert(cur).second) {
+                    activeClaudeUuids.insert(cur);
+                    auto it = parentMap.find(cur);
+                    if (it != parentMap.end()) {
+                        cur = it->second;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     std::ifstream in(filePath);
     if (!in.is_open()) {
         return out;
@@ -1110,6 +1188,8 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
 
     std::string line;
     std::string lastConsecutiveUserPrompt;
+    bool parentTurnEnded = false;
+    std::set<std::string> pendingSubagentToolUseIds;
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         // Fast skip non-turn metadata records before invoking full JSON parser
@@ -1119,7 +1199,7 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             line.find("\"type\": \"progress\"") != std::string::npos) {
             continue;
         }
-        if (summaryOnly && (line.size() > 32768 || line.find("\"tool_result\"") != std::string::npos)) {
+        if (summaryOnly && activeClaudeUuids.empty() && (line.size() > 32768 || line.find("\"tool_result\"") != std::string::npos)) {
             uint64_t fastSec = extractFastTimestamp(line);
             if (fastSec > out.lastActivitySec) {
                 out.lastActivitySec = fastSec;
@@ -1138,22 +1218,31 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         if (j.is_discarded() || !j.is_object()) continue;
         if (j.value("isSidechain", false)) continue;
 
+        if (j.value("type", "") == "turn_ended" ||
+            line.find("\"type\":\"turn_ended\"") != std::string::npos ||
+            line.find("\"type\": \"turn_ended\"") != std::string::npos) {
+            parentTurnEnded = true;
+        }
+
+        auto tStart = line.find("<tool-use-id>");
+        if (tStart != std::string::npos) {
+            auto tEnd = line.find("</tool-use-id>", tStart + 13);
+            if (tEnd != std::string::npos && tEnd > tStart + 13) {
+                std::string completedId = line.substr(tStart + 13, tEnd - (tStart + 13));
+                while (!completedId.empty() && (completedId.front() == ' ' || completedId.front() == '\t' || completedId.front() == '\r' || completedId.front() == '\n')) completedId.erase(0, 1);
+                while (!completedId.empty() && (completedId.back() == ' ' || completedId.back() == '\t' || completedId.back() == '\r' || completedId.back() == '\n')) completedId.pop_back();
+                if (!completedId.empty()) {
+                    pendingSubagentToolUseIds.erase(completedId);
+                }
+            }
+        } else if (line.find("<task-notification>") != std::string::npos && pendingSubagentToolUseIds.size() == 1) {
+            pendingSubagentToolUseIds.clear();
+        }
+
         std::string cwd = j.value("cwd", "");
         if (!cwd.empty()) {
             out.workspacePath = cwd;
             out.workspaceShort = fs::path(cwd).filename().string();
-        }
-        std::string tsStr = j.value("timestamp", j.value("created_at", ""));
-        if (tsStr.empty()) {
-            auto tsTagStart = line.find("<timestamp>");
-            auto tsTagEnd = line.find("</timestamp>");
-            if (tsTagStart != std::string::npos && tsTagEnd != std::string::npos && tsTagEnd > tsTagStart + 11) {
-                tsStr = line.substr(tsTagStart + 11, tsTagEnd - (tsTagStart + 11));
-            }
-        }
-        uint64_t parsedSec = parseIso8601ToEpochSec(tsStr);
-        if (parsedSec > out.lastActivitySec) {
-            out.lastActivitySec = parsedSec;
         }
 
         std::string role = j.value("type", "");
@@ -1167,10 +1256,44 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             continue;
         }
 
+        std::string lineUuid = j.value("uuid", "");
+        if (providerSource == "claude" && !activeClaudeUuids.empty() && !lineUuid.empty() &&
+            !j.value("isCompactSummary", false)) {
+            if (activeClaudeUuids.count(lineUuid) == 0) {
+                continue;
+            }
+        }
+
+        parentTurnEnded = false;
+
+        std::string tsStr = j.value("timestamp", j.value("created_at", ""));
+        if (tsStr.empty()) {
+            auto tsTagStart = line.find("<timestamp>");
+            auto tsTagEnd = line.find("</timestamp>");
+            if (tsTagStart != std::string::npos && tsTagEnd != std::string::npos && tsTagEnd > tsTagStart + 11) {
+                tsStr = line.substr(tsTagStart + 11, tsTagEnd - (tsTagStart + 11));
+            }
+        }
+        uint64_t parsedSec = parseIso8601ToEpochSec(tsStr);
+        if (parsedSec > out.lastActivitySec) {
+            out.lastActivitySec = parsedSec;
+        }
+
         const nlohmann::json& msgObj = (j.contains("message") && j["message"].is_object()) ? j["message"] : j;
         if (msgObj.contains("model") && msgObj["model"].is_string()) {
             std::string m = msgObj["model"].get<std::string>();
             if (!m.empty() && (providerSource != "cursor" || out.model.empty())) out.model = m;
+        }
+
+        if (msgObj.contains("content") && msgObj["content"].is_array()) {
+            for (const auto& blk : msgObj["content"]) {
+                if (blk.is_object() && blk.value("type", "") == "tool_result") {
+                    std::string trId = blk.value("tool_use_id", "");
+                    if (!trId.empty()) {
+                        pendingSubagentToolUseIds.erase(trId);
+                    }
+                }
+            }
         }
 
         if (role == "user") {
@@ -1341,6 +1464,10 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                             }
                         } else if (btype == "tool_use") {
                             std::string toolName = blk.value("name", "tool");
+                            std::string toolId = blk.value("id", "");
+                            if ((toolName == "Agent" || toolName == "Task") && !toolId.empty()) {
+                                pendingSubagentToolUseIds.insert(toolId);
+                            }
                             nlohmann::json inputObj = (blk.contains("input") && blk["input"].is_object())
                                                           ? blk["input"]
                                                           : nlohmann::json::object();
@@ -1373,6 +1500,9 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                                 }
                                 if (inputObj.contains("arguments") && inputObj["arguments"].is_object()) {
                                     inputObj = inputObj["arguments"];
+                                }
+                                if ((toolName == "Agent" || toolName == "Task") && !toolId.empty()) {
+                                    pendingSubagentToolUseIds.insert(toolId);
                                 }
                             }
                             if (toolName == "AskUserQuestion" || toolName == "ask_question") {
@@ -1515,8 +1645,26 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         }
     }
 
-    if (providerSource == "cursor" && filePath.parent_path().filename() != "subagents") {
-        fs::path subDir = filePath.parent_path() / "subagents";
+    bool cursorCanMerge = (providerSource == "cursor" &&
+                           filePath.parent_path().filename() != "subagents" &&
+                           !parentTurnEnded &&
+                           !out.steps.empty() &&
+                           out.steps.back().contains("tool_calls") &&
+                           out.steps.back()["tool_calls"].is_array() &&
+                           !out.steps.back()["tool_calls"].empty());
+
+    bool claudeCanMerge = (providerSource == "claude" &&
+                           filePath.parent_path().filename() != "subagents" &&
+                           !pendingSubagentToolUseIds.empty());
+
+    fs::path subDir;
+    if (cursorCanMerge) {
+        subDir = filePath.parent_path() / "subagents";
+    } else if (claudeCanMerge) {
+        subDir = filePath.parent_path() / filePath.stem() / "subagents";
+    }
+
+    if (cursorCanMerge || claudeCanMerge) {
         std::error_code subEc;
         if (fs::exists(subDir, subEc) && fs::is_directory(subDir, subEc)) {
             auto fileMtimeSec = [](const fs::path& p) -> uint64_t {
@@ -1531,6 +1679,8 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                     return 0;
                 }
             };
+            std::error_code pEc;
+            auto parentFtime = fs::last_write_time(filePath, pEc);
             uint64_t parentMtimeSec = fileMtimeSec(filePath);
             struct ActiveSubagentFile {
                 fs::path path;
@@ -1541,6 +1691,9 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             std::vector<ActiveSubagentFile> activeSubs;
             for (const auto& subEntry : fs::directory_iterator(subDir, subEc)) {
                 if (subEc || !subEntry.is_regular_file() || subEntry.path().extension() != ".jsonl") continue;
+                std::error_code sEc;
+                auto subFtime = fs::last_write_time(subEntry.path(), sEc);
+                if (sEc || (!pEc && subFtime < parentFtime)) continue;
                 uint64_t subMtimeSec = fileMtimeSec(subEntry.path());
                 if (subMtimeSec == 0 || subMtimeSec < parentMtimeSec) continue;
                 std::string subId = subEntry.path().stem().string();
@@ -1568,7 +1721,7 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             });
             for (const auto& subInfo : activeSubs) {
                 NormalizedProviderTranscript subParsed = parseProviderTranscriptJsonl(
-                    subInfo.path, "cursor", -1, projectSlug, false);
+                    subInfo.path, providerSource, -1, projectSlug, false);
                 if (subParsed.steps.size() < 2) {
                     continue;
                 }
@@ -1578,7 +1731,11 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 if (subParsed.lastActivitySec > out.lastActivitySec) {
                     out.lastActivitySec = subParsed.lastActivitySec;
                 }
-                std::string shortSubId = subInfo.subId.substr(0, std::min<size_t>(8, subInfo.subId.size()));
+                std::string shortSubId = subInfo.subId;
+                if (shortSubId.rfind("agent-", 0) == 0) {
+                    shortSubId = shortSubId.substr(6);
+                }
+                shortSubId = shortSubId.substr(0, std::min<size_t>(8, shortSubId.size()));
                 for (auto& subStep : subParsed.steps) {
                     if (!subStep.is_object()) continue;
                     int curIdx = stepIdx++;
@@ -1686,6 +1843,580 @@ static std::string generateSessionId() {
     std::ostringstream oss;
     oss << std::hex << std::setfill('0') << std::setw(16) << part1 << std::setw(16) << part2;
     return oss.str();
+}
+
+static std::string toLowerAscii(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+struct LiveProviderSessionInfo {
+    pid_t ownerPid = 0;
+    std::string screenSession;
+    bool isIdeRendererSession = false;
+};
+
+static std::string readProcCmdline(pid_t pid) {
+    if (pid <= 0) return "";
+    std::string path = "/proc/" + std::to_string(pid) + "/cmdline";
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return "";
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static bool isOneShotCmdline(const std::string& rawCmdline) {
+    if (rawCmdline.empty()) return false;
+    size_t start = 0;
+    while (start < rawCmdline.size()) {
+        size_t end = rawCmdline.find('\0', start);
+        if (end == std::string::npos) end = rawCmdline.size();
+        std::string token = rawCmdline.substr(start, end - start);
+        if (token == "-p" || token == "--print") return true;
+        start = end + 1;
+    }
+    return false;
+}
+
+static bool isProcessInteractiveProvider(pid_t pid, const std::string& targetProvider) {
+    if (pid <= 0) return false;
+    std::string cmdline = readProcCmdline(pid);
+    if (cmdline.empty() || isOneShotCmdline(cmdline)) return false;
+
+    std::string commPath = "/proc/" + std::to_string(pid) + "/comm";
+    std::ifstream commF(commPath);
+    std::string comm;
+    if (commF.is_open()) {
+        std::getline(commF, comm);
+        while (!comm.empty() && (comm.back() == '\r' || comm.back() == '\n' || comm.back() == ' ')) {
+            comm.pop_back();
+        }
+    }
+    std::string commLower = toLowerAscii(comm);
+    std::string cmdLower = toLowerAscii(cmdline);
+
+    if (targetProvider == "cursor") {
+        if (commLower.find("cursor-agent") != std::string::npos ||
+            commLower == "agent" ||
+            cmdLower.find("cursor-agent") != std::string::npos ||
+            cmdLower.find("/agent\0") != std::string::npos ||
+            cmdLower.find("agent") != std::string::npos) {
+            return true;
+        }
+    } else if (targetProvider == "claude") {
+        if (commLower.find("claude") != std::string::npos ||
+            cmdLower.find("claude") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static pid_t getParentPid(pid_t pid) {
+    if (pid <= 1) return 0;
+    std::string statPath = "/proc/" + std::to_string(pid) + "/stat";
+    std::ifstream f(statPath);
+    if (!f.is_open()) return 0;
+    std::string line;
+    std::getline(f, line);
+    size_t lastParen = line.rfind(')');
+    if (lastParen == std::string::npos || lastParen + 2 >= line.size()) return 0;
+    std::istringstream ss(line.substr(lastParen + 2));
+    char state;
+    pid_t ppid = 0;
+    if (ss >> state >> ppid) {
+        return ppid;
+    }
+    return 0;
+}
+
+static std::string findScreenSessionForPid(pid_t pid) {
+    pid_t cur = pid;
+    pid_t screenPid = 0;
+    for (int depth = 0; depth < 30 && cur > 1; ++depth) {
+        std::string commPath = "/proc/" + std::to_string(cur) + "/comm";
+        std::ifstream commF(commPath);
+        std::string comm;
+        if (commF.is_open()) {
+            std::getline(commF, comm);
+            while (!comm.empty() && (comm.back() == '\r' || comm.back() == '\n' || comm.back() == ' ')) {
+                comm.pop_back();
+            }
+        }
+        std::string cmd = readProcCmdline(cur);
+        std::string commUpper = comm;
+        for (auto& c : commUpper) c = toupper(static_cast<unsigned char>(c));
+        if (commUpper == "SCREEN" ||
+            cmd.rfind("SCREEN", 0) == 0 || cmd.rfind("screen", 0) == 0) {
+            screenPid = cur;
+            break;
+        }
+        cur = getParentPid(cur);
+    }
+    if (screenPid <= 0) return "";
+
+    std::vector<fs::path> screenDirs;
+    const char* envSd = std::getenv("SCREENDIR");
+    if (envSd && *envSd) {
+        screenDirs.push_back(envSd);
+    }
+    const char* user = std::getenv("USER");
+    std::string uName = (user && *user) ? user : "";
+    if (uName.empty()) {
+        struct passwd* pw = getpwuid(getuid());
+        if (pw && pw->pw_name) uName = pw->pw_name;
+    }
+    if (!uName.empty()) {
+        screenDirs.push_back("/run/screen/S-" + uName);
+        screenDirs.push_back("/tmp/screens/S-" + uName);
+    }
+
+    std::string pidPrefix = std::to_string(screenPid) + ".";
+    for (const auto& sd : screenDirs) {
+        std::error_code ec;
+        if (!fs::exists(sd, ec) || !fs::is_directory(sd, ec)) continue;
+        for (const auto& ent : fs::directory_iterator(sd, ec)) {
+            if (ec) break;
+            std::string fname = ent.path().filename().string();
+            if (fname.rfind(pidPrefix, 0) == 0) {
+                return fname;
+            }
+        }
+    }
+    return "";
+}
+
+static bool processHoldsCidFd(pid_t pid, const std::string& cid) {
+    if (cid.empty() || pid <= 0) return false;
+    std::string fdDir = "/proc/" + std::to_string(pid) + "/fd";
+    std::error_code ec;
+    if (!fs::exists(fdDir, ec)) return false;
+    for (const auto& ent : fs::directory_iterator(fdDir, ec)) {
+        if (ec) break;
+        std::error_code lEc;
+        fs::path target = fs::read_symlink(ent.path(), lEc);
+        if (!lEc && target.string().find(cid) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool processCwdEquals(pid_t pid, const std::string& wsDir) {
+    if (wsDir.empty() || pid <= 0) return false;
+    std::string cwdPath = "/proc/" + std::to_string(pid) + "/cwd";
+    std::error_code ec;
+    fs::path target = fs::read_symlink(cwdPath, ec);
+    if (!ec) {
+        return target.string() == wsDir;
+    }
+    return false;
+}
+
+static LiveProviderSessionInfo discoverLiveProviderSession(
+    const std::string& targetProvider,
+    const std::string& cid,
+    const std::string& wsDir,
+    const std::string& existingTranscriptPath) {
+    LiveProviderSessionInfo info;
+    if (cid.empty() || cid == "new") {
+        return info;
+    }
+
+    const char* envOwnerOverride = std::getenv("AIMON_LIVE_OWNER_PID_OVERRIDE");
+    if (envOwnerOverride && *envOwnerOverride) {
+        info.ownerPid = static_cast<pid_t>(std::atoi(envOwnerOverride));
+    }
+    const char* envScreenOverride = std::getenv("AIMON_SCREEN_SESSION_OVERRIDE");
+    if (envScreenOverride && *envScreenOverride) {
+        info.screenSession = envScreenOverride;
+    }
+
+    if (info.ownerPid == 0) {
+        const char* envCursorState = std::getenv("AIMON_CURSOR_STATE_DIR");
+        const char* envClaudeState = std::getenv("AIMON_CLAUDE_STATE_DIR");
+        fs::path statePath = (targetProvider == "claude")
+            ? ((envClaudeState && *envClaudeState) ? fs::path(envClaudeState) : fs::path(PathUtils::expandHome("~/.claude/hooks/state"))) / (cid + ".json")
+            : ((envCursorState && *envCursorState) ? fs::path(envCursorState) : fs::path(PathUtils::expandHome("~/.cursor/hooks/state"))) / (cid + ".json");
+        std::error_code ec;
+        if (fs::exists(statePath, ec)) {
+            std::ifstream sf(statePath);
+            if (sf.is_open()) {
+                try {
+                    nlohmann::json sj;
+                    sf >> sj;
+                    if (sj.contains("owner_pid") && sj["owner_pid"].is_number_integer()) {
+                        pid_t candPid = sj["owner_pid"].get<pid_t>();
+                        if (candPid > 0 && fs::exists("/proc/" + std::to_string(candPid), ec)) {
+                            if (isProcessInteractiveProvider(candPid, targetProvider)) {
+                                info.ownerPid = candPid;
+                            }
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+
+    std::vector<pid_t> interactiveCandidates;
+    if (info.ownerPid == 0 || info.screenSession.empty()) {
+        std::error_code pEc;
+        fs::path procDir = "/proc";
+        uid_t myUid = getuid();
+        for (const auto& ent : fs::directory_iterator(procDir, pEc)) {
+            if (pEc) break;
+            std::string name = ent.path().filename().string();
+            if (name.empty() || !std::isdigit(static_cast<unsigned char>(name[0]))) continue;
+            pid_t pid = static_cast<pid_t>(std::atoi(name.c_str()));
+            if (pid <= 0) continue;
+            struct stat st;
+            if (stat(ent.path().c_str(), &st) != 0 || st.st_uid != myUid) continue;
+
+            if (isProcessInteractiveProvider(pid, targetProvider)) {
+                interactiveCandidates.push_back(pid);
+                if (info.ownerPid == 0) {
+                    if (readProcCmdline(pid).find(cid) != std::string::npos ||
+                        processHoldsCidFd(pid, cid)) {
+                        info.ownerPid = pid;
+                    }
+                }
+            }
+        }
+
+        if (info.ownerPid == 0 && !wsDir.empty()) {
+            for (const auto& pid : interactiveCandidates) {
+                if (processCwdEquals(pid, wsDir) && !findScreenSessionForPid(pid).empty()) {
+                    info.ownerPid = pid;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (info.ownerPid > 0 && info.screenSession.empty()) {
+        info.screenSession = findScreenSessionForPid(info.ownerPid);
+    }
+
+    if (targetProvider == "cursor" && !cid.empty() && cid != "new") {
+        bool isAgentTrans = false;
+        if (!existingTranscriptPath.empty()) {
+            std::string pStr = existingTranscriptPath;
+            if (pStr.find("/agent-transcripts/" + cid + "/" + cid + ".jsonl") != std::string::npos) {
+                isAgentTrans = true;
+            }
+        }
+        if (isAgentTrans) {
+            bool hasCliStore = false;
+            const char* envChatsDir = std::getenv("AIMON_CURSOR_CHATS_DIR");
+            fs::path chatsDir;
+            if (envChatsDir && *envChatsDir) {
+                chatsDir = envChatsDir;
+            } else {
+                std::string cProjDir = getCursorProjectsDir();
+                if (!cProjDir.empty()) {
+                    chatsDir = fs::path(cProjDir).parent_path() / "chats";
+                } else {
+                    chatsDir = PathUtils::expandHome("~/.cursor/chats");
+                }
+            }
+            std::error_code ec;
+            if (fs::exists(chatsDir, ec) && fs::is_directory(chatsDir, ec)) {
+                for (const auto& wsEnt : fs::directory_iterator(chatsDir, ec)) {
+                    if (ec || !wsEnt.is_directory()) continue;
+                    fs::path histPath = wsEnt.path() / cid / "prompt_history.json";
+                    fs::path storePath = wsEnt.path() / cid / "store.db";
+                    if (fs::exists(histPath, ec) || fs::exists(storePath, ec)) {
+                        hasCliStore = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasCliStore) {
+                info.isIdeRendererSession = true;
+            }
+        }
+    }
+
+    return info;
+}
+
+static bool runCommandSync(const std::vector<std::string>& cmdArgs) {
+    if (cmdArgs.empty()) return false;
+    pid_t ch = fork();
+    if (ch == 0) {
+        int devNull = open("/dev/null", O_RDWR);
+        if (devNull >= 0) {
+            dup2(devNull, STDIN_FILENO);
+            dup2(devNull, STDOUT_FILENO);
+            dup2(devNull, STDERR_FILENO);
+            if (devNull > 2) close(devNull);
+        }
+        std::vector<char*> argv;
+        for (const auto& a : cmdArgs) {
+            argv.push_back(const_cast<char*>(a.c_str()));
+        }
+        argv.push_back(nullptr);
+        execvp(cmdArgs[0].c_str(), argv.data());
+        _exit(127);
+    } else if (ch > 0) {
+        int st = 0;
+        waitpid(ch, &st, 0);
+        return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    }
+    return false;
+}
+
+static bool pollLiveProviderTurn(
+    const std::string& targetProvider,
+    const std::string& existingTranscriptPath,
+    const std::string& existingSlug,
+    size_t priorLineCount,
+    std::string& replyText) {
+    int timeoutMs = 90000;
+    const char* envTimeout = std::getenv("AIMON_LIVE_ROUTE_TIMEOUT_MS");
+    if (envTimeout && *envTimeout) {
+        timeoutMs = std::atoi(envTimeout);
+        if (timeoutMs <= 0) timeoutMs = 90000;
+    }
+    int pollIntervalMs = 200;
+    const char* envPoll = std::getenv("AIMON_LIVE_ROUTE_POLL_MS");
+    if (envPoll && *envPoll) {
+        pollIntervalMs = std::atoi(envPoll);
+        if (pollIntervalMs <= 0) pollIntervalMs = 200;
+    }
+
+    int elapsedMs = 0;
+    bool turnFinished = false;
+    while (elapsedMs < timeoutMs) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
+        elapsedMs += pollIntervalMs;
+
+        std::error_code ec;
+        if (!fs::exists(existingTranscriptPath, ec)) {
+            continue;
+        }
+
+        std::vector<std::string> lines;
+        {
+            std::ifstream fIn(existingTranscriptPath);
+            std::string l;
+            while (std::getline(fIn, l)) {
+                if (!l.empty()) {
+                    lines.push_back(l);
+                }
+            }
+        }
+
+        if (lines.size() <= priorLineCount) {
+            continue;
+        }
+
+        // When targetProvider is cursor, the interactive CLI replaces the previous turn_ended
+        // line with the new user line. If priorLineCount included that sentinel, searching from
+        // priorLineCount - 1 ensures the new user turn is never skipped.
+        size_t searchStart = priorLineCount;
+        if (targetProvider == "cursor" && searchStart > 0) {
+            searchStart = searchStart - 1;
+        }
+
+        bool foundNewUserLine = false;
+        for (size_t i = searchStart; i < lines.size(); ++i) {
+            const auto& cl = lines[i];
+            if (targetProvider == "cursor") {
+                if (cl.find("\"role\":\"user\"") != std::string::npos ||
+                    cl.find("\"role\": \"user\"") != std::string::npos) {
+                    foundNewUserLine = true;
+                    break;
+                }
+            } else {
+                if (cl.find("\"type\":\"user\"") != std::string::npos ||
+                    cl.find("\"type\": \"user\"") != std::string::npos) {
+                    foundNewUserLine = true;
+                    break;
+                }
+            }
+        }
+
+        if (!foundNewUserLine) {
+            continue;
+        }
+
+        if (targetProvider == "cursor") {
+            for (size_t i = searchStart; i < lines.size(); ++i) {
+                const auto& cl = lines[i];
+                if (cl.find("\"type\":\"turn_ended\"") != std::string::npos ||
+                    cl.find("\"type\": \"turn_ended\"") != std::string::npos) {
+                    turnFinished = true;
+                    break;
+                }
+            }
+            if (turnFinished) {
+                break;
+            }
+        } else {
+            for (size_t i = priorLineCount; i < lines.size(); ++i) {
+                const auto& cl = lines[i];
+                if ((cl.find("\"type\":\"assistant\"") != std::string::npos ||
+                     cl.find("\"type\": \"assistant\"") != std::string::npos) &&
+                    (cl.find("\"stop_reason\":\"end_turn\"") != std::string::npos ||
+                     cl.find("\"stop_reason\": \"end_turn\"") != std::string::npos ||
+                     cl.find("\"stop_reason\":\"stop_sequence\"") != std::string::npos ||
+                     cl.find("\"stop_reason\": \"stop_sequence\"") != std::string::npos)) {
+                    turnFinished = true;
+                    break;
+                }
+            }
+            if (turnFinished) {
+                break;
+            }
+        }
+    }
+
+    if (!turnFinished) {
+        return false;
+    }
+
+    auto norm = parseProviderTranscriptJsonl(existingTranscriptPath, targetProvider, -1, existingSlug, false);
+    std::string collectedReply;
+    size_t lastUserIdx = norm.steps.size();
+    for (size_t i = norm.steps.size(); i > 0; --i) {
+        const auto& s = norm.steps[i - 1];
+        std::string sType = s.value("type", "");
+        if (sType == "USER_INPUT") {
+            lastUserIdx = i - 1;
+            break;
+        }
+    }
+
+    for (size_t i = (lastUserIdx < norm.steps.size() ? lastUserIdx + 1 : 0); i < norm.steps.size(); ++i) {
+        const auto& s = norm.steps[i];
+        std::string textContent = s.value("content", s.value("text", ""));
+        if (!textContent.empty()) {
+            if (!collectedReply.empty()) collectedReply += "\n";
+            collectedReply += textContent;
+        } else if (s.contains("tool_calls") && s["tool_calls"].is_array() && !s["tool_calls"].empty()) {
+            for (const auto& tc : s["tool_calls"]) {
+                std::string tName = tc.value("name", "tool");
+                std::string tSumm = tc.value("toolSummary", "");
+                if (!collectedReply.empty()) collectedReply += "\n";
+                collectedReply += "[Executed: " + tName + (tSumm.empty() ? "" : (" " + tSumm)) + "]";
+            }
+        }
+    }
+    if (collectedReply.empty()) {
+        collectedReply = "OK";
+    }
+    replyText = collectedReply;
+    return true;
+}
+
+static bool routePromptViaScreen(
+    const std::string& screenSession,
+    const std::string& targetProvider,
+    const std::string& cid,
+    const std::string& promptArg,
+    const std::string& existingTranscriptPath,
+    const std::string& existingSlug,
+    std::string& replyText) {
+    if (screenSession.empty()) return false;
+
+    size_t priorLineCount = 0;
+    std::error_code ec;
+    if (fs::exists(existingTranscriptPath, ec)) {
+        std::ifstream countIn(existingTranscriptPath);
+        std::string line;
+        while (std::getline(countIn, line)) {
+            if (!line.empty()) {
+                if (targetProvider == "cursor" &&
+                    (line.find("\"type\":\"turn_ended\"") != std::string::npos ||
+                     line.find("\"type\": \"turn_ended\"") != std::string::npos)) {
+                    continue;
+                }
+                ++priorLineCount;
+            }
+        }
+    }
+
+    std::string sanitizedPrompt = promptArg;
+    for (auto& c : sanitizedPrompt) {
+        if (c == '\r' || c == '\n') c = ' ';
+    }
+
+    const char* envScreenBin = std::getenv("AIMON_SCREEN_BIN");
+    std::string screenBin = (envScreenBin && *envScreenBin) ? envScreenBin : "/usr/bin/screen";
+
+    const size_t kMaxChunk = 256;
+    for (size_t off = 0; off < sanitizedPrompt.size(); off += kMaxChunk) {
+        std::string chunk = sanitizedPrompt.substr(off, kMaxChunk);
+        std::vector<std::string> stuffCmd = {
+            screenBin, "-S", screenSession, "-p", "0", "-X", "stuff", chunk
+        };
+        runCommandSync(stuffCmd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    std::vector<std::string> enterCmd = {
+        screenBin, "-S", screenSession, "-p", "0", "-X", "stuff", "\r"
+    };
+    runCommandSync(enterCmd);
+
+    return pollLiveProviderTurn(targetProvider, existingTranscriptPath, existingSlug, priorLineCount, replyText);
+}
+
+static bool routePromptViaIdeBridge(
+    const std::string& cid,
+    const std::string& text,
+    const std::string& existingTranscriptPath,
+    const std::string& existingSlug,
+    std::string& replyText) {
+    const char* envBridge = std::getenv("AIMON_CURSOR_IDE_BRIDGE_SOCK");
+    std::string sockPath = (envBridge && *envBridge)
+        ? envBridge
+        : PathUtils::expandHome("~/.cache/aimon/cursor-agent-host.sock");
+    std::error_code ec;
+    if (!fs::exists(sockPath, ec)) {
+        return false;
+    }
+
+    int sockFd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sockFd < 0) return false;
+    struct sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
+    if (connect(sockFd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(sockFd);
+        return false;
+    }
+
+    size_t priorLineCount = 0;
+    if (fs::exists(existingTranscriptPath, ec)) {
+        std::ifstream countIn(existingTranscriptPath);
+        std::string line;
+        while (std::getline(countIn, line)) {
+            if (!line.empty()) {
+                if (line.find("\"type\":\"turn_ended\"") != std::string::npos ||
+                    line.find("\"type\": \"turn_ended\"") != std::string::npos) {
+                    continue;
+                }
+                ++priorLineCount;
+            }
+        }
+    }
+
+    nlohmann::json reqPayload = {
+        {"sessionId", cid},
+        {"text", text}
+    };
+    std::string reqStr = reqPayload.dump() + "\n";
+    ssize_t written = write(sockFd, reqStr.c_str(), reqStr.size());
+    close(sockFd);
+    if (written <= 0) return false;
+
+    return pollLiveProviderTurn("cursor", existingTranscriptPath, existingSlug, priorLineCount, replyText);
 }
 
 WebServer::WebServer(StateStore& stateStore, HistoryStore& historyStore,
@@ -5200,19 +5931,6 @@ void WebServer::setupRoutes() {
                                       std::string& outRaw,
                                       std::string& outReply,
                                       std::string& outSessionId) -> bool {
-                std::vector<std::string> priorCursorLines;
-                if (targetProvider == "cursor" && !resumeCid.empty() && resumeCid != "new" &&
-                    !existingTranscriptPath.empty() && fs::exists(existingTranscriptPath)) {
-                    std::ifstream fIn(existingTranscriptPath);
-                    std::string l;
-                    while (std::getline(fIn, l)) {
-                        if (!l.empty() && l.find("\"type\":\"turn_ended\"") == std::string::npos &&
-                            l.find("\"type\": \"turn_ended\"") == std::string::npos) {
-                            priorCursorLines.push_back(l);
-                        }
-                    }
-                }
-
                 int pipeFd[2];
                 if (pipe(pipeFd) != 0) {
                     return false;
@@ -5269,28 +5987,6 @@ void WebServer::setupRoutes() {
                     close(pipeFd[0]);
                     int st = 0;
                     waitpid(child, &st, 0);
-
-                    if (!priorCursorLines.empty() && fs::exists(existingTranscriptPath)) {
-                        std::vector<std::string> afterLines;
-                        {
-                            std::ifstream fAfter(existingTranscriptPath);
-                            std::string l;
-                            while (std::getline(fAfter, l)) {
-                                if (!l.empty()) {
-                                    afterLines.push_back(l);
-                                }
-                            }
-                        }
-                        if (!afterLines.empty() && (afterLines.size() < priorCursorLines.size() || afterLines[0] != priorCursorLines[0])) {
-                            std::ofstream fOut(existingTranscriptPath, std::ios::trunc);
-                            for (const auto& pl : priorCursorLines) {
-                                fOut << pl << "\n";
-                            }
-                            for (const auto& al : afterLines) {
-                                fOut << al << "\n";
-                            }
-                        }
-                    }
 
                     outReply = outRaw;
                     outSessionId = (!resumeCid.empty() && resumeCid != "new") ? resumeCid : "";
@@ -5422,6 +6118,70 @@ void WebServer::setupRoutes() {
                         {"conversationId", cid},
                         {"command", cmdVerb},
                         {"response", compNote}
+                    }).dump(2), "application/json");
+                    return;
+                }
+            }
+
+            if (!cid.empty() && cid != "new") {
+                auto sessionInfo = discoverLiveProviderSession(targetProvider, cid, wsDir, existingTranscriptPath.string());
+                if (!sessionInfo.screenSession.empty()) {
+                    std::string screenReply;
+                    if (routePromptViaScreen(sessionInfo.screenSession, targetProvider, cid, text, existingTranscriptPath.string(), existingSlug, screenReply)) {
+                        res.set_content(nlohmann::json({
+                            {"status", "ok"},
+                            {"agentId", targetProvider},
+                            {"source", targetProvider},
+                            {"conversationId", cid},
+                            {"routedVia", "screen"},
+                            {"screenSession", sessionInfo.screenSession},
+                            {"autoApprove", autoApprove},
+                            {"response", screenReply}
+                        }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                        return;
+                    } else {
+                        res.status = 504;
+                        res.set_content(nlohmann::json({
+                            {"status", "error"},
+                            {"error", "Timed out waiting for response from live screen session " + sessionInfo.screenSession},
+                            {"conversationId", cid}
+                        }).dump(2), "application/json");
+                        return;
+                    }
+                }
+
+                if (targetProvider == "cursor") {
+                    std::string bridgeReply;
+                    if (routePromptViaIdeBridge(cid, text, existingTranscriptPath.string(), existingSlug, bridgeReply)) {
+                        res.set_content(nlohmann::json({
+                            {"status", "ok"},
+                            {"agentId", "cursor"},
+                            {"source", "cursor"},
+                            {"conversationId", cid},
+                            {"routedVia", "ide_bridge"},
+                            {"autoApprove", autoApprove},
+                            {"response", bridgeReply}
+                        }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                        return;
+                    }
+
+                    if (sessionInfo.isIdeRendererSession) {
+                        res.status = 409;
+                        res.set_content(nlohmann::json({
+                            {"status", "error"},
+                            {"error", "Session is currently active in a desktop IDE or non-screen terminal that does not allow headless CLI --resume injection without forking conversation state. Start the CLI agent inside GNU screen for live bidirectional routing."},
+                            {"conversationId", cid}
+                        }).dump(2), "application/json");
+                        return;
+                    }
+                }
+
+                if (sessionInfo.ownerPid > 0) {
+                    res.status = 409;
+                    res.set_content(nlohmann::json({
+                        {"status", "error"},
+                        {"error", "Session is currently active in a desktop IDE or non-screen terminal that does not allow headless CLI --resume injection without forking conversation state. Start the CLI agent inside GNU screen for live bidirectional routing."},
+                        {"conversationId", cid}
                     }).dump(2), "application/json");
                     return;
                 }
