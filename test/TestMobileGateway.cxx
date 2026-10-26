@@ -4057,6 +4057,254 @@ static void RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndP
     std::cout << "[TestMobileGateway] RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndPurge passed!" << std::endl;
 }
 
+static void testSessionScopedWorkspaceBrowsing() {
+    std::cout << "[TestMobileGateway] Running testSessionScopedWorkspaceBrowsing..." << std::endl;
+    std::string baseDir = "/tmp/aimon_sess_ws_" + std::to_string(getpid());
+    fs::remove_all(baseDir);
+    fs::create_directories(baseDir);
+
+    std::string cliRoot = baseDir + "/cli_root";
+    std::string cliBrain = cliRoot + "/brain";
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string dbPath = cliRoot + "/conversation_summaries.db";
+    std::string customWs = baseDir + "/custom_ws";
+    std::string tempMobileDb = baseDir + "/mobile_devices.json";
+
+    fs::create_directories(cliBrain);
+    fs::create_directories(ideBrain);
+    fs::create_directories(customWs);
+
+    // 1. Populate customWs with hello.cxx
+    {
+        std::ofstream hf(customWs + "/hello.cxx");
+        hf << "#include <iostream>\nint main() { std::cout << \"Hello custom_ws\\n\"; return 0; }\n";
+    }
+
+    // 2. Create binary file data.bin with NUL byte
+    {
+        std::ofstream bf(customWs + "/data.bin", std::ios::binary);
+        char binData[] = {'a', 'b', '\0', 'd'};
+        bf.write(binData, sizeof(binData));
+    }
+
+    // 3. Create large file (>1 MB)
+    {
+        std::ofstream lf(customWs + "/large.txt");
+        std::string chunk(1024, 'X');
+        for (int i = 0; i < 1050; ++i) {
+            lf << chunk;
+        }
+    }
+
+    // 4. Create conversation_summaries.db with sess-with-ws and sess-no-ws
+    {
+        sqlite3* db = nullptr;
+        assert(sqlite3_open(dbPath.c_str(), &db) == SQLITE_OK);
+        const char* createSql =
+            "CREATE TABLE conversation_summaries ("
+            "conversation_id TEXT PRIMARY KEY, "
+            "title TEXT NOT NULL DEFAULT '', "
+            "preview TEXT NOT NULL DEFAULT '', "
+            "step_count INTEGER NOT NULL DEFAULT 0, "
+            "last_modified_time TEXT NOT NULL, "
+            "workspace_uris TEXT NOT NULL DEFAULT '[]', "
+            "status TEXT NOT NULL DEFAULT '', "
+            "parent_conversation_id TEXT NOT NULL DEFAULT '', "
+            "nesting_depth INTEGER NOT NULL DEFAULT 0, "
+            "agent_name TEXT NOT NULL DEFAULT ''"
+            ");";
+        char* err = nullptr;
+        assert(sqlite3_exec(db, createSql, nullptr, nullptr, &err) == SQLITE_OK);
+
+        std::string insertWithWs =
+            "INSERT INTO conversation_summaries "
+            "(conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status) "
+            "VALUES ('sess-with-ws', 'Session With WS', 'Preview', 2, '2026-10-26 00:00:00', "
+            "'[\"file://" + customWs + "\"]', 'CASCADE_RUN_STATUS_COMPLETED');";
+        assert(sqlite3_exec(db, insertWithWs.c_str(), nullptr, nullptr, &err) == SQLITE_OK);
+
+        const char* insertNoWs =
+            "INSERT INTO conversation_summaries "
+            "(conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status) "
+            "VALUES ('sess-no-ws', 'Session No WS', 'Preview', 2, '2026-10-26 00:00:00', "
+            "'', 'CASCADE_RUN_STATUS_COMPLETED');";
+        assert(sqlite3_exec(db, insertNoWs, nullptr, nullptr, &err) == SQLITE_OK);
+
+        sqlite3_close(db);
+    }
+
+    // Also create transcript.jsonl for sess-with-ws in cliBrain
+    {
+        fs::path sessLogDir = fs::path(cliBrain) / "sess-with-ws" / ".system_generated" / "logs";
+        fs::create_directories(sessLogDir);
+        std::ofstream tf(sessLogDir / "transcript.jsonl");
+        tf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"<USER_REQUEST>\\nHi\\n</USER_REQUEST>\"}\n";
+        tf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Hello\",\"tool_calls\":[]}\n";
+    }
+
+    // Set test env (specifically unset AIMON_WORKSPACE_ROOT)
+    unsetenv("AIMON_WORKSPACE_ROOT");
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+
+    assert(MobileGateway::getInstance().init(tempMobileDb));
+    std::string secret = MobileGateway::getInstance().createPairingSecret(120);
+    std::string validToken;
+    assert(MobileGateway::getInstance().verifyPairingCode(secret, "sess-ws-dev", "Test Device", validToken));
+
+    StateStore &stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.endpointsEnabled = false;
+
+    WebServer server(stateStore, historyStore, config);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", validToken}};
+
+    // 1. GET /api/workspace/tree (no conversationId): returns 200 with workspaceAvailable: false, workspace: "", tree: []
+    auto resNoCid = client.Get("/api/workspace/tree", headers);
+    assert(resNoCid && resNoCid->status == 200);
+    json jNoCid = json::parse(resNoCid->body);
+    assert(jNoCid.value("workspaceAvailable", true) == false);
+    assert(jNoCid.value("workspace", "foo") == "");
+    assert(jNoCid["tree"].is_array() && jNoCid["tree"].empty());
+    assert(resNoCid->body.find("aimon") == std::string::npos);
+
+    // 2. GET /api/workspace/tree?conversationId=new: returns 200 with workspaceAvailable: false
+    auto resNew = client.Get("/api/workspace/tree?conversationId=new", headers);
+    assert(resNew && resNew->status == 200);
+    json jNew = json::parse(resNew->body);
+    assert(jNew.value("workspaceAvailable", true) == false);
+    assert(jNew.value("workspace", "foo") == "");
+    assert(jNew["tree"].is_array() && jNew["tree"].empty());
+
+    // 3. GET /api/workspace/tree?conversationId=nonexistent-session-id: returns 200 with workspaceAvailable: false
+    auto resNonexistent = client.Get("/api/workspace/tree?conversationId=nonexistent-session-id", headers);
+    assert(resNonexistent && resNonexistent->status == 200);
+    json jNon = json::parse(resNonexistent->body);
+    assert(jNon.value("workspaceAvailable", true) == false);
+    assert(jNon["tree"].is_array() && jNon["tree"].empty());
+
+    // 4. GET /api/workspace/tree?conversationId=sess-with-ws: returns workspaceAvailable: true, workspace: customWs, tree has hello.cxx
+    auto resWithWs = client.Get("/api/workspace/tree?conversationId=sess-with-ws", headers);
+    assert(resWithWs && resWithWs->status == 200);
+    json jWithWs = json::parse(resWithWs->body);
+    assert(jWithWs.value("workspaceAvailable", false) == true);
+    assert(jWithWs.value("workspace", "") == customWs);
+    assert(jWithWs["tree"].is_array() && !jWithWs["tree"].empty());
+    bool foundHello = false;
+    for (const auto& item : jWithWs["tree"]) {
+        if (item.value("name", "") == "hello.cxx") {
+            foundHello = true;
+            break;
+        }
+    }
+    assert(foundHello);
+
+    // 5. GET /api/workspace/file?conversationId=sess-with-ws&path=hello.cxx reads hello.cxx
+    auto resReadFile = client.Get("/api/workspace/file?conversationId=sess-with-ws&path=hello.cxx", headers);
+    assert(resReadFile && resReadFile->status == 200);
+    json jReadFile = json::parse(resReadFile->body);
+    assert(jReadFile.value("path", "") == "hello.cxx");
+    assert(jReadFile.value("content", "").find("Hello custom_ws") != std::string::npos);
+    assert(jReadFile.value("language", "") == ".cxx");
+
+    // 6. POST /api/workspace/file updates hello.cxx in custom_ws
+    json postBody = {
+        {"conversationId", "sess-with-ws"},
+        {"path", "hello.cxx"},
+        {"content", "// Updated content\nint main() { return 1; }\n"}
+    };
+    auto resWrite = client.Post("/api/workspace/file", headers, postBody.dump(), "application/json");
+    assert(resWrite && resWrite->status == 200);
+    json jWrite = json::parse(resWrite->body);
+    assert(jWrite.value("status", "") == "ok");
+
+    auto resReadUpdated = client.Get("/api/workspace/file?conversationId=sess-with-ws&path=hello.cxx", headers);
+    assert(resReadUpdated && resReadUpdated->status == 200);
+    json jReadUpdated = json::parse(resReadUpdated->body);
+    assert(jReadUpdated.value("content", "").find("// Updated content") != std::string::npos);
+
+    // 7. GET /api/workspace/tree?conversationId=sess-no-ws: returns workspaceAvailable: false, tree: []
+    auto resNoWsTree = client.Get("/api/workspace/tree?conversationId=sess-no-ws", headers);
+    assert(resNoWsTree && resNoWsTree->status == 200);
+    json jNoWsTree = json::parse(resNoWsTree->body);
+    assert(jNoWsTree.value("workspaceAvailable", true) == false);
+    assert(jNoWsTree["tree"].is_array() && jNoWsTree["tree"].empty());
+
+    // GET /api/workspace/file?conversationId=sess-no-ws&path=hello.cxx returns 404
+    auto resNoWsFile = client.Get("/api/workspace/file?conversationId=sess-no-ws&path=hello.cxx", headers);
+    assert(resNoWsFile && resNoWsFile->status == 404);
+
+    // 8. Binary file guard: returns 415
+    auto resBin = client.Get("/api/workspace/file?conversationId=sess-with-ws&path=data.bin", headers);
+    assert(resBin && resBin->status == 415);
+
+    // 9. Large file size guard (>1 MB): returns 413
+    auto resLarge = client.Get("/api/workspace/file?conversationId=sess-with-ws&path=large.txt", headers);
+    assert(resLarge && resLarge->status == 413);
+
+    // 10. Directory traversal guard: returns 400
+    auto resTrav = client.Get("/api/workspace/file?conversationId=sess-with-ws&path=../../etc/passwd", headers);
+    assert(resTrav && resTrav->status == 400);
+
+    // 11. /api/agent/available workspace scoping
+    auto resAvailNoCid = client.Get("/api/agent/available", headers);
+    assert(resAvailNoCid && resAvailNoCid->status == 200);
+    json jAvailNoCid = json::parse(resAvailNoCid->body);
+    assert(jAvailNoCid.value("current_workspace", "foo") == "");
+    assert(jAvailNoCid["allowed_workspaces"].is_array() && jAvailNoCid["allowed_workspaces"].empty());
+    assert(jAvailNoCid["agents"][0].value("workspaceRoot", "foo") == "");
+
+    auto resAvailWithCid = client.Get("/api/agent/available?conversationId=sess-with-ws", headers);
+    assert(resAvailWithCid && resAvailWithCid->status == 200);
+    json jAvailWithCid = json::parse(resAvailWithCid->body);
+    assert(jAvailWithCid.value("current_workspace", "") == customWs);
+    assert(jAvailWithCid["allowed_workspaces"].size() == 1 && jAvailWithCid["allowed_workspaces"][0] == customWs);
+    assert(jAvailWithCid["agents"][0].value("workspaceRoot", "") == customWs);
+
+    // 12. /api/agent/transcript workspace scoping
+    auto resTrans = client.Get("/api/agent/transcript?id=sess-with-ws", headers);
+    assert(resTrans && resTrans->status == 200);
+    json jTrans = json::parse(resTrans->body);
+    assert(jTrans.value("workspacePath", "") == customWs);
+    assert(jTrans.value("workspace", "") == fs::path(customWs).filename().string());
+
+    // 13. Large workspace node budget capping: verify returned nodes <= 1000
+    fs::create_directories(customWs + "/bigdir");
+    for (int i = 0; i < 1050; ++i) {
+        std::ofstream ef(customWs + "/bigdir/file_" + std::to_string(i) + ".txt");
+        ef << i;
+    }
+    auto resBigTree = client.Get("/api/workspace/tree?conversationId=sess-with-ws", headers);
+    assert(resBigTree && resBigTree->status == 200);
+    json jBigTree = json::parse(resBigTree->body);
+    assert(jBigTree.value("workspaceAvailable", false) == true);
+    std::function<size_t(const json&)> countNodes = [&](const json& arr) -> size_t {
+        size_t count = 0;
+        for (const auto& item : arr) {
+            count++;
+            if (item.contains("children") && item["children"].is_array()) {
+                count += countNodes(item["children"]);
+            }
+        }
+        return count;
+    };
+    size_t returnedNodes = countNodes(jBigTree["tree"]);
+    assert(returnedNodes <= 1000);
+
+    server.stop();
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] testSessionScopedWorkspaceBrowsing passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -4068,6 +4316,7 @@ int main() {
     testMultiRootBrainConversationDiscovery();
     testTranscriptJsonlParsingAndRapidCheck();
     testWorkspaceRecursiveTree();
+    testSessionScopedWorkspaceBrowsing();
     testAgentPromptNoFakeElizaAndRealBridge();
     testAgentPromptPreservesCascadeConfigAndModelM418();
     testSlashCommandsAndSessionNotifications();

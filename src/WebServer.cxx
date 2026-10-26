@@ -4425,6 +4425,188 @@ void WebServer::setupRoutes() {
         return aimon::getCliBrainDir();
     };
 
+    auto resolveSessionWorkspacePath = [getCliBrainDir, getIdeBrainDir](const std::string& cid) -> std::string {
+        if (cid.empty() || cid == "new" || cid.find("..") != std::string::npos || cid.find('/') != std::string::npos) {
+            return "";
+        }
+
+        // Step 1 (Running agy process): Check discoverRunningAgyProcesses()
+        const char* envProcsOverride = std::getenv("AIMON_AGY_PROCESSES_FILE");
+        for (const auto& proc : discoverRunningAgyProcesses()) {
+            if (proc.lockedConversationId == cid && !proc.cwd.empty()) {
+                if ((fs::exists(proc.cwd) && fs::is_directory(proc.cwd)) ||
+                    (envProcsOverride && *envProcsOverride)) {
+                    return proc.cwd;
+                }
+            }
+        }
+
+        // Step 2 (Antigravity conversation_summaries.db)
+        fs::path sumDbPath = fs::path(getCliBrainDir()).parent_path() / "conversation_summaries.db";
+        if (!fs::exists(sumDbPath)) {
+            sumDbPath = fs::path(getCliBrainDir()) / "conversation_summaries.db";
+        }
+        if (fs::exists(sumDbPath)) {
+            sqlite3* db = nullptr;
+            if (sqlite3_open_v2(sumDbPath.string().c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
+                sqlite3_stmt* stmt = nullptr;
+                const char* sql = "SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ? LIMIT 1";
+                if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, cid.c_str(), -1, SQLITE_STATIC);
+                    if (sqlite3_step(stmt) == SQLITE_ROW) {
+                        const unsigned char* wuTxt = sqlite3_column_text(stmt, 0);
+                        std::string wsUris = wuTxt ? reinterpret_cast<const char*>(wuTxt) : "";
+                        try {
+                            auto wj = nlohmann::json::parse(wsUris, nullptr, false);
+                            if (!wj.is_discarded() && wj.is_array() && !wj.empty() && wj[0].is_string()) {
+                                std::string u = wj[0].get<std::string>();
+                                if (u.rfind("file://", 0) == 0) u = u.substr(7);
+                                if (!u.empty() && fs::exists(u) && fs::is_directory(u)) {
+                                    sqlite3_finalize(stmt);
+                                    sqlite3_close(db);
+                                    return u;
+                                }
+                            }
+                        } catch (...) {}
+                    }
+                    sqlite3_finalize(stmt);
+                }
+                sqlite3_close(db);
+            }
+        }
+
+        // Step 3 (Antigravity transcript.jsonl <user_information>)
+        auto checkTranscriptCwd = [](const fs::path& transPath) -> std::string {
+            if (!fs::exists(transPath)) return "";
+            std::ifstream tf(transPath);
+            if (!tf.is_open()) return "";
+            std::string line;
+            int lineCount = 0;
+            while (lineCount < 30 && std::getline(tf, line)) {
+                lineCount++;
+                if (line.empty()) continue;
+                std::string contentToScan = line;
+                auto j = nlohmann::json::parse(line, nullptr, false);
+                if (!j.is_discarded() && j.contains("content") && j["content"].is_string()) {
+                    contentToScan = j["content"].get<std::string>();
+                }
+                auto cwdPos = contentToScan.find("Command Working Directory: ");
+                if (cwdPos != std::string::npos) {
+                    size_t start = cwdPos + 27;
+                    size_t end = contentToScan.find_first_of("\r\n\"", start);
+                    std::string p = (end == std::string::npos) ? contentToScan.substr(start) : contentToScan.substr(start, end - start);
+                    auto first = p.find_first_not_of(" \t\r\n");
+                    if (first != std::string::npos) {
+                        auto last = p.find_last_not_of(" \t\r\n");
+                        p = p.substr(first, last - first + 1);
+                    } else {
+                        p.clear();
+                    }
+                    if (!p.empty() && fs::exists(p) && fs::is_directory(p)) {
+                        return p;
+                    }
+                }
+                auto wsPos = contentToScan.find("Active Workspaces:");
+                if (wsPos != std::string::npos) {
+                    size_t dashPos = contentToScan.find("- ", wsPos + 18);
+                    if (dashPos != std::string::npos) {
+                        size_t start = dashPos + 2;
+                        size_t end = contentToScan.find_first_of("\r\n\"", start);
+                        std::string p = (end == std::string::npos) ? contentToScan.substr(start) : contentToScan.substr(start, end - start);
+                        auto first = p.find_first_not_of(" \t\r\n");
+                        if (first != std::string::npos) {
+                            auto last = p.find_last_not_of(" \t\r\n");
+                            p = p.substr(first, last - first + 1);
+                        } else {
+                            p.clear();
+                        }
+                        if (!p.empty() && fs::exists(p) && fs::is_directory(p)) {
+                            return p;
+                        }
+                    }
+                }
+            }
+            return "";
+        };
+
+        fs::path cliTrans = fs::path(getCliBrainDir()) / cid / ".system_generated" / "logs" / "transcript.jsonl";
+        std::string cliFound = checkTranscriptCwd(cliTrans);
+        if (!cliFound.empty()) return cliFound;
+
+        fs::path ideTrans = fs::path(getIdeBrainDir()) / cid / ".system_generated" / "logs" / "transcript.jsonl";
+        std::string ideFound = checkTranscriptCwd(ideTrans);
+        if (!ideFound.empty()) return ideFound;
+
+        // Step 4 (Claude Code / Cursor transcript)
+        std::string provSource;
+        std::string provSlug;
+        fs::path provPath = findProviderTranscriptById(cid, provSource, provSlug);
+        if (!provPath.empty()) {
+            auto parsed = parseProviderTranscriptJsonl(provPath, provSource, -1, provSlug, true);
+            if (!parsed.workspacePath.empty() && fs::exists(parsed.workspacePath) && fs::is_directory(parsed.workspacePath)) {
+                return parsed.workspacePath;
+            }
+        }
+
+        // Step 5 (Telemetry DB / Session Hook state)
+        try {
+            auto sRec = AgentTelemetryDb::getInstance().querySessionRecord(cid);
+            if (!sRec.empty()) {
+                std::string wsp = sRec.value("workspace_path", sRec.value("workspace", ""));
+                if (!wsp.empty() && fs::exists(wsp) && fs::is_directory(wsp)) {
+                    return wsp;
+                }
+            }
+        } catch (...) {}
+
+        fs::path hookSessionPath = PathUtils::expandHome("~/.config/aimon/sessions/" + cid + ".json");
+        if (fs::exists(hookSessionPath)) {
+            try {
+                std::ifstream sf(hookSessionPath);
+                if (sf.is_open()) {
+                    auto sj = nlohmann::json::parse(sf, nullptr, false);
+                    if (!sj.is_discarded()) {
+                        std::string wsp = sj.value("workspace_path", sj.value("workspace", ""));
+                        if (!wsp.empty() && fs::exists(wsp) && fs::is_directory(wsp)) {
+                            return wsp;
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+
+        return "";
+    };
+
+    auto resolveRequestedWorkspaceRoot = [resolveSessionWorkspacePath](const std::string& cid, const std::string& explicitWorkspace) -> fs::path {
+        if (!cid.empty() && cid != "new") {
+            std::string ws = resolveSessionWorkspacePath(cid);
+            if (!ws.empty()) {
+                return fs::path(ws);
+            }
+            if (!explicitWorkspace.empty() && explicitWorkspace.find("..") == std::string::npos) {
+                fs::path p = PathUtils::expandHome(explicitWorkspace);
+                if (fs::exists(p) && fs::is_directory(p)) {
+                    return p;
+                }
+            }
+            return fs::path();
+        }
+        if (cid.empty()) {
+            if (!explicitWorkspace.empty() && explicitWorkspace.find("..") == std::string::npos) {
+                fs::path p = PathUtils::expandHome(explicitWorkspace);
+                if (fs::exists(p) && fs::is_directory(p)) {
+                    return p;
+                }
+            } else if (const char* envWs = std::getenv("AIMON_WORKSPACE_ROOT"); envWs && *envWs) {
+                if (fs::exists(envWs) && fs::is_directory(envWs)) {
+                    return fs::path(envWs);
+                }
+            }
+        }
+        return fs::path();
+    };
+
     auto getCliPresenceDir = []() -> std::string {
         const char* envPres = std::getenv("AIMON_CLI_PRESENCE_DIR");
         if (envPres && *envPres) {
@@ -4464,9 +4646,12 @@ void WebServer::setupRoutes() {
         return text.substr(first, last - first + 1);
     };
 
-    auto handleAgentAvailable = [getWorkspaceRoot](const httplib::Request&, httplib::Response& res) {
+    auto handleAgentAvailable = [resolveRequestedWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        std::string wsRoot = getWorkspaceRoot().string();
+        std::string cid = req.get_param_value("conversationId");
+        if (cid.empty()) cid = req.get_param_value("id");
+        fs::path wsPath = resolveRequestedWorkspaceRoot(cid, "");
+        std::string wsRoot = wsPath.string();
         nlohmann::json resp;
         resp["agents"] = nlohmann::json::array({
             {
@@ -4488,7 +4673,7 @@ void WebServer::setupRoutes() {
                 {"workspaceRoot", wsRoot}
             }
         });
-        resp["allowed_workspaces"] = nlohmann::json::array({wsRoot});
+        resp["allowed_workspaces"] = wsRoot.empty() ? nlohmann::json::array() : nlohmann::json::array({wsRoot});
         resp["current_workspace"] = wsRoot;
         res.set_content(resp.dump(2), "application/json");
     };
@@ -6244,7 +6429,7 @@ void WebServer::setupRoutes() {
     _server->Get("/api/agent/conversations", handleAgentConversations);
     _server->Get("/api/agent/history", handleAgentConversations);
 
-    _server->Get("/api/agent/transcript", [getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName, extractConversationModelById, mapLabelToCliModelId](
+    _server->Get("/api/agent/transcript", [resolveSessionWorkspacePath, getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName, extractConversationModelById, mapLabelToCliModelId](
                                               const httplib::Request& req, httplib::Response& res) {
         auto reqStart = std::chrono::steady_clock::now();
         std::string reqId = extractOrGenerateRequestId(req);
@@ -6594,6 +6779,9 @@ void WebServer::setupRoutes() {
                 resp["steps"] = liveSteps;
                 resp["interactive"] = true;
                 resp["nonInteractiveReason"] = "";
+                std::string wsPath = resolveSessionWorkspacePath(id);
+                resp["workspacePath"] = wsPath;
+                resp["workspace"] = !wsPath.empty() ? fs::path(wsPath).filename().string() : "";
                 res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
             }
@@ -6640,13 +6828,13 @@ void WebServer::setupRoutes() {
                     for (const auto& proc : discoverRunningAgyProcesses()) {
                         if (proc.lockedConversationId == id) {
                             resp["terminalPts"] = proc.terminalPts;
-                            std::string wsPath = proc.cwd;
-                            resp["workspacePath"] = wsPath;
-                            resp["workspace"] = !wsPath.empty() ? fs::path(wsPath).filename().string() : "";
                             break;
                         }
                     }
                 }
+                std::string wsPath = resolveSessionWorkspacePath(id);
+                resp["workspacePath"] = wsPath;
+                resp["workspace"] = !wsPath.empty() ? fs::path(wsPath).filename().string() : "";
 
                 res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
@@ -6958,6 +7146,9 @@ void WebServer::setupRoutes() {
         resp["steps"] = steps;
         resp["interactive"] = true;
         resp["nonInteractiveReason"] = "";
+        std::string wsPath = resolveSessionWorkspacePath(id);
+        resp["workspacePath"] = wsPath;
+        resp["workspace"] = !wsPath.empty() ? fs::path(wsPath).filename().string() : "";
         res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
     });
 
@@ -8925,13 +9116,28 @@ void WebServer::setupRoutes() {
         res.set_content(resp.dump(2), "application/json");
     });
 
-    _server->Get("/api/workspace/tree", [getWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
+    _server->Get("/api/workspace/tree", [resolveRequestedWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        fs::path root = getWorkspaceRoot();
         std::string relSubPath = req.get_param_value("path");
         if (relSubPath.find("..") != std::string::npos) {
             res.status = 400;
             res.set_content("{\"error\":\"Invalid path traversal\"}", "application/json");
+            return;
+        }
+
+        std::string cid = req.get_param_value("conversationId");
+        if (cid.empty()) cid = req.get_param_value("id");
+        std::string explicitWs = req.get_param_value("workspace");
+        fs::path root = resolveRequestedWorkspaceRoot(cid, explicitWs);
+
+        if (root.empty() || !fs::exists(root) || !fs::is_directory(root)) {
+            nlohmann::json resp;
+            resp["workspace"] = "";
+            resp["workspaceAvailable"] = false;
+            resp["reason"] = "Workspace information is not available for the selected session.";
+            resp["path"] = "";
+            resp["tree"] = nlohmann::json::array();
+            res.set_content(resp.dump(2), "application/json");
             return;
         }
 
@@ -8948,17 +9154,28 @@ void WebServer::setupRoutes() {
                    name == "third_party" || name == "__pycache__";
         };
 
+        size_t totalNodes = 0;
+        const size_t maxNodes = 1000;
+
         std::function<nlohmann::json(const fs::path&, int)> buildTree;
         buildTree = [&](const fs::path& dirPath, int depth) -> nlohmann::json {
-            nlohmann::json nodes = nlohmann::json::array();
             if (depth > 6) {
-                return nodes;
+                return nullptr;
+            }
+            if (depth > 1 && totalNodes >= maxNodes) {
+                return nullptr;
             }
             std::error_code ec;
             std::vector<fs::directory_entry> entries;
             for (const auto& entry : fs::directory_iterator(dirPath, ec)) {
                 if (ec) break;
+                std::string fname = entry.path().filename().string();
+                if (isSkippedDir(fname)) continue;
                 entries.push_back(entry);
+            }
+            if (depth > 1 && totalNodes + entries.size() > maxNodes) {
+                totalNodes = maxNodes;
+                return nullptr;
             }
             std::sort(entries.begin(), entries.end(), [](const fs::directory_entry& a, const fs::directory_entry& b) {
                 bool aDir = a.is_directory();
@@ -8967,9 +9184,11 @@ void WebServer::setupRoutes() {
                 return a.path().filename().string() < b.path().filename().string();
             });
 
+            nlohmann::json nodes = nlohmann::json::array();
+            std::vector<fs::path> childPaths;
             for (const auto& entry : entries) {
+                if (depth == 1 && nodes.size() >= maxNodes) break;
                 std::string fname = entry.path().filename().string();
-                if (isSkippedDir(fname)) continue;
 
                 std::error_code typeEc;
                 bool isDir = entry.is_directory(typeEc);
@@ -8979,15 +9198,26 @@ void WebServer::setupRoutes() {
                     fsize = static_cast<uint64_t>(entry.file_size(sizeEc));
                 }
 
+                totalNodes++;
                 nlohmann::json node;
                 node["name"] = fname;
                 node["path"] = fs::relative(entry.path(), root, typeEc).string();
                 node["isDir"] = isDir;
                 node["size"] = fsize;
-                if (isDir && depth < 6) {
-                    node["children"] = buildTree(entry.path(), depth + 1);
-                }
                 nodes.push_back(std::move(node));
+                childPaths.push_back(entry.path());
+            }
+
+            if (depth < 6 && totalNodes < maxNodes) {
+                for (size_t i = 0; i < nodes.size(); ++i) {
+                    if (totalNodes >= maxNodes) break;
+                    if (nodes[i].value("isDir", false)) {
+                        nlohmann::json sub = buildTree(childPaths[i], depth + 1);
+                        if (sub.is_array()) {
+                            nodes[i]["children"] = std::move(sub);
+                        }
+                    }
+                }
             }
             return nodes;
         };
@@ -8996,6 +9226,8 @@ void WebServer::setupRoutes() {
             nlohmann::json tree = buildTree(startDir, 1);
             nlohmann::json resp;
             resp["workspace"] = root.string();
+            resp["workspaceAvailable"] = true;
+            resp["reason"] = "";
             resp["path"] = relSubPath;
             resp["tree"] = tree;
             res.set_content(resp.dump(2), "application/json");
@@ -9005,7 +9237,7 @@ void WebServer::setupRoutes() {
         }
     });
 
-    _server->Get("/api/workspace/file", [getWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
+    _server->Get("/api/workspace/file", [resolveRequestedWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string relPath = req.get_param_value("path");
         if (relPath.empty() || relPath.find("..") != std::string::npos) {
@@ -9013,23 +9245,53 @@ void WebServer::setupRoutes() {
             res.set_content("{\"error\":\"Invalid path\"}", "application/json");
             return;
         }
-        fs::path target = getWorkspaceRoot() / relPath;
+
+        std::string cid = req.get_param_value("conversationId");
+        if (cid.empty()) cid = req.get_param_value("id");
+        std::string explicitWs = req.get_param_value("workspace");
+        fs::path root = resolveRequestedWorkspaceRoot(cid, explicitWs);
+        if (root.empty() || !fs::exists(root) || !fs::is_directory(root)) {
+            res.status = 404;
+            res.set_content("{\"error\":\"Workspace information is not available for the selected session\"}", "application/json");
+            return;
+        }
+
+        fs::path target = root / relPath;
         if (!fs::exists(target) || fs::is_directory(target)) {
             res.status = 404;
             res.set_content("{\"error\":\"File not found\"}", "application/json");
             return;
         }
-        std::ifstream f(target);
-        std::stringstream buf;
-        buf << f.rdbuf();
+
+        std::error_code szEc;
+        auto fsize = fs::file_size(target, szEc);
+        if (!szEc && fsize > 1024 * 1024) {
+            res.status = 413;
+            res.set_content("{\"error\":\"File exceeds 1 MB preview limit\"}", "application/json");
+            return;
+        }
+
+        std::ifstream f(target, std::ios::binary);
+        if (!f.is_open()) {
+            res.status = 404;
+            res.set_content("{\"error\":\"File not found\"}", "application/json");
+            return;
+        }
+        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (content.find('\0') != std::string::npos) {
+            res.status = 415;
+            res.set_content("{\"error\":\"Binary file cannot be displayed as text\"}", "application/json");
+            return;
+        }
+
         nlohmann::json resp;
         resp["path"] = relPath;
-        resp["content"] = buf.str();
+        resp["content"] = content;
         resp["language"] = target.extension().string();
-        res.set_content(resp.dump(2), "application/json");
+        res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
     });
 
-    _server->Post("/api/workspace/file", [getWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
+    _server->Post("/api/workspace/file", [resolveRequestedWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         try {
             auto j = nlohmann::json::parse(req.body);
@@ -9040,8 +9302,23 @@ void WebServer::setupRoutes() {
                 res.set_content("{\"error\":\"Invalid path\"}", "application/json");
                 return;
             }
-            fs::path target = getWorkspaceRoot() / relPath;
-            std::ofstream f(target, std::ios::trunc);
+
+            std::string cid = j.value("conversationId", j.value("id", req.get_param_value("conversationId")));
+            if (cid.empty()) cid = req.get_param_value("id");
+            std::string explicitWs = j.value("workspace", req.get_param_value("workspace"));
+            fs::path root = resolveRequestedWorkspaceRoot(cid, explicitWs);
+            if (root.empty() || !fs::exists(root) || !fs::is_directory(root)) {
+                res.status = 404;
+                res.set_content("{\"error\":\"Workspace information is not available for the selected session\"}", "application/json");
+                return;
+            }
+
+            fs::path target = root / relPath;
+            if (target.has_parent_path()) {
+                std::error_code dirEc;
+                fs::create_directories(target.parent_path(), dirEc);
+            }
+            std::ofstream f(target, std::ios::trunc | std::ios::binary);
             if (!f.is_open()) {
                 res.status = 500;
                 res.set_content("{\"error\":\"Failed to open file for writing\"}", "application/json");
