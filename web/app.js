@@ -1964,7 +1964,6 @@ function switchToSubpanel(subpanelId) {
         fetchToolBridgesStatus(false);
     } else if (subpanelId === 'settings') {
         fetchRuntimeConfig(true);
-        fetchDiagnosticsInspector();
     }
 }
 
@@ -2235,7 +2234,7 @@ async function fetchInsightsTab() {
 }
 
 // ==========================================================================
-// Runtime Configuration, Disk Hygiene & Live Gateway Diagnostics Controller
+// Runtime Configuration & Disk Hygiene Controller
 // ==========================================================================
 
 function formatStorageBytes(bytes) {
@@ -2249,19 +2248,16 @@ function formatStorageBytes(bytes) {
 function renderStorageStats(storageStats, staleLocksCount) {
     if (!storageStats || typeof storageStats !== 'object') return;
     const dbSizeEl = document.getElementById('cfg-storage-db-size');
-    const diagRowsEl = document.getElementById('cfg-storage-diag-rows');
     const eventRowsEl = document.getElementById('cfg-storage-event-rows');
     const sessRowsEl = document.getElementById('cfg-storage-session-rows');
     const staleLocksEl = document.getElementById('cfg-storage-stale-locks');
-    const statusBadgeEl = document.getElementById('cfg-diag-status-badge');
 
-    const totalBytes = (Number(storageStats.db_size_bytes) || 0) + (Number(storageStats.wal_size_bytes) || 0);
+    const totalBytes = storageStats.database_size_bytes !== undefined
+        ? (Number(storageStats.database_size_bytes) || 0)
+        : ((Number(storageStats.db_size_bytes) || 0) + (Number(storageStats.wal_size_bytes) || 0));
     if (dbSizeEl) dbSizeEl.textContent = formatStorageBytes(totalBytes);
 
     const counts = storageStats.counts || {};
-    const diagCount = storageStats.diagnostic_logs_count !== undefined
-        ? storageStats.diagnostic_logs_count
-        : (counts.gateway_diagnostic_logs || 0);
     const evCount = storageStats.lifecycle_events_count !== undefined
         ? storageStats.lifecycle_events_count
         : (counts.agent_lifecycle_events || 0);
@@ -2269,20 +2265,10 @@ function renderStorageStats(storageStats, staleLocksCount) {
         ? storageStats.sessions_count
         : (counts.agent_sessions || 0);
 
-    if (diagRowsEl) diagRowsEl.textContent = String(diagCount);
     if (eventRowsEl) eventRowsEl.textContent = String(evCount);
     if (sessRowsEl) sessRowsEl.textContent = String(sessCount);
     if (staleLocksEl && staleLocksCount !== undefined) {
         staleLocksEl.textContent = String(staleLocksCount);
-    }
-    if (statusBadgeEl && storageStats.diagnostics_enabled !== undefined) {
-        if (storageStats.diagnostics_enabled) {
-            statusBadgeEl.className = 'status-pill running';
-            statusBadgeEl.textContent = `Logging: ON (${storageStats.min_level || 'INFO'})`;
-        } else {
-            statusBadgeEl.className = 'status-pill completed';
-            statusBadgeEl.textContent = 'Logging: OFF (Default)';
-        }
     }
 }
 
@@ -2293,7 +2279,6 @@ async function fetchRuntimeConfig(populateInputs = true) {
         const data = await res.json();
         const cfg = data.config || data;
         const gw = cfg.gateway || {};
-        const diag = cfg.diagnostics || {};
 
         if (populateInputs) {
             const setCheck = (id, val) => {
@@ -2305,24 +2290,13 @@ async function fetchRuntimeConfig(populateInputs = true) {
                 if (el && val !== undefined && val !== null) el.value = String(val);
             };
 
-            setCheck('cfg-gw-locked-resume', gw.allow_cli_locked_detached_resume !== false);
             setCheck('cfg-gw-new-spawn', gw.allow_cli_new_session_spawn !== false);
             setCheck('cfg-gw-agentapi', gw.allow_agy_agentapi_fallback !== false);
             setCheck('cfg-gw-strict-fd', gw.strict_presence_fd_check !== false);
             setCheck('cfg-gw-auto-prune-locks', gw.auto_prune_stale_presence_locks !== false);
             setVal('cfg-gw-recency-sec', gw.active_recency_window_sec !== undefined ? gw.active_recency_window_sec : 120);
             setVal('cfg-gw-presence-ttl-sec', gw.presence_stale_ttl_sec !== undefined ? gw.presence_stale_ttl_sec : 3600);
-
-            // All diagnostic logging switches default strictly to OFF (false)
-            setCheck('cfg-diag-enabled', diag.enabled === true);
-            setCheck('cfg-diag-mobile-http', diag.log_mobile_http === true);
-            setCheck('cfg-diag-router', diag.log_router_decisions === true);
-            setCheck('cfg-diag-idle-polls', diag.log_idle_transcript_polls === true);
-            setCheck('cfg-diag-discovery', diag.log_discovery_polls === true);
-            setCheck('cfg-diag-hooks', diag.log_hooks === true);
-            setVal('cfg-diag-min-level', diag.min_level || 'INFO');
-            setVal('cfg-diag-max-rows', diag.max_retained_rows !== undefined ? diag.max_retained_rows : 2000);
-            setVal('cfg-diag-retention-days', diag.telemetry_retention_days !== undefined ? diag.telemetry_retention_days : 14);
+            setVal('cfg-gw-retention-days', gw.telemetry_retention_days !== undefined ? gw.telemetry_retention_days : 14);
         }
 
         renderStorageStats(data.storage_stats, data.stale_presence_locks_count);
@@ -2349,24 +2323,13 @@ async function saveRuntimeConfig() {
 
     const payload = {
         gateway: {
-            allow_cli_locked_detached_resume: getCheck('cfg-gw-locked-resume', true),
             allow_cli_new_session_spawn: getCheck('cfg-gw-new-spawn', true),
             allow_agy_agentapi_fallback: getCheck('cfg-gw-agentapi', true),
             strict_presence_fd_check: getCheck('cfg-gw-strict-fd', true),
             auto_prune_stale_presence_locks: getCheck('cfg-gw-auto-prune-locks', true),
             active_recency_window_sec: getInt('cfg-gw-recency-sec', 120),
-            presence_stale_ttl_sec: getInt('cfg-gw-presence-ttl-sec', 3600)
-        },
-        diagnostics: {
-            enabled: getCheck('cfg-diag-enabled', false),
-            log_mobile_http: getCheck('cfg-diag-mobile-http', false),
-            log_router_decisions: getCheck('cfg-diag-router', false),
-            log_idle_transcript_polls: getCheck('cfg-diag-idle-polls', false),
-            log_discovery_polls: getCheck('cfg-diag-discovery', false),
-            log_hooks: getCheck('cfg-diag-hooks', false),
-            min_level: (document.getElementById('cfg-diag-min-level')?.value || 'INFO'),
-            max_retained_rows: getInt('cfg-diag-max-rows', 2000),
-            telemetry_retention_days: getInt('cfg-diag-retention-days', 14)
+            presence_stale_ttl_sec: getInt('cfg-gw-presence-ttl-sec', 3600),
+            telemetry_retention_days: getInt('cfg-gw-retention-days', 14)
         }
     };
 
@@ -2381,10 +2344,9 @@ async function saveRuntimeConfig() {
             renderStorageStats(data.storage_stats, data.stale_presence_locks_count);
             if (feedbackEl) {
                 feedbackEl.className = 'eda-feedback-banner';
-                feedbackEl.textContent = `Runtime config saved & applied immediately (Diagnostics logging: ${payload.diagnostics.enabled ? 'ENABLED' : 'OFF'}, Locked CLI Fallback 5: ${payload.gateway.allow_cli_locked_detached_resume ? 'ENABLED' : 'DISABLED'}).`;
+                feedbackEl.textContent = `Runtime config saved & applied immediately (New CLI Session Spawn: ${payload.gateway.allow_cli_new_session_spawn ? 'ENABLED' : 'DISABLED'}, Telemetry Retention: ${payload.gateway.telemetry_retention_days} days).`;
                 feedbackEl.classList.remove('hidden');
             }
-            fetchDiagnosticsInspector();
         } else {
             if (feedbackEl) {
                 feedbackEl.className = 'error-banner';
@@ -2403,50 +2365,40 @@ async function saveRuntimeConfig() {
     }
 }
 
-async function purgeDebugDataOnDisk(fullPurge = true) {
-    const btn = document.getElementById(fullPurge ? 'btn-cfg-purge-debug' : 'btn-cfg-prune-telemetry');
+async function pruneTelemetryOnDisk() {
+    const btn = document.getElementById('btn-cfg-prune-telemetry');
     const feedbackEl = document.getElementById('cfg-save-feedback');
     const origText = btn ? btn.textContent : '';
-    if (btn) btn.textContent = fullPurge ? 'Purging Debug Data...' : 'Pruning Telemetry...';
+    if (btn) btn.textContent = 'Pruning Telemetry...';
 
-    const reqBody = fullPurge
-        ? {
-            purge_debug_data: true,
-            clear_logs: true,
-            prune_telemetry: true,
-            prune_stale_locks: true,
-            vacuum: true
-        }
-        : {
-            clear_logs: false,
-            prune_telemetry: true,
-            prune_stale_locks: true,
-            vacuum: true
-        };
+    const reqBody = {
+        prune_telemetry: true,
+        prune_stale_locks: true,
+        vacuum: true
+    };
 
     try {
-        const res = await fetch('/api/agent/diagnostics/clear', {
+        const res = await fetch('/api/telemetry/prune', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(reqBody)
         });
         const data = await res.json();
         if (res.ok && data.ok !== false) {
-            const deletedLogs = data.deleted_diagnostic_logs !== undefined ? data.deleted_diagnostic_logs : (data.deleted || 0);
             const prunedTelem = data.pruned_telemetry_rows || 0;
             const prunedLocks = data.pruned_stale_locks || 0;
             const reclaimed = data.reclaimed_bytes || 0;
             const afterBytes = data.after_bytes !== undefined ? data.after_bytes : (data.size_after_bytes || 0);
 
+            if (data.storage_stats) {
+                renderStorageStats(data.storage_stats);
+            }
             if (feedbackEl) {
                 feedbackEl.className = 'eda-feedback-banner';
-                feedbackEl.textContent = fullPurge
-                    ? `Purged ${deletedLogs} diagnostic log rows, pruned ${prunedTelem} expired telemetry events & ${prunedLocks} stale .lock files. Reclaimed ${formatStorageBytes(reclaimed)} (telemetry.db now ${formatStorageBytes(afterBytes)}).`
-                    : `Pruned ${prunedTelem} expired telemetry events & ${prunedLocks} stale .lock files. Reclaimed ${formatStorageBytes(reclaimed)} (telemetry.db now ${formatStorageBytes(afterBytes)}).`;
+                feedbackEl.textContent = `Pruned ${prunedTelem} expired telemetry events & ${prunedLocks} stale .lock files. Reclaimed ${formatStorageBytes(reclaimed)} (telemetry.db now ${formatStorageBytes(afterBytes)}).`;
                 feedbackEl.classList.remove('hidden');
             }
             await fetchRuntimeConfig(false);
-            await fetchDiagnosticsInspector();
         } else if (feedbackEl) {
             feedbackEl.className = 'error-banner';
             feedbackEl.textContent = `Disk hygiene operation failed: ${data.error || res.statusText}`;
@@ -2460,119 +2412,6 @@ async function purgeDebugDataOnDisk(fullPurge = true) {
         }
     } finally {
         if (btn) btn.textContent = origText;
-    }
-}
-
-async function fetchDiagnosticsInspector() {
-    const category = document.getElementById('diag-filter-category')?.value || '';
-    const minLevel = document.getElementById('diag-filter-level')?.value || '';
-    const cid = (document.getElementById('diag-filter-cid')?.value || '').trim();
-
-    const diagUrl = cid
-        ? `/api/agent/diagnostics?id=${encodeURIComponent(cid)}`
-        : '/api/agent/diagnostics';
-
-    const logParams = new URLSearchParams();
-    logParams.set('limit', '100');
-    if (category) logParams.set('category', category);
-    if (minLevel) logParams.set('minLevel', minLevel);
-    if (cid) logParams.set('id', cid);
-    const logsUrl = `/api/agent/diagnostics/logs?${logParams.toString()}`;
-
-    try {
-        const [diagRes, logsRes] = await Promise.all([
-            fetch(diagUrl),
-            fetch(logsUrl)
-        ]);
-
-        if (diagRes.ok) {
-            const diagData = await diagRes.json();
-            const sessions = Array.isArray(diagData.sessions)
-                ? diagData.sessions
-                : (diagData.conversation_id ? [diagData] : []);
-
-            const countEl = document.getElementById('diag-sessions-count');
-            if (countEl) countEl.textContent = `${sessions.length} Sessions`;
-
-            const tbody = document.getElementById('diag-sessions-body');
-            if (tbody) {
-                if (sessions.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" class="eda-empty-row">No matching sessions found for inspection.</td></tr>';
-                } else {
-                    tbody.innerHTML = sessions.map(s => {
-                        const prov = s.provider || 'antigravity';
-                        const provBadge = prov === 'cursor' ? 'badge-magenta' : (prov === 'claude' ? 'badge-amber' : 'badge-cyan');
-                        const srcDesc = s.open_in_terminal
-                            ? `terminal (${s.terminal_pts || 'pts'})`
-                            : (s.screen_session
-                                ? `screen:${s.screen_session}`
-                                : (s.is_ide_renderer ? 'ide' : (s.has_cli_store ? 'cli' : 'disk')));
-                        const pidPortCsrf = `PID: ${s.owner_pid || '--'} | Port: ${s.http_port || '--'} | CSRF: ${s.has_registered_csrf ? 'Yes' : 'No'}${s.presence_lock_exists ? ' | .lock' : ''}`;
-                        const routeHtml = `<code>${escapeHtml(s.recommended_route || '--')}</code> &rarr; <code>${escapeHtml(s.selected_route || '--')}</code>`;
-                        const interHtml = s.interactive !== false
-                            ? '<span class="status-pill running">Interactive</span>'
-                            : `<span class="status-pill failed" title="${escapeHtml(s.nonInteractiveReason || '')}">Read-Only</span>`;
-
-                        return `
-                            <tr>
-                                <td><span class="badge ${provBadge}">${escapeHtml(prov)}</span></td>
-                                <td><code>${escapeHtml(s.conversation_id || '--')}</code></td>
-                                <td><code>${escapeHtml(srcDesc)}</code></td>
-                                <td class="duration-counter">${escapeHtml(pidPortCsrf)}</td>
-                                <td>${routeHtml}</td>
-                                <td>${interHtml}</td>
-                            </tr>
-                        `;
-                    }).join('');
-                }
-            }
-        }
-
-        if (logsRes.ok) {
-            const logsData = await logsRes.json();
-            if (logsData.storage_stats) {
-                renderStorageStats(logsData.storage_stats);
-            }
-            const logs = Array.isArray(logsData.logs) ? logsData.logs : [];
-            const logsCountEl = document.getElementById('diag-logs-count');
-            if (logsCountEl) logsCountEl.textContent = `${logs.length} Entries`;
-
-            const logsBody = document.getElementById('diag-logs-body');
-            if (logsBody) {
-                if (logs.length === 0) {
-                    const diagEnabled = logsData.diagnostics_config && logsData.diagnostics_config.enabled;
-                    const emptyMsg = diagEnabled
-                        ? 'No diagnostic log entries match the current filter.'
-                        : 'Diagnostic logging is OFF by default (0 rows stored). Enable switches above when debugging.';
-                    logsBody.innerHTML = `<tr><td colspan="7" class="eda-empty-row">${escapeHtml(emptyMsg)}</td></tr>`;
-                } else {
-                    logsBody.innerHTML = logs.map(l => {
-                        const tsSec = l.timestamp_ms ? Math.floor(l.timestamp_ms / 1000) : 0;
-                        const tsStr = tsSec > 0 ? formatFullDateTime(tsSec) : '--';
-                        const lvl = (l.level || 'INFO').toUpperCase();
-                        const lvlClass = lvl === 'ERROR' ? 'badge-magenta' : (lvl === 'WARN' ? 'badge-amber' : 'badge-cyan');
-                        const cidReq = `${l.conversation_id ? `<code>${escapeHtml(l.conversation_id)}</code>` : '--'}${l.request_id ? `<div class="diag-sub-id">req: ${escapeHtml(l.request_id)}</div>` : ''}`;
-                        const detailsStr = (l.details && typeof l.details === 'object')
-                            ? JSON.stringify(l.details)
-                            : String(l.details || '{}');
-
-                        return `
-                            <tr>
-                                <td class="duration-counter">${escapeHtml(tsStr)}</td>
-                                <td><span class="badge ${lvlClass}">${escapeHtml(lvl)}</span></td>
-                                <td><code>${escapeHtml(l.category || '')}</code></td>
-                                <td>${escapeHtml(l.provider || '')}</td>
-                                <td>${cidReq}</td>
-                                <td>${escapeHtml(l.summary || '')}</td>
-                                <td><code class="diag-details-code">${escapeHtml(detailsStr)}</code></td>
-                            </tr>
-                        `;
-                    }).join('');
-                }
-            }
-        }
-    } catch (err) {
-        console.warn('Failed to refresh diagnostics inspector:', err);
     }
 }
 
@@ -2676,69 +2515,9 @@ document.addEventListener('DOMContentLoaded', () => {
         btnCfgSave.addEventListener('click', saveRuntimeConfig);
     }
 
-    const btnCfgPurgeDebug = document.getElementById('btn-cfg-purge-debug');
-    if (btnCfgPurgeDebug) {
-        btnCfgPurgeDebug.addEventListener('click', () => purgeDebugDataOnDisk(true));
-    }
-
     const btnCfgPruneTelem = document.getElementById('btn-cfg-prune-telemetry');
     if (btnCfgPruneTelem) {
-        btnCfgPruneTelem.addEventListener('click', () => purgeDebugDataOnDisk(false));
-    }
-
-    const diagToggleIds = [
-        'cfg-diag-enabled',
-        'cfg-diag-mobile-http',
-        'cfg-diag-router',
-        'cfg-diag-idle-polls',
-        'cfg-diag-discovery',
-        'cfg-diag-hooks'
-    ];
-
-    const btnDiagEnableAll = document.getElementById('btn-cfg-diag-enable-all');
-    if (btnDiagEnableAll) {
-        btnDiagEnableAll.addEventListener('click', () => {
-            diagToggleIds.forEach(id => {
-                const el = document.getElementById(id);
-                if (el) el.checked = true;
-            });
-        });
-    }
-
-    const btnDiagDisableAll = document.getElementById('btn-cfg-diag-disable-all');
-    if (btnDiagDisableAll) {
-        btnDiagDisableAll.addEventListener('click', () => {
-            diagToggleIds.forEach(id => {
-                const el = document.getElementById(id);
-                if (el) el.checked = false;
-            });
-        });
-    }
-
-    const btnDiagRefresh = document.getElementById('btn-diag-refresh');
-    if (btnDiagRefresh) {
-        btnDiagRefresh.addEventListener('click', fetchDiagnosticsInspector);
-    }
-
-    const diagCatSel = document.getElementById('diag-filter-category');
-    if (diagCatSel) {
-        diagCatSel.addEventListener('change', fetchDiagnosticsInspector);
-    }
-
-    const diagLvlSel = document.getElementById('diag-filter-level');
-    if (diagLvlSel) {
-        diagLvlSel.addEventListener('change', fetchDiagnosticsInspector);
-    }
-
-    const diagCidInp = document.getElementById('diag-filter-cid');
-    if (diagCidInp) {
-        diagCidInp.addEventListener('change', fetchDiagnosticsInspector);
-        diagCidInp.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                fetchDiagnosticsInspector();
-            }
-        });
+        btnCfgPruneTelem.addEventListener('click', pruneTelemetryOnDisk);
     }
 
     const btnRebuildInsights = document.getElementById('btn-insights-rebuild');
@@ -2863,7 +2642,6 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchToolBridgesStatus(false);
         } else if (activeSubpanelId === 'settings') {
             fetchRuntimeConfig(false);
-            fetchDiagnosticsInspector();
         }
     }, 8000);
 

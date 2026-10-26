@@ -1515,20 +1515,35 @@ static void testMultiProviderClaudeAndCursorSessionsAndNotifications() {
     assert(cursorTrans["steps"][1]["tool_calls"].size() == 1);
     assert(cursorTrans["steps"][1]["tool_calls"][0].value("name", "") == "Read");
 
-    // Fault path: non-existent Claude binary returns 503
+    // Fault path: non-existent Claude binary returns 503 for new session spawn
     setenv("AIMON_CLAUDE_BIN", (baseDir + "/missing_claude").c_str(), 1);
-    json faultPrompt = {{"prompt", "Hello Claude"}, {"source", "claude"}, {"conversationId", "claude-sess-1"}};
+    json faultPrompt = {{"prompt", "Hello Claude"}, {"source", "claude"}, {"conversationId", "new"}};
     auto resFault = client.Post("/api/agent/prompt", headers, faultPrompt.dump(), "application/json");
     assert(resFault && resFault->status == 503);
 
-    // Nominal prompt dispatch & autoApprove flag verification for Claude and Cursor
+    // Strict same-process relay guard: existing sessions on disk without a live screen/tmux multiplexer return 409 Conflict
+    {
+        json roClaudeReq = {{"prompt", "Hello existing Claude"}, {"source", "claude"}, {"conversationId", "claude-sess-1"}};
+        auto resRoClaude = client.Post("/api/agent/prompt", headers, roClaudeReq.dump(), "application/json");
+        assert(resRoClaude && resRoClaude->status == 409);
+        json roClaudeBody = json::parse(resRoClaude->body);
+        assert(roClaudeBody.value("interactive", true) == false);
+
+        json roCursorReq = {{"prompt", "Hello existing Cursor"}, {"source", "cursor"}, {"conversationId", "cursor-sess-1"}};
+        auto resRoCursor = client.Post("/api/agent/prompt", headers, roCursorReq.dump(), "application/json");
+        assert(resRoCursor && resRoCursor->status == 409);
+        json roCursorBody = json::parse(resRoCursor->body);
+        assert(roCursorBody.value("interactive", true) == false);
+    }
+
+    // Nominal new-session prompt dispatch & autoApprove flag verification for Claude and Cursor
     std::string mockClaudeBin = baseDir + "/mock_claude.sh";
     std::string claudeArgsLog = baseDir + "/claude_args.txt";
     {
         std::ofstream mf(mockClaudeBin);
         mf << "#!/bin/sh\n";
         mf << "echo \"$@\" > \"" << claudeArgsLog << "\"\n";
-        mf << "printf '{\"type\":\"result\",\"result\":\"Claude reply OK\",\"session_id\":\"claude-sess-1\"}\\n'\n";
+        mf << "printf '{\"type\":\"result\",\"result\":\"Claude reply OK\",\"session_id\":\"claude-sess-new-1\"}\\n'\n";
     }
     chmod(mockClaudeBin.c_str(), 0755);
     setenv("AIMON_CLAUDE_BIN", mockClaudeBin.c_str(), 1);
@@ -1539,36 +1554,32 @@ static void testMultiProviderClaudeAndCursorSessionsAndNotifications() {
         std::ofstream mf(mockCursorBin);
         mf << "#!/bin/sh\n";
         mf << "echo \"$@\" > \"" << cursorArgsLog << "\"\n";
-        mf << "printf '{\"type\":\"result\",\"result\":\"Cursor reply OK\"}\\n'\n";
+        mf << "printf '{\"type\":\"result\",\"result\":\"Cursor reply OK\",\"session_id\":\"cursor-sess-new-1\"}\\n'\n";
     }
     chmod(mockCursorBin.c_str(), 0755);
     setenv("AIMON_CURSOR_BIN", mockCursorBin.c_str(), 1);
 
     json claudePromptReq = {
-        {"prompt", "Continue Claude work"},
+        {"prompt", "Start Claude work"},
         {"source", "claude"},
-        {"conversationId", "claude-sess-1"},
+        {"conversationId", "new"},
         {"model", "claude-sonnet-4-6"},
         {"autoApprove", true}
     };
     auto resClaudePrompt = client.Post("/api/agent/prompt", headers, claudePromptReq.dump(), "application/json");
-    if (!resClaudePrompt || resClaudePrompt->status != 200) {
-        std::cout << "DEBUG resClaudePrompt status=" << (resClaudePrompt ? resClaudePrompt->status : -1)
-                  << " body=" << (resClaudePrompt ? resClaudePrompt->body : "") << std::endl;
-    }
     assert(resClaudePrompt && resClaudePrompt->status == 200);
     {
         std::ifstream af(claudeArgsLog);
         std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
-        assert(logged.find("--resume claude-sess-1") != std::string::npos);
+        assert(logged.find("--resume") == std::string::npos);
         assert(logged.find("--dangerously-skip-permissions") != std::string::npos);
         assert(logged.find("--model claude-sonnet-4-6") != std::string::npos);
     }
 
     json cursorPromptReq = {
-        {"prompt", "Continue Cursor work"},
+        {"prompt", "Start Cursor work"},
         {"source", "cursor"},
-        {"conversationId", "cursor-sess-1"},
+        {"conversationId", "new"},
         {"model", "gpt-5"},
         {"autoApprove", true}
     };
@@ -1577,7 +1588,7 @@ static void testMultiProviderClaudeAndCursorSessionsAndNotifications() {
     {
         std::ifstream af(cursorArgsLog);
         std::string logged((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
-        assert(logged.find("--resume cursor-sess-1") != std::string::npos);
+        assert(logged.find("--resume") == std::string::npos);
         assert(logged.find("-f") != std::string::npos);
         assert(logged.find("--model gpt-5") != std::string::npos);
     }
@@ -2383,7 +2394,7 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
 
     // 4e. /plan, /ask, /effort, /status, /doctor, /models
     {
-        json reqPlanClaude = {{"text", "/plan Design auth flow"}, {"source", "claude"}, {"conversationId", "claude-sess-1"}};
+        json reqPlanClaude = {{"text", "/plan Design auth flow"}, {"source", "claude"}, {"conversationId", "new"}};
         auto resPlanClaude = client.Post("/api/agent/prompt", headers, reqPlanClaude.dump(), "application/json");
         assert(resPlanClaude && resPlanClaude->status == 200);
         std::ifstream af(claudeArgsLog);
@@ -2392,7 +2403,7 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         assert(logged.find("Design auth flow") != std::string::npos);
     }
     {
-        json reqPlanCursor = {{"text", "/plan Design auth flow"}, {"source", "cursor"}, {"conversationId", "cursor-sess-1"}};
+        json reqPlanCursor = {{"text", "/plan Design auth flow"}, {"source", "cursor"}, {"conversationId", "new"}};
         auto resPlanCursor = client.Post("/api/agent/prompt", headers, reqPlanCursor.dump(), "application/json");
         assert(resPlanCursor && resPlanCursor->status == 200);
         std::ifstream af(cursorArgsLog);
@@ -2401,7 +2412,7 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         assert(logged.find("Design auth flow") != std::string::npos);
     }
     {
-        json reqAskCursor = {{"text", "/ask How does auth work?"}, {"source", "cursor"}, {"conversationId", "cursor-sess-1"}};
+        json reqAskCursor = {{"text", "/ask How does auth work?"}, {"source", "cursor"}, {"conversationId", "new"}};
         auto resAskCursor = client.Post("/api/agent/prompt", headers, reqAskCursor.dump(), "application/json");
         assert(resAskCursor && resAskCursor->status == 200);
         std::ifstream af(cursorArgsLog);
@@ -2410,7 +2421,7 @@ static void testSubagentFilterAskQuestionAndProviderSlashCommands() {
         assert(logged.find("How does auth work?") != std::string::npos);
     }
     {
-        json reqEffortClaude = {{"text", "/effort high Refactor parser"}, {"source", "claude"}, {"conversationId", "claude-sess-1"}};
+        json reqEffortClaude = {{"text", "/effort high Refactor parser"}, {"source", "claude"}, {"conversationId", "new"}};
         auto resEffortClaude = client.Post("/api/agent/prompt", headers, reqEffortClaude.dump(), "application/json");
         assert(resEffortClaude && resEffortClaude->status == 200);
         std::ifstream af(claudeArgsLog);
@@ -2916,24 +2927,54 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
     setenv("AIMON_SCREEN_BIN", mockScreenBin.c_str(), 1);
     setenv("AIMON_SCREEN_SESSION_OVERRIDE", "2606765.cursor_agent_test", 1);
 
+    std::string agentInvokedLog = baseDir + "/agent_invoked.log";
     std::string mockAgentBin = binDir + "/agent";
     {
         std::ofstream af(mockAgentBin);
         af << "#!/bin/bash\n"
+           << "echo \"$@\" >> \"" << agentInvokedLog << "\"\n"
            << "echo '{\"type\":\"result\",\"result\":\"ACK-CLI-CURSOR-OK\",\"session_id\":\"ba472c97-57a4-4264-9d8f-6065fd61e174\"}'\n"
            << "exit 0\n";
         af.close();
         chmod(mockAgentBin.c_str(), 0755);
     }
+    std::string claudeInvokedLog = baseDir + "/claude_invoked.log";
     std::string mockClaudeBin = binDir + "/claude";
     {
         std::ofstream cf(mockClaudeBin);
         cf << "#!/bin/bash\n"
+           << "echo \"$@\" >> \"" << claudeInvokedLog << "\"\n"
            << "echo '{\"type\":\"result\",\"result\":\"ACK-CLI-CLAUDE-OK\",\"session_id\":\"d0001111-2222-3333-4444-555566667777\"}'\n"
            << "exit 0\n";
         cf.close();
         chmod(mockClaudeBin.c_str(), 0755);
     }
+    std::string mockTmuxBin = binDir + "/mock_tmux";
+    {
+        std::ofstream tf(mockTmuxBin);
+        tf << "#!/bin/bash\n"
+           << "LOG_FILE=\"" << baseDir << "/mock_tmux.log\"\n"
+           << "echo \"$@\" >> \"$LOG_FILE\"\n"
+           << "TARGET_FILE=\"" << baseDir << "/target_transcript.txt\"\n"
+           << "if [ -f \"$TARGET_FILE\" ]; then\n"
+           << "    TRANS_PATH=$(cat \"$TARGET_FILE\")\n"
+           << "    LAST_ARG=\"${@: -1}\"\n"
+           << "    if [ \"$LAST_ARG\" = \"Enter\" ] && [ -f \"$TRANS_PATH\" ]; then\n"
+           << "        if [[ \"$TRANS_PATH\" == *\"cursor\"* ]]; then\n"
+           << "            echo '{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Live tmux cursor prompt\"}]}}' >> \"$TRANS_PATH\"\n"
+           << "            echo '{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ACK-TMUX-CURSOR-OK\"}]}}' >> \"$TRANS_PATH\"\n"
+           << "            echo '{\"type\":\"turn_ended\",\"status\":\"success\"}' >> \"$TRANS_PATH\"\n"
+           << "        else\n"
+           << "            echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Live tmux claude prompt\"}}' >> \"$TRANS_PATH\"\n"
+           << "            echo '{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ACK-TMUX-CLAUDE-OK\"}]},\"stop_reason\":\"end_turn\"}' >> \"$TRANS_PATH\"\n"
+           << "        fi\n"
+           << "    fi\n"
+           << "fi\n"
+           << "exit 0\n";
+        tf.close();
+        chmod(mockTmuxBin.c_str(), 0755);
+    }
+    setenv("AIMON_TMUX_BIN", mockTmuxBin.c_str(), 1);
     setenv("AIMON_CURSOR_BIN", mockAgentBin.c_str(), 1);
     setenv("AIMON_CLAUDE_BIN", mockClaudeBin.c_str(), 1);
 
@@ -3026,8 +3067,58 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
         assert(rj.value("response", "").find("ACK-SCREEN-CLAUDE-OK") != std::string::npos);
     }
 
-    // 3. Renderer-owned Cursor IDE session without store.db and without screen is read-only and rejected with 409
+    // 2b. Nominal test: tmux multiplexer relay for Cursor and Claude + image rejection (400 Bad Request)
     unsetenv("AIMON_SCREEN_SESSION_OVERRIDE");
+    setenv("AIMON_MUX_SESSION_OVERRIDE", "tmux:%1", 1);
+    {
+        std::ofstream tf(baseDir + "/target_transcript.txt");
+        tf << cursorJsonl << "\n";
+    }
+    {
+        json req = {
+            {"agentId", "cursor"},
+            {"conversationId", cursorCid},
+            {"text", "Hello live tmux cursor"}
+        };
+        auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
+        assert(res && res->status == 200);
+        json rj = json::parse(res->body);
+        assert(rj.value("status", "") == "ok");
+        assert(rj.value("routedVia", "") == "tmux");
+        assert(rj.value("muxTarget", "") == "%1");
+        assert(rj.value("response", "").find("ACK-TMUX-CURSOR-OK") != std::string::npos);
+
+        // Image attachment rejection (400 Bad Request)
+        json imgReq = {
+            {"agentId", "cursor"},
+            {"conversationId", cursorCid},
+            {"text", "See image"},
+            {"images", json::array({"data:image/png;base64,iVBORw0KGgo="})}
+        };
+        auto imgRes = client.Post("/api/agent/prompt", headers, imgReq.dump(), "application/json");
+        assert(imgRes && imgRes->status == 400);
+    }
+    {
+        std::ofstream tf(baseDir + "/target_transcript.txt");
+        tf << claudeJsonl << "\n";
+    }
+    {
+        json req = {
+            {"agentId", "claude"},
+            {"conversationId", claudeCid},
+            {"text", "Hello live tmux claude"}
+        };
+        auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
+        assert(res && res->status == 200);
+        json rj = json::parse(res->body);
+        assert(rj.value("status", "") == "ok");
+        assert(rj.value("routedVia", "") == "tmux");
+        assert(rj.value("muxTarget", "") == "%1");
+        assert(rj.value("response", "").find("ACK-TMUX-CLAUDE-OK") != std::string::npos);
+    }
+    unsetenv("AIMON_MUX_SESSION_OVERRIDE");
+
+    // 3. Renderer-owned Cursor IDE session AND inactive CLI session without screen/tmux are read-only and rejected with 409
     std::string ideCid = "ba472c97-57a4-4264-9d8f-6065fd61e174";
     std::string ideTransDir = cursorProjects + "/amba-virt/agent-transcripts/" + ideCid;
     fs::create_directories(ideTransDir);
@@ -3045,14 +3136,14 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
         auto convRes = client.Get("/api/agent/conversations?provider=cursor", headers);
         assert(convRes && convRes->status == 200);
         json convBody = json::parse(convRes->body);
-        bool sawCliInteractive = false;
+        bool sawCliInactive = false;
         bool sawIdeReadOnly = false;
         for (const auto& c : convBody["conversations"]) {
             std::string cidVal = c.value("id", "");
             if (cidVal == cursorCid) {
-                sawCliInteractive = true;
-                assert(c.value("interactive", false) == true);
-                assert(c.value("nonInteractiveReason", "non-empty") == "");
+                sawCliInactive = true;
+                assert(c.value("interactive", true) == false);
+                assert(c.value("nonInteractiveReason", "").find("Inactive CLI session") != std::string::npos);
             } else if (cidVal == ideCid) {
                 sawIdeReadOnly = true;
                 assert(c.value("interactive", true) == false);
@@ -3060,7 +3151,7 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
                     "Cursor IDE GUI session is read-only") != std::string::npos);
             }
         }
-        assert(sawCliInteractive);
+        assert(sawCliInactive);
         assert(sawIdeReadOnly);
 
         json req = {
@@ -3082,21 +3173,26 @@ static void testLiveScreenSessionRoutingAndIdeSessionProtection() {
         assert(curContent == origIdeContent);
     }
 
-    // 4. Live non-screen owning process (ownerPid > 0) falls back to CLI --resume without 409 block
+    // 4. Live non-screen/non-tmux owning process (ownerPid > 0, muxType == "") is rejected with 409 Conflict (never spawns duplicate CLI process)
     setenv("AIMON_LIVE_OWNER_PID_OVERRIDE", "999999", 1);
     {
         json req = {
             {"agentId", "claude"},
             {"conversationId", claudeCid},
-            {"text", "Live process fallback"}
+            {"text", "Should not spawn duplicate CLI process"}
         };
         auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
-        assert(res && res->status == 200);
+        assert(res && res->status == 409);
         json rj = json::parse(res->body);
-        assert(rj.value("status", "") == "ok");
-        assert(rj.value("response", "").find("ACK-CLI-CLAUDE-OK") != std::string::npos);
+        assert(rj.value("ok", true) == false);
+        assert(rj.value("interactive", true) == false);
+        assert(rj.value("nonInteractiveReason", "").find("Read-only terminal session (PID 999999)") != std::string::npos);
+        assert(!fs::exists(claudeInvokedLog));
+        assert(!fs::exists(agentInvokedLog));
     }
     unsetenv("AIMON_LIVE_OWNER_PID_OVERRIDE");
+    unsetenv("AIMON_TMUX_BIN");
+    unsetenv("AIMON_MUX_SESSION_OVERRIDE");
 
     server.stop();
 
@@ -3300,19 +3396,6 @@ static void Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversatio
         assert(sawSubagentStep);
     }
 
-    // 3. Verify WebServer::diagnoseSessions and WebServer::inspectSession
-    {
-        json diagList = WebServer::diagnoseSessions("cursor");
-        assert(diagList.value("ok", false) == true);
-        assert(diagList["sessions"].is_array() && !diagList["sessions"].empty());
-
-        json inspected = WebServer::inspectSession(turn1Cid);
-        assert(inspected.value("ok", false) == true);
-        assert(inspected.value("provider", "") == "cursor");
-        assert(inspected["transcript"].value("step_count", 0) >= 3);
-        assert(inspected["transcript"].value("subagent_file_count", 0) == 2);
-    }
-
     server.stop();
     unsetenv("AIMON_IDE_BRAIN_DIR");
     unsetenv("AIMON_CLI_BRAIN_DIR");
@@ -3367,7 +3450,7 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
            << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"First historic assistant answer\"}]}}\n";
     }
 
-    // 2. Cursor CLI session (WITH store.db)
+    // 2. Cursor CLI session (WITH store.db, on disk without active screen/tmux multiplexer)
     std::string cursorCliCid = "cursor-cli-session-6666";
     std::string cursorCliDir = cursorProjects + "/home-samurai-work-aimon/agent-transcripts/" + cursorCliCid;
     fs::create_directories(cursorCliDir);
@@ -3389,7 +3472,7 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
            << "{\"type\":\"assistant\",\"entrypoint\":\"claude-vscode\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Claude IDE extension reply\"}]}}\n";
     }
 
-    // 4. Interactive Claude CLI session (entrypoint: cli)
+    // 4. Inactive Claude CLI session on disk (entrypoint: cli, NO screen/tmux multiplexer)
     std::string claudeCliCid = "claude-cli-session-7777";
     std::string claudeCliPath = claudeProjects + "/-home-samurai-work-aimon/" + claudeCliCid + ".jsonl";
     {
@@ -3398,7 +3481,7 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
            << "{\"type\":\"assistant\",\"entrypoint\":\"cli\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Claude CLI reply\"}]}}\n";
     }
 
-    // 5. Boundary: Claude session that started in claude-vscode and later transitioned to cli
+    // 5. Boundary: Claude session that started in claude-vscode and later transitioned to cli (also inactive on disk without mux)
     std::string claudeTransCid = "claude-transitioned-session-5555";
     std::string claudeTransPath = claudeProjects + "/-home-samurai-work-aimon/" + claudeTransCid + ".jsonl";
     {
@@ -3455,7 +3538,7 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
     httplib::Client client("http://127.0.0.1:" + std::to_string(port));
     httplib::Headers headers = {{"X-Mobile-Token", token}};
 
-    // A. Assert via GET /api/agent/conversations?provider=cursor
+    // A. Assert via GET /api/agent/conversations?provider=cursor (Case B IDE GUI and Case C Inactive CLI on disk)
     {
         auto res = client.Get("/api/agent/conversations?provider=cursor", headers);
         assert(res && res->status == 200);
@@ -3471,15 +3554,16 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
                     "Cursor IDE GUI session is read-only") != std::string::npos);
             } else if (cid == cursorCliCid) {
                 foundCursorCli = true;
-                assert(c.value("interactive", false) == true);
-                assert(c.value("nonInteractiveReason", "non-empty") == "");
+                assert(c.value("interactive", true) == false);
+                assert(c.value("nonInteractiveReason", "").find(
+                    "Inactive CLI session") != std::string::npos);
             }
         }
         assert(foundCursorIde);
         assert(foundCursorCli);
     }
 
-    // B. Assert via GET /api/agent/transcript?provider=cursor&conversationId=cursor-ide-gui-session-9999
+    // B. Assert via GET /api/agent/transcript for Cursor IDE GUI and Inactive CLI sessions
     {
         auto tres = client.Get(("/api/agent/transcript?provider=cursor&conversationId=" + cursorIdeCid).c_str(), headers);
         assert(tres && tres->status == 200);
@@ -3488,30 +3572,43 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
         assert(tj.value("interactive", true) == false);
         assert(tj.value("nonInteractiveReason", "").find(
             "Cursor IDE GUI session is read-only") != std::string::npos);
+
+        auto tcres = client.Get(("/api/agent/transcript?provider=cursor&conversationId=" + cursorCliCid).c_str(), headers);
+        assert(tcres && tcres->status == 200);
+        json tcj = json::parse(tcres->body);
+        assert(tcj.value("interactive", true) == false);
+        assert(tcj.value("nonInteractiveReason", "").find(
+            "Inactive CLI session") != std::string::npos);
     }
 
-    // C. Assert via POST /api/agent/prompt for cursor-ide-gui-session-9999 -> HTTP 409 Conflict
+    // C. Assert via POST /api/agent/prompt for cursorIdeCid and cursorCliCid -> HTTP 409 Conflict
     {
-        json req = {
+        json reqIde = {
             {"provider", "cursor"},
             {"conversationId", cursorIdeCid},
             {"prompt", "Follow up from mobile"}
         };
-        auto res = client.Post("/api/agent/prompt", headers, req.dump(), "application/json");
-        assert(res && res->status == 409);
-        json rj = json::parse(res->body);
-        assert(rj.value("ok", true) == false);
-        assert(rj.value("interactive", true) == false);
-        assert(rj.value("nonInteractiveReason", "").find(
+        auto resIde = client.Post("/api/agent/prompt", headers, reqIde.dump(), "application/json");
+        assert(resIde && resIde->status == 409);
+        json rjIde = json::parse(resIde->body);
+        assert(rjIde.value("ok", true) == false);
+        assert(rjIde.value("interactive", true) == false);
+        assert(rjIde.value("nonInteractiveReason", "").find(
             "Cursor IDE GUI session is read-only") != std::string::npos);
-        assert(!fs::exists(capturedCursorArgs));
 
-        auto dres = client.Get(("/api/agent/diagnostics?conversationId=" + cursorIdeCid).c_str(), headers);
-        assert(dres && dres->status == 200);
-        json dj = json::parse(dres->body);
-        assert(dj.value("interactive", true) == false);
-        assert(dj.value("selected_route", "") == "rejected_non_interactive_ide");
-        assert(dj.value("recommended_route", "") == "rejected_non_interactive_ide");
+        json reqCli = {
+            {"provider", "cursor"},
+            {"conversationId", cursorCliCid},
+            {"prompt", "Follow up to inactive CLI"}
+        };
+        auto resCli = client.Post("/api/agent/prompt", headers, reqCli.dump(), "application/json");
+        assert(resCli && resCli->status == 409);
+        json rjCli = json::parse(resCli->body);
+        assert(rjCli.value("ok", true) == false);
+        assert(rjCli.value("interactive", true) == false);
+        assert(rjCli.value("nonInteractiveReason", "").find(
+            "Inactive CLI session") != std::string::npos);
+        assert(!fs::exists(capturedCursorArgs));
     }
 
     // D. Assert via GET /api/agent/conversations?provider=claude
@@ -3531,12 +3628,14 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
                     "Claude Code IDE extension session is read-only") != std::string::npos);
             } else if (cid == claudeCliCid) {
                 foundClaudeCli = true;
-                assert(c.value("interactive", false) == true);
-                assert(c.value("nonInteractiveReason", "non-empty") == "");
+                assert(c.value("interactive", true) == false);
+                assert(c.value("nonInteractiveReason", "").find(
+                    "Inactive CLI session") != std::string::npos);
             } else if (cid == claudeTransCid) {
                 foundClaudeTrans = true;
-                assert(c.value("interactive", false) == true);
-                assert(c.value("nonInteractiveReason", "non-empty") == "");
+                assert(c.value("interactive", true) == false);
+                assert(c.value("nonInteractiveReason", "").find(
+                    "Inactive CLI session") != std::string::npos);
             }
         }
         assert(foundClaudeIde);
@@ -3555,7 +3654,7 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
             "Claude Code IDE extension session is read-only") != std::string::npos);
     }
 
-    // F. Assert via POST /api/agent/prompt for claude-ide-ext-session-8888 -> HTTP 409 Conflict
+    // F. Assert via POST /api/agent/prompt for claude-ide-ext-session-8888 and claude-cli-session-7777 -> HTTP 409 Conflict
     {
         json req = {
             {"provider", "claude"},
@@ -3569,18 +3668,63 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
         assert(rj.value("interactive", true) == false);
         assert(rj.value("nonInteractiveReason", "").find(
             "Claude Code IDE extension session is read-only") != std::string::npos);
-        assert(!fs::exists(capturedClaudeArgs));
 
-        auto dres = client.Get(("/api/agent/diagnostics?conversationId=" + claudeIdeCid).c_str(), headers);
-        assert(dres && dres->status == 200);
-        json dj = json::parse(dres->body);
-        assert(dj.value("interactive", true) == false);
-        assert(dj.value("selected_route", "") == "rejected_non_interactive_ide");
-        assert(dj.value("recommended_route", "") == "rejected_non_interactive_ide");
+        json reqCli = {
+            {"provider", "claude"},
+            {"conversationId", claudeCliCid},
+            {"prompt", "Follow up to inactive Claude CLI"}
+        };
+        auto resCli = client.Post("/api/agent/prompt", headers, reqCli.dump(), "application/json");
+        assert(resCli && resCli->status == 409);
+        json rjCli = json::parse(resCli->body);
+        assert(rjCli.value("ok", true) == false);
+        assert(rjCli.value("interactive", true) == false);
+        assert(rjCli.value("nonInteractiveReason", "").find(
+            "Inactive CLI session") != std::string::npos);
+        assert(!fs::exists(capturedClaudeArgs));
     }
 
-    // G. Assert local slash commands (/status, /help) still succeed with 200 OK on read-only sessions,
-    // and interactive CLI sessions (cursorCliCid, claudeCliCid) succeed with 200 OK on POST /api/agent/prompt
+    // F2. Assert Case A (Read-only terminal session with live unwrapped ownerPid > 0) in conversations, transcript, and 409 prompt
+    setenv("AIMON_LIVE_OWNER_PID_OVERRIDE", "888777", 1);
+    {
+        auto cres = client.Get("/api/agent/conversations?provider=cursor", headers);
+        assert(cres && cres->status == 200);
+        json cj = json::parse(cres->body);
+        bool sawTermRo = false;
+        for (const auto& c : cj["conversations"]) {
+            if (c.value("id", "") == cursorCliCid) {
+                sawTermRo = true;
+                assert(c.value("interactive", true) == false);
+                assert(c.value("nonInteractiveReason", "").find(
+                    "Read-only terminal session (PID 888777)") != std::string::npos);
+            }
+        }
+        assert(sawTermRo);
+
+        auto tres = client.Get(("/api/agent/transcript?provider=cursor&conversationId=" + cursorCliCid).c_str(), headers);
+        assert(tres && tres->status == 200);
+        json tj = json::parse(tres->body);
+        assert(tj.value("interactive", true) == false);
+        assert(tj.value("nonInteractiveReason", "").find(
+            "Read-only terminal session (PID 888777)") != std::string::npos);
+
+        json preq = {
+            {"provider", "cursor"},
+            {"conversationId", cursorCliCid},
+            {"prompt", "Attempt prompt on unwrapped terminal session"}
+        };
+        auto pres = client.Post("/api/agent/prompt", headers, preq.dump(), "application/json");
+        assert(pres && pres->status == 409);
+        json pj = json::parse(pres->body);
+        assert(pj.value("interactive", true) == false);
+        assert(pj.value("nonInteractiveReason", "").find(
+            "Read-only terminal session (PID 888777)") != std::string::npos);
+        assert(!fs::exists(capturedCursorArgs));
+    }
+    unsetenv("AIMON_LIVE_OWNER_PID_OVERRIDE");
+
+    // G. Assert local slash commands (/status, /help, /clear) still succeed with 200 OK on read-only sessions,
+    // and "conversationId": "new" spawns a new CLI session with 200 OK
     {
         json slashReq = {
             {"provider", "cursor"},
@@ -3590,21 +3734,39 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
         auto sres = client.Post("/api/agent/prompt", headers, slashReq.dump(), "application/json");
         assert(sres && sres->status == 200);
 
-        json cliCursorReq = {
+        json helpReq = {
+            {"provider", "claude"},
+            {"conversationId", claudeIdeCid},
+            {"prompt", "/help"}
+        };
+        auto hres = client.Post("/api/agent/prompt", headers, helpReq.dump(), "application/json");
+        assert(hres && hres->status == 200);
+
+        json clearReq = {
             {"provider", "cursor"},
             {"conversationId", cursorCliCid},
-            {"prompt", "Continue Cursor CLI"}
+            {"prompt", "/clear"}
         };
-        auto cres = client.Post("/api/agent/prompt", headers, cliCursorReq.dump(), "application/json");
-        assert(cres && cres->status == 200);
+        auto clClearRes = client.Post("/api/agent/prompt", headers, clearReq.dump(), "application/json");
+        assert(clClearRes && clClearRes->status == 200);
 
-        json cliClaudeReq = {
-            {"provider", "claude"},
-            {"conversationId", claudeCliCid},
-            {"prompt", "Continue Claude CLI"}
+        json newCursorReq = {
+            {"provider", "cursor"},
+            {"conversationId", "new"},
+            {"prompt", "Start new Cursor CLI"}
         };
-        auto clres = client.Post("/api/agent/prompt", headers, cliClaudeReq.dump(), "application/json");
+        auto cres = client.Post("/api/agent/prompt", headers, newCursorReq.dump(), "application/json");
+        assert(cres && cres->status == 200);
+        assert(fs::exists(capturedCursorArgs));
+
+        json newClaudeReq = {
+            {"provider", "claude"},
+            {"conversationId", "new"},
+            {"prompt", "Start new Claude CLI"}
+        };
+        auto clres = client.Post("/api/agent/prompt", headers, newClaudeReq.dump(), "application/json");
         assert(clres && clres->status == 200);
+        assert(fs::exists(capturedClaudeArgs));
     }
 
     server.stop();
@@ -3621,183 +3783,10 @@ static void NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndR
     std::cout << "[TestMobileGateway] NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndRejectedOnPromptWith409 passed!" << std::endl;
 }
 
-static void FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens() {
-    std::cout << "[TestMobileGateway] Running FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens..." << std::endl;
+static void RuntimeConfigAndStrictSameProcessRelayControlPlane_LocksAndTelemetryPrune() {
+    std::cout << "[TestMobileGateway] Running RuntimeConfigAndStrictSameProcessRelayControlPlane_LocksAndTelemetryPrune..." << std::endl;
 
-    {
-        DiagnosticsConfig d;
-        d.enabled = true;
-        d.logMobileHttp = true;
-        d.logRouterDecisions = true;
-        d.logIdleTranscriptPolls = true;
-        d.logDiscoveryPolls = true;
-        d.logHooks = true;
-        AgentTelemetryDb::getInstance().setDiagnosticsConfig(d);
-    }
-
-    std::string baseDir = "/tmp/test_4hop_trace_" + std::to_string(getpid());
-    fs::remove_all(baseDir);
-    std::string ideBrain = baseDir + "/ide_brain";
-    std::string cliBrain = baseDir + "/cli_brain";
-    std::string claudeProjects = baseDir + "/claude_projects";
-    std::string cursorProjects = baseDir + "/cursor_projects";
-    std::string cursorChats = baseDir + "/cursor_chats";
-    std::string cursorHookState = baseDir + "/cursor_hook_state";
-    std::string wsRoot = baseDir + "/work";
-    std::string binDir = baseDir + "/bin";
-
-    fs::create_directories(ideBrain);
-    fs::create_directories(cliBrain);
-    fs::create_directories(claudeProjects);
-    fs::create_directories(cursorProjects);
-    fs::create_directories(cursorChats);
-    fs::create_directories(cursorHookState);
-    fs::create_directories(wsRoot + "/aimon");
-    fs::create_directories(binDir);
-
-    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
-    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
-    setenv("AIMON_CLAUDE_PROJECTS_DIR", claudeProjects.c_str(), 1);
-    setenv("AIMON_CURSOR_PROJECTS_DIR", cursorProjects.c_str(), 1);
-    setenv("AIMON_CURSOR_CHATS_DIR", cursorChats.c_str(), 1);
-    setenv("AIMON_CURSOR_HOOK_STATE_DIR", cursorHookState.c_str(), 1);
-    setenv("AIMON_WORKSPACE_ROOT", wsRoot.c_str(), 1);
-
-    std::string traceCid = "f00dbabe-1111-2222-3333-444455556666";
-    std::string transDir = cursorProjects + "/home-samurai-work-aimon/agent-transcripts/" + traceCid;
-    fs::create_directories(transDir);
-    fs::create_directories(cursorChats + "/ws-hash/" + traceCid);
-    {
-        std::ofstream tf(transDir + "/" + traceCid + ".jsonl");
-        tf << "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Initial trace prompt\"}]}}\n"
-           << "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Initial trace reply\"}]}}\n";
-        std::ofstream sf(cursorChats + "/ws-hash/" + traceCid + "/store.db");
-        sf << "sqlite3-store";
-    }
-
-    std::string mockCursorBin = binDir + "/agent";
-    {
-        std::ofstream mf(mockCursorBin);
-        mf << "#!/bin/bash\n"
-           << "echo '{\"type\":\"result\",\"result\":\"Trace reply OK\",\"session_id\":\"" << traceCid << "\"}'\n"
-           << "exit 0\n";
-        mf.close();
-        chmod(mockCursorBin.c_str(), 0755);
-    }
-    setenv("AIMON_CURSOR_BIN", mockCursorBin.c_str(), 1);
-
-    StateStore& stateStore = StateStore::getInstance();
-    HistoryStore historyStore;
-    WebConfig cfg;
-    cfg.host = "127.0.0.1";
-    cfg.port = 0;
-    cfg.endpointsEnabled = false;
-    WebServer server(stateStore, historyStore, cfg);
-    assert(server.start(true));
-    int port = server.getPort();
-
-    MobileGateway& gw = MobileGateway::getInstance();
-    std::string mobileFile = baseDir + "/mobile.json";
-    assert(gw.init(mobileFile));
-    std::string secret = gw.createPairingSecret(120);
-    std::string token;
-    assert(gw.verifyPairingCode(secret, "dev-trace", "Pixel 9", token));
-    assert(!token.empty());
-
-    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
-
-    // Verify User-Agent: aimon-hook without valid auth token is rejected with 401
-    {
-        httplib::Headers spoofHeaders = {{"User-Agent", "aimon-hook"}};
-        auto unauthRes = client.Get("/api/agent/conversations?agent=cursor", spoofHeaders);
-        assert(unauthRes && unauthRes->status == 401);
-    }
-
-    std::string reqId = "req-trace-4hop-01";
-    httplib::Headers headers = {
-        {"X-Mobile-Token", token},
-        {"Authorization", "Bearer " + token},
-        {"X-Request-Id", reqId},
-        {"X-Client-Meta", "android"}
-    };
-
-    auto r1 = client.Get("/api/agent/conversations?agent=cursor", headers);
-    assert(r1 && r1->status == 200);
-
-    auto r2 = client.Get(("/api/agent/transcript?id=" + traceCid + "&agent=cursor").c_str(), headers);
-    assert(r2 && r2->status == 200);
-
-    json promptReq = {
-        {"agentId", "cursor"},
-        {"conversationId", traceCid},
-        {"text", "Trace hop prompt"}
-    };
-    auto r3 = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
-    assert(r3 && r3->status == 200);
-
-    json traceResult = AgentTelemetryDb::getInstance().queryTrace(reqId, 500);
-    std::string rawTraceDump = traceResult.dump();
-
-    // Token must never appear in raw form in diagnostic logs
-    assert(rawTraceDump.find(token) == std::string::npos);
-
-    const auto& logs = traceResult["trace_events"];
-    assert(logs.is_array() && !logs.empty());
-
-    bool sawMobileHttp = false;
-    bool sawDiscovery = false;
-    bool sawTranscript = false;
-    bool sawRouterDecision = false;
-    bool sawPlatformForward = false;
-
-    for (const auto& entry : logs) {
-        assert(entry.value("request_id", "") == reqId);
-        std::string cat = entry.value("category", "");
-        if (cat == "mobile_http") {
-            sawMobileHttp = true;
-            if (entry.contains("details") && entry["details"].is_object()) {
-                std::string fp = entry["details"].value("token_fp", "");
-                assert(fp.size() == 12);
-                assert(fp != token);
-            }
-        } else if (cat == "discovery") {
-            sawDiscovery = true;
-        } else if (cat == "transcript") {
-            sawTranscript = true;
-        } else if (cat == "router_decision") {
-            sawRouterDecision = true;
-        } else if (cat == "platform_forward") {
-            sawPlatformForward = true;
-        }
-    }
-
-    assert(sawMobileHttp);
-    assert(sawDiscovery);
-    assert(sawTranscript);
-    assert(sawRouterDecision);
-    assert(sawPlatformForward);
-
-    server.stop();
-    unsetenv("AIMON_IDE_BRAIN_DIR");
-    unsetenv("AIMON_CLI_BRAIN_DIR");
-    unsetenv("AIMON_CLAUDE_PROJECTS_DIR");
-    unsetenv("AIMON_CURSOR_PROJECTS_DIR");
-    unsetenv("AIMON_CURSOR_CHATS_DIR");
-    unsetenv("AIMON_CURSOR_HOOK_STATE_DIR");
-    unsetenv("AIMON_WORKSPACE_ROOT");
-    unsetenv("AIMON_CURSOR_BIN");
-    fs::remove_all(baseDir);
-    std::cout << "[TestMobileGateway] FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens passed!" << std::endl;
-}
-
-static void RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndPurge() {
-    std::cout << "[TestMobileGateway] Running RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndPurge..." << std::endl;
-
-    // Reset singleton DiagnosticsConfig to defaults (all switches OFF by default)
-    AgentTelemetryDb::getInstance().setDiagnosticsConfig(DiagnosticsConfig{});
-    AgentTelemetryDb::getInstance().clearDiagnostics();
-
-    std::string baseDir = "/tmp/test_runtime_cfg_diag_" + std::to_string(getpid());
+    std::string baseDir = "/tmp/test_runtime_cfg_relay_" + std::to_string(getpid());
     fs::remove_all(baseDir);
     std::string ideBrain = baseDir + "/ide_brain";
     std::string cliBrain = baseDir + "/cli_brain";
@@ -3892,158 +3881,144 @@ static void RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndP
     assert(gw.verifyPairingCode(secret, "dev-cfg-plane", "Pixel 9 Pro", token));
 
     httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+
+    // Verify User-Agent: aimon-hook without valid auth token is rejected with 401
+    {
+        httplib::Headers spoofHeaders = {{"User-Agent", "aimon-hook"}};
+        auto unauthRes = client.Get("/api/agent/conversations", spoofHeaders);
+        assert(unauthRes && unauthRes->status == 401);
+    }
+
     httplib::Headers headers = {{"X-Mobile-Token", token}};
 
-    // 1. Verify GET /api/config returns defaults (all diagnostics switches OFF by default, Fallback 5 ON)
+    // 1. Verify GET /api/config returns gateway settings and NO diagnostics or allow_cli_locked_detached_resume
     {
         auto rCfg = client.Get("/api/config", headers);
         assert(rCfg && rCfg->status == 200);
         json cj = json::parse(rCfg->body);
         assert(cj.value("ok", false) == true);
         assert(cj.value("stale_presence_locks_count", 0) == 1);
+        assert(!cj["config"].contains("diagnostics"));
         const auto& gwJson = cj["config"]["gateway"];
-        const auto& dgJson = cj["config"]["diagnostics"];
-        assert(gwJson.value("allow_cli_locked_detached_resume", false) == true);
+        assert(!gwJson.contains("allow_cli_locked_detached_resume"));
         assert(gwJson.value("allow_cli_new_session_spawn", false) == true);
         assert(gwJson.value("allow_agy_agentapi_fallback", false) == true);
-        assert(dgJson.value("enabled", true) == false);
-        assert(dgJson.value("log_mobile_http", true) == false);
-        assert(dgJson.value("log_router_decisions", true) == false);
-        assert(dgJson.value("log_idle_transcript_polls", true) == false);
-        assert(dgJson.value("log_discovery_polls", true) == false);
-        assert(dgJson.value("log_hooks", true) == false);
+        assert(gwJson.value("strict_presence_fd_check", false) == true);
+        assert(gwJson.value("telemetry_retention_days", 0) == 14);
     }
 
-    // 2. Verify GET /api/agent/diagnostics?id=<lockedCid> and GET /api/agent/diagnostics inspect the session and recommend agy_cli_resume
+    // 2. Verify POST /api/config hot-reloads gateway settings (allow_cli_new_session_spawn, strict_presence_fd_check, telemetry_retention_days, allow_agy_agentapi_fallback)
     {
-        auto rDiag = client.Get(("/api/agent/diagnostics?id=" + lockedCid).c_str(), headers);
-        assert(rDiag && rDiag->status == 200);
-        json dj = json::parse(rDiag->body);
-        assert(dj.value("ok", false) == true);
-        assert(dj.value("conversation_id", "") == lockedCid);
-        assert(dj.value("provider", "") == "antigravity");
-        assert(dj.value("source", "") == "cli");
-        assert(dj.value("open_in_terminal", false) == true);
-        assert(dj.value("locked_by_running_agy", false) == true);
-        assert(dj.value("http_port", 0) == 45231);
-        assert(dj.value("has_registered_csrf", true) == false);
-        assert(dj.value("recommended_route", "") == "agy_cli_resume");
-        assert(dj.value("interactive", false) == true);
-
-        auto rDiagAll = client.Get("/api/agent/diagnostics", headers);
-        assert(rDiagAll && rDiagAll->status == 200);
-        json djAll = json::parse(rDiagAll->body);
-        assert(djAll.value("ok", false) == true);
-        assert(djAll.contains("sessions") && djAll["sessions"].is_array() && !djAll["sessions"].empty());
-    }
-
-    // 3. Dynamically disable allow_cli_locked_detached_resume via POST /api/config and verify 503 block
-    {
-        json disablePatch = {
+        json patchCfg = {
             {"gateway", {
-                {"allow_cli_locked_detached_resume", false}
+                {"allow_cli_new_session_spawn", false},
+                {"allow_agy_agentapi_fallback", false},
+                {"strict_presence_fd_check", false},
+                {"telemetry_retention_days", 30}
             }}
         };
-        auto rPostCfg = client.Post("/api/config", headers, disablePatch.dump(), "application/json");
+        auto rPostCfg = client.Post("/api/config", headers, patchCfg.dump(), "application/json");
         assert(rPostCfg && rPostCfg->status == 200);
-
-        auto rDiagBlocked = client.Get(("/api/agent/diagnostics?id=" + lockedCid).c_str(), headers);
-        assert(rDiagBlocked && rDiagBlocked->status == 200);
-        json djBlocked = json::parse(rDiagBlocked->body);
-        assert(djBlocked.value("recommended_route", "") == "blocked_cli_locked_no_csrf");
-        assert(djBlocked.value("interactive", true) == false);
-
-        json promptReq = {
-            {"agentId", "antigravity"},
-            {"conversationId", lockedCid},
-            {"text", "Should be blocked while Fallback 5 is disabled"}
-        };
-        auto rPromptBlocked = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
-        assert(rPromptBlocked && rPromptBlocked->status == 503);
-        json pbj = json::parse(rPromptBlocked->body);
-        assert(pbj.value("error", "").find("allow_cli_locked_detached_resume is disabled") != std::string::npos);
+        json pj = json::parse(rPostCfg->body);
+        const auto& gwJson = pj["config"]["gateway"];
+        assert(gwJson.value("allow_cli_new_session_spawn", true) == false);
+        assert(gwJson.value("allow_agy_agentapi_fallback", true) == false);
+        assert(gwJson.value("strict_presence_fd_check", true) == false);
+        assert(gwJson.value("telemetry_retention_days", 0) == 30);
     }
 
-    // 4. Re-enable allow_cli_locked_detached_resume + enable diagnostic logging via POST /api/config
+    // 3. Verify terminal-locked agy session without registered CSRF token is marked interactive == false
+    //    and rejected with 409 Conflict on POST /api/agent/prompt without invoking mockAgyBin
     {
-        json enablePatch = {
-            {"gateway", {
-                {"allow_cli_locked_detached_resume", true}
-            }},
-            {"diagnostics", {
-                {"enabled", true},
-                {"min_level", "INFO"},
-                {"log_mobile_http", true},
-                {"log_router_decisions", true}
-            }}
-        };
-        auto rPostCfg = client.Post("/api/config", headers, enablePatch.dump(), "application/json");
-        assert(rPostCfg && rPostCfg->status == 200);
-
-        json promptReq = {
-            {"agentId", "antigravity"},
-            {"conversationId", lockedCid},
-            {"text", "Resume locked terminal session via Fallback 5"}
-        };
-        auto rPromptOk = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
-        assert(rPromptOk && rPromptOk->status == 200);
-        json poj = json::parse(rPromptOk->body);
-        assert(poj.value("status", "") == "dispatched");
-        assert(poj.value("routedVia", "") == "agy_cli_resume");
-
-        // Verify mockAgyBin was invoked with --conversation <lockedCid> --dangerously-skip-permissions -p <text>
-        std::ifstream af(agyArgsFile);
-        std::string loggedArgs((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
-        assert(loggedArgs.find("--conversation\n" + lockedCid) != std::string::npos);
-        assert(loggedArgs.find("--dangerously-skip-permissions") != std::string::npos);
-        assert(loggedArgs.find("Resume locked terminal session via Fallback 5") != std::string::npos);
-    }
-
-    // 5. Verify GET /api/agent/diagnostics/logs returns captured router_decision & platform_forward rows
-    {
-        auto rLogs = client.Get(("/api/agent/diagnostics/logs?id=" + lockedCid).c_str(), headers);
-        assert(rLogs && rLogs->status == 200);
-        json lj = json::parse(rLogs->body);
-        assert(lj.value("ok", false) == true);
-        assert(lj.contains("logs") && lj["logs"].is_array() && !lj["logs"].empty());
-        bool sawRouter = false;
-        bool sawForward = false;
-        for (const auto& row : lj["logs"]) {
-            std::string cat = row.value("category", "");
-            if (cat == "router_decision") sawRouter = true;
-            if (cat == "platform_forward") sawForward = true;
+        auto rConvs = client.Get("/api/agent/conversations", headers);
+        assert(rConvs && rConvs->status == 200);
+        json cj = json::parse(rConvs->body);
+        bool sawLocked = false;
+        for (const auto& c : cj["conversations"]) {
+            if (c.value("id", "") == lockedCid) {
+                sawLocked = true;
+                assert(c.value("openInTerminal", false) == true);
+                assert(c.value("interactive", true) == false);
+                assert(!c.value("nonInteractiveReason", "").empty());
+            }
         }
-        assert(sawRouter);
-        assert(sawForward);
+        assert(sawLocked);
+
+        auto rTrans = client.Get(("/api/agent/transcript?id=" + lockedCid).c_str(), headers);
+        assert(rTrans && rTrans->status == 200);
+        json tj = json::parse(rTrans->body);
+        assert(tj.value("interactive", true) == false);
+        assert(!tj.value("nonInteractiveReason", "").empty());
+
+        json promptReq = {
+            {"agentId", "antigravity"},
+            {"conversationId", lockedCid},
+            {"text", "Should be rejected with 409 Conflict without spawning detached agy"}
+        };
+        auto rPrompt = client.Post("/api/agent/prompt", headers, promptReq.dump(), "application/json");
+        assert(rPrompt && rPrompt->status == 409);
+        json prj = json::parse(rPrompt->body);
+        assert(prj.value("ok", true) == false);
+        assert(prj.value("interactive", true) == false);
+        assert(!prj.value("nonInteractiveReason", "").empty());
+        assert(!fs::exists(agyArgsFile));
     }
 
-    // 6. Verify POST /api/agent/diagnostics/clear purges debug logs and prunes stale presence lock files
+    // 4. Verify removed /api/agent/diagnostics, /api/agent/diagnostics/logs, and /api/agent/diagnostics/clear return 404
     {
+        auto rDiag1 = client.Get("/api/agent/diagnostics", headers);
+        assert(rDiag1 && rDiag1->status == 404);
+        auto rDiag2 = client.Get("/api/agent/diagnostics/logs", headers);
+        assert(rDiag2 && rDiag2->status == 404);
+        auto rDiag3 = client.Post("/api/agent/diagnostics/clear", headers, "{}", "application/json");
+        assert(rDiag3 && rDiag3->status == 404);
+    }
+
+    // 5. Verify POST /api/telemetry/prune prunes expired telemetry rows and stale .lock files
+    {
+        int64_t oldEpoch = static_cast<int64_t>(std::time(nullptr)) - 45 * 86400;
+        AgentLifecycleEvent ev;
+        ev.timestamp = oldEpoch;
+        ev.sessionId = "old-expired-sess";
+        ev.agentType = "cursor";
+        ev.eventType = "USER_TURN";
+        ev.stepIndex = 0;
+        ev.toolName = "";
+        ev.durationMs = 100.0;
+        ev.status = "OK";
+        ev.detailsJson = json::object({{"workspace", wsRoot}, {"model", "gpt-5"}});
+        AgentTelemetryDb::getInstance().insertEvent(ev);
         assert(fs::exists(presenceDir + "/stale-dead-session.lock"));
-        json clearReq = {
-            {"purge_debug_data", true},
-            {"clear_logs", true},
+        json pruneReq = {
             {"prune_telemetry", true},
             {"prune_stale_locks", true},
+            {"retention_days", 14},
             {"vacuum", true}
         };
-        auto rClear = client.Post("/api/agent/diagnostics/clear", headers, clearReq.dump(), "application/json");
-        assert(rClear && rClear->status == 200);
-        json cj = json::parse(rClear->body);
-        assert(cj.value("ok", false) == true);
-        assert(cj.value("deleted_diagnostic_logs", 0) > 0);
-        assert(cj.value("pruned_stale_locks", 0) == 1);
+        auto rPrune = client.Post("/api/telemetry/prune", headers, pruneReq.dump(), "application/json");
+        assert(rPrune && rPrune->status == 200);
+        json pj = json::parse(rPrune->body);
+        assert(pj.value("ok", false) == true);
+        assert(pj.value("pruned_telemetry_rows", 0) >= 1);
+        assert(pj.value("pruned_stale_locks", 0) == 1);
         assert(!fs::exists(presenceDir + "/stale-dead-session.lock"));
         assert(fs::exists(presenceDir + "/" + lockedCid + ".lock"));
-
-        auto rLogsAfter = client.Get("/api/agent/diagnostics/logs", headers);
-        assert(rLogsAfter && rLogsAfter->status == 200);
-        json ljAfter = json::parse(rLogsAfter->body);
-        assert(ljAfter["logs"].is_array() && ljAfter["logs"].empty());
+        assert(pj.contains("storage_stats") && pj["storage_stats"].is_object());
+        assert(!pj["storage_stats"].contains("gateway_diagnostic_logs"));
     }
 
-    // Restore DiagnosticsConfig defaults
-    AgentTelemetryDb::getInstance().setDiagnosticsConfig(DiagnosticsConfig{});
+    // Restore default gateway config
+    {
+        json restorePatch = {
+            {"gateway", {
+                {"allow_cli_new_session_spawn", true},
+                {"allow_agy_agentapi_fallback", true},
+                {"strict_presence_fd_check", true},
+                {"telemetry_retention_days", 14}
+            }}
+        };
+        client.Post("/api/config", headers, restorePatch.dump(), "application/json");
+    }
 
     server.stop();
     unsetenv("AIMON_IDE_BRAIN_DIR");
@@ -4054,7 +4029,7 @@ static void RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndP
     unsetenv("AIMON_WORKSPACE_ROOT");
     unsetenv("AIMON_AGY_BIN");
     fs::remove_all(baseDir);
-    std::cout << "[TestMobileGateway] RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndPurge passed!" << std::endl;
+    std::cout << "[TestMobileGateway] RuntimeConfigAndStrictSameProcessRelayControlPlane_LocksAndTelemetryPrune passed!" << std::endl;
 }
 
 static void testSessionScopedWorkspaceBrowsing() {
@@ -4326,8 +4301,7 @@ int main() {
     testLiveScreenSessionRoutingAndIdeSessionProtection();
     Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversationsAndTranscript();
     NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndRejectedOnPromptWith409();
-    FourHopDiagnosticTrace_CorrelatesRequestIdAndScrubsTokens();
-    RuntimeConfigAndDiagnosticsControlPlane_DynamicLockedCliFallbackAndPurge();
+    RuntimeConfigAndStrictSameProcessRelayControlPlane_LocksAndTelemetryPrune();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;

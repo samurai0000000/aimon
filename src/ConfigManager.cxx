@@ -100,8 +100,7 @@ nlohmann::json AimonConfig::toJson() const {
             {"db_path", cursor.dbPath},
             {"access_token", cursor.accessToken}
         }},
-        {"gateway", gateway.toJson()},
-        {"diagnostics", diagnostics.toJson()}
+        {"gateway", gateway.toJson()}
     };
 
     nlohmann::json claudeAccounts = nlohmann::json::array();
@@ -369,7 +368,13 @@ void AimonConfig::fromJson(const nlohmann::json& j) {
     }
 
     if (j.contains("diagnostics") && j["diagnostics"].is_object()) {
-        diagnostics.fromJson(j["diagnostics"]);
+        const auto& dg = j["diagnostics"];
+        bool hasGwRetention = j.contains("gateway") && j["gateway"].is_object() &&
+                              j["gateway"].contains("telemetry_retention_days");
+        if (!hasGwRetention && dg.contains("telemetry_retention_days") &&
+            dg["telemetry_retention_days"].is_number_integer()) {
+            gateway.telemetryRetentionDays = dg["telemetry_retention_days"];
+        }
     }
 
     if (j.contains("insights") && j["insights"].is_object()) {
@@ -423,7 +428,6 @@ bool AimonConfig::validate(std::string& error) const {
     }
     if (!claude.validate(error)) return false;
     if (!gateway.validate(error)) return false;
-    if (!diagnostics.validate(error)) return false;
     if (!eda.validate(error)) return false;
     error.clear();
     return true;
@@ -497,6 +501,11 @@ bool ClaudeConfig::validate(std::string& error) const {
         dirs.push_back(dir);
     }
     return true;
+}
+
+ConfigManager& ConfigManager::getInstance() {
+    static ConfigManager instance;
+    return instance;
 }
 
 ConfigManager::ConfigManager() {
@@ -615,12 +624,12 @@ bool ConfigManager::loadLibConfig(const std::string& customPath) {
             }
         }
 
+        bool hasGwRetention = false;
         if (root.exists("gateway")) {
             const libconfig::Setting& gw = root["gateway"];
             readSetting(gw, "enabled", _config.gateway.enabled);
             readSetting(gw, "host", _config.gateway.host);
             readSetting(gw, "port", _config.gateway.port);
-            readSetting(gw, "allow_cli_locked_detached_resume", _config.gateway.allowCliLockedDetachedResume);
             readSetting(gw, "allow_cli_new_session_spawn", _config.gateway.allowCliNewSessionSpawn);
             readSetting(gw, "allow_agy_agentapi_fallback", _config.gateway.allowAgyAgentApiFallback);
             readSetting(gw, "strict_presence_fd_check", _config.gateway.strictPresenceFdCheck);
@@ -637,20 +646,12 @@ bool ConfigManager::loadLibConfig(const std::string& customPath) {
                 _config.gateway.stalePresenceLockMaxAgeSec = _config.gateway.presenceStaleTtlSec;
             }
             readSetting(gw, "active_recency_window_sec", _config.gateway.activeRecencyWindowSec);
+            hasGwRetention = readSetting(gw, "telemetry_retention_days", _config.gateway.telemetryRetentionDays);
         }
 
-        if (root.exists("diagnostics")) {
+        if (!hasGwRetention && root.exists("diagnostics")) {
             const libconfig::Setting& dg = root["diagnostics"];
-            readSetting(dg, "enabled", _config.diagnostics.enabled);
-            readSetting(dg, "min_level", _config.diagnostics.minLevel);
-            readSetting(dg, "log_mobile_http", _config.diagnostics.logMobileHttp);
-            readSetting(dg, "log_router_decisions", _config.diagnostics.logRouterDecisions);
-            readSetting(dg, "log_idle_transcript_polls", _config.diagnostics.logIdleTranscriptPolls);
-            readSetting(dg, "log_discovery_polls", _config.diagnostics.logDiscoveryPolls);
-            readSetting(dg, "log_hooks", _config.diagnostics.logHooks);
-            readSetting(dg, "max_retained_rows", _config.diagnostics.maxRetainedRows);
-            readSetting(dg, "retention_hours", _config.diagnostics.retentionHours);
-            readSetting(dg, "telemetry_retention_days", _config.diagnostics.telemetryRetentionDays);
+            readSetting(dg, "telemetry_retention_days", _config.gateway.telemetryRetentionDays);
         }
 
         if (root.exists("insights")) {
@@ -803,8 +804,6 @@ bool ConfigManager::saveLibConfig(const std::string& customPath) const {
         gw.add("enabled", libconfig::Setting::TypeBoolean) = _config.gateway.enabled;
         gw.add("host", libconfig::Setting::TypeString) = _config.gateway.host;
         gw.add("port", libconfig::Setting::TypeInt) = _config.gateway.port;
-        gw.add("allow_cli_locked_detached_resume", libconfig::Setting::TypeBoolean) =
-            _config.gateway.allowCliLockedDetachedResume;
         gw.add("allow_cli_new_session_spawn", libconfig::Setting::TypeBoolean) =
             _config.gateway.allowCliNewSessionSpawn;
         gw.add("allow_agy_agentapi_fallback", libconfig::Setting::TypeBoolean) =
@@ -821,19 +820,8 @@ bool ConfigManager::saveLibConfig(const std::string& customPath) const {
             _config.gateway.presenceStaleTtlSec;
         gw.add("active_recency_window_sec", libconfig::Setting::TypeInt) =
             _config.gateway.activeRecencyWindowSec;
-
-        // diagnostics
-        libconfig::Setting& dg = root.add("diagnostics", libconfig::Setting::TypeGroup);
-        dg.add("enabled", libconfig::Setting::TypeBoolean) = _config.diagnostics.enabled;
-        dg.add("min_level", libconfig::Setting::TypeString) = _config.diagnostics.minLevel;
-        dg.add("log_mobile_http", libconfig::Setting::TypeBoolean) = _config.diagnostics.logMobileHttp;
-        dg.add("log_router_decisions", libconfig::Setting::TypeBoolean) = _config.diagnostics.logRouterDecisions;
-        dg.add("log_idle_transcript_polls", libconfig::Setting::TypeBoolean) = _config.diagnostics.logIdleTranscriptPolls;
-        dg.add("log_discovery_polls", libconfig::Setting::TypeBoolean) = _config.diagnostics.logDiscoveryPolls;
-        dg.add("log_hooks", libconfig::Setting::TypeBoolean) = _config.diagnostics.logHooks;
-        dg.add("max_retained_rows", libconfig::Setting::TypeInt) = _config.diagnostics.maxRetainedRows;
-        dg.add("retention_hours", libconfig::Setting::TypeInt) = _config.diagnostics.retentionHours;
-        dg.add("telemetry_retention_days", libconfig::Setting::TypeInt) = _config.diagnostics.telemetryRetentionDays;
+        gw.add("telemetry_retention_days", libconfig::Setting::TypeInt) =
+            _config.gateway.telemetryRetentionDays;
 
         // insights
         libconfig::Setting& ins = root.add("insights", libconfig::Setting::TypeGroup);

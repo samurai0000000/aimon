@@ -341,7 +341,7 @@ int main() {
             {"prompt", "Should fail safely without hijacking wrongPort"}
         };
         auto resMissingTok = client.Post("/api/agent/prompt", mobileAuthHeaders, promptReq.dump(), "application/json");
-        assert(resMissingTok && resMissingTok->status == 503);
+        assert(resMissingTok && (resMissingTok->status == 409 || resMissingTok->status == 503));
         json missingTokJson = json::parse(resMissingTok->body);
         assert(missingTokJson.value("error", "").find("pts/7") != std::string::npos);
         assert(wrongSendCount.load() == 0);

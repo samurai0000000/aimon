@@ -430,49 +430,33 @@ TEST(LibconfigParser_Integrated, GatewayAndDiagnosticsConfigDefaultsRoundTripAnd
 
     ConfigManager cmDefaults;
     const GatewayConfig& defGw = cmDefaults.getConfig().gateway;
-    const DiagnosticsConfig& defDiag = cmDefaults.getConfig().diagnostics;
 
     // Verify GatewayConfig defaults
     CHECK_TRUE(defGw.enabled);
-    CHECK_TRUE(defGw.allowCliLockedDetachedResume);
     CHECK_TRUE(defGw.allowCliNewSessionSpawn);
     CHECK_TRUE(defGw.allowAgyAgentApiFallback);
     CHECK_TRUE(defGw.strictPresenceFdCheck);
     CHECK_TRUE(defGw.autoPruneStalePresenceLocks);
     CHECK_EQUAL(3600, defGw.presenceStaleTtlSec);
     CHECK_EQUAL(120, defGw.activeRecencyWindowSec);
+    CHECK_EQUAL(14, defGw.telemetryRetentionDays);
 
-    // Verify DiagnosticsConfig defaults (all switches OFF by default)
-    CHECK_FALSE(defDiag.enabled);
-    CHECK_EQUAL("INFO", defDiag.minLevel);
-    CHECK_FALSE(defDiag.logMobileHttp);
-    CHECK_FALSE(defDiag.logRouterDecisions);
-    CHECK_FALSE(defDiag.logIdleTranscriptPolls);
-    CHECK_FALSE(defDiag.logDiscoveryPolls);
-    CHECK_FALSE(defDiag.logHooks);
-    CHECK_EQUAL(2000, defDiag.maxRetainedRows);
-    CHECK_EQUAL(14, defDiag.telemetryRetentionDays);
+    nlohmann::json defJson = cmDefaults.getConfig().toJson();
+    CHECK_FALSE(defJson.contains("diagnostics"));
+    CHECK_TRUE(defJson.contains("gateway"));
+    CHECK_FALSE(defJson["gateway"].contains("allow_cli_locked_detached_resume"));
+    CHECK_EQUAL(14, defJson["gateway"]["telemetry_retention_days"].get<int>());
 
     // Customize and round-trip via libconfig (.cfg) and JSON (.json)
     ConfigManager cm1;
     AimonConfig& c1 = cm1.getConfig();
-    c1.gateway.allowCliLockedDetachedResume = false;
     c1.gateway.allowCliNewSessionSpawn = false;
     c1.gateway.allowAgyAgentApiFallback = false;
     c1.gateway.strictPresenceFdCheck = false;
     c1.gateway.autoPruneStalePresenceLocks = false;
     c1.gateway.presenceStaleTtlSec = 7200;
     c1.gateway.activeRecencyWindowSec = 240;
-
-    c1.diagnostics.enabled = true;
-    c1.diagnostics.minLevel = "WARN";
-    c1.diagnostics.logMobileHttp = true;
-    c1.diagnostics.logRouterDecisions = true;
-    c1.diagnostics.logIdleTranscriptPolls = true;
-    c1.diagnostics.logDiscoveryPolls = true;
-    c1.diagnostics.logHooks = true;
-    c1.diagnostics.maxRetainedRows = 5000;
-    c1.diagnostics.telemetryRetentionDays = 30;
+    c1.gateway.telemetryRetentionDays = 30;
 
     std::string valErr;
     CHECK_TRUE(c1.validate(valErr));
@@ -482,74 +466,100 @@ TEST(LibconfigParser_Integrated, GatewayAndDiagnosticsConfigDefaultsRoundTripAnd
     ConfigManager cmLib;
     CHECK_TRUE(cmLib.loadLibConfig(cfgPath));
     const GatewayConfig& libGw = cmLib.getConfig().gateway;
-    const DiagnosticsConfig& libDiag = cmLib.getConfig().diagnostics;
-    CHECK_FALSE(libGw.allowCliLockedDetachedResume);
     CHECK_FALSE(libGw.allowCliNewSessionSpawn);
     CHECK_FALSE(libGw.allowAgyAgentApiFallback);
     CHECK_FALSE(libGw.strictPresenceFdCheck);
     CHECK_FALSE(libGw.autoPruneStalePresenceLocks);
     CHECK_EQUAL(7200, libGw.presenceStaleTtlSec);
     CHECK_EQUAL(240, libGw.activeRecencyWindowSec);
-    CHECK_TRUE(libDiag.enabled);
-    CHECK_EQUAL("WARN", libDiag.minLevel);
-    CHECK_TRUE(libDiag.logMobileHttp);
-    CHECK_TRUE(libDiag.logRouterDecisions);
-    CHECK_TRUE(libDiag.logIdleTranscriptPolls);
-    CHECK_TRUE(libDiag.logDiscoveryPolls);
-    CHECK_TRUE(libDiag.logHooks);
-    CHECK_EQUAL(5000, libDiag.maxRetainedRows);
-    CHECK_EQUAL(30, libDiag.telemetryRetentionDays);
+    CHECK_EQUAL(30, libGw.telemetryRetentionDays);
 
     CHECK_TRUE(cm1.save(jsonPath));
     ConfigManager cmJson;
     CHECK_TRUE(cmJson.load(jsonPath));
     const GatewayConfig& jsGw = cmJson.getConfig().gateway;
-    const DiagnosticsConfig& jsDiag = cmJson.getConfig().diagnostics;
-    CHECK_FALSE(jsGw.allowCliLockedDetachedResume);
+    CHECK_FALSE(jsGw.allowCliNewSessionSpawn);
+    CHECK_FALSE(jsGw.allowAgyAgentApiFallback);
+    CHECK_FALSE(jsGw.strictPresenceFdCheck);
+    CHECK_FALSE(jsGw.autoPruneStalePresenceLocks);
     CHECK_EQUAL(7200, jsGw.presenceStaleTtlSec);
     CHECK_EQUAL(240, jsGw.activeRecencyWindowSec);
-    CHECK_TRUE(jsDiag.enabled);
-    CHECK_EQUAL("WARN", jsDiag.minLevel);
-    CHECK_TRUE(jsDiag.logMobileHttp);
-    CHECK_TRUE(jsDiag.logRouterDecisions);
-    CHECK_EQUAL(5000, jsDiag.maxRetainedRows);
-    CHECK_EQUAL(30, jsDiag.telemetryRetentionDays);
+    CHECK_EQUAL(30, jsGw.telemetryRetentionDays);
+
+    // Verify legacy .cfg and .json with allow_cli_locked_detached_resume and diagnostics load cleanly
+    std::string legacyGwCfgPath = _tempDir + "/legacy_gw_diag.cfg";
+    {
+        std::ofstream out(legacyGwCfgPath);
+        out << "gateway: {\n"
+            << "    enabled = true;\n"
+            << "    allow_cli_locked_detached_resume = false;\n"
+            << "};\n"
+            << "diagnostics: {\n"
+            << "    enabled = true;\n"
+            << "    min_level = \"WARN\";\n"
+            << "    telemetry_retention_days = 21;\n"
+            << "};\n";
+    }
+    ConfigManager cmLegacyCfg;
+    CHECK_TRUE(cmLegacyCfg.loadLibConfig(legacyGwCfgPath));
+    CHECK_EQUAL(21, cmLegacyCfg.getConfig().gateway.telemetryRetentionDays);
+
+    std::string legacyGwJsonPath = _tempDir + "/legacy_gw_diag.json";
+    {
+        nlohmann::json legacyGwJson = {
+            {"gateway", {
+                {"enabled", true},
+                {"allow_cli_locked_detached_resume", false}
+            }},
+            {"diagnostics", {
+                {"enabled", true},
+                {"min_level", "ERROR"},
+                {"telemetry_retention_days", 28}
+            }}
+        };
+        std::ofstream out(legacyGwJsonPath);
+        out << legacyGwJson.dump(2);
+    }
+    ConfigManager cmLegacyJson;
+    CHECK_TRUE(cmLegacyJson.load(legacyGwJsonPath));
+    CHECK_EQUAL(28, cmLegacyJson.getConfig().gateway.telemetryRetentionDays);
+    nlohmann::json migratedOut = cmLegacyJson.getConfig().toJson();
+    CHECK_FALSE(migratedOut.contains("diagnostics"));
+    CHECK_FALSE(migratedOut["gateway"].contains("allow_cli_locked_detached_resume"));
+    CHECK_EQUAL(28, migratedOut["gateway"]["telemetry_retention_days"].get<int>());
 
     // Verify ConfigManager::updateFromJson atomic validation and persistence
     std::string patchErr;
     nlohmann::json validPatch = {
         {"gateway", {
-            {"allow_cli_locked_detached_resume", true},
+            {"allow_cli_new_session_spawn", true},
             {"active_recency_window_sec", 90},
-            {"presence_stale_ttl_sec", 1800}
-        }},
-        {"diagnostics", {
-            {"enabled", false},
-            {"min_level", "ERROR"},
-            {"log_mobile_http", false},
-            {"max_retained_rows", 1500},
+            {"presence_stale_ttl_sec", 1800},
             {"telemetry_retention_days", 7}
         }}
     };
     CHECK_TRUE(cmLib.updateFromJson(validPatch, patchErr));
     CHECK_EQUAL("", patchErr);
     AimonConfig snap = cmLib.getConfigSnapshot();
-    CHECK_TRUE(snap.gateway.allowCliLockedDetachedResume);
+    CHECK_TRUE(snap.gateway.allowCliNewSessionSpawn);
     CHECK_EQUAL(90, snap.gateway.activeRecencyWindowSec);
     CHECK_EQUAL(1800, snap.gateway.presenceStaleTtlSec);
-    CHECK_FALSE(snap.diagnostics.enabled);
-    CHECK_EQUAL("ERROR", snap.diagnostics.minLevel);
-    CHECK_FALSE(snap.diagnostics.logMobileHttp);
-    CHECK_EQUAL(1500, snap.diagnostics.maxRetainedRows);
-    CHECK_EQUAL(7, snap.diagnostics.telemetryRetentionDays);
+    CHECK_EQUAL(7, snap.gateway.telemetryRetentionDays);
 
     // Invalid patches must fail validation and leave existing snapshot intact
-    nlohmann::json badLevelPatch = {
-        {"diagnostics", {{"min_level", "VERBOSE"}}}
+    nlohmann::json badRetentionLowPatch = {
+        {"gateway", {{"telemetry_retention_days", 0}}}
     };
-    CHECK_FALSE(cmLib.updateFromJson(badLevelPatch, patchErr));
+    CHECK_FALSE(cmLib.updateFromJson(badRetentionLowPatch, patchErr));
     CHECK_FALSE(patchErr.empty());
-    CHECK_EQUAL("ERROR", cmLib.getConfigSnapshot().diagnostics.minLevel);
+    CHECK_EQUAL(7, cmLib.getConfigSnapshot().gateway.telemetryRetentionDays);
+
+    nlohmann::json badRetentionHighPatch = {
+        {"gateway", {{"telemetry_retention_days", 400}}}
+    };
+    CHECK_FALSE(cmLib.updateFromJson(badRetentionHighPatch, patchErr));
+    CHECK_FALSE(patchErr.empty());
+    CHECK_EQUAL(7, cmLib.getConfigSnapshot().gateway.telemetryRetentionDays);
 
     nlohmann::json badRecencyPatch = {
         {"gateway", {{"active_recency_window_sec", 2}}}
@@ -557,13 +567,6 @@ TEST(LibconfigParser_Integrated, GatewayAndDiagnosticsConfigDefaultsRoundTripAnd
     CHECK_FALSE(cmLib.updateFromJson(badRecencyPatch, patchErr));
     CHECK_FALSE(patchErr.empty());
     CHECK_EQUAL(90, cmLib.getConfigSnapshot().gateway.activeRecencyWindowSec);
-
-    nlohmann::json badRowsPatch = {
-        {"diagnostics", {{"max_retained_rows", 50}}}
-    };
-    CHECK_FALSE(cmLib.updateFromJson(badRowsPatch, patchErr));
-    CHECK_FALSE(patchErr.empty());
-    CHECK_EQUAL(1500, cmLib.getConfigSnapshot().diagnostics.maxRetainedRows);
 }
 
 int main(int ac, char** av) {

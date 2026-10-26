@@ -219,109 +219,76 @@ static void testClaudeSeriesIsSeparate() {
     fs::remove(testDbPath);
 }
 
-static void DiagnosticLog_InsertQueryAndFilterByRequestIdAndCategory() {
-    std::cout << "[TestAgentTelemetryDb] Running DiagnosticLog_InsertQueryAndFilterByRequestIdAndCategory..." << std::endl;
-    std::string testDbPath = "/tmp/test_aimon_diag_filter.db";
+static void LegacyDiagnosticTableDroppedAndPruneExpiredTelemetry() {
+    std::cout << "[TestAgentTelemetryDb] Running LegacyDiagnosticTableDroppedAndPruneExpiredTelemetry..." << std::endl;
+    std::string testDbPath = "/tmp/test_aimon_legacy_diag_drop_" + std::to_string(::getpid()) + ".db";
     if (fs::exists(testDbPath)) {
         fs::remove(testDbPath);
     }
 
+    // 1. Seed a legacy gateway_diagnostic_logs table directly via sqlite3
+    {
+        sqlite3 *rawDb = nullptr;
+        assert(sqlite3_open(testDbPath.c_str(), &rawDb) == SQLITE_OK);
+        char *errMsg = nullptr;
+        int rc = sqlite3_exec(rawDb,
+            "CREATE TABLE gateway_diagnostic_logs (id INTEGER PRIMARY KEY, timestamp INTEGER, summary TEXT);"
+            "INSERT INTO gateway_diagnostic_logs (timestamp, summary) VALUES (1000, 'legacy row');",
+            nullptr, nullptr, &errMsg);
+        if (errMsg) {
+            sqlite3_free(errMsg);
+        }
+        assert(rc == SQLITE_OK);
+        sqlite3_close(rawDb);
+    }
+
+    // 2. Open via AgentTelemetryDb and verify gateway_diagnostic_logs was dropped
     auto &db = AgentTelemetryDb::getInstance();
     assert(db.open(testDbPath));
 
-    // Verify default DiagnosticsConfig (enabled = false) writes 0 rows
-    db.setDiagnosticsConfig(DiagnosticsConfig{});
-    assert(db.logDiagnostic("INFO", "mobile_http", "cid-default-off", "cursor",
-                            "Should be suppressed", {{"status", 200}}, "req-off"));
-    assert(db.queryDiagnostics(100).empty());
+    {
+        sqlite3 *rawDb = nullptr;
+        assert(sqlite3_open(testDbPath.c_str(), &rawDb) == SQLITE_OK);
+        sqlite3_stmt *stmt = nullptr;
+        assert(sqlite3_prepare_v2(rawDb,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='gateway_diagnostic_logs';",
+            -1, &stmt, nullptr) == SQLITE_OK);
+        assert(sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        sqlite3_close(rawDb);
+    }
 
-    DiagnosticsConfig d;
-    d.enabled = true;
-    d.logMobileHttp = true;
-    d.logRouterDecisions = true;
-    d.logIdleTranscriptPolls = true;
-    d.logDiscoveryPolls = true;
-    d.logHooks = true;
-    db.setDiagnosticsConfig(d);
+    // 3. Seed old (>20 days) and recent lifecycle events, then run pruneExpiredTelemetry(14, true)
+    int64_t now = static_cast<int64_t>(time(nullptr));
+    AgentLifecycleEvent oldEv;
+    oldEv.timestamp = now - (20 * 86400);
+    oldEv.sessionId = "sess-old-prune";
+    oldEv.agentType = "cursor";
+    oldEv.eventType = "TURN_COMPLETE";
+    assert(db.insertEvent(oldEv));
 
-    assert(db.logDiagnostic("INFO", "mobile_http", "cid-alpha-01", "cursor",
-                            "GET /api/agent/conversations", {{"status", 200}}, "req-1001"));
-    assert(db.logDiagnostic("INFO", "router_decision", "cid-alpha-01", "cursor",
-                            "Selected cli_resume_with_context", {{"has_cli_store", false}}, "req-1001"));
-    assert(db.logDiagnostic("WARN", "platform_forward", "cid-alpha-01", "cursor",
-                            "Slow CLI response", {{"duration_ms", 4200}}, "req-1001"));
-    assert(db.logDiagnostic("ERROR", "transcript", "cid-beta-02", "claude",
-                            "Transcript file missing", {{"code", 404}}, "req-2002"));
+    AgentLifecycleEvent recentEv;
+    recentEv.timestamp = now - 60;
+    recentEv.sessionId = "sess-recent-keep";
+    recentEv.agentType = "cursor";
+    recentEv.eventType = "TURN_COMPLETE";
+    assert(db.insertEvent(recentEv));
 
-    auto allLogs = db.queryDiagnostics(100);
-    assert(allLogs.size() == 4);
-
-    auto byReq = db.queryDiagnostics(100, "", "", "", "req-1001");
-    assert(byReq.size() == 3);
-
-    auto byCid = db.queryDiagnostics(100, "cid-beta-02");
-    assert(byCid.size() == 1);
-    assert(byCid[0]["category"] == "transcript");
-    assert(byCid[0]["level"] == "ERROR");
-
-    auto byCat = db.queryDiagnostics(100, "", "router_decision");
-    assert(byCat.size() == 1);
-    assert(byCat[0]["summary"] == "Selected cli_resume_with_context");
-
-    auto warnAndAbove = db.queryDiagnostics(100, "", "", "WARN");
-    assert(warnAndAbove.size() == 2);
-
-    auto errorOnly = db.queryDiagnostics(100, "", "", "ERROR");
-    assert(errorOnly.size() == 1);
-    assert(errorOnly[0]["conversation_id"] == "cid-beta-02");
-
-    auto trace = db.queryTrace("req-1001");
-    assert(trace["target_id"] == "req-1001");
-    assert(trace["trace_events"].is_array());
-    assert(trace["trace_events"].size() == 3);
-    assert(trace["trace_events"][0]["category"] == "mobile_http");
-    assert(trace["trace_events"][1]["category"] == "router_decision");
-    assert(trace["trace_events"][2]["category"] == "platform_forward");
+    json pruneRes = db.pruneExpiredTelemetry(14, true);
+    assert(pruneRes.value("ok", false));
+    assert(pruneRes.value("retention_days", 0) == 14);
+    assert(pruneRes.value("pruned_telemetry_rows", 0LL) >= 1);
+    assert(pruneRes.contains("storage_stats"));
+    const json &stats = pruneRes["storage_stats"];
+    assert(!stats.contains("diagnostics_enabled"));
+    assert(!stats.contains("gateway_diagnostic_logs"));
+    assert(stats.contains("counts"));
+    assert(!stats["counts"].contains("gateway_diagnostic_logs"));
+    assert(stats.value("lifecycle_events_count", 0LL) == 1);
 
     db.close();
     fs::remove(testDbPath);
-    std::cout << "[TestAgentTelemetryDb] DiagnosticLog_InsertQueryAndFilterByRequestIdAndCategory passed!" << std::endl;
-}
-
-static void DiagnosticLog_EnforcesRingBufferCap() {
-    std::cout << "[TestAgentTelemetryDb] Running DiagnosticLog_EnforcesRingBufferCap..." << std::endl;
-    std::string testDbPath = "/tmp/test_aimon_diag_ringcap.db";
-    if (fs::exists(testDbPath)) {
-        fs::remove(testDbPath);
-    }
-
-    auto &db = AgentTelemetryDb::getInstance();
-    assert(db.open(testDbPath));
-
-    DiagnosticsConfig d;
-    d.enabled = true;
-    d.logMobileHttp = true;
-    d.logRouterDecisions = true;
-    d.logIdleTranscriptPolls = true;
-    d.logDiscoveryPolls = true;
-    d.logHooks = true;
-    db.setDiagnosticsConfig(d);
-
-    for (int i = 1; i <= 25; ++i) {
-        assert(db.logDiagnostic("INFO", "hook", "cid-cap", "cursor",
-                                "Entry " + std::to_string(i),
-                                {{"seq", i}}, "req-cap", 10));
-    }
-
-    auto logs = db.queryDiagnostics(100, "cid-cap");
-    assert(logs.size() == 10);
-    // Ordered DESC: newest is 25, oldest retained is 16
-    assert(logs.front()["details"]["seq"] == 25);
-    assert(logs.back()["details"]["seq"] == 16);
-
-    db.close();
-    fs::remove(testDbPath);
-    std::cout << "[TestAgentTelemetryDb] DiagnosticLog_EnforcesRingBufferCap passed!" << std::endl;
+    std::cout << "[TestAgentTelemetryDb] LegacyDiagnosticTableDroppedAndPruneExpiredTelemetry passed!" << std::endl;
 }
 
 static void AgentHookHandler_CursorTurn1LifecycleAndPermissions() {
@@ -332,19 +299,10 @@ static void AgentHookHandler_CursorTurn1LifecycleAndPermissions() {
     fs::remove_all(testDir);
 
     const std::string cid = "0da2a96a-621c-4b59-8e9a-9ece09bfe723";
+    std::string stateJsonPath = stateDir + "/" + cid + ".json";
+    std::string stateJsonlPath = stateDir + "/" + cid + ".jsonl";
 
-    {
-        DiagnosticsConfig d;
-        d.enabled = true;
-        d.logMobileHttp = true;
-        d.logRouterDecisions = true;
-        d.logIdleTranscriptPolls = true;
-        d.logDiscoveryPolls = true;
-        d.logHooks = true;
-        AgentTelemetryDb::getInstance().setDiagnosticsConfig(d);
-    }
-
-    // 1. sessionStart
+    // 1. sessionStart -> fresh session starts as IDLE
     assert(AgentHookHandler::processPayload({
         {"hook_event_name", "sessionStart"},
         {"conversation_id", cid},
@@ -352,12 +310,34 @@ static void AgentHookHandler_CursorTurn1LifecycleAndPermissions() {
         {"model", "claude-4.6-opus"}
     }, "cursor", "", stateDir, testDbPath));
 
-    // 2. beforeSubmitPrompt
+    {
+        std::ifstream ifs(stateJsonPath);
+        json stateObj = json::parse(ifs);
+        assert(stateObj["status"] == "IDLE");
+        assert(stateObj["turns"] == 0);
+        assert(stateObj.contains("owner_pid") && stateObj["owner_pid"].is_number_integer());
+        assert(stateObj.contains("mux_type") && stateObj["mux_type"].is_string());
+        assert(stateObj.contains("mux_session") && stateObj["mux_session"].is_string());
+        assert(stateObj.contains("mux_target") && stateObj["mux_target"].is_string());
+        assert(stateObj.contains("screen_session") && stateObj["screen_session"].is_string());
+        assert(stateObj.contains("source") && stateObj["source"].is_string());
+        auto &db = AgentTelemetryDb::getInstance();
+        auto sessRec = db.querySessionRecord(cid);
+        assert(sessRec["status"] == "IDLE");
+    }
+
+    // 2. beforeSubmitPrompt -> transitions to RUNNING
     assert(AgentHookHandler::processPayload({
         {"hook_event_name", "beforeSubmitPrompt"},
         {"conversation_id", cid},
         {"prompt", "Investigate Turn-1 session visibility with token=secret_tok_99"}
     }, "cursor", "", stateDir, testDbPath));
+
+    {
+        std::ifstream ifs(stateJsonPath);
+        json stateObj = json::parse(ifs);
+        assert(stateObj["status"] == "RUNNING");
+    }
 
     // 3. afterAgentThought
     assert(AgentHookHandler::processPayload({
@@ -413,8 +393,6 @@ static void AgentHookHandler_CursorTurn1LifecycleAndPermissions() {
     assert(::stat(stateDir.c_str(), &st) == 0);
     assert((st.st_mode & 0777) == 0700);
 
-    std::string stateJsonPath = stateDir + "/" + cid + ".json";
-    std::string stateJsonlPath = stateDir + "/" + cid + ".jsonl";
     assert(fs::exists(stateJsonPath));
     assert(fs::exists(stateJsonlPath));
 
@@ -440,6 +418,61 @@ static void AgentHookHandler_CursorTurn1LifecycleAndPermissions() {
         assert(stateObj["turns"] == 1);
         assert(stateObj["first_prompt"].get<std::string>().find("secret_tok_99") == std::string::npos);
         assert(stateObj["first_prompt"].get<std::string>().find("[REDACTED]") != std::string::npos);
+    }
+
+    // 8. Re-triggering sessionStart on an existing session must preserve turns, tools, prompts, and COMPLETED status
+    assert(AgentHookHandler::processPayload({
+        {"hook_event_name", "sessionStart"},
+        {"conversation_id", cid},
+        {"workspace_roots", json::array({"/workspace/aimon"})},
+        {"model", "claude-4.6-opus"}
+    }, "cursor", "", stateDir, testDbPath));
+    {
+        std::ifstream ifs(stateJsonPath);
+        json stateObj = json::parse(ifs);
+        assert(stateObj["status"] == "COMPLETED");
+        assert(stateObj["tools"] == 1);
+        assert(stateObj["turns"] == 1);
+        assert(!stateObj["first_prompt"].get<std::string>().empty());
+        assert(!stateObj["last_prompt"].get<std::string>().empty());
+    }
+
+    // 9. Verify Claude SessionStart (IDLE) -> UserPromptSubmit (RUNNING) -> Stop (COMPLETED)
+    const std::string claudeCid = "claude-sess-77889900-aabb-ccdd-eeff";
+    std::string claudeStateJsonPath = stateDir + "/" + claudeCid + ".json";
+    assert(AgentHookHandler::processPayload({
+        {"hook_event_name", "SessionStart"},
+        {"session_id", claudeCid},
+        {"cwd", "/workspace/aimon"},
+        {"model", "claude-opus-4-7"}
+    }, "claude", "", stateDir, testDbPath));
+    {
+        std::ifstream ifs(claudeStateJsonPath);
+        json stateObj = json::parse(ifs);
+        assert(stateObj["status"] == "IDLE");
+    }
+    assert(AgentHookHandler::processPayload({
+        {"hook_event_name", "UserPromptSubmit"},
+        {"session_id", claudeCid},
+        {"prompt", "Run Claude turn lifecycle verification"}
+    }, "claude", "", stateDir, testDbPath));
+    {
+        std::ifstream ifs(claudeStateJsonPath);
+        json stateObj = json::parse(ifs);
+        assert(stateObj["status"] == "RUNNING");
+    }
+    assert(AgentHookHandler::processPayload({
+        {"hook_event_name", "Stop"},
+        {"session_id", claudeCid}
+    }, "claude", "", stateDir, testDbPath));
+    {
+        std::ifstream ifs(claudeStateJsonPath);
+        json stateObj = json::parse(ifs);
+        assert(stateObj["status"] == "COMPLETED");
+        assert(stateObj["turns"] == 1);
+        auto &db = AgentTelemetryDb::getInstance();
+        auto claudeRec = db.querySessionRecord(claudeCid);
+        assert(claudeRec["status"] == "COMPLETED");
     }
 
     // Verify <cid>.jsonl lines and absence of tool_output or secrets
@@ -476,9 +509,6 @@ static void AgentHookHandler_CursorTurn1LifecycleAndPermissions() {
     assert(sessRec["total_tool_calls"] == 1);
     assert(sessRec["total_turns"] == 1);
 
-    auto diagLogs = db.queryDiagnostics(50, cid);
-    assert(diagLogs.size() >= 5);
-
     db.close();
     fs::remove_all(testDir);
     std::cout << "[TestAgentTelemetryDb] AgentHookHandler_CursorTurn1LifecycleAndPermissions passed!" << std::endl;
@@ -498,17 +528,6 @@ static void AgentHookHandler_RejectsPathTraversalAndMalformedJson() {
     assert(!AgentTelemetryDb::isValidSessionId("abc\\def"));
     assert(AgentTelemetryDb::isValidSessionId("0da2a96a-621c-4b59-8e9a-9ece09bfe723"));
 
-    {
-        DiagnosticsConfig d;
-        d.enabled = true;
-        d.logMobileHttp = true;
-        d.logRouterDecisions = true;
-        d.logIdleTranscriptPolls = true;
-        d.logDiscoveryPolls = true;
-        d.logHooks = true;
-        AgentTelemetryDb::getInstance().setDiagnosticsConfig(d);
-    }
-
     // 1. Path traversal attempt must return false and create zero state files
     bool ok = AgentHookHandler::processPayload({
         {"hook_event_name", "sessionStart"},
@@ -516,11 +535,6 @@ static void AgentHookHandler_RejectsPathTraversalAndMalformedJson() {
     }, "cursor", "", stateDir, testDbPath);
     assert(!ok);
     assert(!fs::exists(stateDir));
-
-    auto &db = AgentTelemetryDb::getInstance();
-    auto logs = db.queryDiagnostics(10, "", "hook", "WARN");
-    assert(!logs.empty());
-    assert(logs[0]["summary"].get<std::string>().find("Rejected invalid session_id") != std::string::npos);
 
     // 2. Malformed JSON on stdin via AgentHookHandler::run must never throw, outputs "{}\n", and returns 0
     std::istringstream badIn("{not valid json at all!!!");
@@ -532,7 +546,7 @@ static void AgentHookHandler_RejectsPathTraversalAndMalformedJson() {
     assert(rc == 0);
     assert(out.str() == "{}\n");
 
-    db.close();
+    AgentTelemetryDb::getInstance().close();
     fs::remove_all(testDir);
     std::cout << "[TestAgentTelemetryDb] AgentHookHandler_RejectsPathTraversalAndMalformedJson passed!" << std::endl;
 }
@@ -542,8 +556,7 @@ int main() {
     testBasicOperations();
     testPercentileAndRollup();
     testClaudeSeriesIsSeparate();
-    DiagnosticLog_InsertQueryAndFilterByRequestIdAndCategory();
-    DiagnosticLog_EnforcesRingBufferCap();
+    LegacyDiagnosticTableDroppedAndPruneExpiredTelemetry();
     AgentHookHandler_CursorTurn1LifecycleAndPermissions();
     AgentHookHandler_RejectsPathTraversalAndMalformedJson();
     std::cout << "=== TestAgentTelemetryDb: ALL TESTS PASSED ===" << std::endl;

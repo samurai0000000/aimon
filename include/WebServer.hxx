@@ -99,9 +99,6 @@ public:
         return _config.port;
     }
 
-    static nlohmann::json diagnoseSessions(const std::string& providerFilter = "");
-    static nlohmann::json inspectSession(const std::string& conversationId);
-
 private:
     void setupRoutes();
 

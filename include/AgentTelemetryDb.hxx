@@ -57,18 +57,6 @@ struct AgentSessionRecord {
     double      avgTurnMs = 0.0;
 };
 
-struct GatewayDiagnosticLog {
-    int64_t     id = 0;
-    int64_t     timestampMs = 0;
-    std::string requestId;
-    std::string level;          // "INFO", "WARN", "ERROR"
-    std::string category;       // "mobile_http", "router_decision", "platform_forward", "discovery", "transcript", "prompt", "hook"
-    std::string conversationId;
-    std::string provider;
-    std::string summary;
-    nlohmann::json detailsJson;
-};
-
 class AgentTelemetryDb {
 public:
     static AgentTelemetryDb &getInstance();
@@ -80,34 +68,9 @@ public:
     void close();
     bool isOpen() const;
 
-    // Diagnostics & Security-Redacted Trace Logging
-    void setDiagnosticsConfig(const DiagnosticsConfig &cfg);
-    DiagnosticsConfig getDiagnosticsConfig() const;
-
-    bool logDiagnostic(const std::string &level,
-                       const std::string &category,
-                       const std::string &conversationId,
-                       const std::string &provider,
-                       const std::string &summary,
-                       const nlohmann::json &details = nlohmann::json::object(),
-                       const std::string &requestId = "",
-                       int maxRetainedRows = -1);
-
-    size_t clearDiagnostics(const std::string &conversationId = "",
-                            const std::string &category = "",
-                            int olderThanHours = 0);
-
     nlohmann::json getStorageStats() const;
-    nlohmann::json purgeDebugData(bool vacuum = true);
-
-    nlohmann::json queryDiagnostics(int limit = 100,
-                                    const std::string &conversationId = "",
-                                    const std::string &category = "",
-                                    const std::string &minLevel = "",
-                                    const std::string &requestId = "");
-
+    nlohmann::json pruneExpiredTelemetry(int retentionDays, bool vacuum = true);
     nlohmann::json querySessionRecord(const std::string &sessionId);
-    nlohmann::json queryTrace(const std::string &targetId, int limit = 500);
 
     // Session Management
     bool recordSessionStart(const std::string &sessionId,
@@ -167,7 +130,6 @@ private:
     std::string   _dbPath;
     sqlite3      *_db;
     mutable std::mutex _mutex;
-    DiagnosticsConfig _diagConfig;
 
     // Prepared statements
     sqlite3_stmt *_stmtInsertEvent;

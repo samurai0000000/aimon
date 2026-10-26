@@ -73,25 +73,6 @@ static std::string extractOrGenerateRequestId(const httplib::Request& req) {
     return oss.str();
 }
 
-static std::string computeTokenFingerprint(const httplib::Request& req) {
-    std::string rawToken = req.get_header_value("X-Mobile-Token");
-    if (rawToken.empty()) {
-        std::string authHeader = req.get_header_value("Authorization");
-        if (authHeader.rfind("Bearer ", 0) == 0 && authHeader.size() > 7) {
-            rawToken = authHeader.substr(7);
-        }
-    }
-    if (rawToken.empty()) return "ui-or-local";
-    unsigned char digest[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(rawToken.data()), rawToken.size(), digest);
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-    for (int i = 0; i < 6; ++i) {
-        oss << std::setw(2) << static_cast<int>(digest[i]);
-    }
-    return oss.str();
-}
-
 static std::mutex s_cachedCliTokensMutex;
 static std::map<int, std::string> s_cachedCliTokens;
 static std::atomic<int64_t> s_lastProcHarvestSec{0};
@@ -897,6 +878,61 @@ static bool readCursorHookStateJson(const std::string& cid, nlohmann::json& outJ
     return false;
 }
 
+static std::string getClaudeHookStateDir() {
+    const char* envHook = std::getenv("AIMON_CLAUDE_HOOK_STATE_DIR");
+    if (envHook && *envHook) {
+        return std::string(envHook);
+    }
+    const char* envState = std::getenv("AIMON_CLAUDE_STATE_DIR");
+    if (envState && *envState) {
+        return std::string(envState);
+    }
+    std::string claudeProjects = getClaudeProjectsDir();
+    if (!claudeProjects.empty()) {
+        return (fs::path(claudeProjects).parent_path() / "hooks" / "state").string();
+    }
+    const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
+    const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
+    if ((envCli && *envCli) || (envIde && *envIde)) {
+        return "";
+    }
+    return PathUtils::expandHome("~/.claude/hooks/state");
+}
+
+static bool readClaudeHookStateJson(const std::string& cid, nlohmann::json& outJson) {
+    if (cid.empty() || cid.find("..") != std::string::npos || cid.find('/') != std::string::npos) {
+        return false;
+    }
+    std::vector<fs::path> candidates;
+    std::string hookDir = getClaudeHookStateDir();
+    if (!hookDir.empty()) {
+        candidates.push_back(fs::path(hookDir) / (cid + ".json"));
+    }
+    std::string claudeProjects = getClaudeProjectsDir();
+    if (!claudeProjects.empty()) {
+        fs::path alt = fs::path(claudeProjects).parent_path() / "hooks" / "state" / (cid + ".json");
+        if (candidates.empty() || candidates.front() != alt) {
+            candidates.push_back(alt);
+        }
+    }
+    const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
+    const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
+    if ((!envCli || !*envCli) && (!envIde || !*envIde)) {
+        candidates.push_back(fs::path(PathUtils::expandHome("~/.claude/hooks/state")) / (cid + ".json"));
+    }
+    std::error_code ec;
+    for (const auto& p : candidates) {
+        if (!fs::exists(p, ec) || !fs::is_regular_file(p, ec)) continue;
+        std::ifstream f(p);
+        if (!f.is_open()) continue;
+        auto j = nlohmann::json::parse(f, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) continue;
+        outJson = std::move(j);
+        return true;
+    }
+    return false;
+}
+
 static void collectCursorSubagentIdsAndParentMtimes(
     const std::string& cursorRoot,
     std::set<std::string>& outSubagentIds,
@@ -1054,7 +1090,10 @@ struct NormalizedProviderTranscript {
 
 struct LiveProviderSessionInfo {
     pid_t ownerPid = 0;
-    std::string screenSession;
+    std::string muxType;        // "screen" | "tmux" | "zellij" | "wezterm" | "kitty" | ""
+    std::string muxSession;     // e.g. "21504.cursor" or "/tmp/tmux-1000/default" or "default"
+    std::string muxTarget;      // e.g. "0" (screen win) or "%3" (tmux pane) or pane_id
+    std::string screenSession;  // Backwards-compatible alias populated when muxType == "screen"
     bool isIdeRendererSession = false;
     bool hasCliStore = true;
 };
@@ -1676,16 +1715,20 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     std::string hookStatus;
     bool hookIsSubagent = false;
     bool hasHookState = false;
-    if (providerSource == "cursor" && filePath.parent_path().filename() != "subagents") {
+    if ((providerSource == "cursor" || providerSource == "claude") &&
+        filePath.parent_path().filename() != "subagents") {
         std::string cid = filePath.stem().string();
         nlohmann::json hookJson;
-        if (readCursorHookStateJson(cid, hookJson)) {
+        bool readOk = (providerSource == "cursor")
+            ? readCursorHookStateJson(cid, hookJson)
+            : readClaudeHookStateJson(cid, hookJson);
+        if (readOk) {
             hasHookState = true;
             hookIsSubagent = hookJson.value("is_subagent", false) ||
                              !hookJson.value("parent_session_id", "").empty();
             hookStatus = hookJson.value("status", "");
             std::string hookModel = hookJson.value("model", "");
-            if (!hookModel.empty() && hookModel != "Cursor") {
+            if (!hookModel.empty() && hookModel != "Cursor" && hookModel != "Claude Code") {
                 out.model = hookModel;
             }
             std::string hookWorkspace = hookJson.value("workspace", hookJson.value("workspace_path", ""));
@@ -1697,6 +1740,8 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 hookJson.value("first_prompt", hookJson.value("prompt_preview", "")));
             if (hookStatus == "RUNNING") {
                 out.status = "RUNNING";
+            } else if (hookStatus == "IDLE") {
+                out.status = "IDLE";
             }
             uint64_t upd = static_cast<uint64_t>(
                 hookJson.value("updated_ts", hookJson.value("updated_at", hookJson.value("updated_epoch", hookJson.value("start_ts", static_cast<int64_t>(0))))));
@@ -1768,16 +1813,18 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     }
 
     std::error_code fileExistEc;
-    bool parentFileExists = fs::exists(filePath, fileExistEc) &&
+    std::string cursorHookDir = (providerSource == "cursor") ? getCursorHookStateDir() : "";
+    bool isHookShadowFile = !cursorHookDir.empty() && (filePath.parent_path() == fs::path(cursorHookDir));
+    bool parentFileExists = !isHookShadowFile &&
+                            fs::exists(filePath, fileExistEc) &&
                             fs::is_regular_file(filePath, fileExistEc) &&
                             fs::file_size(filePath, fileExistEc) > 0;
     std::ifstream in(filePath);
     if (!in.is_open() || !parentFileExists) {
         if (providerSource == "cursor" && filePath.parent_path().filename() != "subagents") {
             std::string cid = filePath.stem().string();
-            std::string hookDir = getCursorHookStateDir();
-            if (!hookDir.empty()) {
-                fs::path hookJsonl = fs::path(hookDir) / (cid + ".jsonl");
+            if (!cursorHookDir.empty()) {
+                fs::path hookJsonl = fs::path(cursorHookDir) / (cid + ".jsonl");
                 std::error_code hEc;
                 if (fs::exists(hookJsonl, hEc) && fs::is_regular_file(hookJsonl, hEc) &&
                     fs::file_size(hookJsonl, hEc) > 0) {
@@ -2729,26 +2776,18 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     if (out.model.empty()) {
         out.model = (providerSource == "claude") ? "claude-sonnet-4-6" : "cursor-auto";
     }
+    if (out.hasValidTurns && out.status == "IDLE" && (parentTurnEnded || providerSource == "claude")) {
+        out.status = "DONE";
+    }
     if (filePath.parent_path().filename() != "subagents") {
         std::string cid = filePath.stem().string();
-        if (providerSource == "cursor") {
-            if (!hasCursorCliStoreForConversation(fs::path(), cid)) {
-                LiveProviderSessionInfo liveInfo = discoverLiveProviderSession(
-                    providerSource, cid, out.workspacePath, filePath.string());
-                SessionInteractivityInfo inter = evaluateSessionInteractivity(
-                    providerSource, cid, fs::path(), liveInfo, filePath);
-                out.interactive = inter.interactive;
-                out.nonInteractiveReason = inter.nonInteractiveReason;
-            }
-        } else if (providerSource == "claude") {
-            if (isClaudeIdeExtensionTranscript(filePath)) {
-                LiveProviderSessionInfo liveInfo = discoverLiveProviderSession(
-                    providerSource, cid, out.workspacePath, filePath.string());
-                SessionInteractivityInfo inter = evaluateSessionInteractivity(
-                    providerSource, cid, fs::path(), liveInfo, filePath);
-                out.interactive = inter.interactive;
-                out.nonInteractiveReason = inter.nonInteractiveReason;
-            }
+        if (providerSource == "cursor" || providerSource == "claude") {
+            LiveProviderSessionInfo liveInfo = discoverLiveProviderSession(
+                providerSource, cid, out.workspacePath, filePath.string());
+            SessionInteractivityInfo inter = evaluateSessionInteractivity(
+                providerSource, cid, fs::path(), liveInfo, filePath);
+            out.interactive = inter.interactive;
+            out.nonInteractiveReason = inter.nonInteractiveReason;
         }
     }
     return out;
@@ -2919,36 +2958,44 @@ static SessionInteractivityInfo evaluateSessionInteractivity(
     if (conversationId.empty() || conversationId == "new") {
         return result;
     }
-    if (provider == "cursor") {
-        if (hasCursorCliStoreForConversation(homeDir, conversationId) ||
-            !liveInfo.screenSession.empty()) {
+    if (provider == "cursor" || provider == "claude") {
+        if (liveInfo.ownerPid > 0 && !liveInfo.muxType.empty()) {
             return result;
         }
         result.interactive = false;
-        result.nonInteractiveReason =
-            "Bi-directional communication is not possible with this Cursor IDE GUI agent "
-            "(Cursor IDE GUI session is read-only; no CLI chat store or screen session is attached). "
-            "Launch cursor-agent in a terminal/screen session to interact from mobile.";
-        return result;
-    }
-    if (provider == "claude") {
-        if (!liveInfo.screenSession.empty() || liveInfo.ownerPid > 0) {
-            return result;
-        }
-        fs::path resolvedPath = transcriptPath;
-        if (resolvedPath.empty()) {
-            std::string dummySrc;
-            std::string dummySlug;
-            resolvedPath = findProviderTranscriptById(conversationId, dummySrc, dummySlug);
-        }
-        if (!resolvedPath.empty() && isClaudeIdeExtensionTranscript(resolvedPath)) {
-            result.interactive = false;
+        if (liveInfo.ownerPid > 0 && liveInfo.muxType.empty()) {
             result.nonInteractiveReason =
-                "Bi-directional communication is not possible with this Claude IDE extension agent "
-                "(Claude Code IDE extension session is read-only; no interactive Claude CLI session is attached). "
-                "Launch claude in a terminal/screen session to interact from mobile.";
+                "Read-only terminal session (PID " + std::to_string(liveInfo.ownerPid) +
+                "): not running inside a terminal multiplexer (GNU screen or tmux). "
+                "Re-launch inside screen or tmux to enable mobile replies.";
             return result;
         }
+        if (provider == "cursor") {
+            if (!hasCursorCliStoreForConversation(homeDir, conversationId)) {
+                result.nonInteractiveReason =
+                    "Bi-directional communication is not possible with this Cursor IDE GUI agent "
+                    "(Cursor IDE GUI session is read-only; no CLI chat store or screen/tmux multiplexer is attached). "
+                    "Launch cursor-agent in a screen/tmux session to interact from mobile.";
+                return result;
+            }
+        } else if (provider == "claude") {
+            fs::path resolvedPath = transcriptPath;
+            if (resolvedPath.empty()) {
+                std::string dummySrc;
+                std::string dummySlug;
+                resolvedPath = findProviderTranscriptById(conversationId, dummySrc, dummySlug);
+            }
+            if (!resolvedPath.empty() && isClaudeIdeExtensionTranscript(resolvedPath)) {
+                result.nonInteractiveReason =
+                    "Bi-directional communication is not possible with this Claude IDE extension agent "
+                    "(Claude Code IDE extension session is read-only; no interactive screen/tmux session is attached). "
+                    "Launch claude in a screen/tmux session to interact from mobile.";
+                return result;
+            }
+        }
+        result.nonInteractiveReason =
+            "Inactive CLI session: no live process in screen or tmux. "
+            "Resume this session inside screen or tmux on the host to reply from mobile.";
         return result;
     }
     return result;
@@ -3100,51 +3147,206 @@ static pid_t getParentPid(pid_t pid) {
     return 0;
 }
 
-static std::string findScreenSessionForPid(pid_t pid) {
+static std::map<std::string, std::string> readProcEnvironMap(pid_t pid) {
+    std::map<std::string, std::string> envMap;
+    if (pid <= 0) return envMap;
+    try {
+        std::ifstream f("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
+        if (!f.is_open()) return envMap;
+        std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            size_t end = raw.find('\0', pos);
+            if (end == std::string::npos) end = raw.size();
+            if (end > pos) {
+                std::string entry = raw.substr(pos, end - pos);
+                auto eq = entry.find('=');
+                if (eq != std::string::npos && eq > 0) {
+                    envMap[entry.substr(0, eq)] = entry.substr(eq + 1);
+                }
+            }
+            pos = end + 1;
+        }
+    } catch (...) {}
+    return envMap;
+}
+
+static std::string findTerminalMultiplexerForPid(
+    pid_t pid,
+    std::string& outMuxType,
+    std::string& outMuxSession,
+    std::string& outMuxTarget,
+    const std::string& cid = "") {
+    outMuxType.clear();
+    outMuxSession.clear();
+    outMuxTarget.clear();
+
+    const char* envMuxOverride = std::getenv("AIMON_MUX_SESSION_OVERRIDE");
+    if (envMuxOverride && *envMuxOverride) {
+        std::string ov(envMuxOverride);
+        auto c1 = ov.find(':');
+        if (c1 != std::string::npos) {
+            outMuxType = ov.substr(0, c1);
+            auto c2 = ov.find(':', c1 + 1);
+            if (c2 != std::string::npos) {
+                outMuxSession = ov.substr(c1 + 1, c2 - (c1 + 1));
+                outMuxTarget = ov.substr(c2 + 1);
+            } else {
+                outMuxSession = ov.substr(c1 + 1);
+                outMuxTarget = (outMuxType == "screen") ? "0" : outMuxSession;
+            }
+            return outMuxType;
+        }
+    }
+
+    const char* envScreenOverride = std::getenv("AIMON_SCREEN_SESSION_OVERRIDE");
+    if (envScreenOverride && *envScreenOverride) {
+        outMuxType = "screen";
+        outMuxSession = envScreenOverride;
+        outMuxTarget = "0";
+        return outMuxType;
+    }
+
     pid_t cur = pid;
     pid_t screenPid = 0;
+    std::string styEnv;
+    std::string windowEnv;
+    std::string tmuxEnv;
+    std::string tmuxPaneEnv;
+    std::string zellijSessionEnv;
+    std::string weztermPaneEnv;
+    std::string weztermSockEnv;
+    std::string kittyListenEnv;
+    std::string kittyWinEnv;
+
+    std::set<pid_t> ancestorPids;
     for (int depth = 0; depth < 30 && cur > 1; ++depth) {
+        ancestorPids.insert(cur);
+        auto envMap = readProcEnvironMap(cur);
+        if (styEnv.empty() && envMap.count("STY")) styEnv = envMap["STY"];
+        if (windowEnv.empty() && envMap.count("WINDOW")) windowEnv = envMap["WINDOW"];
+        if (tmuxEnv.empty() && envMap.count("TMUX")) tmuxEnv = envMap["TMUX"];
+        if (tmuxPaneEnv.empty() && envMap.count("TMUX_PANE")) tmuxPaneEnv = envMap["TMUX_PANE"];
+        if (zellijSessionEnv.empty() && envMap.count("ZELLIJ_SESSION_NAME")) {
+            zellijSessionEnv = envMap["ZELLIJ_SESSION_NAME"];
+        }
+        if (weztermPaneEnv.empty() && envMap.count("WEZTERM_PANE")) weztermPaneEnv = envMap["WEZTERM_PANE"];
+        if (weztermSockEnv.empty() && envMap.count("WEZTERM_UNIX_SOCKET")) {
+            weztermSockEnv = envMap["WEZTERM_UNIX_SOCKET"];
+        }
+        if (kittyListenEnv.empty() && envMap.count("KITTY_LISTEN_ON")) kittyListenEnv = envMap["KITTY_LISTEN_ON"];
+        if (kittyWinEnv.empty() && envMap.count("KITTY_WINDOW_ID")) kittyWinEnv = envMap["KITTY_WINDOW_ID"];
+
         std::string comm = readProcComm(cur);
         std::string cmd = readProcCmdline(cur);
         std::string commUpper = comm;
-        for (auto& c : commUpper) c = toupper(static_cast<unsigned char>(c));
-        if (commUpper == "SCREEN" ||
-            cmd.rfind("SCREEN", 0) == 0 || cmd.rfind("screen", 0) == 0) {
+        for (auto& c : commUpper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (screenPid <= 0 &&
+            (commUpper == "SCREEN" || cmd.rfind("SCREEN", 0) == 0 || cmd.rfind("screen", 0) == 0)) {
             screenPid = cur;
-            break;
         }
         cur = getParentPid(cur);
     }
-    if (screenPid <= 0) return "";
 
-    std::vector<fs::path> screenDirs;
-    const char* envSd = std::getenv("SCREENDIR");
-    if (envSd && *envSd) {
-        screenDirs.push_back(envSd);
-    }
-    const char* user = std::getenv("USER");
-    std::string uName = (user && *user) ? user : "";
-    if (uName.empty()) {
-        struct passwd* pw = getpwuid(getuid());
-        if (pw && pw->pw_name) uName = pw->pw_name;
-    }
-    if (!uName.empty()) {
-        screenDirs.push_back("/run/screen/S-" + uName);
-        screenDirs.push_back("/tmp/screens/S-" + uName);
-    }
+    // 1. GNU screen via parent SCREEN daemon or STY environment variable
+    if (screenPid > 0 || !styEnv.empty()) {
+        std::vector<fs::path> screenDirs;
+        const char* envSd = std::getenv("SCREENDIR");
+        if (envSd && *envSd) {
+            screenDirs.emplace_back(envSd);
+        }
+        const char* user = std::getenv("USER");
+        std::string uName = (user && *user) ? user : "";
+        if (uName.empty()) {
+            struct passwd* pw = getpwuid(getuid());
+            if (pw && pw->pw_name) uName = pw->pw_name;
+        }
+        if (!uName.empty()) {
+            screenDirs.emplace_back("/run/screen/S-" + uName);
+            screenDirs.emplace_back("/tmp/screens/S-" + uName);
+        }
 
-    std::string pidPrefix = std::to_string(screenPid) + ".";
-    for (const auto& sd : screenDirs) {
-        std::error_code ec;
-        if (!fs::exists(sd, ec) || !fs::is_directory(sd, ec)) continue;
-        for (const auto& ent : fs::directory_iterator(sd, ec)) {
-            if (ec) break;
-            std::string fname = ent.path().filename().string();
-            if (fname.rfind(pidPrefix, 0) == 0) {
-                return fname;
+        std::string pidPrefix = (screenPid > 0) ? (std::to_string(screenPid) + ".") : "";
+        for (const auto& sd : screenDirs) {
+            std::error_code ec;
+            if (!fs::exists(sd, ec) || !fs::is_directory(sd, ec)) continue;
+            for (const auto& ent : fs::directory_iterator(sd, ec)) {
+                if (ec) break;
+                std::string fname = ent.path().filename().string();
+                if ((!pidPrefix.empty() && fname.rfind(pidPrefix, 0) == 0) ||
+                    (!styEnv.empty() && fname == styEnv)) {
+                    outMuxType = "screen";
+                    outMuxSession = fname;
+                    outMuxTarget = !windowEnv.empty() ? windowEnv : "0";
+                    return outMuxType;
+                }
             }
         }
     }
+
+    // 2. tmux via TMUX / TMUX_PANE or cursor-agent-persist binding
+    const char* envTmuxBin = std::getenv("AIMON_TMUX_BIN");
+    std::string tmuxBin = (envTmuxBin && *envTmuxBin) ? envTmuxBin : "/usr/bin/tmux";
+    if (!tmuxEnv.empty()) {
+        auto c1 = tmuxEnv.find(',');
+        std::string sockPath = (c1 != std::string::npos) ? tmuxEnv.substr(0, c1) : tmuxEnv;
+        std::error_code ec;
+        if (!sockPath.empty() && fs::exists(sockPath, ec)) {
+            outMuxType = "tmux";
+            outMuxSession = sockPath;
+            outMuxTarget = !tmuxPaneEnv.empty() ? tmuxPaneEnv : "0";
+            return outMuxType;
+        }
+    }
+
+    if (!cid.empty() && cid != "new") {
+        fs::path persistBind = "/tmp/cursor-agent-persist-" + std::to_string(getuid()) +
+                               "/bindings/" + cid + ".json";
+        std::error_code bEc;
+        if (fs::exists(persistBind, bEc) && fs::is_regular_file(persistBind, bEc)) {
+            try {
+                std::ifstream bf(persistBind);
+                auto bj = nlohmann::json::parse(bf, nullptr, false);
+                if (!bj.is_discarded() && bj.is_object()) {
+                    std::string tmuxSess = bj.value("tmux_session", "");
+                    if (!tmuxSess.empty()) {
+                        outMuxType = "tmux";
+                        outMuxSession = tmuxSess;
+                        outMuxTarget = tmuxSess;
+                        return outMuxType;
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
+    // 3. Zellij
+    if (!zellijSessionEnv.empty()) {
+        outMuxType = "zellij";
+        outMuxSession = zellijSessionEnv;
+        outMuxTarget = "0";
+        return outMuxType;
+    }
+
+    // 4. WezTerm
+    if (!weztermPaneEnv.empty() && !weztermSockEnv.empty()) {
+        std::error_code ec;
+        if (fs::exists(weztermSockEnv, ec)) {
+            outMuxType = "wezterm";
+            outMuxSession = weztermSockEnv;
+            outMuxTarget = weztermPaneEnv;
+            return outMuxType;
+        }
+    }
+
+    // 5. Kitty
+    if (!kittyListenEnv.empty()) {
+        outMuxType = "kitty";
+        outMuxSession = kittyListenEnv;
+        outMuxTarget = !kittyWinEnv.empty() ? kittyWinEnv : "0";
+        return outMuxType;
+    }
+
     return "";
 }
 
@@ -3159,6 +3361,27 @@ static bool processHoldsCidFd(pid_t pid, const std::string& cid) {
         fs::path target = fs::read_symlink(ent.path(), lEc);
         if (!lEc && target.string().find(cid) != std::string::npos) {
             return true;
+        }
+    }
+    return false;
+}
+
+static bool processHoldsOtherCursorStoreFd(pid_t pid, const std::string& cid) {
+    if (pid <= 0) return false;
+    std::string fdDir = "/proc/" + std::to_string(pid) + "/fd";
+    std::error_code ec;
+    if (!fs::exists(fdDir, ec)) return false;
+    for (const auto& ent : fs::directory_iterator(fdDir, ec)) {
+        if (ec) break;
+        std::error_code lEc;
+        fs::path target = fs::read_symlink(ent.path(), lEc);
+        if (lEc) continue;
+        std::string tStr = target.string();
+        if (tStr.find("/.cursor/chats/") != std::string::npos &&
+            tStr.size() > 9 && tStr.compare(tStr.size() - 9, 9, "/store.db") == 0) {
+            if (cid.empty() || tStr.find("/" + cid + "/store.db") == std::string::npos) {
+                return true;
+            }
         }
     }
     return false;
@@ -3189,17 +3412,56 @@ static LiveProviderSessionInfo discoverLiveProviderSession(
     if (envOwnerOverride && *envOwnerOverride) {
         info.ownerPid = static_cast<pid_t>(std::atoi(envOwnerOverride));
     }
+    const char* envMuxOverride = std::getenv("AIMON_MUX_SESSION_OVERRIDE");
     const char* envScreenOverride = std::getenv("AIMON_SCREEN_SESSION_OVERRIDE");
-    if (envScreenOverride && *envScreenOverride) {
-        info.screenSession = envScreenOverride;
+    if ((envMuxOverride && *envMuxOverride) || (envScreenOverride && *envScreenOverride)) {
+        findTerminalMultiplexerForPid(info.ownerPid, info.muxType, info.muxSession, info.muxTarget, cid);
+        if (info.muxType == "screen") {
+            info.screenSession = info.muxSession;
+        }
+        if (!info.muxType.empty() && info.ownerPid <= 0) {
+            info.ownerPid = getpid();
+        }
+    }
+
+    std::string stateDirStr = (targetProvider == "claude")
+        ? getClaudeHookStateDir()
+        : getCursorHookStateDir();
+    if (stateDirStr.empty()) {
+        stateDirStr = (targetProvider == "claude")
+            ? PathUtils::expandHome("~/.claude/hooks/state")
+            : PathUtils::expandHome("~/.cursor/hooks/state");
+    }
+    fs::path stateDirPath(stateDirStr);
+
+    bool recordedDeadOwnerPid = false;
+    std::string hookMuxType;
+    std::string hookMuxSession;
+    std::string hookMuxTarget;
+    std::set<pid_t> claimedByOtherSessions;
+
+    std::error_code sEc;
+    if (fs::exists(stateDirPath, sEc) && fs::is_directory(stateDirPath, sEc)) {
+        for (const auto& sEnt : fs::directory_iterator(stateDirPath, sEc)) {
+            if (sEc || !sEnt.is_regular_file() || sEnt.path().extension() != ".json") continue;
+            std::string otherCid = sEnt.path().stem().string();
+            if (otherCid.empty() || otherCid == cid) continue;
+            try {
+                std::ifstream of(sEnt.path());
+                auto oj = nlohmann::json::parse(of, nullptr, false);
+                if (!oj.is_discarded() && oj.is_object() &&
+                    oj.contains("owner_pid") && oj["owner_pid"].is_number_integer()) {
+                    pid_t oPid = oj["owner_pid"].get<pid_t>();
+                    if (oPid > 0 && kill(oPid, 0) == 0) {
+                        claimedByOtherSessions.insert(oPid);
+                    }
+                }
+            } catch (...) {}
+        }
     }
 
     if (info.ownerPid == 0) {
-        const char* envCursorState = std::getenv("AIMON_CURSOR_STATE_DIR");
-        const char* envClaudeState = std::getenv("AIMON_CLAUDE_STATE_DIR");
-        fs::path statePath = (targetProvider == "claude")
-            ? ((envClaudeState && *envClaudeState) ? fs::path(envClaudeState) : fs::path(PathUtils::expandHome("~/.claude/hooks/state"))) / (cid + ".json")
-            : ((envCursorState && *envCursorState) ? fs::path(envCursorState) : fs::path(PathUtils::expandHome("~/.cursor/hooks/state"))) / (cid + ".json");
+        fs::path statePath = stateDirPath / (cid + ".json");
         std::error_code ec;
         if (fs::exists(statePath, ec)) {
             std::ifstream sf(statePath);
@@ -3209,9 +3471,18 @@ static LiveProviderSessionInfo discoverLiveProviderSession(
                     sf >> sj;
                     if (sj.contains("owner_pid") && sj["owner_pid"].is_number_integer()) {
                         pid_t candPid = sj["owner_pid"].get<pid_t>();
-                        if (candPid > 0 && fs::exists("/proc/" + std::to_string(candPid), ec)) {
-                            if (isProcessInteractiveProvider(candPid, targetProvider)) {
+                        if (candPid > 0) {
+                            if (kill(candPid, 0) == 0 &&
+                                (!fs::exists("/proc/" + std::to_string(candPid), ec) ||
+                                 isProcessInteractiveProvider(candPid, targetProvider))) {
                                 info.ownerPid = candPid;
+                                if (sj.contains("mux_type") && sj["mux_type"].is_string()) {
+                                    hookMuxType = sj.value("mux_type", "");
+                                    hookMuxSession = sj.value("mux_session", sj.value("screen_session", ""));
+                                    hookMuxTarget = sj.value("mux_target", "0");
+                                }
+                            } else {
+                                recordedDeadOwnerPid = true;
                             }
                         }
                     }
@@ -3231,8 +3502,22 @@ static LiveProviderSessionInfo discoverLiveProviderSession(
     bool isClaudeIdeTrans = (targetProvider == "claude" && !existingTranscriptPath.empty() &&
                              isClaudeIdeExtensionTranscript(existingTranscriptPath));
 
+    const char* envCliBrain = std::getenv("AIMON_CLI_BRAIN_DIR");
+    const char* envCursorProj = std::getenv("AIMON_CURSOR_PROJECTS_DIR");
+    const char* envClaudeProj = std::getenv("AIMON_CLAUDE_PROJECTS_DIR");
+    const char* envWsRoot = std::getenv("AIMON_WORKSPACE_ROOT");
+    bool isHermeticTestEnv = (envCliBrain && *envCliBrain) ||
+                             (envCursorProj && *envCursorProj) ||
+                             (envClaudeProj && *envClaudeProj);
+    bool allowCwdFallback = true;
+    if (isHermeticTestEnv) {
+        if (!envWsRoot || !*envWsRoot || wsDir.rfind(envWsRoot, 0) != 0) {
+            allowCwdFallback = false;
+        }
+    }
+
     std::vector<pid_t> interactiveCandidates;
-    if (info.ownerPid == 0 || info.screenSession.empty()) {
+    if (info.ownerPid == 0) {
         std::error_code pEc;
         fs::path procDir = "/proc";
         uid_t myUid = getuid();
@@ -3256,18 +3541,44 @@ static LiveProviderSessionInfo discoverLiveProviderSession(
             }
         }
 
-        if (info.ownerPid == 0 && !wsDir.empty() && hasCliStore && !isClaudeIdeTrans) {
+        if (info.ownerPid == 0 && !recordedDeadOwnerPid && allowCwdFallback &&
+            !wsDir.empty() && hasCliStore && !isClaudeIdeTrans) {
+            pid_t fallbackUnwrappedPid = 0;
             for (const auto& pid : interactiveCandidates) {
-                if (processCwdEquals(pid, wsDir) && !findScreenSessionForPid(pid).empty()) {
+                if (claimedByOtherSessions.count(pid)) continue;
+                if (targetProvider == "cursor" && processHoldsOtherCursorStoreFd(pid, cid)) continue;
+                if (!processCwdEquals(pid, wsDir)) continue;
+                std::string mType, mSess, mTgt;
+                if (!findTerminalMultiplexerForPid(pid, mType, mSess, mTgt, cid).empty()) {
                     info.ownerPid = pid;
+                    info.muxType = mType;
+                    info.muxSession = mSess;
+                    info.muxTarget = mTgt;
+                    if (mType == "screen") {
+                        info.screenSession = mSess;
+                    }
                     break;
                 }
+                if (fallbackUnwrappedPid == 0) {
+                    fallbackUnwrappedPid = pid;
+                }
+            }
+            if (info.ownerPid == 0 && fallbackUnwrappedPid > 0) {
+                info.ownerPid = fallbackUnwrappedPid;
             }
         }
     }
 
-    if (info.ownerPid > 0 && info.screenSession.empty()) {
-        info.screenSession = findScreenSessionForPid(info.ownerPid);
+    if (info.ownerPid > 0 && info.muxType.empty()) {
+        findTerminalMultiplexerForPid(info.ownerPid, info.muxType, info.muxSession, info.muxTarget, cid);
+        if (info.muxType.empty() && !hookMuxType.empty()) {
+            info.muxType = hookMuxType;
+            info.muxSession = hookMuxSession;
+            info.muxTarget = hookMuxTarget;
+        }
+        if (info.muxType == "screen") {
+            info.screenSession = info.muxSession;
+        }
     }
 
     return info;
@@ -3299,12 +3610,24 @@ static bool runCommandSync(const std::vector<std::string>& cmdArgs) {
     return false;
 }
 
+static bool isUserTranscriptLine(const std::string& targetProvider, const std::string& line) {
+    if (targetProvider == "cursor") {
+        return line.find("\"role\":\"user\"") != std::string::npos ||
+               line.find("\"role\": \"user\"") != std::string::npos;
+    }
+    return line.find("\"type\":\"user\"") != std::string::npos ||
+           line.find("\"type\": \"user\"") != std::string::npos;
+}
+
 static bool pollLiveProviderTurn(
     const std::string& targetProvider,
+    const std::string& cid,
     const std::string& existingTranscriptPath,
     const std::string& existingSlug,
     size_t priorLineCount,
+    size_t priorUserLineCount,
     std::string& replyText) {
+    (void)priorLineCount;
     int timeoutMs = 90000;
     const char* envTimeout = std::getenv("AIMON_LIVE_ROUTE_TIMEOUT_MS");
     if (envTimeout && *envTimeout) {
@@ -3340,54 +3663,42 @@ static bool pollLiveProviderTurn(
             }
         }
 
-        if (lines.size() <= priorLineCount) {
-            continue;
-        }
-
-        // When targetProvider is cursor, the interactive CLI replaces the previous turn_ended
-        // line with the new user line. If priorLineCount included that sentinel, searching from
-        // priorLineCount - 1 ensures the new user turn is never skipped.
-        size_t searchStart = priorLineCount;
-        if (targetProvider == "cursor" && searchStart > 0) {
-            searchStart = searchStart - 1;
-        }
-
-        bool foundNewUserLine = false;
-        for (size_t i = searchStart; i < lines.size(); ++i) {
-            const auto& cl = lines[i];
-            if (targetProvider == "cursor") {
-                if (cl.find("\"role\":\"user\"") != std::string::npos ||
-                    cl.find("\"role\": \"user\"") != std::string::npos) {
-                    foundNewUserLine = true;
-                    break;
-                }
-            } else {
-                if (cl.find("\"type\":\"user\"") != std::string::npos ||
-                    cl.find("\"type\": \"user\"") != std::string::npos) {
-                    foundNewUserLine = true;
-                    break;
-                }
+        size_t userLineCount = 0;
+        size_t lastUserLineIdx = 0;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (isUserTranscriptLine(targetProvider, lines[i])) {
+                ++userLineCount;
+                lastUserLineIdx = i;
             }
         }
 
-        if (!foundNewUserLine) {
+        if (userLineCount <= priorUserLineCount) {
             continue;
         }
 
         if (targetProvider == "cursor") {
-            for (size_t i = searchStart; i < lines.size(); ++i) {
+            bool sawTurnEnded = false;
+            for (size_t i = lastUserLineIdx + 1; i < lines.size(); ++i) {
                 const auto& cl = lines[i];
                 if (cl.find("\"type\":\"turn_ended\"") != std::string::npos ||
                     cl.find("\"type\": \"turn_ended\"") != std::string::npos) {
+                    sawTurnEnded = true;
+                    break;
+                }
+            }
+            if (sawTurnEnded) {
+                nlohmann::json hookJ;
+                int activeSubs = 0;
+                if (!cid.empty() && readCursorHookStateJson(cid, hookJ)) {
+                    activeSubs = hookJ.value("active_subagents", 0);
+                }
+                if (activeSubs <= 0) {
                     turnFinished = true;
                     break;
                 }
             }
-            if (turnFinished) {
-                break;
-            }
         } else {
-            for (size_t i = priorLineCount; i < lines.size(); ++i) {
+            for (size_t i = lastUserLineIdx + 1; i < lines.size(); ++i) {
                 const auto& cl = lines[i];
                 if ((cl.find("\"type\":\"assistant\"") != std::string::npos ||
                      cl.find("\"type\": \"assistant\"") != std::string::npos) &&
@@ -3443,29 +3754,33 @@ static bool pollLiveProviderTurn(
     return true;
 }
 
-static bool routePromptViaScreen(
-    const std::string& screenSession,
+static bool routePromptViaMultiplexer(
+    const LiveProviderSessionInfo& sessionInfo,
     const std::string& targetProvider,
     const std::string& cid,
     const std::string& promptArg,
     const std::string& existingTranscriptPath,
     const std::string& existingSlug,
-    std::string& replyText) {
-    if (screenSession.empty()) return false;
+    std::string& replyText,
+    bool& outDispatchFailed) {
+    outDispatchFailed = false;
+    if (sessionInfo.muxType.empty() || sessionInfo.muxSession.empty()) {
+        outDispatchFailed = true;
+        return false;
+    }
 
     size_t priorLineCount = 0;
+    size_t priorUserLineCount = 0;
     std::error_code ec;
     if (fs::exists(existingTranscriptPath, ec)) {
         std::ifstream countIn(existingTranscriptPath);
         std::string line;
         while (std::getline(countIn, line)) {
             if (!line.empty()) {
-                if (targetProvider == "cursor" &&
-                    (line.find("\"type\":\"turn_ended\"") != std::string::npos ||
-                     line.find("\"type\": \"turn_ended\"") != std::string::npos)) {
-                    continue;
-                }
                 ++priorLineCount;
+                if (isUserTranscriptLine(targetProvider, line)) {
+                    ++priorUserLineCount;
+                }
             }
         }
     }
@@ -3475,80 +3790,121 @@ static bool routePromptViaScreen(
         if (c == '\r' || c == '\n') c = ' ';
     }
 
-    const char* envScreenBin = std::getenv("AIMON_SCREEN_BIN");
-    std::string screenBin = (envScreenBin && *envScreenBin) ? envScreenBin : "/usr/bin/screen";
+    if (sessionInfo.muxType == "screen") {
+        const char* envScreenBin = std::getenv("AIMON_SCREEN_BIN");
+        std::string screenBin = (envScreenBin && *envScreenBin) ? envScreenBin : "/usr/bin/screen";
+        std::string winTarget = !sessionInfo.muxTarget.empty() ? sessionInfo.muxTarget : "0";
 
-    const size_t kMaxChunk = 256;
-    for (size_t off = 0; off < sanitizedPrompt.size(); off += kMaxChunk) {
-        std::string chunk = sanitizedPrompt.substr(off, kMaxChunk);
-        std::vector<std::string> stuffCmd = {
-            screenBin, "-S", screenSession, "-p", "0", "-X", "stuff", chunk
-        };
-        runCommandSync(stuffCmd);
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-    std::vector<std::string> enterCmd = {
-        screenBin, "-S", screenSession, "-p", "0", "-X", "stuff", "\r"
-    };
-    runCommandSync(enterCmd);
-
-    return pollLiveProviderTurn(targetProvider, existingTranscriptPath, existingSlug, priorLineCount, replyText);
-}
-
-static bool routePromptViaIdeBridge(
-    const std::string& cid,
-    const std::string& text,
-    const std::string& existingTranscriptPath,
-    const std::string& existingSlug,
-    std::string& replyText) {
-    const char* envBridge = std::getenv("AIMON_CURSOR_IDE_BRIDGE_SOCK");
-    std::string sockPath = (envBridge && *envBridge)
-        ? envBridge
-        : PathUtils::expandHome("~/.cache/aimon/cursor-agent-host.sock");
-    std::error_code ec;
-    if (!fs::exists(sockPath, ec)) {
-        return false;
-    }
-
-    int sockFd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sockFd < 0) return false;
-    struct sockaddr_un addr;
-    std::memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
-    if (connect(sockFd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
-        close(sockFd);
-        return false;
-    }
-
-    size_t priorLineCount = 0;
-    if (fs::exists(existingTranscriptPath, ec)) {
-        std::ifstream countIn(existingTranscriptPath);
-        std::string line;
-        while (std::getline(countIn, line)) {
-            if (!line.empty()) {
-                if (line.find("\"type\":\"turn_ended\"") != std::string::npos ||
-                    line.find("\"type\": \"turn_ended\"") != std::string::npos) {
-                    continue;
-                }
-                ++priorLineCount;
+        std::string escapedPrompt;
+        escapedPrompt.reserve(sanitizedPrompt.size() * 2);
+        for (char c : sanitizedPrompt) {
+            if (c == '^' || c == '\\') {
+                escapedPrompt.push_back('\\');
             }
+            escapedPrompt.push_back(c);
         }
+
+        const size_t kMaxChunk = 256;
+        for (size_t off = 0; off < escapedPrompt.size(); off += kMaxChunk) {
+            std::string chunk = escapedPrompt.substr(off, kMaxChunk);
+            if (!chunk.empty() && chunk.back() == '\\' && (off + kMaxChunk) < escapedPrompt.size()) {
+                chunk.push_back(escapedPrompt[off + kMaxChunk]);
+                ++off;
+            }
+            std::vector<std::string> stuffCmd = {
+                screenBin, "-S", sessionInfo.muxSession, "-p", winTarget, "-X", "stuff", chunk
+            };
+            if (!runCommandSync(stuffCmd)) {
+                outDispatchFailed = true;
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        std::vector<std::string> enterCmd = {
+            screenBin, "-S", sessionInfo.muxSession, "-p", winTarget, "-X", "stuff", "\r"
+        };
+        if (!runCommandSync(enterCmd)) {
+            outDispatchFailed = true;
+            return false;
+        }
+    } else if (sessionInfo.muxType == "tmux") {
+        const char* envTmuxBin = std::getenv("AIMON_TMUX_BIN");
+        std::string tmuxBin = (envTmuxBin && *envTmuxBin) ? envTmuxBin : "/usr/bin/tmux";
+        std::string paneTarget = !sessionInfo.muxTarget.empty() ? sessionInfo.muxTarget : sessionInfo.muxSession;
+        bool isSocketPath = (sessionInfo.muxSession.find('/') != std::string::npos);
+
+        const size_t kMaxChunk = 512;
+        for (size_t off = 0; off < sanitizedPrompt.size(); off += kMaxChunk) {
+            std::string chunk = sanitizedPrompt.substr(off, kMaxChunk);
+            std::vector<std::string> sendCmd = {tmuxBin};
+            if (isSocketPath) {
+                sendCmd.push_back("-S");
+                sendCmd.push_back(sessionInfo.muxSession);
+            }
+            sendCmd.insert(sendCmd.end(), {"send-keys", "-t", paneTarget, "-l", "--", chunk});
+            if (!runCommandSync(sendCmd)) {
+                outDispatchFailed = true;
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        std::vector<std::string> enterCmd = {tmuxBin};
+        if (isSocketPath) {
+            enterCmd.push_back("-S");
+            enterCmd.push_back(sessionInfo.muxSession);
+        }
+        enterCmd.insert(enterCmd.end(), {"send-keys", "-t", paneTarget, "Enter"});
+        if (!runCommandSync(enterCmd)) {
+            outDispatchFailed = true;
+            return false;
+        }
+    } else if (sessionInfo.muxType == "zellij") {
+        std::vector<std::string> writeCmd = {
+            "zellij", "--session", sessionInfo.muxSession, "action", "write-chars", sanitizedPrompt
+        };
+        if (!runCommandSync(writeCmd)) {
+            outDispatchFailed = true;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::vector<std::string> enterCmd = {
+            "zellij", "--session", sessionInfo.muxSession, "action", "write", "13"
+        };
+        if (!runCommandSync(enterCmd)) {
+            outDispatchFailed = true;
+            return false;
+        }
+    } else if (sessionInfo.muxType == "wezterm") {
+        std::vector<std::string> sendCmd = {
+            "wezterm", "cli", "--pane-id", sessionInfo.muxTarget, "send-text", "--no-paste", sanitizedPrompt + "\r"
+        };
+        if (!runCommandSync(sendCmd)) {
+            outDispatchFailed = true;
+            return false;
+        }
+    } else if (sessionInfo.muxType == "kitty") {
+        std::string matchArg = "id:" + (!sessionInfo.muxTarget.empty() ? sessionInfo.muxTarget : "0");
+        std::vector<std::string> sendCmd = {
+            "kitty", "@", "--to", sessionInfo.muxSession, "send-text", "--match", matchArg, sanitizedPrompt + "\r"
+        };
+        if (!runCommandSync(sendCmd)) {
+            outDispatchFailed = true;
+            return false;
+        }
+    } else {
+        outDispatchFailed = true;
+        return false;
     }
 
-    nlohmann::json reqPayload = {
-        {"sessionId", cid},
-        {"text", text}
-    };
-    std::string reqStr = reqPayload.dump() + "\n";
-    ssize_t written = write(sockFd, reqStr.c_str(), reqStr.size());
-    close(sockFd);
-    if (written <= 0) return false;
-
-    return pollLiveProviderTurn("cursor", existingTranscriptPath, existingSlug, priorLineCount, replyText);
+    return pollLiveProviderTurn(
+        targetProvider, cid, existingTranscriptPath, existingSlug,
+        priorLineCount, priorUserLineCount, replyText);
 }
 
 WebServer::WebServer(StateStore& stateStore, HistoryStore& historyStore,
@@ -3726,6 +4082,7 @@ void WebServer::setupRoutes() {
             req.path == "/api/workspace" ||
             req.path.rfind("/api/workspace/", 0) == 0 ||
             req.path == "/api/config" ||
+            req.path == "/api/telemetry/prune" ||
             req.path == "/api/eda/config" ||
             req.path == "/api/eda/probe") {
             if (!isValidMobileOrUiRequest(req)) {
@@ -4558,6 +4915,14 @@ void WebServer::setupRoutes() {
                 }
             }
         } catch (...) {}
+
+        nlohmann::json hookStateJson;
+        if (readCursorHookStateJson(cid, hookStateJson) || readClaudeHookStateJson(cid, hookStateJson)) {
+            std::string wsp = hookStateJson.value("workspace", hookStateJson.value("workspace_path", ""));
+            if (!wsp.empty() && fs::exists(wsp) && fs::is_directory(wsp)) {
+                return wsp;
+            }
+        }
 
         fs::path hookSessionPath = PathUtils::expandHome("~/.config/aimon/sessions/" + cid + ".json");
         if (fs::exists(hookSessionPath)) {
@@ -5543,9 +5908,7 @@ void WebServer::setupRoutes() {
     auto handleAgentConversations = [this, getIdeBrainDir, getCliBrainDir, getCliPresenceDir, stripUserRequestTags,
                                      toLowerAscii, mapModelToHumanLabel, extractConversationModelById, discoverLsEndpoints](
                                         const httplib::Request& req, httplib::Response& res) {
-        auto reqStart = std::chrono::steady_clock::now();
         std::string reqId = extractOrGenerateRequestId(req);
-        std::string tokenFp = computeTokenFingerprint(req);
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("X-Request-Id", reqId);
         size_t limit = 50;
@@ -5957,7 +6320,8 @@ void WebServer::setupRoutes() {
                     if (hj.value("is_subagent", false) || !hj.value("parent_session_id", "").empty()) {
                         continue;
                     }
-                    if (hj.value("status", "") != "RUNNING") continue;
+                    std::string hStatus = hj.value("status", "");
+                    if (hStatus != "RUNNING" && hStatus != "DONE" && hStatus != "IDLE") continue;
                     std::string fp = cleanProviderUserPrompt(
                         hj.value("first_prompt", hj.value("prompt_preview", "")));
                     bool hasLiveSubagents = (cursorParentMaxSubagentTs.find(id) != cursorParentMaxSubagentTs.end());
@@ -5970,6 +6334,15 @@ void WebServer::setupRoutes() {
                     fs::path synthJsonl = fs::path(hookDir) / (id + ".jsonl");
                     addProviderFileCandidate(id, synthJsonl, "cursor", slug);
                 }
+            }
+        }
+
+        std::vector<LsEndpoint> liveLsEndpoints = discoverLsEndpoints();
+        bool hasAnyLiveCliLs = false;
+        for (const auto& ep : liveLsEndpoints) {
+            if (ep.isCli) {
+                hasAnyLiveCliLs = true;
+                break;
             }
         }
 
@@ -6048,8 +6421,9 @@ void WebServer::setupRoutes() {
                 ce.status = norm.status;
                 ce.timestamp = ts;
                 int recWin = (gatewayCfg.activeRecencyWindowSec > 0) ? gatewayCfg.activeRecencyWindowSec : 120;
-                ce.active = (norm.status == "RUNNING") ||
-                            (ts > 0 && nowSec >= ts && (nowSec - ts) < static_cast<uint64_t>(recWin));
+                ce.active = (norm.status != "IDLE") &&
+                            ((norm.status == "RUNNING") ||
+                             (ts > 0 && nowSec >= ts && (nowSec - ts) < static_cast<uint64_t>(recWin)));
                 ce.openInTerminal = false;
                 ce.terminalPts = "";
                 ce.workspace = norm.workspaceShort;
@@ -6368,6 +6742,32 @@ void WebServer::setupRoutes() {
             ce.matchedPrompt = matchedPrompt;
             ce.matchedStepIndex = matchedStepIndex;
 
+            if (openInTerminal) {
+                bool hasCsrf = false;
+                int lockedPort = (agyIt != runningAgyByConvId.end()) ? agyIt->second.httpPort : 0;
+                for (const auto& ep : liveLsEndpoints) {
+                    if (!ep.isCli) continue;
+                    if ((lockedPort > 0 && ep.port == lockedPort) ||
+                        (lockedPort <= 0 && ep.lockedConversationId == id)) {
+                        hasCsrf = true;
+                        break;
+                    }
+                }
+                if (!hasCsrf && !gatewayCfg.allowAgyAgentApiFallback) {
+                    ce.interactive = false;
+                    ce.nonInteractiveReason =
+                        "Antigravity CLI session is open in terminal without a registered ConnectRPC CSRF token.";
+                }
+            } else if (sourceLabel == "cli" && !hasAnyLiveCliLs) {
+                ce.interactive = false;
+                ce.nonInteractiveReason =
+                    "Antigravity CLI session is not running in an active terminal or language server. Resume it in a terminal to interact.";
+            } else if (sourceLabel == "ide" && liveLsEndpoints.empty()) {
+                ce.interactive = false;
+                ce.nonInteractiveReason =
+                    "Antigravity IDE language server is not currently running.";
+            }
+
             collected.push_back(std::move(ce));
             return true;
         };
@@ -6411,17 +6811,6 @@ void WebServer::setupRoutes() {
             });
         }
 
-        auto latMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - reqStart).count());
-        AgentTelemetryDb::getInstance().logDiagnostic(
-            "INFO", "mobile_http", "", "all", req.method + " " + req.path,
-            nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"remote_addr", req.remote_addr}}),
-            reqId);
-        AgentTelemetryDb::getInstance().logDiagnostic(
-            "INFO", "discovery", "", "all", "list_conversations",
-            nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"total_returned", conversations.size()}, {"include_subagents", includeSubagents}}),
-            reqId);
-
         nlohmann::json resp;
         resp["conversations"] = conversations;
         res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
@@ -6429,11 +6818,9 @@ void WebServer::setupRoutes() {
     _server->Get("/api/agent/conversations", handleAgentConversations);
     _server->Get("/api/agent/history", handleAgentConversations);
 
-    _server->Get("/api/agent/transcript", [resolveSessionWorkspacePath, getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName, extractConversationModelById, mapLabelToCliModelId](
+    _server->Get("/api/agent/transcript", [this, resolveSessionWorkspacePath, getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName, extractConversationModelById, mapLabelToCliModelId](
                                               const httplib::Request& req, httplib::Response& res) {
-        auto reqStart = std::chrono::steady_clock::now();
         std::string reqId = extractOrGenerateRequestId(req);
-        std::string tokenFp = computeTokenFingerprint(req);
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("X-Request-Id", reqId);
         std::string id = req.get_param_value("id");
@@ -6502,20 +6889,6 @@ void WebServer::setupRoutes() {
             fs::path providerPath = findProviderTranscriptById(id, providerSource, providerSlug);
             if (!providerPath.empty()) {
                 auto parsed = parseProviderTranscriptJsonl(providerPath, providerSource, sinceIndex, providerSlug);
-                auto latMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - reqStart).count());
-                bool isIdlePoll = (sinceIndex >= 0 && parsed.steps.empty());
-                DiagnosticsConfig diagCfg = AgentTelemetryDb::getInstance().getDiagnosticsConfig();
-                if (!isIdlePoll || diagCfg.logIdleTranscriptPolls) {
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "mobile_http", id, providerSource, "GET /api/agent/transcript",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"since", sinceIndex}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "transcript", id, providerSource, "load_transcript",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"source", providerSource}, {"status", parsed.status}, {"step_count", parsed.totalSteps}}),
-                        reqId);
-                }
                 nlohmann::json resp;
                 resp["conversationId"] = id;
                 resp["source"] = providerSource;
@@ -6814,6 +7187,61 @@ void WebServer::setupRoutes() {
                     }
                 }
 
+                bool agyInteractive = false;
+                std::string agyNonInteractiveReason;
+                {
+                    auto eps = discoverLsEndpoints();
+                    bool hasLiveCliLs = false;
+                    bool hasLiveIdeLs = false;
+                    bool hasRegisteredCsrf = false;
+                    for (const auto& ep : eps) {
+                        if (ep.isCli) {
+                            hasLiveCliLs = true;
+                            if (isLockedByRunningAgy) {
+                                if ((lockedHttpPort > 0 && ep.port == lockedHttpPort) ||
+                                    (lockedHttpPort <= 0 && ep.lockedConversationId == id)) {
+                                    hasRegisteredCsrf = true;
+                                }
+                            }
+                        } else {
+                            hasLiveIdeLs = true;
+                        }
+                    }
+                    const char* envP = std::getenv("AGY_LS_PORT");
+                    const char* envC = std::getenv("AGY_LS_CSRF_TOKEN");
+                    if (envP && *envP && envC && *envC) {
+                        hasLiveCliLs = true;
+                        hasLiveIdeLs = true;
+                        if (isLockedByRunningAgy) {
+                            try {
+                                int epPort = std::stoi(envP);
+                                if (lockedHttpPort <= 0 || epPort == lockedHttpPort) {
+                                    hasRegisteredCsrf = true;
+                                }
+                            } catch (...) {}
+                        }
+                    }
+                    if (isLockedByRunningAgy) {
+                        agyInteractive = hasRegisteredCsrf;
+                        if (!agyInteractive) {
+                            agyNonInteractiveReason =
+                                "Antigravity CLI session is locked in terminal without a registered ConnectRPC endpoint.";
+                        }
+                    } else if (isCliConv) {
+                        agyInteractive = hasLiveCliLs;
+                        if (!agyInteractive) {
+                            agyNonInteractiveReason =
+                                "No live Antigravity CLI language server endpoint is running for this session.";
+                        }
+                    } else {
+                        agyInteractive = hasLiveIdeLs || hasLiveCliLs;
+                        if (!agyInteractive) {
+                            agyNonInteractiveReason =
+                                "No live Antigravity language server endpoint is running for this session.";
+                        }
+                    }
+                }
+
                 nlohmann::json resp;
                 resp["conversationId"] = id;
                 resp["source"] = isLockedByRunningAgy ? "cli" : "ide";
@@ -6821,8 +7249,8 @@ void WebServer::setupRoutes() {
                 resp["stepCount"] = static_cast<int>(fallbackSteps.size());
                 resp["steps"] = fallbackSteps;
                 resp["openInTerminal"] = isLockedByRunningAgy;
-                resp["interactive"] = true;
-                resp["nonInteractiveReason"] = "";
+                resp["interactive"] = agyInteractive;
+                resp["nonInteractiveReason"] = agyNonInteractiveReason;
 
                 if (isLockedByRunningAgy) {
                     for (const auto& proc : discoverRunningAgyProcesses()) {
@@ -7122,19 +7550,59 @@ void WebServer::setupRoutes() {
             resolvedModel = extractedLabel;
         }
 
-        auto latMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - reqStart).count());
-        bool isIdlePoll = (sinceIndex >= 0 && steps.empty());
-        DiagnosticsConfig diagCfg = AgentTelemetryDb::getInstance().getDiagnosticsConfig();
-        if (!isIdlePoll || diagCfg.logIdleTranscriptPolls) {
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "INFO", "mobile_http", id, source, "GET /api/agent/transcript",
-                nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"since", sinceIndex}}),
-                reqId);
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "INFO", "transcript", id, source, "load_transcript",
-                nlohmann::json({{"status_code", 200}, {"duration_ms", latMs}, {"source", source}, {"step_count", totalStepCount}}),
-                reqId);
+        bool agyInteractive = false;
+        std::string agyNonInteractiveReason;
+        {
+            auto eps = discoverLsEndpoints();
+            bool hasLiveCliLs = false;
+            bool hasLiveIdeLs = false;
+            bool hasRegisteredCsrf = false;
+            for (const auto& ep : eps) {
+                if (ep.isCli) {
+                    hasLiveCliLs = true;
+                    if (isLockedByRunningAgy) {
+                        if ((lockedHttpPort > 0 && ep.port == lockedHttpPort) ||
+                            (lockedHttpPort <= 0 && ep.lockedConversationId == id)) {
+                            hasRegisteredCsrf = true;
+                        }
+                    }
+                } else {
+                    hasLiveIdeLs = true;
+                }
+            }
+            const char* envP = std::getenv("AGY_LS_PORT");
+            const char* envC = std::getenv("AGY_LS_CSRF_TOKEN");
+            if (envP && *envP && envC && *envC) {
+                hasLiveCliLs = true;
+                hasLiveIdeLs = true;
+                if (isLockedByRunningAgy) {
+                    try {
+                        int epPort = std::stoi(envP);
+                        if (lockedHttpPort <= 0 || epPort == lockedHttpPort) {
+                            hasRegisteredCsrf = true;
+                        }
+                    } catch (...) {}
+                }
+            }
+            if (isLockedByRunningAgy) {
+                agyInteractive = hasRegisteredCsrf;
+                if (!agyInteractive) {
+                    agyNonInteractiveReason =
+                        "Antigravity CLI session is locked in terminal without a registered ConnectRPC endpoint.";
+                }
+            } else if (isCliConv || source == "cli") {
+                agyInteractive = hasLiveCliLs;
+                if (!agyInteractive) {
+                    agyNonInteractiveReason =
+                        "No live Antigravity CLI language server endpoint is running for this session.";
+                }
+            } else {
+                agyInteractive = hasLiveIdeLs || hasLiveCliLs;
+                if (!agyInteractive) {
+                    agyNonInteractiveReason =
+                        "No live Antigravity language server endpoint is running for this session.";
+                }
+            }
         }
 
         nlohmann::json resp;
@@ -7144,63 +7612,23 @@ void WebServer::setupRoutes() {
         resp["modelId"] = !extractedLabel.empty() ? mapLabelToCliModelId(extractedLabel) : resolvedModel;
         resp["stepCount"] = totalStepCount;
         resp["steps"] = steps;
-        resp["interactive"] = true;
-        resp["nonInteractiveReason"] = "";
+        resp["interactive"] = agyInteractive;
+        resp["nonInteractiveReason"] = agyNonInteractiveReason;
         std::string wsPath = resolveSessionWorkspacePath(id);
         resp["workspacePath"] = wsPath;
         resp["workspace"] = !wsPath.empty() ? fs::path(wsPath).filename().string() : "";
         res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
     });
 
-    _server->Get("/api/agent/diagnostics", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        std::string cid = req.get_param_value("conversationId");
-        if (cid.empty()) {
-            cid = req.get_param_value("id");
-        }
-        GatewayConfig gwCfg = this->getGatewayConfig();
-        auto applyPolicyToSession = [&gwCfg](nlohmann::json& sObj) {
-            if (!sObj.is_object()) return;
-            if (sObj.value("provider", "") == "antigravity" &&
-                sObj.value("open_in_terminal", false) &&
-                !sObj.value("has_registered_csrf", false) &&
-                !gwCfg.allowCliLockedDetachedResume) {
-                sObj["recommended_route"] = "blocked_cli_locked_no_csrf";
-                sObj["interactive"] = false;
-                sObj["nonInteractiveReason"] =
-                    "Conversation is locked in terminal without a registered ConnectRPC CSRF token and allow_cli_locked_detached_resume is disabled";
-            }
-        };
-        nlohmann::json out;
-        if (!cid.empty()) {
-            out = inspectSession(cid);
-            applyPolicyToSession(out);
-        } else {
-            out = diagnoseSessions(req.get_param_value("provider"));
-            if (out.contains("sessions") && out["sessions"].is_array()) {
-                for (auto& sObj : out["sessions"]) {
-                    applyPolicyToSession(sObj);
-                }
-            }
-        }
-        res.set_content(out.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
-    });
-
     _server->Post("/api/agent/prompt", [this, getWorkspaceRoot, getCliBrainDir, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc, extractConversationModelById, mapLabelToCliModelId, toLowerAscii](
                                            const httplib::Request& req, httplib::Response& res) {
-        auto reqStart = std::chrono::steady_clock::now();
         std::string reqId = extractOrGenerateRequestId(req);
-        std::string tokenFp = computeTokenFingerprint(req);
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("X-Request-Id", reqId);
         nlohmann::json j;
         try {
             j = nlohmann::json::parse(req.body);
         } catch (const std::exception& e) {
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "WARN", "mobile_http", "", "all", "POST /api/agent/prompt",
-                nlohmann::json({{"status_code", 400}, {"error", e.what()}, {"token_fp", tokenFp}}),
-                reqId);
             res.status = 400;
             res.set_content(nlohmann::json({{"status", "error"}, {"error", e.what()}}).dump(), "application/json");
             return;
@@ -7246,10 +7674,6 @@ void WebServer::setupRoutes() {
             }
         }
         if (text.empty()) {
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "WARN", "mobile_http", cid, agentId, "POST /api/agent/prompt",
-                nlohmann::json({{"status_code", 400}, {"error", "Prompt text cannot be empty"}, {"token_fp", tokenFp}}),
-                reqId);
             res.status = 400;
             res.set_content("{\"status\":\"error\",\"error\":\"Prompt text cannot be empty\"}", "application/json");
             return;
@@ -7283,6 +7707,16 @@ void WebServer::setupRoutes() {
         }
 
         if (targetProvider == "claude" || targetProvider == "cursor") {
+            if (j.contains("images") && j["images"].is_array() && !j["images"].empty()) {
+                res.status = 400;
+                res.set_content(nlohmann::json({
+                    {"ok", false},
+                    {"status", "error"},
+                    {"error", "Image attachments are not supported for terminal multiplexer relay sessions"}
+                }).dump(2), "application/json");
+                return;
+            }
+
             std::string cmdVerb;
             std::string cmdArgs;
             if (!trimmedText.empty() && trimmedText[0] == '/') {
@@ -7544,16 +7978,6 @@ void WebServer::setupRoutes() {
                 extraCliArgs = {"--effort", level};
             }
 
-            if (providerBin.empty() || !fs::exists(providerBin) || access(providerBin.c_str(), X_OK) != 0) {
-                res.status = 503;
-                res.set_content(nlohmann::json({
-                    {"status", "error"},
-                    {"error", (targetProvider == "claude" ? "Claude Code CLI binary (claude)" : "Cursor Agent CLI binary (cursor-agent)") +
-                              std::string(" is not available or not executable")}
-                }).dump(2), "application/json");
-                return;
-            }
-
             auto runProviderCli = [&](const std::string& promptArg,
                                       const std::string& resumeCid,
                                       const std::vector<std::string>& extraArgs,
@@ -7758,145 +8182,78 @@ void WebServer::setupRoutes() {
                 const SessionInteractivityInfo interactivity = evaluateSessionInteractivity(
                     targetProvider, cid, fs::path(), sessionInfo, existingTranscriptPath);
                 if (!interactivity.interactive) {
-                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - reqStart).count());
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "WARN", "router_decision", cid, targetProvider, "route_prompt",
-                        nlohmann::json({
-                            {"selected_route", "rejected_non_interactive_ide"},
-                            {"interactive", false},
-                            {"owner_pid", sessionInfo.ownerPid},
-                            {"has_cli_store", sessionInfo.hasCliStore},
-                            {"is_ide_renderer", sessionInfo.isIdeRendererSession},
-                            {"error", interactivity.nonInteractiveReason}
-                        }),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "WARN", "mobile_http", cid, targetProvider, "POST /api/agent/prompt",
-                        nlohmann::json({
-                            {"status_code", 409},
-                            {"duration_ms", totalMs},
-                            {"token_fp", tokenFp},
-                            {"client_meta", req.get_header_value("X-Client-Meta")},
-                            {"routed_via", "rejected_non_interactive_ide"},
-                            {"error", interactivity.nonInteractiveReason}
-                        }),
-                        reqId);
                     res.status = 409;
                     res.set_content(nlohmann::json({
                         {"ok", false},
                         {"status", "error"},
-                        {"error", interactivity.nonInteractiveReason},
                         {"interactive", false},
-                        {"nonInteractiveReason", interactivity.nonInteractiveReason}
+                        {"nonInteractiveReason", interactivity.nonInteractiveReason},
+                        {"error", interactivity.nonInteractiveReason}
                     }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                     return;
                 }
-                if (!sessionInfo.screenSession.empty()) {
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "router_decision", cid, targetProvider, "route_prompt",
-                        nlohmann::json({{"selected_route", "screen"}, {"owner_pid", sessionInfo.ownerPid}, {"screen_session", sessionInfo.screenSession}, {"has_cli_store", sessionInfo.hasCliStore}}),
-                        reqId);
-                    auto fwdStart = std::chrono::steady_clock::now();
-                    std::string screenReply;
-                    if (routePromptViaScreen(sessionInfo.screenSession, targetProvider, cid, text, existingTranscriptPath.string(), existingSlug, screenReply)) {
-                        int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - fwdStart).count());
-                        int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - reqStart).count());
-                        AgentTelemetryDb::getInstance().logDiagnostic(
-                            "INFO", "platform_forward", cid, targetProvider, "screen",
-                            nlohmann::json({{"status_code", 200}, {"duration_ms", fwdMs}, {"route", "screen"}, {"screen_session", sessionInfo.screenSession}}),
-                            reqId);
-                        AgentTelemetryDb::getInstance().logDiagnostic(
-                            "INFO", "mobile_http", cid, targetProvider, "POST /api/agent/prompt",
-                            nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "screen"}}),
-                            reqId);
-                        res.set_content(nlohmann::json({
-                            {"status", "ok"},
-                            {"agentId", targetProvider},
-                            {"source", targetProvider},
-                            {"conversationId", cid},
-                            {"routedVia", "screen"},
-                            {"screenSession", sessionInfo.screenSession},
-                            {"autoApprove", autoApprove},
-                            {"response", screenReply}
-                        }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
-                        return;
-                    } else {
-                        int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - fwdStart).count());
-                        AgentTelemetryDb::getInstance().logDiagnostic(
-                            "ERROR", "platform_forward", cid, targetProvider, "screen",
-                            nlohmann::json({{"status_code", 504}, {"duration_ms", fwdMs}, {"route", "screen"}, {"screen_session", sessionInfo.screenSession}, {"error", "timeout"}}),
-                            reqId);
-                        res.status = 504;
-                        res.set_content(nlohmann::json({
-                            {"status", "error"},
-                            {"error", "Timed out waiting for response from live screen session " + sessionInfo.screenSession},
-                            {"conversationId", cid}
-                        }).dump(2), "application/json");
-                        return;
-                    }
+
+                std::string muxReply;
+                bool dispatchFailed = false;
+                if (routePromptViaMultiplexer(
+                        sessionInfo, targetProvider, cid, text,
+                        existingTranscriptPath.string(), existingSlug,
+                        muxReply, dispatchFailed)) {
+                    res.set_content(nlohmann::json({
+                        {"status", "ok"},
+                        {"agentId", targetProvider},
+                        {"source", targetProvider},
+                        {"conversationId", cid},
+                        {"routedVia", sessionInfo.muxType},
+                        {"muxType", sessionInfo.muxType},
+                        {"muxSession", sessionInfo.muxSession},
+                        {"muxTarget", sessionInfo.muxTarget},
+                        {"screenSession", sessionInfo.screenSession},
+                        {"autoApprove", autoApprove},
+                        {"response", muxReply}
+                    }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                    return;
                 }
 
-                if (targetProvider == "cursor") {
-                    auto fwdStart = std::chrono::steady_clock::now();
-                    std::string bridgeReply;
-                    if (routePromptViaIdeBridge(cid, text, existingTranscriptPath.string(), existingSlug, bridgeReply)) {
-                        int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - fwdStart).count());
-                        int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - reqStart).count());
-                        AgentTelemetryDb::getInstance().logDiagnostic(
-                            "INFO", "router_decision", cid, "cursor", "route_prompt",
-                            nlohmann::json({{"selected_route", "ide_bridge"}, {"has_cli_store", sessionInfo.hasCliStore}}),
-                            reqId);
-                        AgentTelemetryDb::getInstance().logDiagnostic(
-                            "INFO", "platform_forward", cid, "cursor", "ide_bridge",
-                            nlohmann::json({{"status_code", 200}, {"duration_ms", fwdMs}, {"route", "ide_bridge"}}),
-                            reqId);
-                        AgentTelemetryDb::getInstance().logDiagnostic(
-                            "INFO", "mobile_http", cid, "cursor", "POST /api/agent/prompt",
-                            nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "ide_bridge"}}),
-                            reqId);
-                        res.set_content(nlohmann::json({
-                            {"status", "ok"},
-                            {"agentId", "cursor"},
-                            {"source", "cursor"},
-                            {"conversationId", cid},
-                            {"routedVia", "ide_bridge"},
-                            {"autoApprove", autoApprove},
-                            {"response", bridgeReply}
-                        }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
-                        return;
-                    }
-                }
+                res.status = dispatchFailed ? 502 : 504;
+                std::string muxErr = dispatchFailed
+                    ? ("Failed to dispatch prompt to live " + sessionInfo.muxType + " session " + sessionInfo.muxSession)
+                    : ("Timed out waiting for response from live " + sessionInfo.muxType + " session " + sessionInfo.muxSession);
+                res.set_content(nlohmann::json({
+                    {"ok", false},
+                    {"status", "error"},
+                    {"error", muxErr},
+                    {"conversationId", cid}
+                }).dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                return;
+            }
+
+            GatewayConfig gatewayCfg = this->getGatewayConfig();
+            if (!gatewayCfg.allowCliNewSessionSpawn) {
+                res.status = 409;
+                res.set_content(nlohmann::json({
+                    {"ok", false},
+                    {"status", "error"},
+                    {"error", "Spawning new headless CLI sessions is disabled"}
+                }).dump(2), "application/json");
+                return;
+            }
+
+            if (providerBin.empty() || !fs::exists(providerBin) || access(providerBin.c_str(), X_OK) != 0) {
+                res.status = 503;
+                res.set_content(nlohmann::json({
+                    {"status", "error"},
+                    {"error", (targetProvider == "claude" ? "Claude Code CLI binary (claude)" : "Cursor Agent CLI binary (cursor-agent)") +
+                              std::string(" is not available or not executable")}
+                }).dump(2), "application/json");
+                return;
             }
 
             std::string selectedRoute = "cli_print";
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "INFO", "router_decision", cid, targetProvider, "route_prompt",
-                nlohmann::json({
-                    {"selected_route", selectedRoute},
-                    {"interactive", true},
-                    {"owner_pid", sessionInfo.ownerPid},
-                    {"has_cli_store", sessionInfo.hasCliStore},
-                    {"is_ide_renderer", sessionInfo.isIdeRendererSession}
-                }),
-                reqId);
-
-            auto fwdStart = std::chrono::steady_clock::now();
             std::string rawOut;
             std::string replyText;
             std::string resolvedCid;
             if (!runProviderCli(text, cid, extraCliArgs, rawOut, replyText, resolvedCid)) {
-                int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - fwdStart).count());
-                AgentTelemetryDb::getInstance().logDiagnostic(
-                    "ERROR", "platform_forward", cid, targetProvider, selectedRoute,
-                    nlohmann::json({{"status_code", 500}, {"duration_ms", fwdMs}, {"route", selectedRoute}, {"error", "fork_failed"}}),
-                    reqId);
                 res.status = 500;
                 res.set_content("{\"status\":\"error\",\"error\":\"Failed to fork provider CLI\"}", "application/json");
                 return;
@@ -7904,18 +8261,6 @@ void WebServer::setupRoutes() {
             if (resolvedCid.empty()) {
                 resolvedCid = (!cid.empty() && cid != "new") ? cid : "new";
             }
-            int fwdMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - fwdStart).count());
-            int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - reqStart).count());
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "INFO", "platform_forward", resolvedCid, targetProvider, selectedRoute,
-                nlohmann::json({{"status_code", 200}, {"duration_ms", fwdMs}, {"route", selectedRoute}, {"conversation_id", resolvedCid}}),
-                reqId);
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "INFO", "mobile_http", resolvedCid, targetProvider, "POST /api/agent/prompt",
-                nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", selectedRoute}}),
-                reqId);
             res.set_content(nlohmann::json({
                 {"status", "ok"},
                 {"agentId", targetProvider},
@@ -8032,14 +8377,6 @@ void WebServer::setupRoutes() {
         }
 
         if (!fs::exists(agyBin) || access(agyBin.c_str(), X_OK) != 0) {
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "ERROR", "router_decision", cid, "antigravity", "route_prompt",
-                nlohmann::json({{"selected_route", "agy_missing"}, {"agy_bin", agyBin}}),
-                reqId);
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "ERROR", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
-                nlohmann::json({{"status_code", 503}, {"error", "agy binary not executable"}, {"token_fp", tokenFp}}),
-                reqId);
             res.status = 503;
             res.set_content(nlohmann::json({
                 {"status", "error"},
@@ -8142,39 +8479,37 @@ void WebServer::setupRoutes() {
         }
 
         if (isLockedByRunningAgy && !lockedHasRegisteredCsrf &&
-            hasCliDiskConversation && !gatewayCfg.allowCliLockedDetachedResume) {
+            !(gatewayCfg.allowCliNewSessionSpawn && !hasCliDiskConversation && !wsPath.empty())) {
             std::string locDesc = !lockedTerminalPts.empty()
                 ? lockedTerminalPts
                 : (lockedHttpPort > 0 ? ("port " + std::to_string(lockedHttpPort)) : "active terminal");
             std::string errMsg = "Conversation is open in terminal (" + locDesc +
-                                 ") without a registered CSRF token and allow_cli_locked_detached_resume is disabled";
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "ERROR", "router_decision", cid, "antigravity", "route_prompt",
-                nlohmann::json({{"selected_route", "rejected_locked_cli_no_csrf"}, {"locked_http_port", lockedHttpPort}}),
-                reqId);
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "ERROR", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
-                nlohmann::json({{"status_code", 503}, {"error", errMsg}, {"token_fp", tokenFp}}),
-                reqId);
-            res.status = 503;
+                                 ") without a registered ConnectRPC CSRF token";
+            res.status = 409;
             res.set_content(nlohmann::json({
+                {"ok", false},
                 {"status", "error"},
+                {"interactive", false},
+                {"nonInteractiveReason", errMsg},
                 {"error", errMsg}
             }).dump(2), "application/json");
             return;
         }
 
         if (endpoints.empty() &&
-            (!hasCliDiskConversation || (isLockedByRunningAgy && !gatewayCfg.allowCliLockedDetachedResume)) &&
-            !(isLockedByRunningAgy && gatewayCfg.allowCliNewSessionSpawn && !wsPath.empty())) {
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "ERROR", "router_decision", cid, "antigravity", "route_prompt",
-                nlohmann::json({{"selected_route", "no_endpoint"}, {"has_cli_disk", hasCliDiskConversation}, {"is_locked", isLockedByRunningAgy}}),
-                reqId);
-            AgentTelemetryDb::getInstance().logDiagnostic(
-                "ERROR", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
-                nlohmann::json({{"status_code", 503}, {"error", "No active Antigravity language server or agy agent session found"}, {"token_fp", tokenFp}}),
-                reqId);
+            !(isLockedByRunningAgy && gatewayCfg.allowCliNewSessionSpawn && !hasCliDiskConversation && !wsPath.empty())) {
+            if (!cid.empty() && cid != "new") {
+                std::string errMsg = "No live Antigravity ConnectRPC or agentapi endpoint is running for this conversation";
+                res.status = 409;
+                res.set_content(nlohmann::json({
+                    {"ok", false},
+                    {"status", "error"},
+                    {"interactive", false},
+                    {"nonInteractiveReason", errMsg},
+                    {"error", errMsg}
+                }).dump(2), "application/json");
+                return;
+            }
             res.status = 503;
             res.set_content(nlohmann::json({
                 {"status", "error"},
@@ -8602,20 +8937,6 @@ void WebServer::setupRoutes() {
                 }
                 std::string interactionOut;
                 if (tryHandleWaitingAskQuestion(ep, cid, interactionOut)) {
-                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - reqStart).count());
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "router_decision", cid, "antigravity", "route_prompt",
-                        nlohmann::json({{"selected_route", "connect_rpc_interaction"}, {"port", ep.port}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "platform_forward", cid, "antigravity", "connect_rpc_interaction",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "connect_rpc_interaction"}, {"port", ep.port}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "connect_rpc_interaction"}}),
-                        reqId);
                     nlohmann::json resp;
                     resp["status"] = "dispatched";
                     resp["interactionHandled"] = true;
@@ -8630,20 +8951,6 @@ void WebServer::setupRoutes() {
                 if (isLockedByRunningAgy || endpointOwnsConversation(ep, cid, reachable)) {
                     std::string rpcOut;
                     if (sendRpcCascadeMessage(ep, cid, rpcOut)) {
-                        int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - reqStart).count());
-                        AgentTelemetryDb::getInstance().logDiagnostic(
-                            "INFO", "router_decision", cid, "antigravity", "route_prompt",
-                            nlohmann::json({{"selected_route", "connect_rpc"}, {"port", ep.port}}),
-                            reqId);
-                        AgentTelemetryDb::getInstance().logDiagnostic(
-                            "INFO", "platform_forward", cid, "antigravity", "connect_rpc",
-                            nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "connect_rpc"}, {"port", ep.port}}),
-                            reqId);
-                        AgentTelemetryDb::getInstance().logDiagnostic(
-                            "INFO", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
-                            nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "connect_rpc"}}),
-                            reqId);
                         nlohmann::json resp;
                         resp["status"] = "dispatched";
                         resp["agentId"] = agentId;
@@ -8664,20 +8971,6 @@ void WebServer::setupRoutes() {
                 std::string rpcOut;
                 if (startRpcNewCascade(*firstReachableEp, newCid) &&
                     sendRpcCascadeMessage(*firstReachableEp, newCid, rpcOut)) {
-                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - reqStart).count());
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "router_decision", newCid, "antigravity", "route_prompt",
-                        nlohmann::json({{"selected_route", "connect_rpc_new"}, {"port", firstReachableEp->port}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "platform_forward", newCid, "antigravity", "connect_rpc_new",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "connect_rpc_new"}, {"port", firstReachableEp->port}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "mobile_http", newCid, "antigravity", "POST /api/agent/prompt",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "connect_rpc_new"}}),
-                        reqId);
                     nlohmann::json resp;
                     resp["status"] = "dispatched";
                     resp["agentId"] = agentId;
@@ -8695,20 +8988,6 @@ void WebServer::setupRoutes() {
                 std::string newCid;
                 std::string rpcOut;
                 if (startRpcNewCascade(ep, newCid) && sendRpcCascadeMessage(ep, newCid, rpcOut)) {
-                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - reqStart).count());
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "router_decision", newCid, "antigravity", "route_prompt",
-                        nlohmann::json({{"selected_route", "connect_rpc_new"}, {"port", ep.port}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "platform_forward", newCid, "antigravity", "connect_rpc_new",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "connect_rpc_new"}, {"port", ep.port}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "mobile_http", newCid, "antigravity", "POST /api/agent/prompt",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"client_meta", req.get_header_value("X-Client-Meta")}, {"routed_via", "connect_rpc_new"}}),
-                        reqId);
                     nlohmann::json resp;
                     resp["status"] = "dispatched";
                     resp["agentId"] = agentId;
@@ -8859,21 +9138,6 @@ void WebServer::setupRoutes() {
                         }
                     }
 
-                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - reqStart).count());
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "router_decision", resolvedCid, "antigravity", "route_prompt",
-                        nlohmann::json({{"selected_route", "agy_agentapi"}, {"port", ep.port}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "platform_forward", resolvedCid, "antigravity", "agy_agentapi",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "agy_agentapi"}, {"port", ep.port}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "mobile_http", resolvedCid, "antigravity", "POST /api/agent/prompt",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"routed_via", "agy_agentapi"}}),
-                        reqId);
-
                     nlohmann::json resp;
                     resp["status"] = "dispatched";
                     resp["agentId"] = agentId;
@@ -8894,93 +9158,7 @@ void WebServer::setupRoutes() {
             }
         }
 
-        // 5. Fallback for CLI conversations on disk (unlocked, or locked without a registered CSRF token when allowCliLockedDetachedResume is enabled):
-        // resume directly via detached `agy --conversation <cid> -p <prompt>`
-        if (hasCliDiskConversation && (!isLockedByRunningAgy || gatewayCfg.allowCliLockedDetachedResume) &&
-            !cid.empty() && cid != "new") {
-            std::string cliModelId = mapLabelToCliModelId(desiredModel);
-            pid_t child = fork();
-            if (child == 0) {
-                setsid();
-                if (!wsPath.empty()) {
-                    if (chdir(wsPath.c_str()) != 0) {}
-                }
-                int devNull = open("/dev/null", O_RDWR);
-                if (devNull >= 0) {
-                    dup2(devNull, STDIN_FILENO);
-                    dup2(devNull, STDOUT_FILENO);
-                    dup2(devNull, STDERR_FILENO);
-                    if (devNull > 2) close(devNull);
-                }
-                unsetenv("ANTIGRAVITY_CONVERSATION_ID");
-                unsetenv("AGY_LS_PORT");
-                unsetenv("AGY_LS_CSRF_TOKEN");
-                unsetenv("ANTIGRAVITY_LS_ADDRESS");
-                unsetenv("ANTIGRAVITY_CSRF_TOKEN");
-                std::string modelArg = "--model=" + cliModelId;
-                std::vector<char*> argv;
-                argv.push_back(const_cast<char*>(agyBin.c_str()));
-                argv.push_back(const_cast<char*>("--conversation"));
-                argv.push_back(const_cast<char*>(cid.c_str()));
-                argv.push_back(const_cast<char*>("--dangerously-skip-permissions"));
-                if (!cliModelId.empty()) {
-                    argv.push_back(const_cast<char*>(modelArg.c_str()));
-                }
-                argv.push_back(const_cast<char*>("-p"));
-                argv.push_back(const_cast<char*>(text.c_str()));
-                argv.push_back(nullptr);
-                execv(agyBin.c_str(), argv.data());
-                _exit(127);
-            } else if (child > 0) {
-                bool spawnOk = true;
-                int status = 0;
-                for (int waitedMs = 0; waitedMs < 150; waitedMs += 15) {
-                    pid_t w = waitpid(child, &status, WNOHANG);
-                    if (w == child) {
-                        int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-                        if (code != 0) {
-                            spawnOk = false;
-                        }
-                        child = -1;
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
-                }
-                if (child > 0) {
-                    std::thread([child]() {
-                        int st = 0;
-                        waitpid(child, &st, 0);
-                    }).detach();
-                }
-                if (spawnOk) {
-                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - reqStart).count());
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "router_decision", cid, "antigravity", "route_prompt",
-                        nlohmann::json({{"selected_route", "agy_cli_resume"}, {"is_locked_by_running_agy", isLockedByRunningAgy}, {"locked_http_port", lockedHttpPort}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "platform_forward", cid, "antigravity", "agy_cli_resume",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "agy_cli_resume"}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"routed_via", "agy_cli_resume"}}),
-                        reqId);
-
-                    nlohmann::json resp;
-                    resp["status"] = "dispatched";
-                    resp["agentId"] = agentId;
-                    resp["conversationId"] = cid;
-                    resp["routedVia"] = "agy_cli_resume";
-                    resp["output"] = "{\"status\":\"resumed_cli_conversation\"}";
-                    res.set_content(resp.dump(2), "application/json");
-                    return;
-                }
-            }
-        }
-
-        // 6. Fallback for 0-step locked CLI conversations without CSRF token in workspace: start new detached prompt in wsPath
+        // 5. Fallback for 0-step locked CLI conversations without CSRF token in workspace: start new detached prompt in wsPath
         if (gatewayCfg.allowCliNewSessionSpawn && isLockedByRunningAgy && !hasCliDiskConversation && !wsPath.empty()) {
             std::string cliModelId = mapLabelToCliModelId(desiredModel);
             pid_t child = fork();
@@ -9035,21 +9213,6 @@ void WebServer::setupRoutes() {
                     }).detach();
                 }
                 if (spawnOk) {
-                    int totalMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - reqStart).count());
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "router_decision", cid, "antigravity", "route_prompt",
-                        nlohmann::json({{"selected_route", "agy_cli_new"}, {"workspace", wsPath}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "platform_forward", cid, "antigravity", "agy_cli_new",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"route", "agy_cli_new"}}),
-                        reqId);
-                    AgentTelemetryDb::getInstance().logDiagnostic(
-                        "INFO", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
-                        nlohmann::json({{"status_code", 200}, {"duration_ms", totalMs}, {"token_fp", tokenFp}, {"routed_via", "agy_cli_new"}}),
-                        reqId);
-
                     nlohmann::json resp;
                     resp["status"] = "dispatched";
                     resp["agentId"] = agentId;
@@ -9062,16 +9225,17 @@ void WebServer::setupRoutes() {
             }
         }
 
-        int failMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - reqStart).count());
-        AgentTelemetryDb::getInstance().logDiagnostic(
-            "ERROR", "router_decision", cid, "antigravity", "route_prompt",
-            nlohmann::json({{"selected_route", "all_fallbacks_failed"}, {"error", lastError}}),
-            reqId);
-        AgentTelemetryDb::getInstance().logDiagnostic(
-            "ERROR", "mobile_http", cid, "antigravity", "POST /api/agent/prompt",
-            nlohmann::json({{"status_code", 503}, {"duration_ms", failMs}, {"error", lastError}, {"token_fp", tokenFp}}),
-            reqId);
+        if (!cid.empty() && cid != "new") {
+            res.status = 409;
+            res.set_content(nlohmann::json({
+                {"ok", false},
+                {"status", "error"},
+                {"interactive", false},
+                {"nonInteractiveReason", lastError},
+                {"error", lastError}
+            }).dump(2), "application/json");
+            return;
+        }
 
         res.status = 503;
         res.set_content(nlohmann::json({
@@ -9793,7 +9957,6 @@ void WebServer::setupRoutes() {
             snap = this->_configManager->getConfigSnapshot();
         } else {
             snap.gateway = this->getGatewayConfig();
-            snap.diagnostics = AgentTelemetryDb::getInstance().getDiagnosticsConfig();
         }
         nlohmann::json cfgJson = snap.toJson();
         if (cfgJson.contains("eda") && cfgJson["eda"].is_object()) {
@@ -9840,7 +10003,6 @@ void WebServer::setupRoutes() {
             snap = this->_configManager->getConfigSnapshot();
         } else {
             snap.gateway = this->getGatewayConfig();
-            snap.diagnostics = AgentTelemetryDb::getInstance().getDiagnosticsConfig();
             snap.fromJson(patch);
             if (!snap.validate(err)) {
                 res.status = 400;
@@ -9849,7 +10011,6 @@ void WebServer::setupRoutes() {
             }
         }
 
-        AgentTelemetryDb::getInstance().setDiagnosticsConfig(snap.diagnostics);
         this->setGatewayConfig(snap.gateway);
 
         nlohmann::json cfgJson = snap.toJson();
@@ -9864,37 +10025,7 @@ void WebServer::setupRoutes() {
         res.set_content(out.dump(2), "application/json");
     });
 
-    _server->Get("/api/agent/diagnostics/logs", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        if (!isValidMobileOrUiRequest(req)) {
-            res.status = 401;
-            res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
-            return;
-        }
-        int limit = 100;
-        if (req.has_param("limit")) {
-            try { limit = std::clamp(std::stoi(req.get_param_value("limit")), 1, 2000); } catch (...) {}
-        }
-        std::string cid = req.get_param_value("conversationId");
-        if (cid.empty()) cid = req.get_param_value("id");
-        std::string category = req.get_param_value("category");
-        std::string minLevel = req.get_param_value("minLevel");
-        if (minLevel.empty()) minLevel = req.get_param_value("level");
-        std::string reqId = req.get_param_value("requestId");
-
-        auto& db = AgentTelemetryDb::getInstance();
-        nlohmann::json logs = db.queryDiagnostics(limit, cid, category, minLevel, reqId);
-        nlohmann::json out = {
-            {"ok", true},
-            {"count", logs.size()},
-            {"logs", std::move(logs)},
-            {"diagnostics_config", db.getDiagnosticsConfig().toJson()},
-            {"storage_stats", db.getStorageStats()}
-        };
-        res.set_content(out.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
-    });
-
-    _server->Post("/api/agent/diagnostics/clear", [this, getCliPresenceDir](const httplib::Request& req, httplib::Response& res) {
+    _server->Post("/api/telemetry/prune", [this, getCliPresenceDir](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         if (!isValidMobileOrUiRequest(req)) {
             res.status = 401;
@@ -9911,36 +10042,18 @@ void WebServer::setupRoutes() {
         auto& db = AgentTelemetryDb::getInstance();
         int64_t sizeBefore = db.getDatabaseSizeBytes();
 
-        bool purgeAllDebug = body.value("purge_debug_data", false);
-        bool clearLogs = body.value("clear_logs", true);
-        bool pruneTelemetry = body.value("prune_telemetry", false);
+        bool pruneTelemetry = body.value("prune_telemetry", true);
         bool pruneStaleLocks = body.value("prune_stale_locks", false);
         bool vacuum = body.value("vacuum", true);
+        int retentionDays = body.value("retention_days", 14);
 
-        std::string cid = body.value("conversation_id", body.value("conversationId", ""));
-        std::string category = body.value("category", "");
-        int olderThanHours = body.value("older_than_hours", 0);
-
-        size_t deletedLogs = 0;
         size_t prunedTelemetryRows = 0;
         int prunedStaleLocks = 0;
 
         if (pruneTelemetry) {
-            int retDays = db.getDiagnosticsConfig().telemetryRetentionDays;
-            prunedTelemetryRows = db.rollupAndPrune(retDays > 0 ? retDays : 14);
-        }
-
-        if (purgeAllDebug) {
-            nlohmann::json out = db.purgeDebugData(vacuum);
-            deletedLogs = static_cast<size_t>(out.value("deleted_diagnostic_logs", int64_t(0)));
-            pruneStaleLocks = true;
-        } else {
-            if (clearLogs) {
-                deletedLogs = db.clearDiagnostics(cid, category, olderThanHours);
-            }
-            if (clearLogs && cid.empty() && category.empty() && olderThanHours <= 0 && vacuum) {
-                db.purgeDebugData(true);
-            }
+            prunedTelemetryRows = db.rollupAndPrune(retentionDays > 0 ? retentionDays : 14);
+        } else if (vacuum) {
+            db.rollupAndPrune(36500);
         }
 
         if (pruneStaleLocks) {
@@ -9971,8 +10084,6 @@ void WebServer::setupRoutes() {
         int64_t reclaimed = (sizeBefore > sizeAfter) ? (sizeBefore - sizeAfter) : 0;
         nlohmann::json out = {
             {"ok", true},
-            {"deleted", deletedLogs},
-            {"deleted_diagnostic_logs", deletedLogs},
             {"pruned_telemetry_rows", prunedTelemetryRows},
             {"pruned_stale_locks", prunedStaleLocks},
             {"before_bytes", sizeBefore},
@@ -10661,334 +10772,6 @@ void WebServer::stop() {
         _thread->join();
         _thread.reset();
     }
-}
-
-nlohmann::json WebServer::diagnoseSessions(const std::string& providerFilter) {
-    auto& db = AgentTelemetryDb::getInstance();
-    nlohmann::json dbSessions = db.querySessions(50);
-    std::set<std::string> candidateIds;
-    if (dbSessions.is_array()) {
-        for (const auto& s : dbSessions) {
-            if (!s.is_object()) continue;
-            std::string cid = s.value("conversation_id", "");
-            std::string prov = s.value("agent_type", "");
-            if (!providerFilter.empty() && prov != providerFilter) continue;
-            if (!cid.empty()) candidateIds.insert(cid);
-        }
-    }
-
-    if (providerFilter.empty() || providerFilter == "cursor") {
-        std::string cursorRoot = getCursorProjectsDir();
-        std::error_code ec;
-        if (!cursorRoot.empty() && fs::exists(cursorRoot, ec) && fs::is_directory(cursorRoot, ec)) {
-            for (const auto& projEntry : fs::directory_iterator(cursorRoot, ec)) {
-                if (ec || !projEntry.is_directory()) continue;
-                fs::path transDir = projEntry.path() / "agent-transcripts";
-                std::error_code tEc;
-                if (!fs::exists(transDir, tEc) || !fs::is_directory(transDir, tEc)) continue;
-                for (const auto& convEntry : fs::directory_iterator(transDir, tEc)) {
-                    if (tEc || !convEntry.is_directory()) continue;
-                    std::string id = convEntry.path().filename().string();
-                    if (!id.empty() && id[0] != '.' && id != "subagents") {
-                        candidateIds.insert(id);
-                    }
-                }
-            }
-        }
-        std::string hookDir = getCursorHookStateDir();
-        if (!hookDir.empty() && fs::exists(hookDir, ec) && fs::is_directory(hookDir, ec)) {
-            for (const auto& hEntry : fs::directory_iterator(hookDir, ec)) {
-                if (ec || !hEntry.is_regular_file() || hEntry.path().extension() != ".json") continue;
-                std::string id = hEntry.path().stem().string();
-                if (!id.empty() && id[0] != '.' && id != "agy_ls_endpoints" &&
-                    id != "current" && id != "cursor-telemetry-probe" &&
-                    id.rfind("sess-", 0) != 0 && id.rfind("agent-", 0) != 0) {
-                    candidateIds.insert(id);
-                }
-            }
-        }
-    }
-
-    if (providerFilter.empty() || providerFilter == "claude") {
-        std::string claudeRoot = getClaudeProjectsDir();
-        std::error_code ec;
-        if (!claudeRoot.empty() && fs::exists(claudeRoot, ec) && fs::is_directory(claudeRoot, ec)) {
-            for (const auto& projEntry : fs::directory_iterator(claudeRoot, ec)) {
-                if (ec || !projEntry.is_directory()) continue;
-                std::error_code fEc;
-                for (const auto& fEntry : fs::directory_iterator(projEntry.path(), fEc)) {
-                    if (fEc || !fEntry.is_regular_file() || fEntry.path().extension() != ".jsonl") continue;
-                    std::string id = fEntry.path().stem().string();
-                    if (!id.empty() && id[0] != '.') {
-                        candidateIds.insert(id);
-                    }
-                }
-            }
-        }
-    }
-
-    if (providerFilter.empty() || providerFilter == "antigravity" ||
-        providerFilter == "cli" || providerFilter == "ide") {
-        for (const auto& proc : discoverRunningAgyProcesses()) {
-            if (!proc.lockedConversationId.empty() &&
-                AgentTelemetryDb::isValidSessionId(proc.lockedConversationId)) {
-                candidateIds.insert(proc.lockedConversationId);
-            }
-        }
-        auto scanBrainIds = [&](const std::string& rootDir) {
-            std::error_code ec;
-            if (rootDir.empty() || !fs::exists(rootDir, ec) || !fs::is_directory(rootDir, ec)) return;
-            for (const auto& entry : fs::directory_iterator(rootDir, ec)) {
-                if (ec || !entry.is_directory()) continue;
-                std::string id = entry.path().filename().string();
-                if (!id.empty() && id[0] != '.' && id != "tempmediaStorage" &&
-                    AgentTelemetryDb::isValidSessionId(id)) {
-                    fs::path tPath = entry.path() / ".system_generated" / "logs" / "transcript.jsonl";
-                    if (fs::exists(tPath, ec) || fs::exists(entry.path() / "task.md", ec)) {
-                        candidateIds.insert(id);
-                    }
-                }
-            }
-        };
-        if (providerFilter != "ide") scanBrainIds(getCliBrainDir());
-        if (providerFilter != "cli") scanBrainIds(getIdeBrainDir());
-    }
-
-    nlohmann::json inspected = nlohmann::json::array();
-    for (const auto& cid : candidateIds) {
-        auto item = inspectSession(cid);
-        if (!providerFilter.empty() &&
-            item.value("provider", "") != providerFilter &&
-            !(providerFilter == "antigravity" &&
-              (item.value("provider", "") == "cli" || item.value("provider", "") == "ide"))) {
-            continue;
-        }
-        inspected.push_back(std::move(item));
-        if (inspected.size() >= 50) break;
-    }
-
-    return nlohmann::json({
-        {"ok", true},
-        {"provider_filter", providerFilter},
-        {"count", inspected.size()},
-        {"sessions", std::move(inspected)}
-    });
-}
-
-nlohmann::json WebServer::inspectSession(const std::string& conversationId) {
-    if (!AgentTelemetryDb::isValidSessionId(conversationId)) {
-        return nlohmann::json({
-            {"ok", false},
-            {"error", "Invalid conversation ID"},
-            {"conversation_id", conversationId}
-        });
-    }
-
-    auto& db = AgentTelemetryDb::getInstance();
-    nlohmann::json sessionRec = db.querySessionRecord(conversationId);
-    nlohmann::json events = db.querySessionEvents(conversationId);
-    nlohmann::json diagLogs = db.queryDiagnostics(50, conversationId);
-
-    std::string provSource;
-    std::string provSlug;
-    fs::path provFile = findProviderTranscriptById(conversationId, provSource, provSlug);
-    if (provSource.empty() && !sessionRec.empty()) {
-        provSource = sessionRec.value("agent_type", "antigravity");
-    }
-    if (provSource.empty()) {
-        provSource = "antigravity";
-    }
-
-    std::error_code ec;
-    bool parentJsonlExists = !provFile.empty() && fs::exists(provFile, ec) &&
-                             fs::is_regular_file(provFile, ec) &&
-                             fs::file_size(provFile, ec) > 0;
-    nlohmann::json hookJson;
-    bool hookStateExists = readCursorHookStateJson(conversationId, hookJson);
-
-    NormalizedProviderTranscript parsed;
-    if (!provFile.empty() && (provSource == "cursor" || provSource == "claude")) {
-        parsed = parseProviderTranscriptJsonl(provFile, provSource, -1, provSlug, false);
-    }
-
-    bool openInTerminal = false;
-    std::string terminalPts;
-    int lockedHttpPort = 0;
-    bool hasRegisteredCsrf = false;
-    bool presenceLockExists = false;
-
-    LiveProviderSessionInfo liveInfo;
-    SessionInteractivityInfo interactivity;
-    std::string recommendedRoute = "cli_print";
-    std::string sessionSource = provSource;
-
-    if (provSource == "cursor" || provSource == "claude") {
-        liveInfo = discoverLiveProviderSession(
-            provSource, conversationId, parsed.workspacePath, provFile.string());
-        interactivity = evaluateSessionInteractivity(
-            provSource, conversationId, fs::path(), liveInfo, provFile);
-        if (!interactivity.interactive) {
-            recommendedRoute = "rejected_non_interactive_ide";
-        } else if (!liveInfo.screenSession.empty()) {
-            recommendedRoute = "screen";
-        }
-    } else {
-        if (provSource == "cli" || provSource == "ide") {
-            provSource = "antigravity";
-        }
-        fs::path cliBrainDir = fs::path(getCliBrainDir());
-        fs::path ideBrainDir = fs::path(getIdeBrainDir());
-        fs::path cliRootDir = cliBrainDir.parent_path();
-        fs::path cliTrans = cliBrainDir / conversationId / ".system_generated" / "logs" / "transcript.jsonl";
-        fs::path ideTrans = ideBrainDir / conversationId / ".system_generated" / "logs" / "transcript.jsonl";
-        bool hasCliDisk = fs::exists(cliBrainDir / conversationId, ec) ||
-                          fs::exists(cliRootDir / "conversations" / (conversationId + ".db"), ec);
-        bool hasIdeDisk = fs::exists(ideBrainDir / conversationId, ec);
-
-        if (fs::exists(cliTrans, ec)) {
-            provFile = cliTrans;
-            parentJsonlExists = fs::file_size(cliTrans, ec) > 0;
-        } else if (fs::exists(ideTrans, ec)) {
-            provFile = ideTrans;
-            parentJsonlExists = fs::file_size(ideTrans, ec) > 0;
-        }
-        if (parentJsonlExists) {
-            std::ifstream tf(provFile);
-            std::string line;
-            int steps = 0;
-            while (std::getline(tf, line)) {
-                if (!line.empty()) ++steps;
-            }
-            parsed.totalSteps = steps;
-            parsed.hasValidTurns = (steps > 0);
-        }
-
-        const char* envPres = std::getenv("AIMON_CLI_PRESENCE_DIR");
-        std::string presDir = (envPres && *envPres)
-            ? std::string(envPres)
-            : PathUtils::expandHome("~/.gemini/antigravity-cli/presence");
-        presenceLockExists = !presDir.empty() && fs::exists(fs::path(presDir) / (conversationId + ".lock"), ec);
-
-        auto agyProcs = discoverRunningAgyProcesses();
-        auto liveEnvEndpoints = syncAndPruneCliEndpointsState(agyProcs, false);
-        for (const auto& proc : agyProcs) {
-            if (proc.lockedConversationId == conversationId) {
-                openInTerminal = true;
-                terminalPts = proc.terminalPts;
-                lockedHttpPort = proc.httpPort;
-                try { liveInfo.ownerPid = std::stoi(proc.pidStr); } catch (...) {}
-                if (parsed.workspacePath.empty() && !proc.cwd.empty()) {
-                    parsed.workspacePath = proc.cwd;
-                }
-                if (lockedHttpPort > 0) {
-                    {
-                        std::lock_guard<std::mutex> lk(s_cachedCliTokensMutex);
-                        if (s_cachedCliTokens.count(lockedHttpPort)) {
-                            hasRegisteredCsrf = true;
-                        }
-                    }
-                    if (!hasRegisteredCsrf && liveEnvEndpoints.count(lockedHttpPort)) {
-                        hasRegisteredCsrf = true;
-                    }
-                }
-                break;
-            }
-        }
-        sessionSource = (hasCliDisk || openInTerminal) ? "cli" : (hasIdeDisk ? "ide" : "antigravity");
-        liveInfo.hasCliStore = hasCliDisk;
-        liveInfo.isIdeRendererSession = hasIdeDisk && !hasCliDisk && !openInTerminal;
-        parsed.status = openInTerminal ? "RUNNING" : (parsed.hasValidTurns ? "DONE" : "UNKNOWN");
-        interactivity.interactive = true;
-
-        if (openInTerminal && hasRegisteredCsrf) {
-            recommendedRoute = "connect_rpc";
-        } else if (hasCliDisk || openInTerminal) {
-            recommendedRoute = "agy_cli_resume";
-        } else {
-            recommendedRoute = "agy_cli_new";
-        }
-    }
-
-    std::string selectedRoute = recommendedRoute;
-    if (diagLogs.is_array()) {
-        for (const auto& entry : diagLogs) {
-            if (entry.is_object() && entry.value("category", "") == "router_decision" &&
-                entry.contains("details") && entry["details"].is_object()) {
-                std::string sr = entry["details"].value("selected_route", "");
-                if (!sr.empty()) {
-                    selectedRoute = sr;
-                    break;
-                }
-            }
-        }
-    }
-
-    nlohmann::json subagentFiles = nlohmann::json::array();
-    if (!provFile.empty()) {
-        fs::path subDir = (provSource == "cursor")
-            ? (provFile.parent_path() / "subagents")
-            : (provFile.parent_path() / provFile.stem() / "subagents");
-        std::error_code sEc;
-        if (!fs::exists(subDir, sEc) && provSource == "cursor") {
-            std::string cursorRoot = getCursorProjectsDir();
-            if (!cursorRoot.empty() && fs::exists(cursorRoot, sEc) && fs::is_directory(cursorRoot, sEc)) {
-                for (const auto& projEntry : fs::directory_iterator(cursorRoot, sEc)) {
-                    if (sEc || !projEntry.is_directory()) continue;
-                    fs::path altSub = projEntry.path() / "agent-transcripts" / conversationId / "subagents";
-                    if (fs::exists(altSub, sEc) && fs::is_directory(altSub, sEc)) {
-                        subDir = altSub;
-                        break;
-                    }
-                }
-            }
-        }
-        if (fs::exists(subDir, sEc) && fs::is_directory(subDir, sEc)) {
-            for (const auto& se : fs::directory_iterator(subDir, sEc)) {
-                if (!sEc && se.is_regular_file() && se.path().extension() == ".jsonl") {
-                    subagentFiles.push_back(se.path().filename().string());
-                }
-            }
-        }
-    }
-
-    size_t subCount = subagentFiles.size();
-    return nlohmann::json({
-        {"ok", true},
-        {"conversation_id", conversationId},
-        {"provider", provSource},
-        {"source", sessionSource},
-        {"status", parsed.hasValidTurns ? parsed.status : sessionRec.value("status", "UNKNOWN")},
-        {"workspace", !parsed.workspacePath.empty() ? parsed.workspacePath : sessionRec.value("workspace_path", sessionRec.value("workspace", ""))},
-        {"model", !parsed.model.empty() ? parsed.model : sessionRec.value("model_name", sessionRec.value("model", ""))},
-        {"interactive", interactivity.interactive},
-        {"nonInteractiveReason", interactivity.nonInteractiveReason},
-        {"recommended_route", recommendedRoute},
-        {"selected_route", selectedRoute},
-        {"parent_jsonl_path", provFile.string()},
-        {"parent_jsonl_exists", parentJsonlExists},
-        {"hook_state_exists", hookStateExists},
-        {"has_cli_store", liveInfo.hasCliStore},
-        {"is_ide_renderer", liveInfo.isIdeRendererSession},
-        {"owner_pid", liveInfo.ownerPid},
-        {"open_in_terminal", openInTerminal},
-        {"locked_by_running_agy", openInTerminal},
-        {"terminal_pts", terminalPts},
-        {"http_port", lockedHttpPort},
-        {"has_registered_csrf", hasRegisteredCsrf},
-        {"presence_lock_exists", presenceLockExists},
-        {"screen_session", liveInfo.screenSession},
-        {"step_count", parsed.totalSteps},
-        {"subagent_files", subagentFiles},
-        {"transcript", {
-            {"step_count", parsed.totalSteps},
-            {"subagent_file_count", subCount},
-            {"parent_jsonl_path", provFile.string()},
-            {"parent_jsonl_exists", parentJsonlExists}
-        }},
-        {"session_record", std::move(sessionRec)},
-        {"lifecycle_events", std::move(events)},
-        {"diagnostic_logs", std::move(diagLogs)}
-    });
 }
 
 } // namespace aimon

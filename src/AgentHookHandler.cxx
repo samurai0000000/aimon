@@ -215,21 +215,159 @@ bool isOneShotTokens(const std::vector<std::string>& tokens) {
     return false;
 }
 
+int readParentPidFromProcStat(int pid) {
+    if (pid <= 1) {
+        return 0;
+    }
+    try {
+        std::ifstream statIfs("/proc/" + std::to_string(pid) + "/stat");
+        std::string statLine;
+        if (!statIfs.is_open() || !std::getline(statIfs, statLine)) {
+            return 0;
+        }
+        size_t rparen = statLine.rfind(')');
+        if (rparen == std::string::npos || (rparen + 2) >= statLine.size()) {
+            return 0;
+        }
+        std::istringstream iss(statLine.substr(rparen + 2));
+        std::string stateCh;
+        int ppid = 0;
+        iss >> stateCh >> ppid;
+        return ppid;
+    } catch (...) {
+        return 0;
+    }
+}
+
 std::string readScreenSessionFromProc(int pid) {
     const char* envSty = std::getenv("STY");
     if (envSty && envSty[0] != '\0') {
         return std::string(envSty);
     }
-    if (pid <= 0) {
-        return "";
-    }
-    auto envTokens = readProcNulTokens("/proc/" + std::to_string(pid) + "/environ");
-    for (const auto& item : envTokens) {
-        if (item.rfind("STY=", 0) == 0 && item.size() > 4) {
-            return item.substr(4);
+    int curPid = pid;
+    for (int hop = 0; hop <= 10 && curPid > 1; ++hop) {
+        auto envTokens = readProcNulTokens("/proc/" + std::to_string(curPid) + "/environ");
+        for (const auto& item : envTokens) {
+            if (item.rfind("STY=", 0) == 0 && item.size() > 4) {
+                return item.substr(4);
+            }
         }
+        curPid = readParentPidFromProcStat(curPid);
     }
     return "";
+}
+
+void detectMultiplexerForPid(int startPid,
+                             std::string& outMuxType,
+                             std::string& outMuxSession,
+                             std::string& outMuxTarget,
+                             std::string& outScreenSession) {
+    outMuxType.clear();
+    outMuxSession.clear();
+    outMuxTarget.clear();
+    outScreenSession.clear();
+
+    std::string sty;
+    std::string windowIdx;
+    std::string tmuxEnv;
+    std::string tmuxPane;
+    std::string zellijSession;
+    std::string weztermPane;
+    std::string kittyListen;
+    std::string kittyWindow;
+    int screenAncestorPid = 0;
+
+    auto inspectEnvTokens = [&](const std::vector<std::string>& envTokens) {
+        for (const auto& item : envTokens) {
+            if (sty.empty() && item.rfind("STY=", 0) == 0 && item.size() > 4) {
+                sty = item.substr(4);
+            } else if (windowIdx.empty() && item.rfind("WINDOW=", 0) == 0 && item.size() > 7) {
+                windowIdx = item.substr(7);
+            } else if (tmuxEnv.empty() && item.rfind("TMUX=", 0) == 0 && item.size() > 5) {
+                tmuxEnv = item.substr(5);
+            } else if (tmuxPane.empty() && item.rfind("TMUX_PANE=", 0) == 0 && item.size() > 10) {
+                tmuxPane = item.substr(10);
+            } else if (zellijSession.empty() && item.rfind("ZELLIJ_SESSION_NAME=", 0) == 0 && item.size() > 20) {
+                zellijSession = item.substr(20);
+            } else if (weztermPane.empty() && item.rfind("WEZTERM_PANE=", 0) == 0 && item.size() > 13) {
+                weztermPane = item.substr(13);
+            } else if (kittyListen.empty() && item.rfind("KITTY_LISTEN_ON=", 0) == 0 && item.size() > 16) {
+                kittyListen = item.substr(16);
+            } else if (kittyWindow.empty() && item.rfind("KITTY_WINDOW_ID=", 0) == 0 && item.size() > 16) {
+                kittyWindow = item.substr(16);
+            }
+        }
+    };
+
+    int curPid = startPid;
+    for (int hop = 0; hop <= 10 && curPid > 1; ++hop) {
+        inspectEnvTokens(readProcNulTokens("/proc/" + std::to_string(curPid) + "/environ"));
+        try {
+            std::ifstream commIfs("/proc/" + std::to_string(curPid) + "/comm");
+            std::string comm;
+            if (commIfs.is_open() && std::getline(commIfs, comm)) {
+                comm = trimString(comm);
+                if (comm == "SCREEN" && screenAncestorPid == 0) {
+                    screenAncestorPid = curPid;
+                }
+            }
+        } catch (...) {}
+        curPid = readParentPidFromProcStat(curPid);
+    }
+
+    if (sty.empty() && screenAncestorPid > 0) {
+        sty = std::to_string(screenAncestorPid);
+    }
+
+    if (!sty.empty()) {
+        outMuxType = "screen";
+        outMuxSession = sty;
+        outMuxTarget = windowIdx.empty() ? "0" : windowIdx;
+        outScreenSession = sty;
+        return;
+    }
+
+    if (!tmuxEnv.empty() || !tmuxPane.empty()) {
+        std::string socketPath;
+        std::string sessionIdx;
+        if (!tmuxEnv.empty()) {
+            size_t firstComma = tmuxEnv.find(',');
+            if (firstComma != std::string::npos) {
+                socketPath = tmuxEnv.substr(0, firstComma);
+                size_t secondComma = tmuxEnv.find(',', firstComma + 1);
+                if (secondComma != std::string::npos && (secondComma + 1) < tmuxEnv.size()) {
+                    sessionIdx = tmuxEnv.substr(secondComma + 1);
+                }
+            } else {
+                socketPath = tmuxEnv;
+            }
+        }
+        outMuxType = "tmux";
+        outMuxSession = socketPath;
+        outMuxTarget = !tmuxPane.empty() ? tmuxPane : sessionIdx;
+        return;
+    }
+
+    if (!zellijSession.empty()) {
+        outMuxType = "zellij";
+        outMuxSession = zellijSession;
+        outMuxTarget = zellijSession;
+        return;
+    }
+
+    if (!weztermPane.empty()) {
+        outMuxType = "wezterm";
+        outMuxSession = weztermPane;
+        outMuxTarget = weztermPane;
+        return;
+    }
+
+    if (!kittyListen.empty() && !kittyWindow.empty()) {
+        outMuxType = "kitty";
+        outMuxSession = kittyListen;
+        outMuxTarget = kittyWindow;
+        return;
+    }
 }
 
 bool isCursorSubagentSession(const std::string& sessionId) {
@@ -364,7 +502,11 @@ json createDefaultState(const std::string& sessionId,
         {"start_ts", nowSec},
         {"updated_ts", nowSec},
         {"owner_pid", 0},
+        {"mux_type", ""},
+        {"mux_session", ""},
+        {"mux_target", ""},
         {"screen_session", ""},
+        {"source", ""},
         {"status", "RUNNING"},
         {"step", 0},
         {"tools", 0},
@@ -428,8 +570,20 @@ json loadSessionState(const std::string& stateDir,
     if (!state.contains("owner_pid") || !state["owner_pid"].is_number_integer()) {
         state["owner_pid"] = 0;
     }
+    if (!state.contains("mux_type") || !state["mux_type"].is_string()) {
+        state["mux_type"] = "";
+    }
+    if (!state.contains("mux_session") || !state["mux_session"].is_string()) {
+        state["mux_session"] = "";
+    }
+    if (!state.contains("mux_target") || !state["mux_target"].is_string()) {
+        state["mux_target"] = "";
+    }
     if (!state.contains("screen_session") || !state["screen_session"].is_string()) {
         state["screen_session"] = "";
+    }
+    if (!state.contains("source") || !state["source"].is_string()) {
+        state["source"] = "";
     }
     if (!state.contains("status") || !state["status"].is_string()) {
         state["status"] = "RUNNING";
@@ -474,16 +628,43 @@ void saveSessionState(const std::string& stateDir,
     if (!AgentTelemetryDb::isValidSessionId(sid)) {
         return;
     }
-    int ppid = ::getppid();
+    int ownerPid = 0;
     std::string screenSess;
-    bool interactiveCli = AgentHookHandler::isInteractiveCliProcess(ppid, provider, &screenSess);
+    int curPid = ::getppid();
+    for (int hop = 0; hop < 12 && curPid > 1; ++hop) {
+        if (AgentHookHandler::isInteractiveCliProcess(curPid, provider, &screenSess)) {
+            ownerPid = curPid;
+            break;
+        }
+        curPid = readParentPidFromProcStat(curPid);
+    }
+
     if (provider == "cursor" && (isCursorSubagentSession(sid) || sid.rfind("agent-", 0) == 0)) {
         state["is_subagent"] = true;
-    } else if (interactiveCli) {
-        state["owner_pid"] = ppid;
+    } else if (ownerPid > 0) {
+        state["owner_pid"] = ownerPid;
+    }
+
+    if (ownerPid > 0) {
+        state["source"] = "cli";
+    } else if (state.value("source", "") != "cli") {
+        state["source"] = "ide";
+    }
+
+    int muxStartPid = (ownerPid > 0) ? ownerPid : ::getppid();
+    std::string muxType;
+    std::string muxSession;
+    std::string muxTarget;
+    std::string detectedScreen;
+    detectMultiplexerForPid(muxStartPid, muxType, muxSession, muxTarget, detectedScreen);
+
+    if (!muxType.empty()) {
+        state["mux_type"] = muxType;
+        state["mux_session"] = muxSession;
+        state["mux_target"] = muxTarget;
     }
     if (screenSess.empty()) {
-        screenSess = readScreenSessionFromProc(ppid);
+        screenSess = detectedScreen;
     }
     if (!screenSess.empty()) {
         state["screen_session"] = screenSess;
@@ -812,6 +993,7 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
             provider = "antigravity";
         } else if (provider.empty()) {
             if (eventName == "SessionStart" || eventName == "UserPromptSubmit" ||
+                eventName == "PreToolUse" ||
                 eventName == "PostToolUse" || eventName == "PostToolUseFailure" ||
                 eventName == "Stop" || eventName == "SessionEnd") {
                 provider = "claude";
@@ -827,9 +1009,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
         if (provider == "antigravity") {
             std::string rawConvId = firstString(payload, {"conversationId", "conversation_id", "session_id"});
             if (!rawConvId.empty() && !AgentTelemetryDb::isValidSessionId(rawConvId)) {
-                db.logDiagnostic("WARN", "hook", "", "antigravity",
-                                 "Rejected invalid session_id in hook",
-                                 {{"raw_session_id", rawConvId.substr(0, 64)}});
                 return false;
             }
             recordAgyLsEndpointFromEnv(stateDir, payload);
@@ -884,9 +1063,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                 db.insertEvent(ev);
             } else if (eventKindOverride == "session-start") {
                 db.recordSessionStart(agySid, rawConvId, "antigravity", workspace, model, nowSec);
-                db.logDiagnostic("INFO", "hook", rawConvId, "antigravity",
-                                 "Antigravity session started",
-                                 {{"session_id", agySid}, {"workspace", workspace}, {"model", model}});
             }
             return true;
         }
@@ -895,10 +1071,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
         std::string rawSessionId = firstString(payload, {"conversation_id", "session_id"});
         if (!rawSessionId.empty()) {
             if (!AgentTelemetryDb::isValidSessionId(rawSessionId)) {
-                db.logDiagnostic("WARN", "hook", "", provider,
-                                 "Rejected invalid session_id in hook",
-                                 {{"raw_session_id", rawSessionId.substr(0, 64)},
-                                  {"event", eventName}});
                 return false;
             }
             if (provider == "cursor" && !isCursorSubagentSession(rawSessionId)) {
@@ -909,9 +1081,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
         }
 
         if (rawSessionId.empty() || !AgentTelemetryDb::isValidSessionId(rawSessionId)) {
-            db.logDiagnostic("WARN", "hook", "", provider,
-                             "Rejected missing or invalid session_id in hook",
-                             {{"event", eventName}});
             return false;
         }
 
@@ -928,19 +1097,34 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                 if (!state.value("started", false)) {
                     db.recordSessionStart(cid, cid, "claude",
                                           state.value("workspace", ""),
-                                          state.value("model", "Claude"), nowSec);
+                                          state.value("model", "Claude"),
+                                          state.value("start_ts", nowSec));
                     state["started"] = true;
                 }
             };
 
             if (eventName == "SessionStart") {
-                state = createDefaultState(cid, workspace, model, nowSec);
+                bool isFresh = (state.value("turns", 0) == 0 &&
+                                state.value("first_prompt", "").empty());
+                bool wasStarted = state.value("started", false);
                 state["started"] = true;
-                state["status"] = "RUNNING";
+                if (isFresh) {
+                    state["status"] = "IDLE";
+                } else if (state.value("status", "") != "RUNNING") {
+                    state["status"] = "COMPLETED";
+                }
                 saveSessionState(stateDir, "claude", state);
-                db.recordSessionStart(cid, cid, "claude", workspace, model, nowSec);
-                db.logDiagnostic("INFO", "hook", cid, "claude", "Claude session started",
-                                 {{"workspace", workspace}, {"model", model}});
+                if (isFresh && !wasStarted) {
+                    db.recordSessionStart(cid, cid, "claude",
+                                          state.value("workspace", ""),
+                                          state.value("model", "Claude"),
+                                          state.value("start_ts", nowSec));
+                    db.touchSession(cid, "IDLE", nowSec);
+                } else if (isFresh) {
+                    db.touchSession(cid, "IDLE", nowSec);
+                } else {
+                    db.touchSession(cid, state.value("status", "COMPLETED"), nowSec);
+                }
             } else if (eventName == "UserPromptSubmit") {
                 ensureStarted();
                 state["prompt_ts"] = nowSec;
@@ -955,9 +1139,12 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                     state["last_prompt"] = summaryPrompt;
                 }
                 saveSessionState(stateDir, "claude", state);
-                db.logDiagnostic("INFO", "hook", cid, "claude", "Claude prompt submitted",
-                                 {{"workspace", state.value("workspace", "")},
-                                  {"model", state.value("model", "Claude")}});
+                db.touchSession(cid, "RUNNING", nowSec);
+            } else if (eventName == "PreToolUse") {
+                ensureStarted();
+                state["status"] = "RUNNING";
+                saveSessionState(stateDir, "claude", state);
+                db.touchSession(cid, "RUNNING", nowSec);
             } else if (eventName == "PostToolUse" || eventName == "PostToolUseFailure") {
                 ensureStarted();
                 bool failed = (eventName == "PostToolUseFailure");
@@ -1014,11 +1201,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                                       state.value("turns", 0), 0, 0,
                                       tools, errors, 0.0,
                                       state.value("start_ts", nowSec), nowSec);
-                if (failed) {
-                    db.logDiagnostic("WARN", "hook", cid, "claude",
-                                     "Claude tool execution failed: " + toolName,
-                                     {{"tool_name", toolName}, {"step_index", step}});
-                }
             } else if (eventName == "Stop") {
                 ensureStarted();
                 int64_t promptTs = state.value("prompt_ts", int64_t(0));
@@ -1032,7 +1214,7 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                 int step = state.value("step", 0) + 1;
                 state["turns"] = turns;
                 state["step"] = step;
-                state["status"] = "RUNNING";
+                state["status"] = "COMPLETED";
                 saveSessionState(stateDir, "claude", state);
 
                 AgentLifecycleEvent ev;
@@ -1049,14 +1231,12 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                 db.insertEvent(ev);
 
                 double avgTurnMs = (turns > 0) ? (turnMsTotal / turns) : 0.0;
-                db.updateSessionStats(cid, "RUNNING",
+                db.updateSessionStats(cid, "COMPLETED",
                                       turns, 0, 0,
                                       state.value("tools", 0),
                                       state.value("errors", 0),
                                       avgTurnMs,
                                       state.value("start_ts", nowSec), nowSec);
-                db.logDiagnostic("INFO", "hook", cid, "claude", "Claude turn stopped",
-                                 {{"turns", turns}, {"tools", state.value("tools", 0)}});
             } else if (eventName == "SessionEnd") {
                 auto ppidTokens = readProcNulTokens("/proc/" + std::to_string(::getppid()) + "/cmdline");
                 if (isOneShotTokens(ppidTokens)) {
@@ -1076,8 +1256,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                                     state.value("tools", 0),
                                     state.value("errors", 0),
                                     avgTurnMs, nowSec);
-                db.logDiagnostic("INFO", "hook", cid, "claude", "Claude session ended",
-                                 {{"turns", turns}, {"tools", state.value("tools", 0)}});
             }
             return true;
         }
@@ -1086,16 +1264,27 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
         json state = loadSessionState(stateDir, cid, workspace, model, "Cursor", nowSec);
 
         if (eventName == "sessionStart") {
-            state = createDefaultState(cid, workspace, model, nowSec);
+            bool isFresh = (state.value("turns", 0) == 0 &&
+                            state.value("first_prompt", "").empty());
+            bool wasStarted = state.value("started", false);
             state["started"] = true;
-            state["status"] = "RUNNING";
+            if (isFresh) {
+                state["status"] = "IDLE";
+            } else if (state.value("status", "") != "RUNNING") {
+                state["status"] = "COMPLETED";
+            }
             saveSessionState(stateDir, "cursor", state);
-            db.recordSessionStart(cid, cid, "cursor",
-                                  state.value("workspace", ""),
-                                  state.value("model", "Cursor"), nowSec);
-            db.logDiagnostic("INFO", "hook", cid, "cursor", "Cursor session started",
-                             {{"workspace", state.value("workspace", "")},
-                              {"model", state.value("model", "Cursor")}});
+            if (isFresh && !wasStarted) {
+                db.recordSessionStart(cid, cid, "cursor",
+                                      state.value("workspace", ""),
+                                      state.value("model", "Cursor"),
+                                      state.value("start_ts", nowSec));
+                db.touchSession(cid, "IDLE", nowSec);
+            } else if (isFresh) {
+                db.touchSession(cid, "IDLE", nowSec);
+            } else {
+                db.touchSession(cid, state.value("status", "COMPLETED"), nowSec);
+            }
         } else if (eventName == "beforeSubmitPrompt") {
             std::string rawPrompt = firstString(payload, {"prompt", "text", "user_prompt"});
             std::string scrubbedPrompt = AgentTelemetryDb::scrubSecrets(rawPrompt);
@@ -1111,6 +1300,7 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                 }
                 state["last_prompt"] = shortPrompt;
             }
+            bool wasStarted = state.value("started", false);
             state["status"] = "RUNNING";
             state["started"] = true;
             int step = state.value("step", 0) + 1;
@@ -1130,10 +1320,12 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                 appendAtomicJsonl0600(stateDir, jsonlPath, userLine);
             }
 
-            db.recordSessionStart(cid, cid, "cursor",
-                                  state.value("workspace", ""),
-                                  state.value("model", "Cursor"),
-                                  state.value("start_ts", nowSec));
+            if (!wasStarted && state.value("turns", 0) == 0 && state.value("tools", 0) == 0) {
+                db.recordSessionStart(cid, cid, "cursor",
+                                      state.value("workspace", ""),
+                                      state.value("model", "Cursor"),
+                                      state.value("start_ts", nowSec));
+            }
 
             AgentLifecycleEvent ev;
             ev.timestamp = nowSec;
@@ -1149,10 +1341,10 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
             };
             db.insertEvent(ev);
             db.touchSession(cid, "RUNNING", nowSec);
-            db.logDiagnostic("INFO", "hook", cid, "cursor", "Cursor prompt submitted",
-                             {{"workspace", state.value("workspace", "")},
-                              {"model", state.value("model", "Cursor")},
-                              {"step_index", step}});
+        } else if (eventName == "preToolUse" || eventName == "PreToolUse") {
+            state["status"] = "RUNNING";
+            saveSessionState(stateDir, "cursor", state);
+            db.touchSession(cid, "RUNNING", nowSec);
         } else if (eventName == "afterAgentThought") {
             std::string rawText = firstString(payload, {"text", "thought", "thinking"});
             std::string scrubbedText = AgentTelemetryDb::scrubSecrets(rawText);
@@ -1270,11 +1462,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                                   state.value("comp_tokens", 0),
                                   tools, errors, 0.0,
                                   state.value("start_ts", nowSec), nowSec);
-            if (failed) {
-                db.logDiagnostic("WARN", "hook", cid, "cursor",
-                                 "Cursor tool execution failed: " + toolName,
-                                 {{"tool_name", toolName}, {"step_index", step}});
-            }
         } else if (eventName == "subagentStart" || eventName == "subagentStop") {
             int activeSubs = state.value("active_subagents", 0);
             if (eventName == "subagentStart") {
@@ -1296,13 +1483,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                 }
                 saveSessionState(stateDir, "cursor", subState);
             }
-            db.logDiagnostic("INFO", "hook", cid, "cursor",
-                             eventName == "subagentStart"
-                                 ? "Cursor subagent started"
-                                 : "Cursor subagent stopped",
-                             {{"event", eventName},
-                              {"subagent_id", subId},
-                              {"active_subagents", activeSubs}});
         } else if (eventName == "stop") {
             int turns = state.value("turns", 0) + 1;
             int step = state.value("step", 0) + 1;
@@ -1355,10 +1535,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                                   state.value("tools", 0),
                                   state.value("errors", 0),
                                   avgTurnMs, startTs, nowSec);
-            db.logDiagnostic("INFO", "hook", cid, "cursor", "Cursor turn stopped",
-                             {{"status", finalStatus},
-                              {"turns", turns},
-                              {"tools", state.value("tools", 0)}});
         } else if (eventName == "sessionEnd") {
             auto ppidTokens = readProcNulTokens("/proc/" + std::to_string(::getppid()) + "/cmdline");
             if (isOneShotTokens(ppidTokens)) {
@@ -1401,10 +1577,6 @@ bool AgentHookHandler::processPayload(const nlohmann::json& payload,
                                 state.value("tools", 0),
                                 state.value("errors", 0),
                                 avgTurnMs, nowSec);
-            db.logDiagnostic("INFO", "hook", cid, "cursor", "Cursor session ended",
-                             {{"status", finalStatus},
-                              {"turns", turns},
-                              {"tools", state.value("tools", 0)}});
         }
 
         return true;

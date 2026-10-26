@@ -70,7 +70,6 @@ static void printUsage(const char* progName) {
               << "  web                    Run embedded web dashboard server\n"
               << "  mcp                    Run as stdio JSON-RPC 2.0 MCP server for AI agents\n"
               << "  hook [cursor|claude|antigravity]  Process IDE/CLI lifecycle hook event from stdin\n"
-              << "  diag [sessions|session|logs|trace] Run local gateway & session diagnostics CLI\n"
               << "  insights [subcommand]  Run usage insights CLI (findings|report|rebuild|export|digest|compare)\n\n"
               << "Options:\n"
               << "  --config <path>        Custom path to configuration file (default: ~/.config/aimon/config.json)\n"
@@ -114,83 +113,6 @@ int main(int argc, char* argv[]) {
 
     if (command == "hook") {
         return AgentHookHandler::run(argc - argIdx + 1, &argv[argIdx - 1], std::cin, std::cout);
-    }
-
-    if (command == "diag") {
-        std::string subcmd = "sessions";
-        if (argIdx < argc && argv[argIdx][0] != '-') {
-            subcmd = argv[argIdx++];
-        }
-        std::string targetId;
-        if ((subcmd == "session" || subcmd == "trace") && argIdx < argc && argv[argIdx][0] != '-') {
-            targetId = argv[argIdx++];
-        }
-
-        int limit = 100;
-        std::string cidFilter;
-        std::string reqFilter;
-        std::string catFilter;
-        std::string lvlFilter;
-        std::string providerFilter;
-        std::string customDbPath;
-
-        while (argIdx < argc) {
-            std::string arg = argv[argIdx++];
-            if (arg == "--limit" && argIdx < argc) {
-                limit = std::stoi(argv[argIdx++]);
-            } else if ((arg == "--cid" || arg == "--id") && argIdx < argc) {
-                cidFilter = argv[argIdx++];
-                if (targetId.empty()) targetId = cidFilter;
-            } else if (arg == "--req" && argIdx < argc) {
-                reqFilter = argv[argIdx++];
-                if (targetId.empty()) targetId = reqFilter;
-            } else if (arg == "--category" && argIdx < argc) {
-                catFilter = argv[argIdx++];
-            } else if (arg == "--level" && argIdx < argc) {
-                lvlFilter = argv[argIdx++];
-            } else if (arg == "--provider" && argIdx < argc) {
-                providerFilter = argv[argIdx++];
-            } else if (arg == "--db" && argIdx < argc) {
-                customDbPath = argv[argIdx++];
-            } else if (arg == "--help" || arg == "-h") {
-                printUsage(argv[0]);
-                return 0;
-            } else if (targetId.empty() && !arg.empty() && arg[0] != '-') {
-                targetId = arg;
-            }
-        }
-
-        auto& db = AgentTelemetryDb::getInstance();
-        if (!db.open(customDbPath)) {
-            std::cerr << "[aimon diag] Failed to open telemetry database.\n";
-            return 1;
-        }
-
-        if (subcmd == "logs") {
-            std::cout << db.queryDiagnostics(limit, cidFilter, catFilter, lvlFilter, reqFilter).dump(2) << "\n";
-            return 0;
-        } else if (subcmd == "trace") {
-            if (targetId.empty()) {
-                std::cerr << "[aimon diag] Usage: aimon diag trace <request_id_or_conversation_id>\n";
-                return 1;
-            }
-            std::cout << db.queryTrace(targetId, limit > 0 ? limit : 500).dump(2) << "\n";
-            return 0;
-        } else if (subcmd == "sessions") {
-            std::cout << WebServer::diagnoseSessions(providerFilter).dump(2) << "\n";
-            return 0;
-        } else if (subcmd == "session") {
-            if (targetId.empty() || !AgentTelemetryDb::isValidSessionId(targetId)) {
-                std::cerr << "[aimon diag] Invalid or missing session ID.\n";
-                return 1;
-            }
-            auto res = WebServer::inspectSession(targetId);
-            std::cout << res.dump(2) << "\n";
-            return res.value("ok", true) ? 0 : 1;
-        } else {
-            std::cerr << "[aimon diag] Unknown subcommand: " << subcmd << "\n";
-            return 1;
-        }
     }
 
     if (command == "insights") {
@@ -356,7 +278,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Load configuration
-    ConfigManager configMgr;
+    ConfigManager& configMgr = ConfigManager::getInstance();
     configMgr.load(customConfigPath);
     AimonConfig& cfg = configMgr.getConfig();
 
@@ -384,9 +306,9 @@ int main(int argc, char* argv[]) {
     int64_t lastInsightRebuildEpoch = 0;
 
     AgentTelemetryDb::getInstance().open();
-    AgentTelemetryDb::getInstance().setDiagnosticsConfig(cfg.diagnostics);
-    AgentTelemetryDb::getInstance().rollupAndPrune(
-        cfg.diagnostics.telemetryRetentionDays > 0 ? cfg.diagnostics.telemetryRetentionDays : 14);
+    int initialRetDays = cfg.gateway.telemetryRetentionDays;
+    if (initialRetDays < 1 || initialRetDays > 365) initialRetDays = 14;
+    AgentTelemetryDb::getInstance().rollupAndPrune(initialRetDays);
     int64_t lastTelemetryPruneEpoch = static_cast<int64_t>(std::time(nullptr));
     MobileGateway::getInstance().init(PathUtils::getAimonConfigDir() + "/mobile_devices.json");
 
@@ -461,8 +383,9 @@ int main(int argc, char* argv[]) {
 
         if (nowEpoch - lastTelemetryPruneEpoch >= 21600) {
             lastTelemetryPruneEpoch = nowEpoch;
-            int retDays = AgentTelemetryDb::getInstance().getDiagnosticsConfig().telemetryRetentionDays;
-            AgentTelemetryDb::getInstance().rollupAndPrune(retDays > 0 ? retDays : 14);
+            int retDays = ConfigManager::getInstance().getConfigSnapshot().gateway.telemetryRetentionDays;
+            if (retDays < 1 || retDays > 365) retDays = 14;
+            AgentTelemetryDb::getInstance().rollupAndPrune(retDays);
         }
 
         if (cfg.history.enabled) {
