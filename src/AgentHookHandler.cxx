@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <fcntl.h>
 
 namespace fs = std::filesystem;
@@ -750,6 +751,12 @@ bool saveAgyEndpointEntry(const std::string& stateDir,
 
     ensureStateDirPerms(stateDir);
     std::string epPath = stateDir + "/agy_ls_endpoints.json";
+    std::string lockPath = epPath + ".lock";
+    int lockFd = ::open(lockPath.c_str(), O_CREAT | O_RDWR, 0600);
+    if (lockFd >= 0) {
+        (void)::flock(lockFd, LOCK_EX);
+    }
+
     json data = json::object();
     try {
         if (fs::exists(epPath)) {
@@ -783,27 +790,12 @@ bool saveAgyEndpointEntry(const std::string& stateDir,
         {"model", effModel},
         {"updated_at", static_cast<int64_t>(std::time(nullptr))}
     };
-    return writeAtomicFile0600(stateDir, epPath, data.dump());
-}
-
-void recordAgyLsEndpointFromEnv(const std::string& stateDir, const json& payload) {
-    const char* lsEnv = std::getenv("ANTIGRAVITY_LS_ADDRESS");
-    const char* csrfEnv = std::getenv("ANTIGRAVITY_CSRF_TOKEN");
-    const char* cidEnv = std::getenv("ANTIGRAVITY_CONVERSATION_ID");
-    std::string lsAddr = lsEnv ? trimString(lsEnv) : "";
-    std::string csrf = csrfEnv ? trimString(csrfEnv) : "";
-    std::string convId = firstString(payload, {"conversationId", "conversation_id"});
-    if (convId.empty() && cidEnv) {
-        convId = trimString(cidEnv);
+    bool ok = writeAtomicFile0600(stateDir, epPath, data.dump());
+    if (lockFd >= 0) {
+        (void)::flock(lockFd, LOCK_UN);
+        ::close(lockFd);
     }
-    std::string workspace = extractWorkspace(payload, "antigravity");
-    if (workspace.empty()) {
-        try {
-            workspace = fs::current_path().string();
-        } catch (...) {}
-    }
-    std::string model = extractModel(payload, "antigravity");
-    saveAgyEndpointEntry(stateDir, lsAddr, csrf, convId, workspace, model);
+    return ok;
 }
 
 std::vector<int> findAncestorAgyPids() {
@@ -841,6 +833,71 @@ std::vector<int> findAncestorAgyPids() {
     return pids;
 }
 
+void resolveAncestorAgyContext(std::string& ioConvId, std::string& ioWorkspace) {
+    auto agyPids = findAncestorAgyPids();
+    for (int apid : agyPids) {
+        std::string pidStr = std::to_string(apid);
+        if (ioWorkspace.empty()) {
+            std::error_code ec;
+            auto cwdPath = fs::read_symlink("/proc/" + pidStr + "/cwd", ec);
+            if (!ec && !cwdPath.empty()) {
+                ioWorkspace = cwdPath.string();
+            }
+        }
+        if (ioConvId.empty()) {
+            std::error_code ec;
+            std::string fdDir = "/proc/" + pidStr + "/fd";
+            if (fs::exists(fdDir, ec)) {
+                for (const auto& fdEntry : fs::directory_iterator(fdDir, ec)) {
+                    if (ec) break;
+                    std::error_code linkEc;
+                    if (!fs::is_symlink(fdEntry.path(), linkEc) || linkEc) continue;
+                    std::string target = fs::read_symlink(fdEntry.path(), linkEc).string();
+                    if (linkEc || target.empty()) continue;
+                    const std::string deletedSuffix = " (deleted)";
+                    if (target.size() > deletedSuffix.size() &&
+                        target.compare(target.size() - deletedSuffix.size(), deletedSuffix.size(), deletedSuffix) == 0) {
+                        target.resize(target.size() - deletedSuffix.size());
+                    }
+                    auto presPos = target.find("/presence/");
+                    if (presPos != std::string::npos && target.size() > presPos + 15 &&
+                        target.compare(target.size() - 5, 5, ".lock") == 0) {
+                        std::string lockName = target.substr(presPos + 10);
+                        if (lockName.size() > 5) {
+                            ioConvId = lockName.substr(0, lockName.size() - 5);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!ioConvId.empty() && !ioWorkspace.empty()) {
+            break;
+        }
+    }
+}
+
+void recordAgyLsEndpointFromEnv(const std::string& stateDir, const json& payload) {
+    const char* lsEnv = std::getenv("ANTIGRAVITY_LS_ADDRESS");
+    const char* csrfEnv = std::getenv("ANTIGRAVITY_CSRF_TOKEN");
+    const char* cidEnv = std::getenv("ANTIGRAVITY_CONVERSATION_ID");
+    std::string lsAddr = lsEnv ? trimString(lsEnv) : "";
+    std::string csrf = csrfEnv ? trimString(csrfEnv) : "";
+    std::string convId = firstString(payload, {"conversationId", "conversation_id"});
+    if (convId.empty() && cidEnv) {
+        convId = trimString(cidEnv);
+    }
+    std::string workspace = extractWorkspace(payload, "antigravity");
+    resolveAncestorAgyContext(convId, workspace);
+    if (workspace.empty()) {
+        try {
+            workspace = fs::current_path().string();
+        } catch (...) {}
+    }
+    std::string model = extractModel(payload, "antigravity");
+    saveAgyEndpointEntry(stateDir, lsAddr, csrf, convId, workspace, model);
+}
+
 void spawnAgyChildEnvWatcher(const std::string& stateDir, const json& payload) {
     auto agyPids = findAncestorAgyPids();
     if (agyPids.empty()) {
@@ -848,6 +905,7 @@ void spawnAgyChildEnvWatcher(const std::string& stateDir, const json& payload) {
     }
     std::string convId = firstString(payload, {"conversationId", "conversation_id"});
     std::string workspace = extractWorkspace(payload, "antigravity");
+    resolveAncestorAgyContext(convId, workspace);
     if (workspace.empty()) {
         try {
             workspace = fs::current_path().string();
@@ -873,16 +931,28 @@ void spawnAgyChildEnvWatcher(const std::string& stateDir, const json& payload) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(450);
     while (std::chrono::steady_clock::now() < deadline) {
         for (int apid : agyPids) {
-            std::string taskDir = "/proc/" + std::to_string(apid) + "/task";
+            std::string pidStr = std::to_string(apid);
+            std::string taskDir = "/proc/" + pidStr + "/task";
             try {
                 if (!fs::exists(taskDir)) continue;
                 std::set<std::string> childPids;
-                for (const auto& tidEntry : fs::directory_iterator(taskDir)) {
-                    std::ifstream cIfs(tidEntry.path() / "children");
+                std::ifstream mainChildrenIfs(taskDir + "/" + pidStr + "/children");
+                if (mainChildrenIfs.is_open()) {
                     std::string tok;
-                    while (cIfs >> tok) {
+                    while (mainChildrenIfs >> tok) {
                         if (!tok.empty() && std::all_of(tok.begin(), tok.end(), ::isdigit)) {
                             childPids.insert(tok);
+                        }
+                    }
+                }
+                if (childPids.empty()) {
+                    for (const auto& tidEntry : fs::directory_iterator(taskDir)) {
+                        std::ifstream cIfs(tidEntry.path() / "children");
+                        std::string tok;
+                        while (cIfs >> tok) {
+                            if (!tok.empty() && std::all_of(tok.begin(), tok.end(), ::isdigit)) {
+                                childPids.insert(tok);
+                            }
                         }
                     }
                 }
@@ -907,7 +977,7 @@ void spawnAgyChildEnvWatcher(const std::string& stateDir, const json& payload) {
                 }
             } catch (...) {}
         }
-        ::usleep(2000);
+        ::usleep(200);
     }
     ::_exit(0);
 }

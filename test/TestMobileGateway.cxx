@@ -3927,8 +3927,8 @@ static void RuntimeConfigAndStrictSameProcessRelayControlPlane_LocksAndTelemetry
         assert(gwJson.value("telemetry_retention_days", 0) == 30);
     }
 
-    // 3. Verify terminal-locked agy session without registered CSRF token is marked interactive == false
-    //    and rejected with 409 Conflict on POST /api/agent/prompt without invoking mockAgyBin
+    // 3. Verify terminal-locked agy session remains interactive in GET /api/agent/conversations & GET /api/agent/transcript,
+    //    and POST /api/agent/prompt rejects hijacking/spawning with 409 Conflict when hermetic CSRF is absent
     {
         auto rConvs = client.Get("/api/agent/conversations", headers);
         assert(rConvs && rConvs->status == 200);
@@ -3938,8 +3938,8 @@ static void RuntimeConfigAndStrictSameProcessRelayControlPlane_LocksAndTelemetry
             if (c.value("id", "") == lockedCid) {
                 sawLocked = true;
                 assert(c.value("openInTerminal", false) == true);
-                assert(c.value("interactive", true) == false);
-                assert(!c.value("nonInteractiveReason", "").empty());
+                assert(c.value("interactive", false) == true);
+                assert(c.value("nonInteractiveReason", "") == "");
             }
         }
         assert(sawLocked);
@@ -3947,8 +3947,8 @@ static void RuntimeConfigAndStrictSameProcessRelayControlPlane_LocksAndTelemetry
         auto rTrans = client.Get(("/api/agent/transcript?id=" + lockedCid).c_str(), headers);
         assert(rTrans && rTrans->status == 200);
         json tj = json::parse(rTrans->body);
-        assert(tj.value("interactive", true) == false);
-        assert(!tj.value("nonInteractiveReason", "").empty());
+        assert(tj.value("interactive", false) == true);
+        assert(tj.value("nonInteractiveReason", "") == "");
 
         json promptReq = {
             {"agentId", "antigravity"},

@@ -42,8 +42,10 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <fcntl.h>
 #include <pwd.h>
 #include <signal.h>
 
@@ -76,6 +78,24 @@ static std::string extractOrGenerateRequestId(const httplib::Request& req) {
 static std::mutex s_cachedCliTokensMutex;
 static std::map<int, std::string> s_cachedCliTokens;
 static std::atomic<int64_t> s_lastProcHarvestSec{0};
+static std::atomic<int64_t> s_lastSidecarTouchMs{0};
+
+static bool triggerAgySidecarReregistration(bool force = false) {
+    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t lastMs = s_lastSidecarTouchMs.load();
+    if (!force && lastMs > 0 && (nowMs - lastMs) < 2500) {
+        return false;
+    }
+    std::string sidecarPath = PathUtils::expandHome(
+        "~/.gemini/config/sidecars/aimon-ls-registrar/sidecar.json");
+    std::error_code ec;
+    if (!fs::exists(sidecarPath, ec)) {
+        return false;
+    }
+    s_lastSidecarTouchMs.store(nowMs);
+    return (::utimensat(AT_FDCWD, sidecarPath.c_str(), nullptr, 0) == 0);
+}
 
 struct AgyProcessInfo {
     pid_t pid = 0;
@@ -340,30 +360,57 @@ static std::map<int, std::pair<std::string, std::string>> syncAndPruneCliEndpoin
 
     nlohmann::json ej = {{"endpoints", nlohmann::json::object()}};
     std::map<int, int64_t> fileUpdatedAt;
-    if (fs::exists(epStatePath)) {
-        try {
-            std::ifstream ef(epStatePath);
-            auto parsed = nlohmann::json::parse(ef, nullptr, false);
-            if (!parsed.is_discarded() && parsed.is_object()) {
-                ej = std::move(parsed);
-            }
-        } catch (...) {}
-    }
-    if (!ej.contains("endpoints") || !ej["endpoints"].is_object()) {
-        ej["endpoints"] = nlohmann::json::object();
-    }
-
-    for (auto it = ej["endpoints"].begin(); it != ej["endpoints"].end(); ++it) {
-        if (!it.value().is_object()) continue;
-        int p = it.value().value("port", 0);
-        if (p <= 0) {
-            try { p = std::stoi(it.key()); } catch (...) { p = 0; }
+    auto reloadEndpointsFromFile = [&]() {
+        if (fs::exists(epStatePath)) {
+            try {
+                std::ifstream ef(epStatePath);
+                auto parsed = nlohmann::json::parse(ef, nullptr, false);
+                if (!parsed.is_discarded() && parsed.is_object()) {
+                    ej = std::move(parsed);
+                }
+            } catch (...) {}
         }
-        std::string tok = it.value().value("csrf_token", "");
-        int64_t upd = it.value().value("updated_at", static_cast<int64_t>(0));
-        if (p > 0 && p <= 65535 && !tok.empty()) {
-            s_cachedCliTokens[p] = tok;
-            fileUpdatedAt[p] = upd;
+        if (!ej.contains("endpoints") || !ej["endpoints"].is_object()) {
+            ej["endpoints"] = nlohmann::json::object();
+        }
+        for (auto it = ej["endpoints"].begin(); it != ej["endpoints"].end(); ++it) {
+            if (!it.value().is_object()) continue;
+            int p = it.value().value("port", 0);
+            if (p <= 0) {
+                try { p = std::stoi(it.key()); } catch (...) { p = 0; }
+            }
+            std::string tok = it.value().value("csrf_token", "");
+            int64_t upd = it.value().value("updated_at", static_cast<int64_t>(0));
+            if (p > 0 && p <= 65535 && !tok.empty()) {
+                s_cachedCliTokens[p] = tok;
+                fileUpdatedAt[p] = upd;
+            }
+        }
+    };
+    reloadEndpointsFromFile();
+
+    if (!hermeticTestMode) {
+        std::vector<int> missingPorts;
+        for (const auto& proc : agyProcs) {
+            if (proc.httpPort > 0 && s_cachedCliTokens.find(proc.httpPort) == s_cachedCliTokens.end()) {
+                missingPorts.push_back(proc.httpPort);
+            }
+        }
+        if (!missingPorts.empty() && triggerAgySidecarReregistration(false)) {
+            for (int waitStep = 0; waitStep < 24; ++waitStep) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                reloadEndpointsFromFile();
+                bool allFound = true;
+                for (int mp : missingPorts) {
+                    if (s_cachedCliTokens.find(mp) == s_cachedCliTokens.end()) {
+                        allFound = false;
+                        break;
+                    }
+                }
+                if (allFound) {
+                    break;
+                }
+            }
         }
     }
 
@@ -476,6 +523,13 @@ static std::map<int, std::pair<std::string, std::string>> syncAndPruneCliEndpoin
         }
     }
 
+    std::string lockPath = epStatePath + ".lock";
+    int lockFd = ::open(lockPath.c_str(), O_CREAT | O_RDWR, 0600);
+    if (lockFd >= 0) {
+        (void)::flock(lockFd, LOCK_EX);
+    }
+    reloadEndpointsFromFile();
+
     std::set<int> livePorts;
     for (const auto& proc : agyProcs) {
         if (proc.httpPort > 0) livePorts.insert(proc.httpPort);
@@ -576,6 +630,10 @@ static std::map<int, std::pair<std::string, std::string>> syncAndPruneCliEndpoin
 
     if (stateChanged) {
         writeJsonFileAtomically(epStatePath, ej);
+    }
+    if (lockFd >= 0) {
+        (void)::flock(lockFd, LOCK_UN);
+        ::close(lockFd);
     }
     return outLiveEnvEndpoints;
 }
@@ -6742,31 +6800,11 @@ void WebServer::setupRoutes() {
             ce.matchedPrompt = matchedPrompt;
             ce.matchedStepIndex = matchedStepIndex;
 
-            if (openInTerminal) {
-                bool hasCsrf = false;
-                int lockedPort = (agyIt != runningAgyByConvId.end()) ? agyIt->second.httpPort : 0;
-                for (const auto& ep : liveLsEndpoints) {
-                    if (!ep.isCli) continue;
-                    if ((lockedPort > 0 && ep.port == lockedPort) ||
-                        (lockedPort <= 0 && ep.lockedConversationId == id)) {
-                        hasCsrf = true;
-                        break;
-                    }
-                }
-                if (!hasCsrf && !gatewayCfg.allowAgyAgentApiFallback) {
-                    ce.interactive = false;
-                    ce.nonInteractiveReason =
-                        "Antigravity CLI session is open in terminal without a registered ConnectRPC CSRF token.";
-                }
-            } else if (sourceLabel == "cli" && !hasAnyLiveCliLs) {
-                ce.interactive = false;
-                ce.nonInteractiveReason =
-                    "Antigravity CLI session is not running in an active terminal or language server. Resume it in a terminal to interact.";
-            } else if (sourceLabel == "ide" && liveLsEndpoints.empty()) {
-                ce.interactive = false;
-                ce.nonInteractiveReason =
-                    "Antigravity IDE language server is not currently running.";
-            }
+            ce.interactive = true;
+            ce.nonInteractiveReason.clear();
+            (void)liveLsEndpoints;
+            (void)hasAnyLiveCliLs;
+            (void)gatewayCfg;
 
             collected.push_back(std::move(ce));
             return true;
@@ -7187,60 +7225,11 @@ void WebServer::setupRoutes() {
                     }
                 }
 
-                bool agyInteractive = false;
+                bool agyInteractive = true;
                 std::string agyNonInteractiveReason;
-                {
-                    auto eps = discoverLsEndpoints();
-                    bool hasLiveCliLs = false;
-                    bool hasLiveIdeLs = false;
-                    bool hasRegisteredCsrf = false;
-                    for (const auto& ep : eps) {
-                        if (ep.isCli) {
-                            hasLiveCliLs = true;
-                            if (isLockedByRunningAgy) {
-                                if ((lockedHttpPort > 0 && ep.port == lockedHttpPort) ||
-                                    (lockedHttpPort <= 0 && ep.lockedConversationId == id)) {
-                                    hasRegisteredCsrf = true;
-                                }
-                            }
-                        } else {
-                            hasLiveIdeLs = true;
-                        }
-                    }
-                    const char* envP = std::getenv("AGY_LS_PORT");
-                    const char* envC = std::getenv("AGY_LS_CSRF_TOKEN");
-                    if (envP && *envP && envC && *envC) {
-                        hasLiveCliLs = true;
-                        hasLiveIdeLs = true;
-                        if (isLockedByRunningAgy) {
-                            try {
-                                int epPort = std::stoi(envP);
-                                if (lockedHttpPort <= 0 || epPort == lockedHttpPort) {
-                                    hasRegisteredCsrf = true;
-                                }
-                            } catch (...) {}
-                        }
-                    }
-                    if (isLockedByRunningAgy) {
-                        agyInteractive = hasRegisteredCsrf;
-                        if (!agyInteractive) {
-                            agyNonInteractiveReason =
-                                "Antigravity CLI session is locked in terminal without a registered ConnectRPC endpoint.";
-                        }
-                    } else if (isCliConv) {
-                        agyInteractive = hasLiveCliLs;
-                        if (!agyInteractive) {
-                            agyNonInteractiveReason =
-                                "No live Antigravity CLI language server endpoint is running for this session.";
-                        }
-                    } else {
-                        agyInteractive = hasLiveIdeLs || hasLiveCliLs;
-                        if (!agyInteractive) {
-                            agyNonInteractiveReason =
-                                "No live Antigravity language server endpoint is running for this session.";
-                        }
-                    }
-                }
+                (void)discoverLsEndpoints();
+                (void)lockedHttpPort;
+                (void)isCliConv;
 
                 nlohmann::json resp;
                 resp["conversationId"] = id;
@@ -7550,60 +7539,11 @@ void WebServer::setupRoutes() {
             resolvedModel = extractedLabel;
         }
 
-        bool agyInteractive = false;
+        bool agyInteractive = true;
         std::string agyNonInteractiveReason;
-        {
-            auto eps = discoverLsEndpoints();
-            bool hasLiveCliLs = false;
-            bool hasLiveIdeLs = false;
-            bool hasRegisteredCsrf = false;
-            for (const auto& ep : eps) {
-                if (ep.isCli) {
-                    hasLiveCliLs = true;
-                    if (isLockedByRunningAgy) {
-                        if ((lockedHttpPort > 0 && ep.port == lockedHttpPort) ||
-                            (lockedHttpPort <= 0 && ep.lockedConversationId == id)) {
-                            hasRegisteredCsrf = true;
-                        }
-                    }
-                } else {
-                    hasLiveIdeLs = true;
-                }
-            }
-            const char* envP = std::getenv("AGY_LS_PORT");
-            const char* envC = std::getenv("AGY_LS_CSRF_TOKEN");
-            if (envP && *envP && envC && *envC) {
-                hasLiveCliLs = true;
-                hasLiveIdeLs = true;
-                if (isLockedByRunningAgy) {
-                    try {
-                        int epPort = std::stoi(envP);
-                        if (lockedHttpPort <= 0 || epPort == lockedHttpPort) {
-                            hasRegisteredCsrf = true;
-                        }
-                    } catch (...) {}
-                }
-            }
-            if (isLockedByRunningAgy) {
-                agyInteractive = hasRegisteredCsrf;
-                if (!agyInteractive) {
-                    agyNonInteractiveReason =
-                        "Antigravity CLI session is locked in terminal without a registered ConnectRPC endpoint.";
-                }
-            } else if (isCliConv || source == "cli") {
-                agyInteractive = hasLiveCliLs;
-                if (!agyInteractive) {
-                    agyNonInteractiveReason =
-                        "No live Antigravity CLI language server endpoint is running for this session.";
-                }
-            } else {
-                agyInteractive = hasLiveIdeLs || hasLiveCliLs;
-                if (!agyInteractive) {
-                    agyNonInteractiveReason =
-                        "No live Antigravity language server endpoint is running for this session.";
-                }
-            }
-        }
+        (void)discoverLsEndpoints();
+        (void)lockedHttpPort;
+        (void)isCliConv;
 
         nlohmann::json resp;
         resp["conversationId"] = id;
@@ -8463,17 +8403,43 @@ void WebServer::setupRoutes() {
         });
 
         GatewayConfig gatewayCfg = this->getGatewayConfig();
-        bool lockedHasRegisteredCsrf = false;
-        if (isLockedByRunningAgy) {
+        auto checkLockedHasRegisteredCsrf = [&]() -> bool {
+            if (!isLockedByRunningAgy) return false;
             for (const auto& ep : endpoints) {
                 if (!ep.isCli) continue;
                 if (lockedHttpPort > 0 && ep.port == lockedHttpPort) {
-                    lockedHasRegisteredCsrf = true;
-                    break;
+                    return true;
                 }
                 if (lockedHttpPort <= 0 && !cid.empty() && ep.lockedConversationId == cid) {
-                    lockedHasRegisteredCsrf = true;
-                    break;
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        bool lockedHasRegisteredCsrf = checkLockedHasRegisteredCsrf();
+        const char* envEpOverride = std::getenv("AIMON_AGY_ENDPOINTS_FILE");
+        const char* envProcsOverride = std::getenv("AIMON_AGY_PROCESSES_FILE");
+        bool hasHermeticOverride = (envEpOverride && *envEpOverride) || (envProcsOverride && *envProcsOverride);
+        if (isLockedByRunningAgy && !lockedHasRegisteredCsrf && !hasHermeticOverride) {
+            if (triggerAgySidecarReregistration(true)) {
+                for (int waitIdx = 0; waitIdx < 30; ++waitIdx) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    endpoints = discoverLsEndpoints();
+                    std::stable_sort(endpoints.begin(), endpoints.end(), [&](const LsEndpoint& a, const LsEndpoint& b) {
+                        bool aOwns = (!cid.empty() && cid != "new" && a.lockedConversationId == cid);
+                        bool bOwns = (!cid.empty() && cid != "new" && b.lockedConversationId == cid);
+                        if (aOwns != bOwns) return aOwns > bOwns;
+                        bool aWs = (!wsPath.empty() && a.cwd == wsPath);
+                        bool bWs = (!wsPath.empty() && b.cwd == wsPath);
+                        if (aWs != bWs) return aWs > bWs;
+                        if (a.isCli != b.isCli) return a.isCli > b.isCli;
+                        return a.isPreferredWorkspace > b.isPreferredWorkspace;
+                    });
+                    if (checkLockedHasRegisteredCsrf()) {
+                        lockedHasRegisteredCsrf = true;
+                        break;
+                    }
                 }
             }
         }
@@ -8492,28 +8458,6 @@ void WebServer::setupRoutes() {
                 {"interactive", false},
                 {"nonInteractiveReason", errMsg},
                 {"error", errMsg}
-            }).dump(2), "application/json");
-            return;
-        }
-
-        if (endpoints.empty() &&
-            !(isLockedByRunningAgy && gatewayCfg.allowCliNewSessionSpawn && !hasCliDiskConversation && !wsPath.empty())) {
-            if (!cid.empty() && cid != "new") {
-                std::string errMsg = "No live Antigravity ConnectRPC or agentapi endpoint is running for this conversation";
-                res.status = 409;
-                res.set_content(nlohmann::json({
-                    {"ok", false},
-                    {"status", "error"},
-                    {"interactive", false},
-                    {"nonInteractiveReason", errMsg},
-                    {"error", errMsg}
-                }).dump(2), "application/json");
-                return;
-            }
-            res.status = 503;
-            res.set_content(nlohmann::json({
-                {"status", "error"},
-                {"error", "No active Antigravity language server or agy agent session found"}
             }).dump(2), "application/json");
             return;
         }
@@ -9158,9 +9102,11 @@ void WebServer::setupRoutes() {
             }
         }
 
-        // 5. Fallback for 0-step locked CLI conversations without CSRF token in workspace: start new detached prompt in wsPath
-        if (gatewayCfg.allowCliNewSessionSpawn && isLockedByRunningAgy && !hasCliDiskConversation && !wsPath.empty()) {
+        // 5. Fallback for non-locked CLI conversations or new CLI conversations: invoke agy CLI directly (-r <cid> -p <text> or -p <text>)
+        if ((!isLockedByRunningAgy && !cid.empty() && cid != "new") ||
+            (gatewayCfg.allowCliNewSessionSpawn && (cid.empty() || cid == "new" || (isLockedByRunningAgy && !hasCliDiskConversation && !wsPath.empty())))) {
             std::string cliModelId = mapLabelToCliModelId(desiredModel);
+            bool resumeExisting = (!isLockedByRunningAgy && !cid.empty() && cid != "new" && hasCliDiskConversation);
             pid_t child = fork();
             if (child == 0) {
                 setsid();
@@ -9185,6 +9131,10 @@ void WebServer::setupRoutes() {
                 argv.push_back(const_cast<char*>("--dangerously-skip-permissions"));
                 if (!cliModelId.empty()) {
                     argv.push_back(const_cast<char*>(modelArg.c_str()));
+                }
+                if (resumeExisting) {
+                    argv.push_back(const_cast<char*>("-r"));
+                    argv.push_back(const_cast<char*>(cid.c_str()));
                 }
                 argv.push_back(const_cast<char*>("-p"));
                 argv.push_back(const_cast<char*>(text.c_str()));
@@ -9217,8 +9167,10 @@ void WebServer::setupRoutes() {
                     resp["status"] = "dispatched";
                     resp["agentId"] = agentId;
                     resp["conversationId"] = cid;
-                    resp["routedVia"] = "agy_cli_new";
-                    resp["output"] = "{\"status\":\"started_cli_conversation_in_workspace\"}";
+                    resp["routedVia"] = resumeExisting ? "agy_cli_resume" : "agy_cli_new";
+                    resp["output"] = resumeExisting
+                        ? "{\"status\":\"resumed_cli_conversation\"}"
+                        : "{\"status\":\"started_cli_conversation_in_workspace\"}";
                     res.set_content(resp.dump(2), "application/json");
                     return;
                 }
