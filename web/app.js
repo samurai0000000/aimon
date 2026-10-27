@@ -25,6 +25,73 @@ function formatCountdown(ms) {
     return `${minutes}m ${pad(seconds)}s`;
 }
 
+function computeBucketWindowMs(bucket) {
+    if (!bucket) return 7 * 86400 * 1000;
+    const win = (bucket.window || '').toLowerCase();
+    const bid = (bucket.bucket_id || '').toLowerCase();
+    const dname = (bucket.display_name || '').toLowerCase();
+    if (win === '5h' || win === 'five_hour' || bid.includes('5h') || dname.includes('five hour') || dname.includes('5-hour')) {
+        return 5 * 3600 * 1000;
+    }
+    return 7 * 86400 * 1000;
+}
+
+function computeBucketIdealRemainingPct(bucket, elapsedSinceFetch, serverNow) {
+    if (!bucket) return null;
+    const windowMs = computeBucketWindowMs(bucket);
+    let diff = 0;
+    if (bucket.reset_time_remaining_seconds !== undefined && bucket.reset_time_remaining_seconds > 0) {
+        diff = Math.max(0, (bucket.reset_time_remaining_seconds * 1000) - elapsedSinceFetch);
+    } else if (bucket.reset_time_iso) {
+        const resetTime = new Date(bucket.reset_time_iso).getTime();
+        if (!Number.isNaN(resetTime)) {
+            diff = resetTime - serverNow;
+        }
+    }
+    if (diff <= 0 || diff > windowMs * 1.05) {
+        return null;
+    }
+    return Math.max(0, Math.min(100, (diff / windowMs) * 100));
+}
+
+function computeCycleIdealUsedPct(cycleResetIso, fromEpochSec, serverNowMs) {
+    if (!cycleResetIso) return null;
+    const trimmed = String(cycleResetIso).trim();
+    if (!trimmed) return null;
+    const endDate = new Date(trimmed.includes('T') ? trimmed : (trimmed + 'T00:00:00Z'));
+    const endMs = endDate.getTime();
+    if (Number.isNaN(endMs)) return null;
+    let startMs = 0;
+    if (fromEpochSec && Number(fromEpochSec) > 0 && Number(fromEpochSec) * 1000 < endMs) {
+        startMs = Number(fromEpochSec) * 1000;
+    } else {
+        startMs = Date.UTC(
+            endDate.getUTCFullYear(),
+            endDate.getUTCMonth() - 1,
+            endDate.getUTCDate(),
+            endDate.getUTCHours(),
+            endDate.getUTCMinutes(),
+            endDate.getUTCSeconds()
+        );
+    }
+    if (endMs <= startMs || serverNowMs < startMs || serverNowMs > endMs) {
+        return null;
+    }
+    return Math.max(0, Math.min(100, ((serverNowMs - startMs) / (endMs - startMs)) * 100));
+}
+
+function applyPaceMarker(markerEl, idealPct, labelPrefix) {
+    if (!markerEl) return;
+    if (idealPct === null || idealPct === undefined || Number.isNaN(idealPct)) {
+        markerEl.classList.add('hidden');
+        return;
+    }
+    const clamped = Math.max(0, Math.min(100, idealPct));
+    markerEl.style.left = `${clamped.toFixed(1)}%`;
+    markerEl.title = `${labelPrefix || 'Ideal uniform pace'}: ${clamped.toFixed(1)}%`;
+    markerEl.classList.remove('hidden');
+}
+
 function updateCountdowns() {
     if (!currentStatus || !currentStatus.antigravity) {
         return;
@@ -38,6 +105,10 @@ function updateCountdowns() {
         currentStatus.antigravity.quota_groups.forEach((group, gIdx) => {
             if (!group.buckets) return;
             group.buckets.forEach((bucket, bIdx) => {
+                const paceEl = document.getElementById(`pace-bucket-${gIdx}-${bIdx}`);
+                const idealRemPct = computeBucketIdealRemainingPct(bucket, elapsedSinceFetch, serverNow);
+                applyPaceMarker(paceEl, idealRemPct, 'Ideal remaining pace');
+
                 const timerEl = document.getElementById(`timer-bucket-${gIdx}-${bIdx}`);
                 if (!timerEl) return;
 
@@ -203,6 +274,10 @@ function renderAntigravity(ag) {
 
                     const win = (b.window || '').toLowerCase();
                     const windowLabel = (win === 'weekly') ? 'Weekly' : ((win === '5h' || win === 'five_hour') ? '5-Hour' : (b.display_name || 'Limit'));
+                    const idealPct = computeBucketIdealRemainingPct(b, Date.now() - statusFetchedAt, Date.now() + serverTimeOffset);
+                    const paceStyle = idealPct !== null ? `left: ${idealPct.toFixed(1)}%;` : '';
+                    const paceClass = idealPct !== null ? 'quota-pace-marker' : 'quota-pace-marker hidden';
+                    const paceTitle = idealPct !== null ? `Ideal remaining pace: ${idealPct.toFixed(1)}%` : '';
 
                     bucketsHtml += `
                         <div class="bucket-card">
@@ -212,6 +287,7 @@ function renderAntigravity(ag) {
                             </div>
                             <div class="bucket-track">
                                 <div class="bucket-fill" style="width: ${pct}%; background: ${fillColor};"></div>
+                                <div id="pace-bucket-${gIdx}-${bIdx}" class="${paceClass}" style="${paceStyle}" title="${paceTitle}"></div>
                             </div>
                             <div class="bucket-bottom">
                                 <span class="bucket-window-badge">${windowLabel}</span>
@@ -288,6 +364,7 @@ function renderCursor(cr) {
     const planBadge = document.getElementById('cursor-plan-badge');
     const ratioEl = document.getElementById('cursor-fast-ratio');
     const progressBar = document.getElementById('cursor-progress-bar');
+    const paceMarker = document.getElementById('cursor-pace-marker');
     const remainingTxt = document.getElementById('cursor-remaining-txt');
     const percentTxt = document.getElementById('cursor-percent-txt');
     const resetDateEl = document.getElementById('cursor-reset-date');
@@ -302,6 +379,7 @@ function renderCursor(cr) {
         }
         if (ratioEl) ratioEl.textContent = '-- / --';
         if (progressBar) progressBar.style.width = '0%';
+        if (paceMarker) paceMarker.classList.add('hidden');
         if (remainingTxt) remainingTxt.textContent = 'Unauthenticated';
         if (percentTxt) percentTxt.textContent = '0%';
         if (resetDateEl) resetDateEl.textContent = '--';
@@ -331,6 +409,10 @@ function renderCursor(cr) {
     const pct = Math.round(frac * 100);
     if (progressBar) progressBar.style.width = `${pct}%`;
     if (percentTxt) percentTxt.textContent = `${pct}% used`;
+    const cursorIdealPct = limit > 0
+        ? computeCycleIdealUsedPct(cr.cycle_reset_iso, 0, Date.now() + serverTimeOffset)
+        : null;
+    applyPaceMarker(paceMarker, cursorIdealPct, 'Ideal cycle usage pace');
 
     const remaining = Math.max(0, limit - used);
     if (remainingTxt) remainingTxt.textContent = `${remaining.toLocaleString()} fast requests remaining`;
@@ -583,6 +665,7 @@ function renderClaude(cl) {
     const mainValue = document.getElementById('claude-main-value');
     const track = document.getElementById('claude-progress-track');
     const bar = document.getElementById('claude-progress-bar');
+    const paceMarker = document.getElementById('claude-pace-marker');
     const mainSub = document.getElementById('claude-main-sub');
     const mainPct = document.getElementById('claude-main-pct');
     const modelsList = document.getElementById('claude-models-list');
@@ -602,6 +685,7 @@ function renderClaude(cl) {
         renderClaudeDaily([]);
         if (others) others.classList.add('hidden');
         if (track) track.classList.add('hidden');
+        if (paceMarker) paceMarker.classList.add('hidden');
         if (mainPct) mainPct.textContent = '';
         if (mainValue) { mainValue.dataset.nano = '0'; mainValue.textContent = '--'; }
     };
@@ -670,8 +754,15 @@ function renderClaude(cl) {
             if (track) track.classList.remove('hidden');
             if (bar) bar.style.width = Math.min(100, Math.max(0, a.est_pct_of_limit || 0)) + '%';
             if (mainPct) mainPct.textContent = (a.est_pct_of_limit || 0).toFixed(1) + '% of limit';
+            const claudeIdealPct = computeCycleIdealUsedPct(
+                a.cycle_reset_iso,
+                a.cycle ? a.cycle.from_epoch : 0,
+                Date.now() + serverTimeOffset
+            );
+            applyPaceMarker(paceMarker, claudeIdealPct, 'Ideal cycle spend pace');
         } else {
             if (track) track.classList.add('hidden');
+            if (paceMarker) paceMarker.classList.add('hidden');
             if (mainPct) mainPct.textContent = '';
         }
         if (mainSub) {
