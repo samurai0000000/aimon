@@ -5069,6 +5069,35 @@ void WebServer::setupRoutes() {
         return text.substr(first, last - first + 1);
     };
 
+    static std::mutex s_cancelledConversationsMutex;
+    static std::map<std::string, uint64_t> s_cancelledConversations;
+
+    auto markConversationCancelled = [](const std::string& cid) {
+        if (cid.empty() || cid == "new") return;
+        std::lock_guard<std::mutex> lk(s_cancelledConversationsMutex);
+        s_cancelledConversations[cid] = static_cast<uint64_t>(std::time(nullptr));
+    };
+
+    auto clearConversationCancelled = [](const std::string& cid) {
+        if (cid.empty() || cid == "new") return;
+        std::lock_guard<std::mutex> lk(s_cancelledConversationsMutex);
+        s_cancelledConversations.erase(cid);
+    };
+
+    auto isConversationCancelledSince = [](const std::string& cid, uint64_t lastActivitySec) -> bool {
+        if (cid.empty() || cid == "new") return false;
+        std::lock_guard<std::mutex> lk(s_cancelledConversationsMutex);
+        auto it = s_cancelledConversations.find(cid);
+        if (it == s_cancelledConversations.end()) return false;
+        return lastActivitySec == 0 || it->second >= lastActivitySec;
+    };
+
+    auto isTransientRetryErrorMessage = [](const std::string& errText) -> bool {
+        return errText.find("API error (attempt ") != std::string::npos ||
+               errText.find("The stream was interrupted") != std::string::npos ||
+               errText.find("stream idle timeout") != std::string::npos;
+    };
+
     auto handleAgentAvailable = [resolveRequestedWorkspaceRoot](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         std::string cid = req.get_param_value("conversationId");
@@ -6856,7 +6885,7 @@ void WebServer::setupRoutes() {
     _server->Get("/api/agent/conversations", handleAgentConversations);
     _server->Get("/api/agent/history", handleAgentConversations);
 
-    _server->Get("/api/agent/transcript", [this, resolveSessionWorkspacePath, getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName, extractConversationModelById, mapLabelToCliModelId](
+    _server->Get("/api/agent/transcript", [this, resolveSessionWorkspacePath, getIdeBrainDir, getCliBrainDir, stripUserRequestTags, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, extractTrajectoryModelName, extractConversationModelById, mapLabelToCliModelId, isConversationCancelledSince, isTransientRetryErrorMessage](
                                               const httplib::Request& req, httplib::Response& res) {
         std::string reqId = extractOrGenerateRequestId(req);
         res.set_header("Access-Control-Allow-Origin", "*");
@@ -6927,10 +6956,13 @@ void WebServer::setupRoutes() {
             fs::path providerPath = findProviderTranscriptById(id, providerSource, providerSlug);
             if (!providerPath.empty()) {
                 auto parsed = parseProviderTranscriptJsonl(providerPath, providerSource, sinceIndex, providerSlug);
+                bool isCancelled = isConversationCancelledSince(id, parsed.lastActivitySec);
+                bool isGen = (parsed.status == "RUNNING") && !isCancelled;
                 nlohmann::json resp;
                 resp["conversationId"] = id;
                 resp["source"] = providerSource;
-                resp["status"] = parsed.status;
+                resp["status"] = isGen ? "RUNNING" : "DONE";
+                resp["generating"] = isGen;
                 resp["model"] = parsed.model;
                 resp["modelId"] = parsed.model;
                 resp["workspace"] = parsed.workspaceShort;
@@ -6948,6 +6980,7 @@ void WebServer::setupRoutes() {
             int liveTotalSteps = 0;
             std::string liveModel = "gemini-4-argon-medium";
             bool foundInMemory = false;
+            bool liveTurnInFlight = false;
 
             auto tryProbeRpcTrajectory = [&](int port, const std::string& csrf) -> bool {
                 if (port <= 0 || port > 65535 || csrf.empty()) return false;
@@ -6973,12 +7006,29 @@ void WebServer::setupRoutes() {
                             nlohmann::json parsedLiveSteps = nlohmann::json::array();
                             int parsedTotalSteps = 0;
                             bool hasUnknownModelError = false;
+                            bool rpcTurnInFlight = false;
                             int idx = 0;
                             for (const auto& rs : rawSteps) {
                                 int stepIdx = idx++;
                                 parsedTotalSteps = std::max(parsedTotalSteps, stepIdx + 1);
                                 std::string stType = rs.value("type", "");
-                                if (stType == "CORTEX_STEP_TYPE_ERROR_MESSAGE" && rs.contains("errorMessage")) {
+                                if (stType == "CORTEX_STEP_TYPE_USER_INPUT") {
+                                    rpcTurnInFlight = true;
+                                } else if (stType == "CORTEX_STEP_TYPE_ASK_QUESTION" ||
+                                           rs.contains("askQuestion") ||
+                                           (rs.contains("requestedInteraction") && rs["requestedInteraction"].is_object() &&
+                                            rs["requestedInteraction"].contains("askQuestion"))) {
+                                    bool isWaiting = (rs.value("status", "") == "CORTEX_STEP_STATUS_WAITING");
+                                    rpcTurnInFlight = !isWaiting;
+                                } else if (stType == "CORTEX_STEP_TYPE_PLANNER_RESPONSE" && rs.contains("plannerResponse")) {
+                                    std::string pText = rs["plannerResponse"].value("modifiedResponse", rs["plannerResponse"].value("response", ""));
+                                    bool hasToolCalls = rs["plannerResponse"].contains("toolCalls") &&
+                                                        rs["plannerResponse"]["toolCalls"].is_array() &&
+                                                        !rs["plannerResponse"]["toolCalls"].empty();
+                                    rpcTurnInFlight = hasToolCalls || pText.empty();
+                                } else if (stType == "CORTEX_STEP_TYPE_CHECKPOINT") {
+                                    rpcTurnInFlight = true;
+                                } else if (stType == "CORTEX_STEP_TYPE_ERROR_MESSAGE" && rs.contains("errorMessage")) {
                                     std::string errCheck;
                                     if (rs["errorMessage"].contains("error") && rs["errorMessage"]["error"].is_object()) {
                                         const auto& errObj = rs["errorMessage"]["error"];
@@ -6990,6 +7040,9 @@ void WebServer::setupRoutes() {
                                         errCheck.find("failed to construct executor") != std::string::npos) {
                                         hasUnknownModelError = true;
                                     }
+                                    rpcTurnInFlight = isTransientRetryErrorMessage(errCheck);
+                                } else {
+                                    rpcTurnInFlight = true;
                                 }
                                 if (sinceIndex >= 0 && stepIdx <= sinceIndex) continue;
                                 if (stType == "CORTEX_STEP_TYPE_USER_INPUT" && rs.contains("userInput")) {
@@ -7119,6 +7172,7 @@ void WebServer::setupRoutes() {
                             }
                             liveSteps = std::move(parsedLiveSteps);
                             liveTotalSteps = parsedTotalSteps;
+                            liveTurnInFlight = rpcTurnInFlight;
                             return true;
                         }
                     }
@@ -7182,9 +7236,12 @@ void WebServer::setupRoutes() {
             }
 
             if (foundInMemory) {
+                bool liveIsGen = liveTurnInFlight && !isConversationCancelledSince(id, 0);
                 nlohmann::json resp;
                 resp["conversationId"] = id;
                 resp["source"] = "live";
+                resp["status"] = liveIsGen ? "RUNNING" : "DONE";
+                resp["generating"] = liveIsGen;
                 resp["model"] = liveModel;
                 resp["stepCount"] = liveTotalSteps;
                 resp["steps"] = liveSteps;
@@ -7234,6 +7291,8 @@ void WebServer::setupRoutes() {
                 nlohmann::json resp;
                 resp["conversationId"] = id;
                 resp["source"] = isLockedByRunningAgy ? "cli" : "ide";
+                resp["status"] = "DONE";
+                resp["generating"] = false;
                 resp["model"] = extractConversationModelById(id);
                 resp["stepCount"] = static_cast<int>(fallbackSteps.size());
                 resp["steps"] = fallbackSteps;
@@ -7273,6 +7332,7 @@ void WebServer::setupRoutes() {
         int prevCheckpointStepIdx = 0;
         uint64_t lastPlannerContextTokens = 0;
         uint64_t prevStepEpochSec = 0;
+        bool turnInFlight = false;
 
         while (std::getline(f, line)) {
             if (line.empty()) continue;
@@ -7287,6 +7347,54 @@ void WebServer::setupRoutes() {
                 std::string lineType = j.value("type", "");
                 std::string lineCreatedAt = j.value("created_at", "");
                 uint64_t curEpochSec = lineCreatedAt.empty() ? 0 : parseIso8601ToEpochSec(lineCreatedAt);
+
+                if (lineType == "USER_INPUT") {
+                    turnInFlight = true;
+                } else if (lineType == "GENERIC") {
+                    turnInFlight = true;
+                } else if (lineType == "CHECKPOINT") {
+                    turnInFlight = true;
+                } else if (lineType == "ERROR_MESSAGE") {
+                    std::string lineErrText = j.value("content", "");
+                    if (lineErrText.empty()) lineErrText = j.value("error", "");
+                    turnInFlight = isTransientRetryErrorMessage(lineErrText);
+                } else if (lineType == "PLANNER_RESPONSE") {
+                    bool hasAskQ = false;
+                    bool hasAnyToolCalls = false;
+                    if (j.contains("tool_calls") && j["tool_calls"].is_array() && !j["tool_calls"].empty()) {
+                        hasAnyToolCalls = true;
+                        for (const auto& tc : j["tool_calls"]) {
+                            if (!tc.is_object()) continue;
+                            std::string tName = tc.value("name", "");
+                            if (tName == "ask_question" || tName == "AskUserQuestion") {
+                                hasAskQ = true;
+                                break;
+                            }
+                        }
+                    }
+                    std::string lineContent = j.value("content", "");
+                    if (hasAskQ) {
+                        turnInFlight = false;
+                    } else if (hasAnyToolCalls) {
+                        turnInFlight = true;
+                    } else if (!lineContent.empty()) {
+                        turnInFlight = false;
+                    } else {
+                        turnInFlight = true;
+                    }
+                } else if (j.contains("tool_calls") && j["tool_calls"].is_array() && !j["tool_calls"].empty()) {
+                    bool hasAskQ = false;
+                    for (const auto& tc : j["tool_calls"]) {
+                        if (tc.is_object()) {
+                            std::string tName = tc.value("name", "");
+                            if (tName == "ask_question" || tName == "AskUserQuestion") {
+                                hasAskQ = true;
+                                break;
+                            }
+                        }
+                    }
+                    turnInFlight = !hasAskQ;
+                }
 
                 if (lineType == "PLANNER_RESPONSE") {
                     uint64_t inT = j.value("input_tokens", static_cast<uint64_t>(0)) +
@@ -7545,9 +7653,30 @@ void WebServer::setupRoutes() {
         (void)lockedHttpPort;
         (void)isCliConv;
 
+        uint64_t lastStepOrFileEpochSec = prevStepEpochSec;
+        try {
+            auto ftime = fs::last_write_time(transcriptPath);
+            auto sctp = std::chrono::time_point_cast<std::chrono::seconds>(
+                ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+            );
+            uint64_t mtimeSec = static_cast<uint64_t>(sctp.time_since_epoch().count());
+            if (mtimeSec > lastStepOrFileEpochSec) {
+                lastStepOrFileEpochSec = mtimeSec;
+            }
+        } catch (...) {}
+
+        uint64_t nowEpochSec = static_cast<uint64_t>(std::time(nullptr));
+        uint64_t maxInFlightAgeSec = isLockedByRunningAgy ? 900 : 420;
+        bool isRecentEnough = (lastStepOrFileEpochSec == 0) ||
+                              (nowEpochSec <= lastStepOrFileEpochSec + maxInFlightAgeSec);
+        bool agyGenerating = turnInFlight && isRecentEnough &&
+                             !isConversationCancelledSince(id, lastStepOrFileEpochSec);
+
         nlohmann::json resp;
         resp["conversationId"] = id;
         resp["source"] = source;
+        resp["status"] = agyGenerating ? "RUNNING" : "DONE";
+        resp["generating"] = agyGenerating;
         resp["model"] = resolvedModel;
         resp["modelId"] = !extractedLabel.empty() ? mapLabelToCliModelId(extractedLabel) : resolvedModel;
         resp["stepCount"] = totalStepCount;
@@ -7560,7 +7689,7 @@ void WebServer::setupRoutes() {
         res.set_content(resp.dump(2, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
     });
 
-    _server->Post("/api/agent/prompt", [this, getWorkspaceRoot, getCliBrainDir, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc, extractConversationModelById, mapLabelToCliModelId, toLowerAscii](
+    _server->Post("/api/agent/prompt", [this, getWorkspaceRoot, getCliBrainDir, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, resolveCascadeConfigForRpc, extractConversationModelById, mapLabelToCliModelId, toLowerAscii, clearConversationCancelled](
                                            const httplib::Request& req, httplib::Response& res) {
         std::string reqId = extractOrGenerateRequestId(req);
         res.set_header("Access-Control-Allow-Origin", "*");
@@ -7618,6 +7747,7 @@ void WebServer::setupRoutes() {
             res.set_content("{\"status\":\"error\",\"error\":\"Prompt text cannot be empty\"}", "application/json");
             return;
         }
+        clearConversationCancelled(cid);
 
         // Trim leading/trailing whitespace to inspect potential slash commands
         std::string trimmedText = text;
@@ -9193,6 +9323,204 @@ void WebServer::setupRoutes() {
         res.set_content(nlohmann::json({
             {"status", "error"},
             {"error", lastError}
+        }).dump(2), "application/json");
+    });
+
+    _server->Post("/api/agent/cancel", [this, getWorkspaceRoot, discoverLsEndpoints, lastRpcEndpoint, lastRpcMutex, toLowerAscii, markConversationCancelled](
+                                           const httplib::Request& req, httplib::Response& res) {
+        std::string reqId = extractOrGenerateRequestId(req);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("X-Request-Id", reqId);
+        nlohmann::json j = nlohmann::json::object();
+        if (!req.body.empty()) {
+            auto parsed = nlohmann::json::parse(req.body, nullptr, false);
+            if (!parsed.is_discarded() && parsed.is_object()) {
+                j = std::move(parsed);
+            }
+        }
+
+        std::string cid = j.value("conversationId", j.value("id", req.get_param_value("conversationId")));
+        if (cid.empty()) {
+            cid = req.get_param_value("id");
+        }
+        std::string agentId = j.value("agentId", "antigravity");
+        std::string requestedSource = toLowerAscii(j.value("source", j.value("provider", "")));
+
+        if (!cid.empty() && cid != "new") {
+            markConversationCancelled(cid);
+        }
+
+        std::string targetProvider = requestedSource;
+        std::string resolvedProviderSlug;
+        fs::path existingTranscriptPath;
+        if (targetProvider != "claude" && targetProvider != "cursor") {
+            std::string agentLower = toLowerAscii(agentId);
+            if (agentLower == "claude" || agentLower == "cursor") {
+                targetProvider = agentLower;
+            } else if (!cid.empty() && cid != "new") {
+                std::string foundSrc;
+                existingTranscriptPath = findProviderTranscriptById(cid, foundSrc, resolvedProviderSlug);
+                if (!existingTranscriptPath.empty() && (foundSrc == "claude" || foundSrc == "cursor")) {
+                    targetProvider = foundSrc;
+                }
+            }
+        }
+        if (targetProvider.empty() || (targetProvider != "claude" && targetProvider != "cursor")) {
+            targetProvider = "antigravity";
+        }
+
+        std::string cancelMethod = "state_marked";
+        bool rpcOrMuxCancelled = false;
+
+        if (targetProvider == "claude" || targetProvider == "cursor") {
+            std::string wsDir = getWorkspaceRoot().string();
+            if (!cid.empty() && cid != "new") {
+                if (existingTranscriptPath.empty()) {
+                    std::string dummySrc;
+                    existingTranscriptPath = findProviderTranscriptById(cid, dummySrc, resolvedProviderSlug);
+                }
+                if (!existingTranscriptPath.empty()) {
+                    auto parsed = parseProviderTranscriptJsonl(existingTranscriptPath, targetProvider, 999999, resolvedProviderSlug, true);
+                    if (!parsed.workspacePath.empty() && fs::exists(parsed.workspacePath)) {
+                        wsDir = parsed.workspacePath;
+                    }
+                }
+            }
+            auto sessionInfo = discoverLiveProviderSession(targetProvider, cid, wsDir, existingTranscriptPath.string());
+            if (!sessionInfo.muxType.empty() && !sessionInfo.muxSession.empty()) {
+                if (sessionInfo.muxType == "tmux") {
+                    const char* envTmuxBin = std::getenv("AIMON_TMUX_BIN");
+                    std::string tmuxBin = (envTmuxBin && *envTmuxBin) ? envTmuxBin : "tmux";
+                    std::string targetPane = !sessionInfo.muxTarget.empty() ? sessionInfo.muxTarget : sessionInfo.muxSession;
+                    if (sessionInfo.muxSession.find('/') != std::string::npos) {
+                        runCommandSync({tmuxBin, "-S", sessionInfo.muxSession, "send-keys", "-t", targetPane, "Escape"});
+                        runCommandSync({tmuxBin, "-S", sessionInfo.muxSession, "send-keys", "-t", targetPane, "C-c"});
+                    } else {
+                        runCommandSync({tmuxBin, "send-keys", "-t", targetPane, "Escape"});
+                        runCommandSync({tmuxBin, "send-keys", "-t", targetPane, "C-c"});
+                    }
+                    cancelMethod = "tmux_interrupt";
+                    rpcOrMuxCancelled = true;
+                } else if (sessionInfo.muxType == "screen") {
+                    const char* envScreenBin = std::getenv("AIMON_SCREEN_BIN");
+                    std::string screenBin = (envScreenBin && *envScreenBin) ? envScreenBin : "screen";
+                    std::string winIdx = !sessionInfo.muxTarget.empty() ? sessionInfo.muxTarget : "0";
+                    runCommandSync({screenBin, "-S", sessionInfo.muxSession, "-p", winIdx, "-X", "stuff", "\033\003"});
+                    cancelMethod = "screen_interrupt";
+                    rpcOrMuxCancelled = true;
+                }
+            }
+            if (targetProvider == "cursor" && !cid.empty() && cid != "new") {
+                fs::path hookStatePath = PathUtils::expandHome("~/.cursor/hooks/state/" + cid + ".json");
+                if (fs::exists(hookStatePath)) {
+                    try {
+                        nlohmann::json hj;
+                        {
+                            std::ifstream hf(hookStatePath);
+                            if (hf.is_open()) {
+                                hj = nlohmann::json::parse(hf, nullptr, false);
+                            }
+                        }
+                        if (!hj.is_discarded() && hj.is_object() && hj.value("status", "") == "RUNNING") {
+                            hj["status"] = "ABORTED";
+                            std::ofstream outF(hookStatePath, std::ios::trunc);
+                            if (outF.is_open()) {
+                                outF << hj.dump(2);
+                            }
+                        }
+                    } catch (...) {}
+                }
+            }
+        } else if (!cid.empty() && cid != "new") {
+            bool isLockedByRunningAgy = false;
+            int lockedHttpPort = 0;
+            for (const auto& proc : discoverRunningAgyProcesses()) {
+                if (proc.lockedConversationId == cid) {
+                    isLockedByRunningAgy = true;
+                    lockedHttpPort = proc.httpPort;
+                    break;
+                }
+            }
+            auto endpoints = discoverLsEndpoints();
+            if (isLockedByRunningAgy && lockedHttpPort > 0) {
+                bool foundLockedEp = false;
+                for (const auto& ep : endpoints) {
+                    if (ep.port == lockedHttpPort && !ep.csrf.empty()) {
+                        foundLockedEp = true;
+                        break;
+                    }
+                }
+                if (!foundLockedEp) {
+                    triggerAgySidecarReregistration(true);
+                    endpoints = discoverLsEndpoints();
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(*lastRpcMutex);
+                if (lastRpcEndpoint->first > 0 && !lastRpcEndpoint->second.empty()) {
+                    bool alreadyListed = false;
+                    for (const auto& ep : endpoints) {
+                        if (ep.port == lastRpcEndpoint->first && ep.csrf == lastRpcEndpoint->second) {
+                            alreadyListed = true;
+                            break;
+                        }
+                    }
+                    if (!alreadyListed) {
+                        LsEndpoint cachedEp;
+                        cachedEp.port = lastRpcEndpoint->first;
+                        cachedEp.csrf = lastRpcEndpoint->second;
+                        endpoints.push_back(std::move(cachedEp));
+                    }
+                }
+            }
+            std::stable_sort(endpoints.begin(), endpoints.end(), [&](const LsEndpoint& a, const LsEndpoint& b) {
+                bool aOwns = (a.lockedConversationId == cid) || (lockedHttpPort > 0 && a.port == lockedHttpPort);
+                bool bOwns = (b.lockedConversationId == cid) || (lockedHttpPort > 0 && b.port == lockedHttpPort);
+                if (aOwns != bOwns) return aOwns > bOwns;
+                return false;
+            });
+
+            nlohmann::json cancelPayload = {
+                {"cascadeId", cid},
+                {"killBackgroundTasks", true}
+            };
+            std::string bodyStr = cancelPayload.dump();
+
+            for (const auto& ep : endpoints) {
+                if (ep.port <= 0 || ep.port > 65535 || ep.csrf.empty()) continue;
+                if (isLockedByRunningAgy && lockedHttpPort > 0 && ep.port != lockedHttpPort) {
+                    continue;
+                }
+                try {
+                    httplib::Client cli("127.0.0.1", ep.port);
+                    cli.set_connection_timeout(1, 0);
+                    cli.set_read_timeout(3, 0);
+                    httplib::Headers hdrs = {
+                        {"Content-Type", "application/json"},
+                        {"x-codeium-csrf-token", ep.csrf}
+                    };
+                    auto rpcRes = cli.Post(
+                        "/exa.language_server_pb.LanguageServerService/CancelCascadeInvocation",
+                        hdrs,
+                        bodyStr,
+                        "application/json"
+                    );
+                    if (rpcRes && rpcRes->status == 200) {
+                        cancelMethod = "connect_rpc_cancel_cascade";
+                        rpcOrMuxCancelled = true;
+                        break;
+                    }
+                } catch (...) {}
+            }
+        }
+
+        res.set_content(nlohmann::json({
+            {"ok", true},
+            {"status", "cancelled"},
+            {"conversationId", cid},
+            {"provider", targetProvider},
+            {"method", cancelMethod},
+            {"dispatched", rpcOrMuxCancelled}
         }).dump(2), "application/json");
     });
 

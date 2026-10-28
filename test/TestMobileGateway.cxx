@@ -4280,6 +4280,114 @@ static void testSessionScopedWorkspaceBrowsing() {
     std::cout << "[TestMobileGateway] testSessionScopedWorkspaceBrowsing passed!" << std::endl;
 }
 
+static void testTranscriptGeneratingStateAndCancelCascadeInvocation() {
+    std::cout << "[TestMobileGateway] Running testTranscriptGeneratingStateAndCancelCascadeInvocation..." << std::endl;
+    std::string baseDir = "/tmp/test_mobile_gw_cancel_" + std::to_string(getpid());
+    std::string cliBrain = baseDir + "/cli_brain";
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string tempMobileDb = baseDir + "/mobile_gateway.db";
+    fs::create_directories(cliBrain);
+    fs::create_directories(ideBrain);
+
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+
+    std::string cid = "active-retry-session";
+    fs::path convDir = fs::path(cliBrain) / cid / ".system_generated" / "logs";
+    fs::create_directories(convDir);
+    fs::path transFile = convDir / "transcript.jsonl";
+    {
+        std::ofstream tf(transFile);
+        tf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>Build and verify</USER_REQUEST>\"}\n";
+        tf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"thinking\":\"Running build\",\"content\":\"\",\"tool_calls\":[{\"name\":\"run_command\",\"arguments\":{\"CommandLine\":\"make all\"}}]}\n";
+        tf << "{\"step_index\":2,\"type\":\"ERROR_MESSAGE\",\"content\":\"API error (attempt 1): request failed: stream idle timeout (5m0s): context deadline exceeded\"}\n";
+    }
+
+    httplib::Server mockLs;
+    std::mutex cancelMutex;
+    json lastCancelBody;
+    int cancelCallCount = 0;
+    mockLs.Post("/exa.language_server_pb.LanguageServerService/CancelCascadeInvocation",
+                [&](const httplib::Request& req, httplib::Response& res) {
+        std::lock_guard<std::mutex> lk(cancelMutex);
+        lastCancelBody = json::parse(req.body, nullptr, false);
+        ++cancelCallCount;
+        res.set_content("{}", "application/json");
+    });
+
+    int lsPort = mockLs.bind_to_any_port("127.0.0.1");
+    assert(lsPort > 0);
+    std::thread lsThread([&]() { mockLs.listen_after_bind(); });
+    mockLs.wait_until_ready();
+
+    setenv("AGY_LS_PORT", std::to_string(lsPort).c_str(), 1);
+    setenv("AGY_LS_CSRF_TOKEN", "cancel-csrf-token", 1);
+
+    MobileGateway& gw = MobileGateway::getInstance();
+    assert(gw.init(tempMobileDb));
+    std::string secret = gw.createPairingSecret(120);
+    std::string validToken;
+    assert(gw.verifyPairingCode(secret, "cancel-test-dev", "Test Phone", validToken));
+
+    StateStore& stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.endpointsEnabled = false;
+
+    WebServer server(stateStore, historyStore, config);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", validToken}};
+
+    // 1. While in transient API retry error, generating must be true and status RUNNING
+    auto res1 = client.Get(("/api/agent/transcript?id=" + cid).c_str(), headers);
+    assert(res1 && res1->status == 200);
+    json j1 = json::parse(res1->body);
+    assert(j1.value("generating", false) == true);
+    assert(j1.value("status", "") == "RUNNING");
+
+    // 2. Cancel the running turn via POST /api/agent/cancel
+    json cancelReq = {
+        {"conversationId", cid},
+        {"agentId", "antigravity"},
+        {"source", "cli"}
+    };
+    auto resCancel = client.Post("/api/agent/cancel", headers, cancelReq.dump(), "application/json");
+    assert(resCancel && resCancel->status == 200);
+    json jCancel = json::parse(resCancel->body);
+    assert(jCancel.value("ok", false) == true);
+    assert(jCancel.value("status", "") == "cancelled");
+    assert(jCancel.value("dispatched", false) == true);
+    assert(jCancel.value("method", "") == "connect_rpc_cancel_cascade");
+    {
+        std::lock_guard<std::mutex> lk(cancelMutex);
+        assert(cancelCallCount == 1);
+        assert(lastCancelBody.value("cascadeId", "") == cid);
+        assert(lastCancelBody.value("killBackgroundTasks", false) == true);
+    }
+
+    // 3. Subsequent transcript poll reports generating = false, status = DONE
+    auto res2 = client.Get(("/api/agent/transcript?id=" + cid).c_str(), headers);
+    assert(res2 && res2->status == 200);
+    json j2 = json::parse(res2->body);
+    assert(j2.value("generating", true) == false);
+    assert(j2.value("status", "") == "DONE");
+
+    server.stop();
+    mockLs.stop();
+    if (lsThread.joinable()) lsThread.join();
+    unsetenv("AGY_LS_PORT");
+    unsetenv("AGY_LS_CSRF_TOKEN");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] testTranscriptGeneratingStateAndCancelCascadeInvocation passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -4302,6 +4410,7 @@ int main() {
     Turn1CursorSessionWithSubagentsAndNoParentJsonl_AppearsInConversationsAndTranscript();
     NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndRejectedOnPromptWith409();
     RuntimeConfigAndStrictSameProcessRelayControlPlane_LocksAndTelemetryPrune();
+    testTranscriptGeneratingStateAndCancelCascadeInvocation();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;
