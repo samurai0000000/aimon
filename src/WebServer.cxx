@@ -796,6 +796,10 @@ static std::string cleanProviderUserPrompt(const std::string& raw) {
     return trimmed;
 }
 
+static bool isAskQuestionToolName(const std::string& name) {
+    return name == "ask_question" || name == "AskUserQuestion" || name == "AskQuestion";
+}
+
 static nlohmann::json normalizeQuestionsJson(const nlohmann::json& rawQ) {
     nlohmann::json parsedQ = rawQ;
     if (rawQ.is_string()) {
@@ -807,15 +811,33 @@ static nlohmann::json normalizeQuestionsJson(const nlohmann::json& rawQ) {
     nlohmann::json items = nlohmann::json::array();
     if (parsedQ.is_array()) {
         items = parsedQ;
-    } else if (parsedQ.is_object() && parsedQ.contains("question")) {
+    } else if (parsedQ.is_object() && (parsedQ.contains("question") || parsedQ.contains("prompt"))) {
         items.push_back(parsedQ);
     }
+
+    auto getStrField = [](const nlohmann::json& obj, const char* key) -> std::string {
+        if (obj.contains(key) && obj[key].is_string()) {
+            return obj[key].get<std::string>();
+        }
+        return "";
+    };
 
     nlohmann::json out = nlohmann::json::array();
     for (const auto& qObj : items) {
         if (!qObj.is_object()) continue;
-        std::string qText = qObj.value("question", "");
-        bool isMulti = qObj.value("is_multi_select", qObj.value("isMultiSelect", false));
+        std::string qText = getStrField(qObj, "question");
+        if (qText.empty()) qText = getStrField(qObj, "prompt");
+        if (qText.empty()) qText = getStrField(qObj, "text");
+        if (qText.empty()) qText = getStrField(qObj, "title");
+
+        bool isMulti = false;
+        for (const char* k : {"is_multi_select", "isMultiSelect", "multiSelect", "allowMultiple", "allow_multiple"}) {
+            if (qObj.contains(k) && qObj[k].is_boolean()) {
+                isMulti = qObj[k].get<bool>();
+                break;
+            }
+        }
+
         nlohmann::json optsStrArr = nlohmann::json::array();
         nlohmann::json optObjsArr = nlohmann::json::array();
 
@@ -832,28 +854,332 @@ static nlohmann::json normalizeQuestionsJson(const nlohmann::json& rawQ) {
                     const auto& opt = rawOpts[idx];
                     if (opt.is_string()) {
                         std::string txt = opt.get<std::string>();
+                        std::string idStr = std::to_string(idx + 1);
                         optsStrArr.push_back(txt);
-                        optObjsArr.push_back({{"id", std::to_string(idx + 1)}, {"text", txt}});
+                        optObjsArr.push_back({{"id", idStr}, {"text", txt}, {"label", txt}});
                     } else if (opt.is_object()) {
-                        std::string txt = opt.value("text", opt.value("label", ""));
-                        std::string idStr = opt.value("id", std::to_string(idx + 1));
+                        std::string txt = getStrField(opt, "text");
+                        if (txt.empty()) txt = getStrField(opt, "label");
+                        std::string idStr = getStrField(opt, "id");
+                        if (idStr.empty()) idStr = std::to_string(idx + 1);
+                        std::string descStr = getStrField(opt, "description");
                         optsStrArr.push_back(txt);
-                        optObjsArr.push_back({{"id", idStr}, {"text", txt}});
+                        nlohmann::json optItem = {
+                            {"id", idStr},
+                            {"text", txt},
+                            {"label", txt}
+                        };
+                        if (!descStr.empty()) {
+                            optItem["description"] = descStr;
+                        }
+                        optObjsArr.push_back(std::move(optItem));
                     }
                 }
             }
         }
 
         if (qText.empty() && optsStrArr.empty()) continue;
-        out.push_back({
+        nlohmann::json normItem = {
             {"question", qText},
             {"options", optsStrArr},
             {"optionObjects", optObjsArr},
             {"is_multi_select", isMulti},
-            {"isMultiSelect", isMulti}
-        });
+            {"isMultiSelect", isMulti},
+            {"multiSelect", isMulti},
+            {"allowMultiple", isMulti}
+        };
+        if (qObj.contains("id") && qObj["id"].is_string()) {
+            normItem["id"] = qObj["id"].get<std::string>();
+        }
+        if (qObj.contains("header") && qObj["header"].is_string()) {
+            normItem["header"] = qObj["header"].get<std::string>();
+        }
+        out.push_back(std::move(normItem));
     }
     return out;
+}
+
+struct PendingCursorStoreQuestion {
+    bool found = false;
+    std::string toolCallId;
+    std::string title;
+    std::string leadingText;
+    std::string thinkingText;
+    nlohmann::json rawArgs = nlohmann::json::object();
+    nlohmann::json normalizedQuestions = nlohmann::json::array();
+    uint64_t startedAtSec = 0;
+};
+
+static std::string decodeHexToString(const std::string& hex) {
+    std::string trimmed = hex;
+    while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t' ||
+                                trimmed.front() == '\r' || trimmed.front() == '\n')) {
+        trimmed.erase(0, 1);
+    }
+    while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t' ||
+                                trimmed.back() == '\r' || trimmed.back() == '\n')) {
+        trimmed.pop_back();
+    }
+    if (trimmed.empty()) return "";
+    if (trimmed.front() == '{' || trimmed.front() == '[') {
+        return trimmed;
+    }
+    if (trimmed.size() % 2 != 0) return "";
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    };
+    std::string out;
+    out.reserve(trimmed.size() / 2);
+    for (size_t i = 0; i + 1 < trimmed.size(); i += 2) {
+        int hi = hexVal(trimmed[i]);
+        int lo = hexVal(trimmed[i + 1]);
+        if (hi < 0 || lo < 0) return "";
+        out.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    return out;
+}
+
+static PendingCursorStoreQuestion extractPendingCursorStoreQuestion(const std::string& cid) {
+    PendingCursorStoreQuestion result;
+    if (cid.empty() || cid == "new" || cid.find("..") != std::string::npos || cid.find('/') != std::string::npos) {
+        return result;
+    }
+
+    std::vector<fs::path> candidateRoots;
+    const char* envChats = std::getenv("AIMON_CURSOR_CHATS_DIR");
+    if (envChats && *envChats) {
+        candidateRoots.emplace_back(envChats);
+    } else {
+        const char* envCursorProj = std::getenv("AIMON_CURSOR_PROJECTS_DIR");
+        const char* envCli = std::getenv("AIMON_CLI_BRAIN_DIR");
+        const char* envIde = std::getenv("AIMON_IDE_BRAIN_DIR");
+        if (envCursorProj && *envCursorProj) {
+            candidateRoots.push_back(fs::path(envCursorProj).parent_path() / "chats");
+        }
+        if (!(envCli && *envCli) && !(envIde && *envIde)) {
+            candidateRoots.emplace_back(PathUtils::expandHome("~/.cursor/chats"));
+        }
+    }
+
+    fs::path dbPath;
+    for (const auto& chatsRoot : candidateRoots) {
+        std::error_code ec;
+        if (!fs::exists(chatsRoot, ec) || !fs::is_directory(chatsRoot, ec)) continue;
+        fs::path directDb = chatsRoot / cid / "store.db";
+        if (fs::exists(directDb, ec) && fs::is_regular_file(directDb, ec)) {
+            dbPath = directDb;
+            break;
+        }
+        for (const auto& wsEnt : fs::directory_iterator(chatsRoot, ec)) {
+            if (ec || !wsEnt.is_directory()) continue;
+            fs::path candDb = wsEnt.path() / cid / "store.db";
+            std::error_code cEc;
+            if (fs::exists(candDb, cEc) && fs::is_regular_file(candDb, cEc)) {
+                dbPath = candDb;
+                break;
+            }
+        }
+        if (!dbPath.empty()) break;
+    }
+
+    if (dbPath.empty()) {
+        return result;
+    }
+
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(dbPath.string().c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr) != SQLITE_OK || !db) {
+        if (db) sqlite3_close(db);
+        return result;
+    }
+    sqlite3_busy_timeout(db, 250);
+
+    std::string latestRootBlobId;
+    {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "SELECT value FROM meta WHERE key = '0' LIMIT 1;";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK && stmt) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                const void* rawPtr = sqlite3_column_blob(stmt, 0);
+                int rawLen = sqlite3_column_bytes(stmt, 0);
+                if (rawPtr && rawLen > 0) {
+                    std::string rawVal(static_cast<const char*>(rawPtr), static_cast<size_t>(rawLen));
+                    std::string decoded = decodeHexToString(rawVal);
+                    if (!decoded.empty()) {
+                        auto metaJson = nlohmann::json::parse(decoded, nullptr, false);
+                        if (!metaJson.is_discarded() && metaJson.is_object()) {
+                            latestRootBlobId = metaJson.value("latestRootBlobId", "");
+                        }
+                    }
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    if (latestRootBlobId.empty()) {
+        sqlite3_close(db);
+        return result;
+    }
+
+    std::string blobData;
+    {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "SELECT data FROM blobs WHERE id = ? LIMIT 1;";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK && stmt) {
+            sqlite3_bind_text(stmt, 1, latestRootBlobId.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                const void* rawPtr = sqlite3_column_blob(stmt, 0);
+                int rawLen = sqlite3_column_bytes(stmt, 0);
+                if (rawPtr && rawLen > 0) {
+                    blobData.assign(static_cast<const char*>(rawPtr), static_cast<size_t>(rawLen));
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+    sqlite3_close(db);
+
+    if (blobData.empty()) {
+        return result;
+    }
+
+    auto blobJson = nlohmann::json::parse(blobData, nullptr, false);
+    if (blobJson.is_discarded() || !blobJson.is_object()) {
+        return result;
+    }
+    if (blobJson.value("role", "") != "assistant" ||
+        !blobJson.contains("content") || !blobJson["content"].is_array()) {
+        return result;
+    }
+
+    std::set<std::string> contractToolCallIds;
+    bool hasAskQuestionContract = false;
+    uint64_t startedAtSec = 0;
+    if (blobJson.contains("providerOptions") && blobJson["providerOptions"].is_object()) {
+        const auto& po = blobJson["providerOptions"];
+        if (po.contains("cursor") && po["cursor"].is_object()) {
+            const auto& curOpt = po["cursor"];
+            if (curOpt.contains("pendingToolCallStartedAtMs") &&
+                curOpt["pendingToolCallStartedAtMs"].is_number()) {
+                int64_t ms = curOpt["pendingToolCallStartedAtMs"].get<int64_t>();
+                if (ms > 0) {
+                    startedAtSec = static_cast<uint64_t>(ms / 1000);
+                }
+            }
+            if (curOpt.contains("pendingToolExecutionContracts") &&
+                curOpt["pendingToolExecutionContracts"].is_array()) {
+                for (const auto& contract : curOpt["pendingToolExecutionContracts"]) {
+                    if (!contract.is_object()) continue;
+                    std::string outerName = contract.value("outerToolName", "");
+                    std::string toolIdent = contract.value("toolIdentifier", "");
+                    if (isAskQuestionToolName(outerName) || toolIdent == "ASK_QUESTION") {
+                        hasAskQuestionContract = true;
+                        std::string cidStr = contract.value("toolCallId", "");
+                        if (!cidStr.empty()) {
+                            contractToolCallIds.insert(cidStr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::string thinkingText;
+    std::string leadingText;
+    std::string foundToolCallId;
+    nlohmann::json foundRawArgs = nlohmann::json::object();
+    bool sawAskQuestionToolCall = false;
+    std::set<std::string> resolvedToolCallIdsInBlob;
+
+    for (const auto& blk : blobJson["content"]) {
+        if (!blk.is_object()) continue;
+        std::string btype = blk.value("type", "");
+        if (btype == "reasoning" || btype == "thinking") {
+            std::string th = blk.value("text", blk.value("thinking", ""));
+            if (!th.empty()) {
+                if (!thinkingText.empty()) thinkingText += "\n";
+                thinkingText += th;
+            }
+        } else if (btype == "text") {
+            std::string tx = blk.value("text", "");
+            if (!tx.empty()) {
+                if (!leadingText.empty()) leadingText += "\n";
+                leadingText += tx;
+            }
+        } else if (btype == "tool-call" || btype == "tool_use") {
+            std::string tName = blk.value("toolName", blk.value("name", ""));
+            std::string tcId = blk.value("toolCallId", blk.value("id", ""));
+            nlohmann::json argsObj = nlohmann::json::object();
+            for (const char* ak : {"args", "input", "arguments"}) {
+                if (blk.contains(ak)) {
+                    if (blk[ak].is_object()) {
+                        argsObj = blk[ak];
+                        break;
+                    } else if (blk[ak].is_string()) {
+                        auto pa = nlohmann::json::parse(blk[ak].get<std::string>(), nullptr, false);
+                        if (!pa.is_discarded() && pa.is_object()) {
+                            argsObj = std::move(pa);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (tName == "CallDynamicTool") {
+                std::string innerName = argsObj.value("toolName", argsObj.value("name", ""));
+                if (!innerName.empty()) {
+                    tName = innerName;
+                }
+                if (argsObj.contains("arguments") && argsObj["arguments"].is_object()) {
+                    argsObj = argsObj["arguments"];
+                } else if (argsObj.contains("args") && argsObj["args"].is_object()) {
+                    argsObj = argsObj["args"];
+                }
+            }
+            if (isAskQuestionToolName(tName) ||
+                (!tcId.empty() && contractToolCallIds.count(tcId) > 0)) {
+                sawAskQuestionToolCall = true;
+                foundToolCallId = tcId;
+                foundRawArgs = std::move(argsObj);
+            }
+        } else if (btype == "tool-result" || btype == "tool_result") {
+            std::string trId = blk.value("toolCallId", blk.value("tool_use_id", ""));
+            if (!trId.empty()) {
+                resolvedToolCallIdsInBlob.insert(trId);
+            }
+        }
+    }
+
+    if (!sawAskQuestionToolCall && !hasAskQuestionContract) {
+        return result;
+    }
+    if (!foundToolCallId.empty() && resolvedToolCallIdsInBlob.count(foundToolCallId) > 0) {
+        return result;
+    }
+
+    nlohmann::json normQ = foundRawArgs.contains("questions")
+        ? normalizeQuestionsJson(foundRawArgs["questions"])
+        : nlohmann::json::array();
+    if (normQ.empty() && ((foundRawArgs.contains("question") && foundRawArgs["question"].is_string()) ||
+                          (foundRawArgs.contains("prompt") && foundRawArgs["prompt"].is_string()))) {
+        normQ = normalizeQuestionsJson(nlohmann::json::array({foundRawArgs}));
+    }
+    if (normQ.empty()) {
+        return result;
+    }
+
+    foundRawArgs["questions"] = normQ;
+    result.found = true;
+    result.toolCallId = foundToolCallId;
+    result.title = foundRawArgs.value("title", "");
+    result.leadingText = leadingText;
+    result.thinkingText = thinkingText;
+    result.rawArgs = std::move(foundRawArgs);
+    result.normalizedQuestions = std::move(normQ);
+    result.startedAtSec = startedAtSec;
+    return result;
 }
 
 static void inferWorkspaceFromProjectSlug(const std::string& slug,
@@ -2005,6 +2331,8 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     std::string lastConsecutiveUserPrompt;
     bool parentTurnEnded = false;
     std::set<std::string> pendingSubagentToolUseIds;
+    std::set<std::string> completedToolCallIds;
+    std::set<std::string> seenToolUseIds;
     int lastClaudeCompactStepIdx = 0;
     uint64_t pendingClaudePreTokens = 0;
     uint64_t pendingClaudePostTokens = 0;
@@ -2054,6 +2382,7 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                 while (!completedId.empty() && (completedId.back() == ' ' || completedId.back() == '\t' || completedId.back() == '\r' || completedId.back() == '\n')) completedId.pop_back();
                 if (!completedId.empty()) {
                     pendingSubagentToolUseIds.erase(completedId);
+                    completedToolCallIds.insert(completedId);
                 }
             }
         } else if (line.find("<task-notification>") != std::string::npos && pendingSubagentToolUseIds.size() == 1) {
@@ -2131,10 +2460,11 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
 
         if (msgObj.contains("content") && msgObj["content"].is_array()) {
             for (const auto& blk : msgObj["content"]) {
-                if (blk.is_object() && blk.value("type", "") == "tool_result") {
-                    std::string trId = blk.value("tool_use_id", "");
+                if (blk.is_object() && (blk.value("type", "") == "tool_result" || blk.value("type", "") == "tool-result")) {
+                    std::string trId = blk.value("tool_use_id", blk.value("toolCallId", ""));
                     if (!trId.empty()) {
                         pendingSubagentToolUseIds.erase(trId);
+                        completedToolCallIds.insert(trId);
                     }
                 }
             }
@@ -2166,12 +2496,55 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
             }
 
             if (!summaryOnly) {
+                nlohmann::json toolUseAnswersObj = nlohmann::json::object();
+                if (j.contains("toolUseResult") && j["toolUseResult"].is_object() &&
+                    j["toolUseResult"].contains("answers") && j["toolUseResult"]["answers"].is_object()) {
+                    toolUseAnswersObj = j["toolUseResult"]["answers"];
+                }
+                auto appendAnswerValue = [](nlohmann::json& arr, const nlohmann::json& val) {
+                    if (val.is_string()) {
+                        std::string s = val.get<std::string>();
+                        if (!s.empty()) arr.push_back(s);
+                    } else if (val.is_array()) {
+                        for (const auto& el : val) {
+                            if (el.is_string() && !el.get<std::string>().empty()) {
+                                arr.push_back(el.get<std::string>());
+                            }
+                        }
+                    }
+                };
                 for (auto& prevSt : out.steps) {
                     if (prevSt.is_object() && prevSt.contains("askQuestion") &&
                         prevSt["askQuestion"].is_object() &&
                         prevSt["askQuestion"].value("answered", true) == false) {
                         prevSt["askQuestion"]["answered"] = true;
+                        if (!toolUseAnswersObj.empty()) {
+                            nlohmann::json extractedAnswers = nlohmann::json::array();
+                            std::set<std::string> matchedKeys;
+                            if (prevSt["askQuestion"].contains("questions") &&
+                                prevSt["askQuestion"]["questions"].is_array()) {
+                                for (const auto& qItem : prevSt["askQuestion"]["questions"]) {
+                                    if (!qItem.is_object()) continue;
+                                    std::string qTxt = qItem.value("question", "");
+                                    if (!qTxt.empty() && toolUseAnswersObj.contains(qTxt)) {
+                                        appendAnswerValue(extractedAnswers, toolUseAnswersObj[qTxt]);
+                                        matchedKeys.insert(qTxt);
+                                    }
+                                }
+                            }
+                            for (auto it = toolUseAnswersObj.begin(); it != toolUseAnswersObj.end(); ++it) {
+                                if (matchedKeys.count(it.key()) == 0) {
+                                    appendAnswerValue(extractedAnswers, it.value());
+                                }
+                            }
+                            prevSt["askQuestion"]["answers"] = std::move(extractedAnswers);
+                        }
                     }
+                }
+                if (out.lastStepObj.is_object() && out.lastStepObj.contains("askQuestion") &&
+                    out.lastStepObj["askQuestion"].is_object() &&
+                    out.lastStepObj["askQuestion"].value("answered", true) == false) {
+                    out.lastStepObj["askQuestion"]["answered"] = true;
                 }
             }
 
@@ -2315,15 +2688,20 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                                     replyText += tx;
                                 }
                             }
-                        } else if (btype == "tool_use") {
-                            std::string toolName = blk.value("name", "tool");
-                            std::string toolId = blk.value("id", "");
+                        } else if (btype == "tool_use" || btype == "tool-call") {
+                            std::string toolName = blk.value("name", blk.value("toolName", "tool"));
+                            std::string toolId = blk.value("id", blk.value("toolCallId", ""));
+                            if (!toolId.empty()) {
+                                seenToolUseIds.insert(toolId);
+                            }
                             if ((toolName == "Agent" || toolName == "Task") && !toolId.empty()) {
                                 pendingSubagentToolUseIds.insert(toolId);
                             }
                             nlohmann::json inputObj = (blk.contains("input") && blk["input"].is_object())
                                                           ? blk["input"]
-                                                          : nlohmann::json::object();
+                                                          : ((blk.contains("args") && blk["args"].is_object())
+                                                                 ? blk["args"]
+                                                                 : nlohmann::json::object());
                             if (toolName == "GetDynamicTools") {
                                 continue;
                             }
@@ -2358,11 +2736,12 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
                                     pendingSubagentToolUseIds.insert(toolId);
                                 }
                             }
-                            if (toolName == "AskUserQuestion" || toolName == "ask_question") {
+                            if (isAskQuestionToolName(toolName)) {
                                 nlohmann::json normQ = inputObj.contains("questions")
                                     ? normalizeQuestionsJson(inputObj["questions"])
                                     : nlohmann::json::array();
-                                if (normQ.empty() && inputObj.contains("question") && inputObj["question"].is_string()) {
+                                if (normQ.empty() && ((inputObj.contains("question") && inputObj["question"].is_string()) ||
+                                                      (inputObj.contains("prompt") && inputObj["prompt"].is_string()))) {
                                     normQ = normalizeQuestionsJson(nlohmann::json::array({inputObj}));
                                 }
                                 if (!normQ.empty()) {
@@ -2827,6 +3206,121 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
         }
     }
 
+    if (providerSource == "cursor" && filePath.parent_path().filename() != "subagents" && !parentTurnEnded) {
+        std::string cid = filePath.stem().string();
+        PendingCursorStoreQuestion pendingQ = extractPendingCursorStoreQuestion(cid);
+        if (pendingQ.found && !pendingQ.normalizedQuestions.empty()) {
+            bool alreadyInTranscript = false;
+            if (!pendingQ.toolCallId.empty() &&
+                (seenToolUseIds.count(pendingQ.toolCallId) > 0 ||
+                 completedToolCallIds.count(pendingQ.toolCallId) > 0)) {
+                alreadyInTranscript = true;
+            }
+            std::string firstPendingQText = pendingQ.normalizedQuestions[0].value("question", "");
+            for (const auto& existingStep : out.steps) {
+                if (!existingStep.is_object() || !existingStep.contains("askQuestion") ||
+                    !existingStep["askQuestion"].is_object()) {
+                    continue;
+                }
+                if (!existingStep["askQuestion"].value("answered", true)) {
+                    alreadyInTranscript = true;
+                    break;
+                }
+                const auto& eqs = existingStep["askQuestion"].value("questions", nlohmann::json::array());
+                if (eqs.is_array() && !eqs.empty() && eqs[0].is_object() &&
+                    !firstPendingQText.empty() &&
+                    eqs[0].value("question", "") == firstPendingQText) {
+                    alreadyInTranscript = true;
+                    break;
+                }
+            }
+            if (!alreadyInTranscript) {
+                if (out.userPrompts.empty() && !hookFirstPrompt.empty()) {
+                    int uIdx = stepIdx++;
+                    out.totalSteps = uIdx + 1;
+                    out.hasValidTurns = true;
+                    out.firstPrompt = hookFirstPrompt;
+                    out.lastPrompt = hookFirstPrompt;
+                    out.lastPromptStepIndex = uIdx;
+                    out.userPrompts.push_back({
+                        {"stepIndex", uIdx},
+                        {"filteredStepIndex", uIdx},
+                        {"text", hookFirstPrompt},
+                        {"timestamp", ""}
+                    });
+                    if (!summaryOnly) {
+                        nlohmann::json uStep = {
+                            {"index", uIdx},
+                            {"stepIndex", uIdx},
+                            {"step_index", uIdx},
+                            {"type", "USER_INPUT"},
+                            {"status", "DONE"},
+                            {"content", hookFirstPrompt},
+                            {"text", hookFirstPrompt},
+                            {"userInput", hookFirstPrompt},
+                            {"createdAt", ""},
+                            {"step", {{"case", "userInput"}, {"value", hookFirstPrompt}}}
+                        };
+                        out.lastStepObj = uStep;
+                        if (sinceIndex < 0 || uIdx > sinceIndex) {
+                            out.steps.push_back(std::move(uStep));
+                        }
+                    }
+                }
+                int curIdx = stepIdx++;
+                out.totalSteps = curIdx + 1;
+                out.hasValidTurns = true;
+                if (pendingQ.startedAtSec > out.lastActivitySec) {
+                    out.lastActivitySec = pendingQ.startedAtSec;
+                }
+                if (out.firstPrompt.empty()) {
+                    out.firstPrompt = !pendingQ.title.empty() ? pendingQ.title : firstPendingQText;
+                }
+                if (!summaryOnly) {
+                    nlohmann::json synthToolCalls = nlohmann::json::array({
+                        {
+                            {"name", "AskQuestion"},
+                            {"toolAction", ""},
+                            {"toolSummary", pendingQ.title},
+                            {"command", ""},
+                            {"arguments", pendingQ.rawArgs},
+                            {"args", pendingQ.rawArgs}
+                        }
+                    });
+                    std::string displayVal = !pendingQ.leadingText.empty()
+                        ? pendingQ.leadingText
+                        : (!pendingQ.thinkingText.empty() ? pendingQ.thinkingText : firstPendingQText);
+                    nlohmann::json qStep = {
+                        {"index", curIdx},
+                        {"stepIndex", curIdx},
+                        {"step_index", curIdx},
+                        {"type", "PLANNER_RESPONSE"},
+                        {"status", "WAITING"},
+                        {"content", pendingQ.leadingText},
+                        {"thinking", pendingQ.thinkingText},
+                        {"plannerResponse", pendingQ.thinkingText},
+                        {"text", pendingQ.leadingText},
+                        {"tool_calls", std::move(synthToolCalls)},
+                        {"createdAt", ""},
+                        {"askQuestion", {
+                            {"questions", pendingQ.normalizedQuestions},
+                            {"answered", false},
+                            {"answers", nlohmann::json::array()}
+                        }},
+                        {"step", {
+                            {"case", !pendingQ.leadingText.empty() ? "text" : "plannerResponse"},
+                            {"value", displayVal}
+                        }}
+                    };
+                    out.lastStepObj = qStep;
+                    if (sinceIndex < 0 || curIdx > sinceIndex) {
+                        out.steps.push_back(std::move(qStep));
+                    }
+                }
+            }
+        }
+    }
+
     if (out.firstPrompt.empty() && out.hasValidTurns) {
         out.firstPrompt = (providerSource == "cursor") ? "Compacted Cursor Session" : "Compacted Session";
     }
@@ -2836,6 +3330,14 @@ static NormalizedProviderTranscript parseProviderTranscriptJsonl(
     }
     if (out.hasValidTurns && out.status == "IDLE" && (parentTurnEnded || providerSource == "claude")) {
         out.status = "DONE";
+    }
+    if ((!out.steps.empty() && out.steps.back().is_object() &&
+         out.steps.back().contains("askQuestion") && out.steps.back()["askQuestion"].is_object() &&
+         !out.steps.back()["askQuestion"].value("answered", true)) ||
+        (out.lastStepObj.is_object() && out.lastStepObj.contains("askQuestion") &&
+         out.lastStepObj["askQuestion"].is_object() &&
+         !out.lastStepObj["askQuestion"].value("answered", true))) {
+        out.status = "WAITING";
     }
     if (filePath.parent_path().filename() != "subagents") {
         std::string cid = filePath.stem().string();
@@ -2913,6 +3415,12 @@ static fs::path findProviderTranscriptById(const std::string& id,
         if (!ws.empty()) {
             outProjectSlug = fs::path(ws).filename().string();
         }
+        std::string hookDir = getCursorHookStateDir();
+        return fs::path(hookDir.empty() ? "/tmp" : hookDir) / (id + ".jsonl");
+    }
+
+    if (extractPendingCursorStoreQuestion(id).found) {
+        outSource = "cursor";
         std::string hookDir = getCursorHookStateDir();
         return fs::path(hookDir.empty() ? "/tmp" : hookDir) / (id + ".jsonl");
     }
@@ -3677,6 +4185,210 @@ static bool isUserTranscriptLine(const std::string& targetProvider, const std::s
            line.find("\"type\": \"user\"") != std::string::npos;
 }
 
+static std::vector<std::string> buildProviderAskQuestionTuiKeystrokes(
+    const std::string& provider,
+    const nlohmann::json& questions,
+    const nlohmann::json& questionResponses,
+    const std::string& fallbackPrompt) {
+    std::vector<std::string> keys;
+    if (!questions.is_array() || questions.empty()) {
+        return keys;
+    }
+
+    auto trimAscii = [](const std::string& str) -> std::string {
+        auto fPos = str.find_first_not_of(" \t\r\n");
+        if (fPos == std::string::npos) return "";
+        auto lPos = str.find_last_not_of(" \t\r\n");
+        return str.substr(fPos, lPos - fPos + 1);
+    };
+
+    auto sanitizeWriteIn = [&](const std::string& raw) -> std::string {
+        std::string s = raw;
+        for (auto& c : s) {
+            if (c == '\r' || c == '\n') c = ' ';
+        }
+        return trimAscii(s);
+    };
+
+    auto matchOptionIndex = [&](const std::string& candidate,
+                                const nlohmann::json& optsArr,
+                                const nlohmann::json& optObjsArr,
+                                size_t& outIdx) -> bool {
+        std::string trimmed = trimAscii(candidate);
+        if (trimmed.empty()) return false;
+        size_t M = optsArr.is_array() ? optsArr.size() : 0;
+        for (size_t idx = 0; idx < M; ++idx) {
+            if (optsArr[idx].is_string()) {
+                std::string optTxt = optsArr[idx].get<std::string>();
+                if (candidate == optTxt || trimmed == trimAscii(optTxt)) {
+                    outIdx = idx;
+                    return true;
+                }
+            }
+            if (optObjsArr.is_array() && idx < optObjsArr.size() && optObjsArr[idx].is_object()) {
+                const auto& oObj = optObjsArr[idx];
+                std::string oId = oObj.value("id", "");
+                std::string oLbl = oObj.value("label", oObj.value("text", ""));
+                if (!oId.empty() && (candidate == oId || trimmed == trimAscii(oId))) {
+                    outIdx = idx;
+                    return true;
+                }
+                if (!oLbl.empty() && (candidate == oLbl || trimmed == trimAscii(oLbl))) {
+                    outIdx = idx;
+                    return true;
+                }
+            }
+        }
+        for (size_t idx = 0; idx < M; ++idx) {
+            if (trimmed == std::to_string(idx + 1)) {
+                outIdx = idx;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    size_t Q = questions.size();
+    for (size_t qi = 0; qi < Q; ++qi) {
+        const auto& qObj = questions[qi];
+        if (!qObj.is_object()) continue;
+
+        bool isMulti = qObj.value("isMultiSelect", false);
+        std::string qText = qObj.value("question", "");
+        const nlohmann::json emptyArr = nlohmann::json::array();
+        const nlohmann::json& optsArr = (qObj.contains("options") && qObj["options"].is_array())
+            ? qObj["options"] : emptyArr;
+        const nlohmann::json& optObjsArr = (qObj.contains("optionObjects") && qObj["optionObjects"].is_array())
+            ? qObj["optionObjects"] : emptyArr;
+        size_t M = optsArr.size();
+
+        nlohmann::json matchedResp = nlohmann::json::object();
+        bool hasMatchedResp = false;
+        if (questionResponses.is_array() && !questionResponses.empty()) {
+            if (!qText.empty()) {
+                for (const auto& r : questionResponses) {
+                    if (r.is_object() && r.value("question", "") == qText) {
+                        matchedResp = r;
+                        hasMatchedResp = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasMatchedResp && qi < questionResponses.size() && questionResponses[qi].is_object()) {
+                matchedResp = questionResponses[qi];
+                hasMatchedResp = true;
+            }
+        }
+
+        std::vector<size_t> selectedIndices;
+        std::string writeIn;
+        if (hasMatchedResp) {
+            auto collectSelections = [&](const nlohmann::json& selArr) {
+                if (!selArr.is_array()) return;
+                for (const auto& sItem : selArr) {
+                    if (!sItem.is_string()) continue;
+                    size_t matchedIdx = 0;
+                    if (matchOptionIndex(sItem.get<std::string>(), optsArr, optObjsArr, matchedIdx)) {
+                        selectedIndices.push_back(matchedIdx);
+                    }
+                }
+            };
+            if (matchedResp.contains("selectedOptions")) {
+                collectSelections(matchedResp["selectedOptions"]);
+            }
+            if (selectedIndices.empty() && matchedResp.contains("selectedOptionIds")) {
+                collectSelections(matchedResp["selectedOptionIds"]);
+            }
+            writeIn = sanitizeWriteIn(matchedResp.value("writeInResponse", ""));
+        } else if (qi == 0 && !fallbackPrompt.empty()) {
+            size_t matchedIdx = 0;
+            if (matchOptionIndex(fallbackPrompt, optsArr, optObjsArr, matchedIdx)) {
+                selectedIndices.push_back(matchedIdx);
+            } else {
+                writeIn = sanitizeWriteIn(fallbackPrompt);
+            }
+        }
+
+        std::sort(selectedIndices.begin(), selectedIndices.end());
+        selectedIndices.erase(
+            std::unique(selectedIndices.begin(), selectedIndices.end()),
+            selectedIndices.end());
+
+        if (provider == "cursor") {
+            if (!isMulti) {
+                if (!writeIn.empty() && selectedIndices.empty()) {
+                    for (size_t step = 0; step < M; ++step) {
+                        keys.push_back("\x1b[B");
+                    }
+                    keys.push_back(writeIn);
+                    keys.push_back("\r");
+                } else {
+                    size_t idx = selectedIndices.empty() ? 0 : selectedIndices[0];
+                    for (size_t step = 0; step < idx; ++step) {
+                        keys.push_back("\x1b[B");
+                    }
+                    keys.push_back("\r");
+                }
+            } else {
+                size_t curPos = 0;
+                for (size_t idx : selectedIndices) {
+                    while (curPos < idx) {
+                        keys.push_back("\x1b[B");
+                        ++curPos;
+                    }
+                    keys.push_back(" ");
+                }
+                keys.push_back("s");
+            }
+        } else if (provider == "claude") {
+            if (!isMulti) {
+                if (!writeIn.empty() && selectedIndices.empty()) {
+                    for (size_t step = 0; step < M; ++step) {
+                        keys.push_back("\x1b[B");
+                    }
+                    keys.push_back(writeIn);
+                    keys.push_back("\r");
+                } else {
+                    size_t idx = selectedIndices.empty() ? 0 : selectedIndices[0];
+                    for (size_t step = 0; step < idx; ++step) {
+                        keys.push_back("\x1b[B");
+                    }
+                    keys.push_back("\r");
+                }
+            } else {
+                size_t curPos = 0;
+                for (size_t idx : selectedIndices) {
+                    while (curPos < idx) {
+                        keys.push_back("\x1b[B");
+                        ++curPos;
+                    }
+                    keys.push_back(" ");
+                }
+                if (!writeIn.empty()) {
+                    while (curPos < M) {
+                        keys.push_back("\x1b[B");
+                        ++curPos;
+                    }
+                    keys.push_back(writeIn);
+                    keys.push_back("\x1b[B");
+                    curPos = M + 1;
+                } else {
+                    while (curPos < M + 1) {
+                        keys.push_back("\x1b[B");
+                        ++curPos;
+                    }
+                }
+                keys.push_back("\r");
+            }
+        }
+    }
+
+    if (provider == "claude" && !keys.empty()) {
+        keys.push_back("\r");
+    }
+    return keys;
+}
+
 static bool pollLiveProviderTurn(
     const std::string& targetProvider,
     const std::string& cid,
@@ -3684,8 +4396,8 @@ static bool pollLiveProviderTurn(
     const std::string& existingSlug,
     size_t priorLineCount,
     size_t priorUserLineCount,
-    std::string& replyText) {
-    (void)priorLineCount;
+    std::string& replyText,
+    bool isAnsweringPendingQuestion = false) {
     int timeoutMs = 90000;
     const char* envTimeout = std::getenv("AIMON_LIVE_ROUTE_TIMEOUT_MS");
     if (envTimeout && *envTimeout) {
@@ -3730,13 +4442,22 @@ static bool pollLiveProviderTurn(
             }
         }
 
-        if (userLineCount <= priorUserLineCount) {
-            continue;
+        size_t scanStart = 0;
+        if (isAnsweringPendingQuestion) {
+            if (lines.size() <= priorLineCount) {
+                continue;
+            }
+            scanStart = priorLineCount;
+        } else {
+            if (userLineCount <= priorUserLineCount) {
+                continue;
+            }
+            scanStart = lastUserLineIdx + 1;
         }
 
         if (targetProvider == "cursor") {
             bool sawTurnEnded = false;
-            for (size_t i = lastUserLineIdx + 1; i < lines.size(); ++i) {
+            for (size_t i = scanStart; i < lines.size(); ++i) {
                 const auto& cl = lines[i];
                 if (cl.find("\"type\":\"turn_ended\"") != std::string::npos ||
                     cl.find("\"type\": \"turn_ended\"") != std::string::npos) {
@@ -3756,7 +4477,7 @@ static bool pollLiveProviderTurn(
                 }
             }
         } else {
-            for (size_t i = lastUserLineIdx + 1; i < lines.size(); ++i) {
+            for (size_t i = scanStart; i < lines.size(); ++i) {
                 const auto& cl = lines[i];
                 if ((cl.find("\"type\":\"assistant\"") != std::string::npos ||
                      cl.find("\"type\": \"assistant\"") != std::string::npos) &&
@@ -3820,7 +4541,8 @@ static bool routePromptViaMultiplexer(
     const std::string& existingTranscriptPath,
     const std::string& existingSlug,
     std::string& replyText,
-    bool& outDispatchFailed) {
+    bool& outDispatchFailed,
+    const nlohmann::json& questionResponses = nlohmann::json::array()) {
     outDispatchFailed = false;
     if (sessionInfo.muxType.empty() || sessionInfo.muxSession.empty()) {
         outDispatchFailed = true;
@@ -3841,6 +4563,145 @@ static bool routePromptViaMultiplexer(
                 }
             }
         }
+    }
+
+    nlohmann::json pendingQuestions = nlohmann::json::array();
+    if (!existingTranscriptPath.empty()) {
+        auto parsedPre = parseProviderTranscriptJsonl(
+            existingTranscriptPath, targetProvider, -1, existingSlug, false);
+        if (!parsedPre.steps.empty() && parsedPre.steps.back().is_object() &&
+            parsedPre.steps.back().contains("askQuestion") &&
+            parsedPre.steps.back()["askQuestion"].is_object() &&
+            !parsedPre.steps.back()["askQuestion"].value("answered", true)) {
+            pendingQuestions = parsedPre.steps.back()["askQuestion"].value(
+                "questions", nlohmann::json::array());
+        }
+    }
+    if (pendingQuestions.empty() && targetProvider == "cursor" && !cid.empty()) {
+        auto sq = extractPendingCursorStoreQuestion(cid);
+        if (sq.found && !sq.normalizedQuestions.empty()) {
+            pendingQuestions = sq.normalizedQuestions;
+        }
+    }
+
+    bool isAnsweringPendingQuestion = false;
+    std::vector<std::string> tuiKeys;
+    if (pendingQuestions.is_array() && !pendingQuestions.empty()) {
+        tuiKeys = buildProviderAskQuestionTuiKeystrokes(
+            targetProvider, pendingQuestions, questionResponses, promptArg);
+        if (!tuiKeys.empty()) {
+            isAnsweringPendingQuestion = true;
+        }
+    }
+
+    if (isAnsweringPendingQuestion) {
+        if (sessionInfo.muxType == "screen") {
+            const char* envScreenBin = std::getenv("AIMON_SCREEN_BIN");
+            std::string screenBin = (envScreenBin && *envScreenBin) ? envScreenBin : "/usr/bin/screen";
+            std::string winTarget = !sessionInfo.muxTarget.empty() ? sessionInfo.muxTarget : "0";
+            for (size_t ki = 0; ki < tuiKeys.size(); ++ki) {
+                std::string escapedChunk;
+                escapedChunk.reserve(tuiKeys[ki].size() * 2);
+                for (char c : tuiKeys[ki]) {
+                    if (c == '^' || c == '\\') {
+                        escapedChunk.push_back('\\');
+                    }
+                    escapedChunk.push_back(c);
+                }
+                std::vector<std::string> stuffCmd = {
+                    screenBin, "-S", sessionInfo.muxSession, "-p", winTarget, "-X", "stuff", escapedChunk
+                };
+                if (!runCommandSync(stuffCmd)) {
+                    outDispatchFailed = true;
+                    return false;
+                }
+                if (ki + 1 < tuiKeys.size()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                }
+            }
+        } else if (sessionInfo.muxType == "tmux") {
+            const char* envTmuxBin = std::getenv("AIMON_TMUX_BIN");
+            std::string tmuxBin = (envTmuxBin && *envTmuxBin) ? envTmuxBin : "/usr/bin/tmux";
+            std::string paneTarget = !sessionInfo.muxTarget.empty() ? sessionInfo.muxTarget : sessionInfo.muxSession;
+            bool isSocketPath = (sessionInfo.muxSession.find('/') != std::string::npos);
+            for (size_t ki = 0; ki < tuiKeys.size(); ++ki) {
+                const std::string& k = tuiKeys[ki];
+                std::vector<std::string> sendCmd = {tmuxBin};
+                if (isSocketPath) {
+                    sendCmd.push_back("-S");
+                    sendCmd.push_back(sessionInfo.muxSession);
+                }
+                if (k == "\x1b[B") {
+                    sendCmd.insert(sendCmd.end(), {"send-keys", "-t", paneTarget, "Down"});
+                } else if (k == "\r") {
+                    sendCmd.insert(sendCmd.end(), {"send-keys", "-t", paneTarget, "Enter"});
+                } else if (k == " ") {
+                    sendCmd.insert(sendCmd.end(), {"send-keys", "-t", paneTarget, "Space"});
+                } else {
+                    sendCmd.insert(sendCmd.end(), {"send-keys", "-t", paneTarget, "-l", "--", k});
+                }
+                if (!runCommandSync(sendCmd)) {
+                    outDispatchFailed = true;
+                    return false;
+                }
+                if (ki + 1 < tuiKeys.size()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                }
+            }
+        } else if (sessionInfo.muxType == "zellij") {
+            for (size_t ki = 0; ki < tuiKeys.size(); ++ki) {
+                const std::string& k = tuiKeys[ki];
+                std::vector<std::string> zCmd;
+                if (k == "\r") {
+                    zCmd = {"zellij", "--session", sessionInfo.muxSession, "action", "write", "13"};
+                } else if (k == "\x1b[B") {
+                    zCmd = {"zellij", "--session", sessionInfo.muxSession, "action", "write", "27", "91", "66"};
+                } else {
+                    zCmd = {"zellij", "--session", sessionInfo.muxSession, "action", "write-chars", k};
+                }
+                if (!runCommandSync(zCmd)) {
+                    outDispatchFailed = true;
+                    return false;
+                }
+                if (ki + 1 < tuiKeys.size()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                }
+            }
+        } else if (sessionInfo.muxType == "wezterm") {
+            for (size_t ki = 0; ki < tuiKeys.size(); ++ki) {
+                std::vector<std::string> sendCmd = {
+                    "wezterm", "cli", "--pane-id", sessionInfo.muxTarget, "send-text", "--no-paste", tuiKeys[ki]
+                };
+                if (!runCommandSync(sendCmd)) {
+                    outDispatchFailed = true;
+                    return false;
+                }
+                if (ki + 1 < tuiKeys.size()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                }
+            }
+        } else if (sessionInfo.muxType == "kitty") {
+            std::string matchArg = "id:" + (!sessionInfo.muxTarget.empty() ? sessionInfo.muxTarget : "0");
+            for (size_t ki = 0; ki < tuiKeys.size(); ++ki) {
+                std::vector<std::string> sendCmd = {
+                    "kitty", "@", "--to", sessionInfo.muxSession, "send-text", "--match", matchArg, tuiKeys[ki]
+                };
+                if (!runCommandSync(sendCmd)) {
+                    outDispatchFailed = true;
+                    return false;
+                }
+                if (ki + 1 < tuiKeys.size()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                }
+            }
+        } else {
+            outDispatchFailed = true;
+            return false;
+        }
+
+        return pollLiveProviderTurn(
+            targetProvider, cid, existingTranscriptPath, existingSlug,
+            priorLineCount, priorUserLineCount, replyText, true);
     }
 
     std::string sanitizedPrompt = promptArg;
@@ -3962,7 +4823,7 @@ static bool routePromptViaMultiplexer(
 
     return pollLiveProviderTurn(
         targetProvider, cid, existingTranscriptPath, existingSlug,
-        priorLineCount, priorUserLineCount, replyText);
+        priorLineCount, priorUserLineCount, replyText, false);
 }
 
 WebServer::WebServer(StateStore& stateStore, HistoryStore& historyStore,
@@ -6957,7 +7818,15 @@ void WebServer::setupRoutes() {
             if (!providerPath.empty()) {
                 auto parsed = parseProviderTranscriptJsonl(providerPath, providerSource, sinceIndex, providerSlug);
                 bool isCancelled = isConversationCancelledSince(id, parsed.lastActivitySec);
-                bool isGen = (parsed.status == "RUNNING") && !isCancelled;
+                bool hasPendingAskQ = (!parsed.steps.empty() && parsed.steps.back().is_object() &&
+                                       parsed.steps.back().contains("askQuestion") &&
+                                       parsed.steps.back()["askQuestion"].is_object() &&
+                                       !parsed.steps.back()["askQuestion"].value("answered", true)) ||
+                                      (parsed.lastStepObj.is_object() &&
+                                       parsed.lastStepObj.contains("askQuestion") &&
+                                       parsed.lastStepObj["askQuestion"].is_object() &&
+                                       !parsed.lastStepObj["askQuestion"].value("answered", true));
+                bool isGen = (parsed.status == "RUNNING") && !isCancelled && !hasPendingAskQ;
                 nlohmann::json resp;
                 resp["conversationId"] = id;
                 resp["source"] = providerSource;
@@ -7366,7 +8235,7 @@ void WebServer::setupRoutes() {
                         for (const auto& tc : j["tool_calls"]) {
                             if (!tc.is_object()) continue;
                             std::string tName = tc.value("name", "");
-                            if (tName == "ask_question" || tName == "AskUserQuestion") {
+                            if (isAskQuestionToolName(tName)) {
                                 hasAskQ = true;
                                 break;
                             }
@@ -7387,7 +8256,7 @@ void WebServer::setupRoutes() {
                     for (const auto& tc : j["tool_calls"]) {
                         if (tc.is_object()) {
                             std::string tName = tc.value("name", "");
-                            if (tName == "ask_question" || tName == "AskUserQuestion") {
+                            if (isAskQuestionToolName(tName)) {
                                 hasAskQ = true;
                                 break;
                             }
@@ -7500,7 +8369,7 @@ void WebServer::setupRoutes() {
                             }
                         }
 
-                        if (toolName == "ask_question" || toolName == "AskUserQuestion") {
+                        if (isAskQuestionToolName(toolName)) {
                             nlohmann::json normQ = argsObj.contains("questions")
                                 ? normalizeQuestionsJson(argsObj["questions"])
                                 : nlohmann::json::array();
@@ -8265,10 +9134,13 @@ void WebServer::setupRoutes() {
 
                 std::string muxReply;
                 bool dispatchFailed = false;
+                nlohmann::json qResponses = hasQuestionResponses
+                    ? j["questionResponses"]
+                    : nlohmann::json::array();
                 if (routePromptViaMultiplexer(
                         sessionInfo, targetProvider, cid, text,
                         existingTranscriptPath.string(), existingSlug,
-                        muxReply, dispatchFailed)) {
+                        muxReply, dispatchFailed, qResponses)) {
                     res.set_content(nlohmann::json({
                         {"status", "ok"},
                         {"agentId", targetProvider},
@@ -10722,7 +11594,7 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                         }
                     }
 
-                    if (tcName == "ask_question" || tcName == "AskUserQuestion") {
+                    if (isAskQuestionToolName(tcName)) {
                         isAgentQuestion = true;
                         if (argsObj.contains("questions")) {
                             nlohmann::json normQ = normalizeQuestionsJson(argsObj["questions"]);
@@ -10946,13 +11818,23 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
             for (const auto& tc : lastStepObj["tool_calls"]) {
                 if (!tc.is_object()) continue;
                 std::string tcName = tc.value("name", "");
-                if (tcName == "ask_question" || tcName == "AskUserQuestion") {
+                if (isAskQuestionToolName(tcName)) {
                     isAgentQuestion = true;
-                    if (tc.contains("arguments") && tc["arguments"].is_object()) {
+                    if (lastStepObj.contains("askQuestion") && lastStepObj["askQuestion"].is_object() &&
+                        lastStepObj["askQuestion"].contains("questions") &&
+                        lastStepObj["askQuestion"]["questions"].is_array() &&
+                        !lastStepObj["askQuestion"]["questions"].empty() &&
+                        lastStepObj["askQuestion"]["questions"][0].is_object()) {
+                        questionSnippet = trimText(
+                            lastStepObj["askQuestion"]["questions"][0].value("question", ""));
+                    }
+                    if (questionSnippet.empty() && tc.contains("arguments") && tc["arguments"].is_object()) {
                         const auto& argsObj = tc["arguments"];
-                        if (argsObj.contains("questions") && argsObj["questions"].is_array() &&
-                            !argsObj["questions"].empty() && argsObj["questions"][0].is_object()) {
-                            questionSnippet = trimText(argsObj["questions"][0].value("question", ""));
+                        if (argsObj.contains("questions")) {
+                            nlohmann::json normQ = normalizeQuestionsJson(argsObj["questions"]);
+                            if (normQ.is_array() && !normQ.empty() && normQ[0].is_object()) {
+                                questionSnippet = trimText(normQ[0].value("question", ""));
+                            }
                         } else if (argsObj.contains("question") && argsObj["question"].is_string()) {
                             questionSnippet = trimText(argsObj["question"].get<std::string>());
                         }
