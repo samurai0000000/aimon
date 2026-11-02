@@ -10,11 +10,14 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -152,6 +155,118 @@ int64_t mtimeNanos(const struct stat& st) {
     return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec;
 }
 
+std::string formatYmdCompact(int64_t epoch) {
+    time_t t = static_cast<time_t>(epoch);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d%02d%02d", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+    return buf;
+}
+
+std::string formatYmdDashLocal(int64_t epoch) {
+    time_t t = static_cast<time_t>(epoch);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+    return buf;
+}
+
+std::string formatYmdDashUtc(int64_t epoch) {
+    time_t t = static_cast<time_t>(epoch);
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+    return buf;
+}
+
+std::string findCcusageBinary() {
+    static const char* kCandidates[] = {
+        "/usr/lib/node_modules/ccusage/node_modules/@ccusage/ccusage-linux-x64/bin/ccusage",
+        "/usr/local/lib/node_modules/ccusage/node_modules/@ccusage/ccusage-linux-x64/bin/ccusage",
+        "/usr/bin/ccusage",
+        "/usr/local/bin/ccusage"
+    };
+    for (const char* path : kCandidates) {
+        if (::access(path, X_OK) == 0) {
+            return path;
+        }
+    }
+    return "";
+}
+
+bool runCcusageSubprocess(const std::string& configDir,
+                          const std::vector<std::string>& args,
+                          std::string& outJson) {
+    outJson.clear();
+    std::string bin = findCcusageBinary();
+    if (bin.empty()) {
+        return false;
+    }
+
+    int pipefd[2] = {-1, -1};
+    if (::pipe(pipefd) != 0) {
+        return false;
+    }
+
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(pipefd[0]);
+        ::close(pipefd[1]);
+        return false;
+    }
+
+    if (pid == 0) {
+        ::close(pipefd[0]);
+        ::dup2(pipefd[1], STDOUT_FILENO);
+        int devNull = ::open("/dev/null", O_WRONLY);
+        if (devNull >= 0) {
+            ::dup2(devNull, STDERR_FILENO);
+            ::close(devNull);
+        }
+        ::close(pipefd[1]);
+
+        if (!configDir.empty()) {
+            ::setenv("CLAUDE_CONFIG_DIR", configDir.c_str(), 1);
+        }
+        ::setenv("NO_COLOR", "1", 1);
+
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(bin.c_str()));
+        for (const std::string& a : args) {
+            argv.push_back(const_cast<char*>(a.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        ::execv(bin.c_str(), argv.data());
+        _exit(127);
+    }
+
+    ::close(pipefd[1]);
+    char buf[8192];
+    while (true) {
+        ssize_t n = ::read(pipefd[0], buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        outJson.append(buf, static_cast<size_t>(n));
+        if (outJson.size() > 16u * 1024u * 1024u) {
+            break;
+        }
+    }
+    ::close(pipefd[0]);
+
+    int wstatus = 0;
+    if (::waitpid(pid, &wstatus, 0) < 0) {
+        return false;
+    }
+    return WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0 && !outJson.empty();
+}
+
 } // namespace
 
 ClaudeLineResult ClaudeCollector::parseLine(const std::string& line, const std::string& account,
@@ -229,6 +344,226 @@ ClaudeCollector::ClaudeCollector(const ClaudeConfig& config, ClaudeUsageStore& s
 
 ClaudeCollector::~ClaudeCollector() {
     stopPriceRefresh();
+}
+
+void ClaudeCollector::setCcusageRunnerFn(CcusageRunnerFn fn) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _ccusageRunnerFn = std::move(fn);
+}
+
+bool ClaudeCollector::shouldUseCcusage(int64_t nowEpoch) const {
+    if (_ccusageRunnerFn) {
+        return true;
+    }
+    if (!_config.pricingUrl.empty()) {
+        return false;
+    }
+    const int64_t wallNow = static_cast<int64_t>(std::time(nullptr));
+    return std::llabs(wallNow - nowEpoch) < 3600;
+}
+
+bool ClaudeCollector::tryOverlayFromCcusage(const ClaudeAccountConfig& acct, int64_t nowEpoch,
+                                            bool cycleConfigured, const ClaudeCycle& cycle,
+                                            ClaudeAccountStatus& as) {
+    const std::string expandedCfgDir = PathUtils::expandHome(acct.configDir);
+    auto runner = _ccusageRunnerFn ? _ccusageRunnerFn : runCcusageSubprocess;
+
+    int64_t earliestEpoch = nowEpoch - static_cast<int64_t>(_config.windowDays + 2) * 86400;
+    if (cycleConfigured && cycle.startEpoch > 0 && cycle.startEpoch - 86400 < earliestEpoch) {
+        earliestEpoch = cycle.startEpoch - 86400;
+    }
+    const std::string sinceYmd = formatYmdCompact(earliestEpoch);
+
+    std::string dailyJsonStr;
+    if (!runner(expandedCfgDir, {"claude", "daily", "--json", "-O", "-s", sinceYmd}, dailyJsonStr)) {
+        return false;
+    }
+
+    nlohmann::json dailyDoc = nlohmann::json::parse(dailyJsonStr, nullptr, false);
+    if (dailyDoc.is_discarded() || !dailyDoc.is_object() ||
+        !dailyDoc.contains("daily") || !dailyDoc["daily"].is_array()) {
+        return false;
+    }
+
+    const auto& dailyArr = dailyDoc["daily"];
+    if (dailyArr.empty() && as.rowsInStore == 0) {
+        return false;
+    }
+
+    const std::string todayStr = formatYmdDashLocal(nowEpoch);
+    const std::string last7dStartStr = formatYmdDashLocal(nowEpoch - 7 * 86400);
+    const std::string windowStartStr = formatYmdDashLocal(nowEpoch - static_cast<int64_t>(_config.windowDays) * 86400);
+    const std::string cycleStartStr = cycleConfigured ? formatYmdDashUtc(cycle.startEpoch) : "";
+    const std::string cycleEndStr = cycleConfigured ? formatYmdDashUtc(cycle.endEpoch) : "";
+
+    std::map<std::string, int64_t> storeMsgsByDay;
+    for (const auto& d : as.daily) {
+        storeMsgsByDay[d.dayStr] = d.messages;
+    }
+    std::map<std::string, int64_t> storeMsgsByModel;
+    for (const auto& m : as.models) {
+        storeMsgsByModel[m.model] = m.messages;
+    }
+
+    auto resetWindowTokensAndCost = [](ClaudeWindowTotals& w) {
+        w.input = 0;
+        w.output = 0;
+        w.cacheRead = 0;
+        w.cacheWrite5m = 0;
+        w.cacheWrite1h = 0;
+        w.costNano = 0;
+        w.unpricedMessages = 0;
+        w.costOverflow = false;
+    };
+
+    resetWindowTokensAndCost(as.today);
+    resetWindowTokensAndCost(as.last7d);
+    resetWindowTokensAndCost(as.window);
+    if (cycleConfigured) {
+        resetWindowTokensAndCost(as.cycle);
+    }
+
+    std::map<std::string, ClaudeModelUsage> byModel;
+    std::vector<ClaudeDailyPoint> newDaily;
+
+    auto addDayToWindow = [](ClaudeWindowTotals& w, int64_t inTok, int64_t outTok,
+                             int64_t cacheCreateTok, int64_t cacheReadTok, int64_t costNano) {
+        w.input += inTok;
+        w.output += outTok;
+        w.cacheWrite5m += cacheCreateTok;
+        w.cacheRead += cacheReadTok;
+        w.costNano += costNano;
+    };
+
+    for (const auto& item : dailyArr) {
+        if (!item.is_object()) continue;
+        std::string dateStr = stringField(item, "date");
+        if (dateStr.size() != 10) continue;
+
+        int64_t inTok = intField(item, "inputTokens");
+        int64_t outTok = intField(item, "outputTokens");
+        int64_t cacheCreateTok = intField(item, "cacheCreationTokens");
+        int64_t cacheReadTok = intField(item, "cacheReadTokens");
+        double totalCostUsd = (item.contains("totalCost") && item["totalCost"].is_number())
+            ? item["totalCost"].get<double>() : 0.0;
+        int64_t costNano = static_cast<int64_t>(std::llround(totalCostUsd * 1e9));
+
+        if (dateStr == todayStr) {
+            addDayToWindow(as.today, inTok, outTok, cacheCreateTok, cacheReadTok, costNano);
+        }
+        if (dateStr >= last7dStartStr && dateStr <= todayStr) {
+            addDayToWindow(as.last7d, inTok, outTok, cacheCreateTok, cacheReadTok, costNano);
+        }
+        if (cycleConfigured && dateStr >= cycleStartStr && dateStr < cycleEndStr) {
+            addDayToWindow(as.cycle, inTok, outTok, cacheCreateTok, cacheReadTok, costNano);
+        }
+        if (dateStr >= windowStartStr && dateStr <= todayStr) {
+            addDayToWindow(as.window, inTok, outTok, cacheCreateTok, cacheReadTok, costNano);
+
+            ClaudeDailyPoint dp;
+            dp.dayStr = dateStr;
+            dp.dayMs = dayStringToMs(dateStr);
+            auto mit = storeMsgsByDay.find(dateStr);
+            dp.messages = (mit != storeMsgsByDay.end() && mit->second > 0) ? mit->second : 1;
+            dp.tokens = inTok + outTok + cacheCreateTok + cacheReadTok;
+            dp.costNano = costNano;
+            newDaily.push_back(dp);
+
+            if (item.contains("modelBreakdowns") && item["modelBreakdowns"].is_array()) {
+                for (const auto& mb : item["modelBreakdowns"]) {
+                    if (!mb.is_object()) continue;
+                    std::string modelName = stringField(mb, "modelName");
+                    if (modelName.empty()) continue;
+
+                    int64_t mIn = intField(mb, "inputTokens");
+                    int64_t mOut = intField(mb, "outputTokens");
+                    int64_t mCC = intField(mb, "cacheCreationTokens");
+                    int64_t mCR = intField(mb, "cacheReadTokens");
+                    double mCostUsd = (mb.contains("cost") && mb["cost"].is_number())
+                        ? mb["cost"].get<double>() : 0.0;
+                    int64_t mCostNano = static_cast<int64_t>(std::llround(mCostUsd * 1e9));
+
+                    ClaudeModelUsage& mu = byModel[modelName];
+                    mu.model = modelName;
+                    mu.input += mIn;
+                    mu.output += mOut;
+                    mu.cacheWrite5m += mCC;
+                    mu.cacheRead += mCR;
+                    mu.costNano += mCostNano;
+                }
+            }
+        }
+    }
+
+    if (as.today.totalTokens() > 0 && as.today.messages == 0) as.today.messages = 1;
+    if (as.last7d.totalTokens() > 0 && as.last7d.messages == 0) as.last7d.messages = 1;
+    if (as.window.totalTokens() > 0 && as.window.messages == 0) as.window.messages = 1;
+    if (cycleConfigured) {
+        if (as.cycle.totalTokens() > 0 && as.cycle.messages == 0) as.cycle.messages = 1;
+        if (acct.spendLimitUsd > 0.0 && !as.cycle.costOverflow) {
+            as.estPctOfLimit = claudeNanoToUsd(as.cycle.costNano) / acct.spendLimitUsd * 100.0;
+        } else {
+            as.estPctOfLimit = 0.0;
+        }
+    }
+
+    as.daily = std::move(newDaily);
+    as.models.clear();
+    for (auto& kv : byModel) {
+        auto smIt = storeMsgsByModel.find(kv.first);
+        if (smIt != storeMsgsByModel.end() && smIt->second > 0) {
+            kv.second.messages = smIt->second;
+        } else {
+            // Try matching prefix/short model id in storeMsgsByModel
+            for (const auto& sm : storeMsgsByModel) {
+                if (sm.first.find(kv.first) != std::string::npos || kv.first.find(sm.first) != std::string::npos) {
+                    kv.second.messages += sm.second;
+                }
+            }
+            if (kv.second.messages == 0 &&
+                (kv.second.input + kv.second.output + kv.second.cacheRead + kv.second.cacheWrite5m + kv.second.cacheWrite1h) > 0) {
+                kv.second.messages = 1;
+            }
+        }
+        as.models.push_back(std::move(kv.second));
+    }
+    std::sort(as.models.begin(), as.models.end(), [](const ClaudeModelUsage& a, const ClaudeModelUsage& b) {
+        return a.costNano != b.costNano ? a.costNano > b.costNano : a.model < b.model;
+    });
+    as.unpricedModels.clear();
+
+    // Query active 5-hour session block via `ccusage claude blocks --json --active -O`
+    std::string blocksJsonStr;
+    if (runner(expandedCfgDir, {"claude", "blocks", "--json", "--active", "-O"}, blocksJsonStr)) {
+        nlohmann::json blocksDoc = nlohmann::json::parse(blocksJsonStr, nullptr, false);
+        if (!blocksDoc.is_discarded() && blocksDoc.is_object() &&
+            blocksDoc.contains("blocks") && blocksDoc["blocks"].is_array() &&
+            !blocksDoc["blocks"].empty()) {
+            resetWindowTokensAndCost(as.last5h);
+            for (const auto& blk : blocksDoc["blocks"]) {
+                if (!blk.is_object()) continue;
+                if (blk.contains("isGap") && blk["isGap"].is_boolean() && blk["isGap"].get<bool>()) {
+                    continue;
+                }
+                if (blk.contains("tokenCounts") && blk["tokenCounts"].is_object()) {
+                    const auto& tc = blk["tokenCounts"];
+                    as.last5h.input += intField(tc, "inputTokens");
+                    as.last5h.output += intField(tc, "outputTokens");
+                    as.last5h.cacheWrite5m += intField(tc, "cacheCreationInputTokens");
+                    as.last5h.cacheRead += intField(tc, "cacheReadInputTokens");
+                }
+                if (blk.contains("costUSD") && blk["costUSD"].is_number()) {
+                    as.last5h.costNano += static_cast<int64_t>(std::llround(blk["costUSD"].get<double>() * 1e9));
+                }
+            }
+            if (as.last5h.totalTokens() > 0 && as.last5h.messages == 0) {
+                as.last5h.messages = 1;
+            }
+        }
+    }
+
+    as.hasData = as.hasData || !dailyArr.empty() || as.window.totalTokens() > 0;
+    return true;
 }
 
 ClaudeCollector::ScanResult ClaudeCollector::scanFile(const std::string& account, const std::string& relPath,
@@ -549,6 +884,9 @@ ClaudeStatus ClaudeCollector::fetchStatus(int64_t nowEpoch) {
             if (acct.spendLimitUsd > 0.0 && !as.cycle.costOverflow) {
                 as.estPctOfLimit = claudeNanoToUsd(as.cycle.costNano) / acct.spendLimitUsd * 100.0;
             }
+        }
+        if (as.errorMessage.empty() && shouldUseCcusage(nowEpoch)) {
+            tryOverlayFromCcusage(acct, nowEpoch, as.cycleConfigured, cycle, as);
         }
         status.accounts.push_back(as);
     }

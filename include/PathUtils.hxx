@@ -16,6 +16,7 @@ public:
     static std::string expandHome(const std::string& path);
     static bool ensureDirectoryExists(const std::string& path);
     static std::string getDefaultCursorDbPath();
+    static std::string getDefaultCursorCliAuthPath();
     static std::string getAimonConfigDir();
     static std::string getDefaultConfigFilePath();
     static std::string getDefaultLibConfigFilePath();

@@ -69,6 +69,26 @@ std::string PathUtils::getDefaultCursorDbPath() {
 #endif
 }
 
+std::string PathUtils::getDefaultCursorCliAuthPath() {
+    const char* cursorCfgDir = std::getenv("CURSOR_CONFIG_DIR");
+    if (cursorCfgDir && *cursorCfgDir) {
+        return expandHome(std::string(cursorCfgDir)) + "/auth.json";
+    }
+#if defined(_WIN32)
+    const char* appData = std::getenv("APPDATA");
+    if (appData && *appData) {
+        return std::string(appData) + "\\cursor\\auth.json";
+    }
+    return expandHome("~/.config/cursor/auth.json");
+#else
+    const char* xdgConfig = std::getenv("XDG_CONFIG_HOME");
+    if (xdgConfig && *xdgConfig) {
+        return expandHome(std::string(xdgConfig)) + "/cursor/auth.json";
+    }
+    return expandHome("~/.config/cursor/auth.json");
+#endif
+}
+
 std::string PathUtils::getAimonConfigDir() {
 #if defined(_WIN32)
     const char* appData = std::getenv("APPDATA");

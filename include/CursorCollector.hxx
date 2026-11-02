@@ -43,6 +43,8 @@ public:
 
 private:
     std::string extractTokenFromDb(const std::string& dbPath, std::string& outTier);
+    std::string extractTokenFromCliAuth(const std::string& authPath);
+    std::vector<std::string> resolveCandidateTokens(std::string& outTier);
     CursorHttpResponse performRequest(
         const std::string& method,
         const std::string& path,

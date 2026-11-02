@@ -47,6 +47,78 @@ static std::string formatEpochMsToDate(int64_t ms) {
     return buf;
 }
 
+static std::string base64UrlDecode(const std::string& input) {
+    std::string b64 = input;
+    for (char& c : b64) {
+        if (c == '-') c = '+';
+        else if (c == '_') c = '/';
+    }
+    while (b64.size() % 4 != 0) {
+        b64.push_back('=');
+    }
+
+    static const int8_t kDecTable[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+    };
+
+    std::string out;
+    out.reserve((b64.size() * 3) / 4);
+    uint32_t val = 0;
+    int valb = -8;
+    for (unsigned char c : b64) {
+        int8_t d = kDecTable[c];
+        if (d == -1) return "";
+        if (d == -2) break;
+        val = (val << 6) + static_cast<uint32_t>(d);
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
+static bool parseJwtClaims(const std::string& token, int64_t& outExp, int64_t& outIssuedAt) {
+    outExp = 0;
+    outIssuedAt = 0;
+    size_t firstDot = token.find('.');
+    if (firstDot == std::string::npos) return false;
+    size_t secondDot = token.find('.', firstDot + 1);
+    if (secondDot == std::string::npos) return false;
+
+    std::string payload = base64UrlDecode(token.substr(firstDot + 1, secondDot - firstDot - 1));
+    if (payload.empty()) return false;
+
+    nlohmann::json j = nlohmann::json::parse(payload, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return false;
+
+    if (j.contains("exp") && j["exp"].is_number_integer()) {
+        outExp = j["exp"].get<int64_t>();
+    }
+    if (j.contains("time") && j["time"].is_number_integer()) {
+        outIssuedAt = j["time"].get<int64_t>();
+    } else if (j.contains("iat") && j["iat"].is_number_integer()) {
+        outIssuedAt = j["iat"].get<int64_t>();
+    }
+    return true;
+}
+
 CursorCollector::CursorCollector(const CursorConfig& config)
     : _config(config) {
 }
@@ -141,21 +213,86 @@ std::string CursorCollector::extractTokenFromDb(const std::string& dbPath, std::
     return token;
 }
 
-std::string CursorCollector::resolveAccessToken() {
-    if (!_config.accessToken.empty()) {
-        return _config.accessToken;
+std::string CursorCollector::extractTokenFromCliAuth(const std::string& authPath) {
+    if (authPath.empty() || !fs::exists(authPath)) {
+        return "";
+    }
+    try {
+        std::ifstream f(authPath);
+        if (!f.is_open()) {
+            return "";
+        }
+        nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) {
+            return "";
+        }
+        if (j.contains("accessToken") && j["accessToken"].is_string()) {
+            return j["accessToken"].get<std::string>();
+        }
+        if (j.contains("access_token") && j["access_token"].is_string()) {
+            return j["access_token"].get<std::string>();
+        }
+    } catch (...) {
+    }
+    return "";
+}
+
+std::vector<std::string> CursorCollector::resolveCandidateTokens(std::string& outTier) {
+    struct Candidate {
+        std::string token;
+        int64_t exp = 0;
+        int64_t iat = 0;
+        bool isJwt = false;
+        int priority = 0;
+    };
+
+    std::vector<Candidate> rawCandidates;
+    auto addCandidate = [&](const std::string& tok, int prio) {
+        if (tok.empty()) return;
+        for (const auto& existing : rawCandidates) {
+            if (existing.token == tok) return;
+        }
+        Candidate c;
+        c.token = tok;
+        c.priority = prio;
+        c.isJwt = parseJwtClaims(tok, c.exp, c.iat);
+        rawCandidates.push_back(std::move(c));
+    };
+
+    // When a custom HTTP transport is injected (unit tests), stay strictly isolated from host auth files.
+    if (_httpRequestFn) {
+        addCandidate(_config.accessToken, 100);
+        if (rawCandidates.empty()) {
+            std::string dbPath = _config.dbPath.empty() ?
+                PathUtils::getDefaultCursorDbPath() : PathUtils::expandHome(_config.dbPath);
+            addCandidate(extractTokenFromDb(dbPath, outTier), 50);
+        }
+        std::vector<std::string> out;
+        for (const auto& c : rawCandidates) {
+            out.push_back(c.token);
+        }
+        return out;
     }
 
-    const char* envToken = std::getenv("CURSOR_ACCESS_TOKEN");
-    if (!envToken) {
-        envToken = std::getenv("CURSOR_API_KEY");
-    }
-    if (envToken && *envToken) {
-        return envToken;
+    // 1. Environment variables
+    const char* envVars[] = {"CURSOR_ACCESS_TOKEN", "CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"};
+    for (const char* var : envVars) {
+        const char* val = std::getenv(var);
+        if (val && *val) {
+            addCandidate(val, 90);
+        }
     }
 
-    // Try reading directly from config file in case it was updated at runtime
-    std::string configPath = PathUtils::expandHome("~/.config/aimon/config.json");
+    // 2. Cursor CLI auth.json (~/.config/cursor/auth.json)
+    if (_config.autoDiscover) {
+        addCandidate(extractTokenFromCliAuth(PathUtils::getDefaultCursorCliAuthPath()), 85);
+    }
+
+    // 3. In-memory configured token
+    addCandidate(_config.accessToken, 80);
+
+    // 4. Runtime config.json check
+    std::string configPath = PathUtils::getDefaultConfigFilePath();
     if (fs::exists(configPath)) {
         try {
             std::ifstream f(configPath);
@@ -163,11 +300,7 @@ std::string CursorCollector::resolveAccessToken() {
                 nlohmann::json c = nlohmann::json::parse(f, nullptr, false);
                 if (!c.is_discarded() && c.contains("cursor") && c["cursor"].is_object()) {
                     if (c["cursor"].contains("access_token") && c["cursor"]["access_token"].is_string()) {
-                        std::string t = c["cursor"]["access_token"].get<std::string>();
-                        if (!t.empty()) {
-                            _config.accessToken = t;
-                            return t;
-                        }
+                        addCandidate(c["cursor"]["access_token"].get<std::string>(), 75);
                     }
                 }
             }
@@ -175,11 +308,56 @@ std::string CursorCollector::resolveAccessToken() {
         }
     }
 
-    std::string dbPath = _config.dbPath.empty() ?
-        PathUtils::getDefaultCursorDbPath() : PathUtils::expandHome(_config.dbPath);
+    // 5. Cursor IDE SQLite state.vscdb
+    if (_config.autoDiscover || rawCandidates.empty()) {
+        std::string dbPath = _config.dbPath.empty() ?
+            PathUtils::getDefaultCursorDbPath() : PathUtils::expandHome(_config.dbPath);
+        addCandidate(extractTokenFromDb(dbPath, outTier), 70);
+    }
 
+    const int64_t nowEpoch = static_cast<int64_t>(std::time(nullptr));
+    std::vector<Candidate> validCandidates;
+    std::vector<Candidate> expiredCandidates;
+
+    for (const auto& c : rawCandidates) {
+        if (c.isJwt && c.exp > 0 && c.exp <= nowEpoch) {
+            expiredCandidates.push_back(c);
+        } else {
+            validCandidates.push_back(c);
+        }
+    }
+
+    auto sortComparator = [](const Candidate& a, const Candidate& b) {
+        if (a.isJwt && b.isJwt && a.exp != b.exp) {
+            return a.exp > b.exp;
+        }
+        if (a.isJwt != b.isJwt) {
+            return !a.isJwt; // non-JWT explicit tokens first
+        }
+        return a.priority > b.priority;
+    };
+
+    std::stable_sort(validCandidates.begin(), validCandidates.end(), sortComparator);
+    std::stable_sort(expiredCandidates.begin(), expiredCandidates.end(), sortComparator);
+
+    std::vector<std::string> result;
+    for (const auto& c : validCandidates) {
+        result.push_back(c.token);
+    }
+    if (result.empty() && !expiredCandidates.empty()) {
+        result.push_back(expiredCandidates.front().token);
+    }
+    return result;
+}
+
+std::string CursorCollector::resolveAccessToken() {
     std::string tier;
-    return extractTokenFromDb(dbPath, tier);
+    std::vector<std::string> candidates = resolveCandidateTokens(tier);
+    if (!candidates.empty()) {
+        _config.accessToken = candidates.front();
+        return candidates.front();
+    }
+    return "";
 }
 
 CursorStatus CursorCollector::fetchStatus() {
@@ -189,12 +367,14 @@ CursorStatus CursorCollector::fetchStatus() {
     std::string dbPath = _config.dbPath.empty() ?
         PathUtils::getDefaultCursorDbPath() : PathUtils::expandHome(_config.dbPath);
 
-    std::string token = resolveAccessToken();
-    if (token.empty()) {
+    std::vector<std::string> candidates = resolveCandidateTokens(tier);
+    if (candidates.empty()) {
         _hasLastValidStatus = false;
         _lastValidStatus = CursorStatus{};
         // Check if we at least found membership tier in DB
-        extractTokenFromDb(dbPath, tier);
+        if (tier.empty()) {
+            extractTokenFromDb(dbPath, tier);
+        }
         if (!tier.empty()) {
             status.planTier = tier;
         }
@@ -204,32 +384,55 @@ CursorStatus CursorCollector::fetchStatus() {
     }
 
     try {
-        std::vector<std::pair<std::string, std::string>> headers = {
-            {"Authorization", "Bearer " + token},
-            {"Content-Type", "application/json"}
-        };
-
-        // 1. Primary modern endpoint: /auth/usage-summary (retry once on transient failure)
+        std::string token = candidates.front();
         CursorHttpResponse res;
-        for (int attempt = 0; attempt < 2; ++attempt) {
-            res = performRequest("GET", "/auth/usage-summary", headers);
-            if (!isTransientHttpFailure(res)) {
+
+        for (size_t idx = 0; idx < candidates.size(); ++idx) {
+            token = candidates[idx];
+            std::vector<std::pair<std::string, std::string>> headers = {
+                {"Authorization", "Bearer " + token},
+                {"Content-Type", "application/json"}
+            };
+
+            // 1. Primary modern endpoint: /auth/usage-summary (retry once on transient failure)
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                res = performRequest("GET", "/auth/usage-summary", headers);
+                if (!isTransientHttpFailure(res)) {
+                    break;
+                }
+                if (!_httpRequestFn && attempt == 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+                }
+            }
+
+            // Only fall back to legacy endpoints when /auth/usage-summary is unsupported (e.g. 404/405),
+            // not when the server is experiencing a transient connection/5xx error or auth rejection.
+            if (res.connected && (res.status == 404 || res.status == 405)) {
+                // 2. Fallback endpoint: /aiserver.v1.DashboardService/GetCurrentPeriodUsage
+                res = performRequest("POST", "/aiserver.v1.DashboardService/GetCurrentPeriodUsage", headers, "{}");
+                if (!res.connected || res.status != 200) {
+                    // 3. Fallback endpoint: /auth/usage
+                    res = performRequest("GET", "/auth/usage", headers);
+                }
+            }
+
+            if (res.connected && res.status == 200) {
+                if (!_httpRequestFn) {
+                    _config.accessToken = token;
+                    auto& globalCfg = ConfigManager::getInstance().getConfig();
+                    if (!globalCfg.cursor.accessToken.empty() && globalCfg.cursor.accessToken != token) {
+                        globalCfg.cursor.accessToken = token;
+                        ConfigManager::getInstance().save();
+                    }
+                }
                 break;
             }
-            if (!_httpRequestFn && attempt == 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            }
-        }
 
-        // Only fall back to legacy endpoints when /auth/usage-summary is unsupported (e.g. 404/405),
-        // not when the server is experiencing a transient connection/5xx error or auth rejection.
-        if (res.connected && (res.status == 404 || res.status == 405)) {
-            // 2. Fallback endpoint: /aiserver.v1.DashboardService/GetCurrentPeriodUsage
-            res = performRequest("POST", "/aiserver.v1.DashboardService/GetCurrentPeriodUsage", headers, "{}");
-            if (!res.connected || res.status != 200) {
-                // 3. Fallback endpoint: /auth/usage
-                res = performRequest("GET", "/auth/usage", headers);
+            // If this candidate failed with 401/403 and another candidate exists, try the next candidate.
+            if (res.connected && (res.status == 401 || res.status == 403) && (idx + 1 < candidates.size())) {
+                continue;
             }
+            break;
         }
 
         if (!res.connected || res.status != 200) {

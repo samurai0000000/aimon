@@ -11,10 +11,12 @@
 #include <filesystem>
 #include <iomanip>
 #include <ctime>
+#include <cstring>
 #include <algorithm>
 #include <functional>
 #include <set>
 #include <unistd.h>
+#include <sqlite3.h>
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #endif
@@ -185,6 +187,24 @@ bool AntigravityCollector::discoverProcess(int& outPort, std::string& outCsrf) {
         envCsrf = envTok;
     }
 
+    const char* envAddr = std::getenv("ANTIGRAVITY_LS_ADDRESS");
+    if (envAddr && *envAddr && !envCsrf.empty()) {
+        std::string addrStr(envAddr);
+        auto colon = addrStr.rfind(':');
+        if (colon != std::string::npos) {
+            try {
+                int p = std::stoi(addrStr.substr(colon + 1));
+                if (p > 0 && p <= 65535 && probePort(p, envCsrf)) {
+                    _cachedPort = p;
+                    _cachedCsrf = envCsrf;
+                    outPort = p;
+                    outCsrf = envCsrf;
+                    return true;
+                }
+            } catch (...) {}
+        }
+    }
+
     if (!fs::exists("/proc")) {
         return false;
     }
@@ -248,6 +268,58 @@ bool AntigravityCollector::discoverProcess(int& outPort, std::string& outCsrf) {
         }
     }
 
+    // 2. Scan /proc/<pid>/environ for ANTIGRAVITY_LS_ADDRESS and ANTIGRAVITY_CSRF_TOKEN
+    //    (set on MCP servers and child processes spawned by active agy CLI / IDE sessions)
+    std::set<std::pair<int, std::string>> probedEnvEndpoints;
+    for (pid_t pid : candidatePids) {
+        std::string envPath = "/proc/" + std::to_string(pid) + "/environ";
+        std::string envContent;
+        try {
+            std::ifstream envFile(envPath, std::ios::binary);
+            if (!envFile.is_open()) continue;
+            envContent.assign((std::istreambuf_iterator<char>(envFile)),
+                              std::istreambuf_iterator<char>());
+        } catch (...) {
+            continue;
+        }
+        if (envContent.find("ANTIGRAVITY_LS_ADDRESS=") == std::string::npos) {
+            continue;
+        }
+
+        std::string procAddr;
+        std::string procCsrf;
+        size_t pos = 0;
+        while (pos < envContent.size()) {
+            std::string entry = envContent.c_str() + pos;
+            if (entry.rfind("ANTIGRAVITY_LS_ADDRESS=", 0) == 0) {
+                procAddr = entry.substr(std::strlen("ANTIGRAVITY_LS_ADDRESS="));
+            } else if (entry.rfind("ANTIGRAVITY_CSRF_TOKEN=", 0) == 0) {
+                procCsrf = entry.substr(std::strlen("ANTIGRAVITY_CSRF_TOKEN="));
+            }
+            pos += entry.length() + 1;
+        }
+
+        if (!procAddr.empty() && !procCsrf.empty()) {
+            auto colon = procAddr.rfind(':');
+            if (colon != std::string::npos) {
+                try {
+                    int p = std::stoi(procAddr.substr(colon + 1));
+                    if (p > 0 && p <= 65535 && probedEnvEndpoints.insert({p, procCsrf}).second) {
+                        if (probePort(p, procCsrf)) {
+                            _cachedPid = pid;
+                            _cachedPort = p;
+                            _cachedCsrf = procCsrf;
+                            outPort = p;
+                            outCsrf = procCsrf;
+                            return true;
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+
+    // 3. Scan /proc/<pid>/cmdline for language_server or agy processes
     for (pid_t pid : candidatePids) {
         std::string cmdlinePath = "/proc/" + std::to_string(pid) + "/cmdline";
         std::string content;
@@ -260,17 +332,22 @@ bool AntigravityCollector::discoverProcess(int& outPort, std::string& outCsrf) {
         } catch (...) {
             continue;
         }
-        if (content.find("language_server") == std::string::npos) {
+        if (content.find("language_server") == std::string::npos &&
+            content.find("agy") == std::string::npos) {
             continue;
         }
 
-        // Extract CSRF token
+        // Extract CSRF token (--csrf_token <val> or --csrf_token=<val>)
         std::string discoveredCsrf;
         size_t pos = 0;
         while (pos < content.size()) {
             std::string arg = content.c_str() + pos;
             if (arg == "--csrf_token" && (pos + arg.length() + 1) < content.size()) {
                 discoveredCsrf = content.c_str() + pos + arg.length() + 1;
+                break;
+            }
+            if (arg.rfind("--csrf_token=", 0) == 0) {
+                discoveredCsrf = arg.substr(std::strlen("--csrf_token="));
                 break;
             }
             pos += arg.length() + 1;
@@ -511,13 +588,46 @@ void AntigravityCollector::syncTranscriptTelemetry() {
     const char *home = getenv("HOME");
     if (!home) return;
 
-    fs::path brainDir = fs::path(home) / ".gemini" / "antigravity-ide" / "brain";
-    if (!fs::exists(brainDir) || !fs::is_directory(brainDir)) {
-        return;
+    // Ensure any uninitialized 4096-byte conversation .db files have empty tables so ccusage antigravity succeeds
+    static const char* kConvSchemaSql =
+        "CREATE TABLE IF NOT EXISTS `trajectory_meta` (`trajectory_id` text,`cascade_id` text,`trajectory_type` integer,`source` integer,PRIMARY KEY (`trajectory_id`));"
+        "CREATE TABLE IF NOT EXISTS `steps` (`idx` integer,`step_type` integer NOT NULL DEFAULT 0,`status` integer NOT NULL DEFAULT 0,`has_subtrajectory` numeric NOT NULL DEFAULT false,`metadata` blob,`error_details` blob,`permissions` blob,`task_details` blob,`render_info` blob,`step_payload` blob,`step_format` integer NOT NULL DEFAULT 0,PRIMARY KEY (`idx`));"
+        "CREATE TABLE IF NOT EXISTS `gen_metadata` (`idx` integer,`data` blob,`size` integer NOT NULL DEFAULT 0,PRIMARY KEY (`idx`));"
+        "CREATE TABLE IF NOT EXISTS `executor_metadata` (`idx` integer,`data` blob,PRIMARY KEY (`idx`));"
+        "CREATE TABLE IF NOT EXISTS `parent_references` (`idx` integer,`data` blob,PRIMARY KEY (`idx`));"
+        "CREATE TABLE IF NOT EXISTS `trajectory_metadata_blob` (`id` text DEFAULT \"main\",`data` blob,PRIMARY KEY (`id`));"
+        "CREATE TABLE IF NOT EXISTS `battle_mode_infos` (`idx` integer,`data` blob,PRIMARY KEY (`idx`));";
+
+    for (const char* sub : {"antigravity-ide", "antigravity-cli"}) {
+        fs::path convDir = fs::path(home) / ".gemini" / sub / "conversations";
+        if (fs::exists(convDir) && fs::is_directory(convDir)) {
+            try {
+                for (const auto& entry : fs::directory_iterator(convDir)) {
+                    if (!entry.is_regular_file() || entry.path().extension() != ".db") continue;
+                    if (fs::file_size(entry.path()) <= 4096) {
+                        sqlite3* db = nullptr;
+                        if (sqlite3_open(entry.path().c_str(), &db) == SQLITE_OK && db) {
+                            sqlite3_exec(db, kConvSchemaSql, nullptr, nullptr, nullptr);
+                        }
+                        if (db) sqlite3_close(db);
+                    }
+                }
+            } catch (...) {}
+        }
     }
 
-    try {
-        for (const auto& entry : fs::directory_iterator(brainDir)) {
+    std::vector<fs::path> brainDirs = {
+        fs::path(home) / ".gemini" / "antigravity-ide" / "brain",
+        fs::path(home) / ".gemini" / "antigravity-cli" / "brain"
+    };
+
+    for (const auto& brainDir : brainDirs) {
+        if (!fs::exists(brainDir) || !fs::is_directory(brainDir)) {
+            continue;
+        }
+
+        try {
+            for (const auto& entry : fs::directory_iterator(brainDir)) {
             if (!entry.is_directory()) continue;
             std::string convId = entry.path().filename().string();
             fs::path transcriptPath = entry.path() / ".system_generated" / "logs" / "transcript.jsonl";
@@ -658,8 +768,9 @@ void AntigravityCollector::syncTranscriptTelemetry() {
             int64_t sessionEnd = lastTs > 0 ? lastTs : mtime;
             sessionStatus = (now - sessionEnd < 300) ? "RUNNING" : "COMPLETED";
             AgentTelemetryDb::getInstance().touchSession(sessionId, sessionStatus, sessionEnd);
-        }
-    } catch (...) {}
+            }
+        } catch (...) {}
+    }
 }
 
 } // namespace aimon

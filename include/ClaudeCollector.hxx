@@ -17,9 +17,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "ClaudeUsageStore.hxx"
 #include "ConfigManager.hxx"
@@ -58,6 +60,11 @@ public:
     static ClaudeLineResult parseLine(const std::string& line, const std::string& account,
                                       ClaudeUsageRow& row);
 
+    using CcusageRunnerFn = std::function<bool(const std::string& configDir,
+                                               const std::vector<std::string>& args,
+                                               std::string& outJson)>;
+    void setCcusageRunnerFn(CcusageRunnerFn fn);
+
 private:
     struct ScanResult {
         int64_t bytesRead = 0;
@@ -68,12 +75,17 @@ private:
 
     ScanResult scanFile(const std::string& account, const std::string& relPath,
                         const std::string& fullPath, const ClaudeFileCursor* cursor);
+    bool shouldUseCcusage(int64_t nowEpoch) const;
+    bool tryOverlayFromCcusage(const ClaudeAccountConfig& acct, int64_t nowEpoch,
+                               bool cycleConfigured, const ClaudeCycle& cycle,
+                               ClaudeAccountStatus& as);
     void recordPriceVersion(int64_t nowEpoch);
     void priceRefreshLoop(std::chrono::milliseconds checkEvery);
 
     ClaudeConfig _config;
     ClaudeUsageStore& _store;
     PriceCatalog& _catalog;
+    CcusageRunnerFn _ccusageRunnerFn;
 
     std::mutex _mutex;                       // serializes fetchStatus
     int64_t _lastPruneEpoch = 0;

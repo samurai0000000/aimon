@@ -524,6 +524,82 @@ TEST(ClaudeCollectorGroup, LargeTreeIsReadOnceAndThenCostsNothing) {
     CHECK_TRUE(secondSec < 5.0);
 }
 
+TEST(ClaudeCollectorGroup, CcusagePrimaryWithCollectorFallback) {
+    config.accounts[0].spendLimitUsd = 1000.0;
+    config.accounts[0].cycleResetDay = 1;
+    writeFile(transcript(), usageLine("m1", "r1", now - 3600, "claude-opus-5-5", 10, 20, 30));
+
+    ClaudeCollector collector(config, *store, *catalog);
+    bool simulateCcusageSuccess = true;
+    collector.setCcusageRunnerFn([&](const std::string&, const std::vector<std::string>& args,
+                                     std::string& outJson) -> bool {
+        if (!simulateCcusageSuccess) {
+            return false;
+        }
+        if (args.size() >= 2 && args[1] == "daily") {
+            outJson = R"({
+                "daily": [
+                    {
+                        "date": "2026-10-08",
+                        "inputTokens": 1002,
+                        "outputTokens": 643271,
+                        "cacheCreationTokens": 5000,
+                        "cacheReadTokens": 100000,
+                        "totalTokens": 749273,
+                        "totalCost": 26.50,
+                        "modelBreakdowns": [
+                            {
+                                "modelName": "claude-opus-5-5",
+                                "inputTokens": 1002,
+                                "outputTokens": 643271,
+                                "cacheCreationTokens": 5000,
+                                "cacheReadTokens": 100000,
+                                "cost": 26.50
+                            }
+                        ]
+                    }
+                ]
+            })";
+            return true;
+        }
+        if (args.size() >= 2 && args[1] == "blocks") {
+            outJson = R"({
+                "blocks": [
+                    {
+                        "isActive": true,
+                        "isGap": false,
+                        "tokenCounts": {
+                            "inputTokens": 500,
+                            "outputTokens": 10000,
+                            "cacheCreationInputTokens": 2000,
+                            "cacheReadInputTokens": 50000
+                        },
+                        "costUSD": 5.25
+                    }
+                ]
+            })";
+            return true;
+        }
+        return false;
+    });
+
+    ClaudeAccountStatus primary = poll(collector);
+    CHECK_TRUE(primary.hasData);
+    DOUBLES_EQUAL(26.50, claudeNanoToUsd(primary.cycle.costNano), 1e-6);
+    DOUBLES_EQUAL(2.65, primary.estPctOfLimit, 1e-6);
+    DOUBLES_EQUAL(5.25, claudeNanoToUsd(primary.last5h.costNano), 1e-6);
+    LONGS_EQUAL(1002, static_cast<long>(primary.window.input));
+    LONGS_EQUAL(643271, static_cast<long>(primary.window.output));
+
+    // When ccusage fails, collector falls back to the transcript store calculation seamlessly
+    simulateCcusageSuccess = false;
+    ClaudeAccountStatus fallback = poll(collector);
+    CHECK_TRUE(fallback.hasData);
+    LONGS_EQUAL(10, static_cast<long>(fallback.window.input));
+    LONGS_EQUAL(20, static_cast<long>(fallback.window.output));
+    LONGS_EQUAL(446000, static_cast<long>(fallback.window.costNano));
+}
+
 //------------------------------------------------------------------------
 // Price refresh thread
 //------------------------------------------------------------------------
