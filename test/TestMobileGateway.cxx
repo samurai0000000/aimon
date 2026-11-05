@@ -4388,6 +4388,191 @@ static void testTranscriptGeneratingStateAndCancelCascadeInvocation() {
     std::cout << "[TestMobileGateway] testTranscriptGeneratingStateAndCancelCascadeInvocation passed!" << std::endl;
 }
 
+static void testOctiBotSessionAndNotificationFiltering() {
+    std::cout << "[TestMobileGateway] Running testOctiBotSessionAndNotificationFiltering..." << std::endl;
+    std::string baseDir = "/tmp/test_mobile_gw_octibot_" + std::to_string(getpid());
+    fs::remove_all(baseDir);
+
+    std::string ideBrain = baseDir + "/ide_brain";
+    std::string cliRoot = baseDir + "/cli_root";
+    std::string cliBrain = cliRoot + "/brain";
+    std::string dbPath = cliRoot + "/conversation_summaries.db";
+    std::string procsFile = baseDir + "/running_agy.json";
+    std::string tempMobileDb = baseDir + "/mobile_gateway.db";
+    fs::create_directories(ideBrain);
+    fs::create_directories(cliBrain);
+
+    // 1. Populate conversation_summaries.db with:
+    //    - coding-octibot-cc (legitimate coding session in /tmp/work/octibot_cc)
+    //    - bot-sandbox-sess (automated session in /tmp/octibot-ai-sandbox)
+    {
+        sqlite3* db = nullptr;
+        assert(sqlite3_open(dbPath.c_str(), &db) == SQLITE_OK);
+        const char* createSql =
+            "CREATE TABLE conversation_summaries ("
+            "conversation_id TEXT PRIMARY KEY, "
+            "title TEXT NOT NULL DEFAULT '', "
+            "preview TEXT NOT NULL DEFAULT '', "
+            "step_count INTEGER NOT NULL DEFAULT 0, "
+            "last_modified_time TEXT NOT NULL, "
+            "workspace_uris TEXT NOT NULL DEFAULT '[]', "
+            "status TEXT NOT NULL DEFAULT '', "
+            "parent_conversation_id TEXT NOT NULL DEFAULT '', "
+            "nesting_depth INTEGER NOT NULL DEFAULT 0, "
+            "agent_name TEXT NOT NULL DEFAULT ''"
+            ");";
+        char* err = nullptr;
+        assert(sqlite3_exec(db, createSql, nullptr, nullptr, &err) == SQLITE_OK);
+
+        const char* insertCodingSql =
+            "INSERT INTO conversation_summaries "
+            "(conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status) "
+            "VALUES ('coding-octibot-cc', 'Revive 2001 Octi Bot', "
+            "'<USER_REQUEST>\nRevive 2001 Octi Bot\n</USER_REQUEST>', 2, "
+            "'2026-11-05 12:00:00', '[\"file:///tmp/work/octibot_cc\"]', 'CASCADE_RUN_STATUS_COMPLETED');";
+        assert(sqlite3_exec(db, insertCodingSql, nullptr, nullptr, &err) == SQLITE_OK);
+
+        const char* insertSandboxSql =
+            "INSERT INTO conversation_summaries "
+            "(conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status) "
+            "VALUES ('bot-sandbox-sess', 'Casual Reply', "
+            "'<USER_REQUEST>\nSay hello to player\n</USER_REQUEST>', 2, "
+            "'2026-11-05 12:01:00', '[\"file:///tmp/octibot-ai-sandbox\"]', 'CASCADE_RUN_STATUS_COMPLETED');";
+        assert(sqlite3_exec(db, insertSandboxSql, nullptr, nullptr, &err) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+
+    // 2. Create transcript.jsonl files for coding-octibot-cc, bot-sandbox-sess, and bot-persona-sess
+    fs::path codingLogs = fs::path(cliBrain) / "coding-octibot-cc" / ".system_generated" / "logs";
+    fs::create_directories(codingLogs);
+    fs::path codingTrans = codingLogs / "transcript.jsonl";
+    {
+        std::ofstream tf(codingTrans);
+        tf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"<USER_REQUEST>\\nRevive 2001 Octi Bot\\n</USER_REQUEST>\"}\n";
+        tf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Inspected octibot_wait_for_event and octibot_get_game_state in OctiBotMcpServer.cxx.\",\"tool_calls\":[]}\n";
+    }
+
+    fs::path sandboxLogs = fs::path(cliBrain) / "bot-sandbox-sess" / ".system_generated" / "logs";
+    fs::create_directories(sandboxLogs);
+    fs::path sandboxTrans = sandboxLogs / "transcript.jsonl";
+    {
+        std::ofstream tf(sandboxTrans);
+        tf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"<USER_REQUEST>\\nSay hello to player\\n</USER_REQUEST>\"}\n";
+        tf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Hello challenger!\",\"tool_calls\":[]}\n";
+    }
+
+    fs::path personaLogs = fs::path(cliBrain) / "bot-persona-sess" / ".system_generated" / "logs";
+    fs::create_directories(personaLogs);
+    fs::path personaTrans = personaLogs / "transcript.jsonl";
+    {
+        std::ofstream tf(personaTrans);
+        tf << "{\"step_index\":0,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"<USER_REQUEST>\\nYou are @octibot-sdk-cpu, an autonomous AI robot playing OCTI.\\n</USER_REQUEST>\"}\n";
+        tf << "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Ready for battle on the OCTI grid.\",\"tool_calls\":[]}\n";
+    }
+
+    // 3. Create running agy process in /tmp/octibot-ai-sandbox
+    fs::create_directories(fs::path(cliBrain) / "bot-running-proc");
+    {
+        std::ofstream pf(procsFile);
+        json pj = {
+            {"processes", json::array({
+                {
+                    {"pid", 999888},
+                    {"cwd", "/tmp/octibot-ai-sandbox"},
+                    {"lockedConversationId", "bot-running-proc"},
+                    {"terminalPts", "pts/77"},
+                    {"httpPort", 45678}
+                }
+            })}
+        };
+        pf << pj.dump(2);
+    }
+
+    setenv("AIMON_IDE_BRAIN_DIR", ideBrain.c_str(), 1);
+    setenv("AIMON_CLI_BRAIN_DIR", cliBrain.c_str(), 1);
+    setenv("AIMON_AGY_PROCESSES_FILE", procsFile.c_str(), 1);
+    setenv("AIMON_NOTIFICATION_SETTLE_MS", "25", 1);
+
+    MobileGateway& gw = MobileGateway::getInstance();
+    assert(gw.init(tempMobileDb));
+    gw.clearAgentEvents();
+    std::string secret = gw.createPairingSecret(120);
+    std::string validToken;
+    assert(gw.verifyPairingCode(secret, "octibot-filter-dev", "Test Phone", validToken));
+
+    StateStore& stateStore = StateStore::getInstance();
+    HistoryStore historyStore;
+    WebConfig config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.endpointsEnabled = false;
+
+    WebServer server(stateStore, historyStore, config);
+    assert(server.start(true));
+    int port = server.getPort();
+
+    httplib::Client client("http://127.0.0.1:" + std::to_string(port));
+    httplib::Headers headers = {{"X-Mobile-Token", validToken}};
+
+    // 4. Verify GET /api/agent/conversations includes coding-octibot-cc and excludes all 3 bot sessions
+    auto resConvs = client.Get("/api/agent/conversations", headers);
+    assert(resConvs && resConvs->status == 200);
+    json convsJson = json::parse(resConvs->body);
+    bool foundCoding = false;
+    bool foundSandbox = false;
+    bool foundPersona = false;
+    bool foundRunningBot = false;
+    for (const auto& c : convsJson["conversations"]) {
+        std::string cid = c.value("id", "");
+        if (cid == "coding-octibot-cc") foundCoding = true;
+        if (cid == "bot-sandbox-sess") foundSandbox = true;
+        if (cid == "bot-persona-sess") foundPersona = true;
+        if (cid == "bot-running-proc") foundRunningBot = true;
+    }
+    assert(foundCoding);
+    assert(!foundSandbox);
+    assert(!foundPersona);
+    assert(!foundRunningBot);
+
+    // 5. Append new terminal PLANNER_RESPONSE steps to all 3 transcripts and verify notifications
+    gw.clearAgentEvents();
+    auto bumpTime = fs::file_time_type::clock::now() + std::chrono::seconds(2);
+    {
+        std::ofstream tf(codingTrans, std::ios::app);
+        tf << "{\"step_index\":2,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Finished coding OctiBotMcpServer.cxx changes.\",\"tool_calls\":[]}\n";
+    }
+    fs::last_write_time(codingTrans, bumpTime);
+
+    {
+        std::ofstream tf(sandboxTrans, std::ios::app);
+        tf << "{\"step_index\":2,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Sandbox bot reply after move.\",\"tool_calls\":[]}\n";
+    }
+    fs::last_write_time(sandboxTrans, bumpTime);
+
+    {
+        std::ofstream tf(personaTrans, std::ios::app);
+        tf << "{\"step_index\":2,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Persona bot reply after move.\",\"tool_calls\":[]}\n";
+    }
+    fs::last_write_time(personaTrans, bumpTime);
+
+    server.scanTranscriptsForNotifications(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    server.scanTranscriptsForNotifications(false);
+
+    auto events = gw.getRecentAgentEventsSince(0);
+    assert(events.size() == 1);
+    assert(events[0].conversationId == "coding-octibot-cc");
+    assert(events[0].event == "prompt_answered");
+
+    server.stop();
+    unsetenv("AIMON_IDE_BRAIN_DIR");
+    unsetenv("AIMON_CLI_BRAIN_DIR");
+    unsetenv("AIMON_AGY_PROCESSES_FILE");
+    unsetenv("AIMON_NOTIFICATION_SETTLE_MS");
+    fs::remove_all(baseDir);
+    std::cout << "[TestMobileGateway] testOctiBotSessionAndNotificationFiltering passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Starting TestMobileGateway ===" << std::endl;
     std::string testDbPath = "/tmp/test_mobile_gw_telemetry_" + std::to_string(getpid()) + ".db";
@@ -4411,6 +4596,7 @@ int main() {
     NonInteractiveCursorAndClaudeIdeSessions_ReadOnlyInConversationsAndRejectedOnPromptWith409();
     RuntimeConfigAndStrictSameProcessRelayControlPlane_LocksAndTelemetryPrune();
     testTranscriptGeneratingStateAndCancelCascadeInvocation();
+    testOctiBotSessionAndNotificationFiltering();
     fs::remove(testDbPath);
     std::cout << "=== TestMobileGateway: ALL TESTS PASSED ===" << std::endl;
     return 0;

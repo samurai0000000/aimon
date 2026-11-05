@@ -695,33 +695,95 @@ void McpServer::run() {
     }
 }
 
-nlohmann::json McpServer::handleMessage(const nlohmann::json& request, const std::string& profile) {
-    if (!request.contains("method")) {
+nlohmann::json McpServer::handleMessage(const nlohmann::json& request, const std::string& profile, bool isStreamableHttp) {
+    if (!request.is_object() || !request.contains("method") || !request["method"].is_string()) {
+        if (request.is_object() && request.contains("id") && !request["id"].is_null()) {
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", request["id"]},
+                {"error", {
+                    {"code", -32600},
+                    {"message", "Invalid Request"}
+                }}
+            };
+        }
         return nullptr;
     }
 
-    std::string method = request["method"].get<std::string>();
+    const bool isNotification = !request.contains("id");
     nlohmann::json id = request.value("id", nlohmann::json());
 
+    std::string method = request["method"].get<std::string>();
     std::string effectiveProfile = !profile.empty() ? profile : this->_defaultProfile;
 
     if (method == "initialize") {
-        return handleInitialize(id, request.value("params", nlohmann::json::object()));
+        if (isNotification) {
+            return nullptr;
+        }
+        return handleInitialize(id, request.value("params", nlohmann::json::object()), isStreamableHttp);
     } else if (method == "notifications/initialized") {
         return nullptr;
+    } else if (method.rfind("notifications/", 0) == 0) {
+        return nullptr;
     } else if (method == "ping") {
+        if (isNotification) {
+            return nullptr;
+        }
         return {
             {"jsonrpc", "2.0"},
             {"id", id},
             {"result", nlohmann::json::object()}
         };
     } else if (method == "tools/list") {
+        if (isNotification) {
+            return nullptr;
+        }
         return handleToolsList(id, effectiveProfile);
     } else if (method == "tools/call") {
+        if (isNotification) {
+            handleToolsCall(id, request.value("params", nlohmann::json::object()), effectiveProfile);
+            return nullptr;
+        }
         return handleToolsCall(id, request.value("params", nlohmann::json::object()), effectiveProfile);
+    } else if (method == "resources/list") {
+        if (isNotification) {
+            return nullptr;
+        }
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", id},
+            {"result", {{"resources", nlohmann::json::array()}}}
+        };
+    } else if (method == "resources/templates/list") {
+        if (isNotification) {
+            return nullptr;
+        }
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", id},
+            {"result", {{"resourceTemplates", nlohmann::json::array()}}}
+        };
+    } else if (method == "prompts/list") {
+        if (isNotification) {
+            return nullptr;
+        }
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", id},
+            {"result", {{"prompts", nlohmann::json::array()}}}
+        };
+    } else if (method == "logging/setLevel") {
+        if (isNotification) {
+            return nullptr;
+        }
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", id},
+            {"result", nlohmann::json::object()}
+        };
     }
 
-    if (!id.is_null()) {
+    if (!isNotification && !id.is_null()) {
         return {
             {"jsonrpc", "2.0"},
             {"id", id},
@@ -735,14 +797,29 @@ nlohmann::json McpServer::handleMessage(const nlohmann::json& request, const std
     return nullptr;
 }
 
-nlohmann::json McpServer::handleInitialize(const nlohmann::json& id, const nlohmann::json& /* params */) {
+nlohmann::json McpServer::handleInitialize(const nlohmann::json& id, const nlohmann::json& params, bool isStreamableHttp) {
+    std::string clientVersion = "";
+    if (params.is_object() && params.contains("protocolVersion") && params["protocolVersion"].is_string()) {
+        clientVersion = params["protocolVersion"].get<std::string>();
+    }
+    std::string negotiatedVersion;
+    if (!clientVersion.empty()) {
+        negotiatedVersion = (clientVersion == "2025-03-26") ? "2025-03-26" : "2024-11-05";
+    } else {
+        negotiatedVersion = isStreamableHttp ? "2025-03-26" : "2024-11-05";
+    }
+
     return {
         {"jsonrpc", "2.0"},
         {"id", id},
         {"result", {
-            {"protocolVersion", "2024-11-05"},
+            {"protocolVersion", negotiatedVersion},
             {"capabilities", {
-                {"tools", nlohmann::json::object()}
+                {"tools", {
+                    {"listChanged", true}
+                }},
+                {"resources", nlohmann::json::object()},
+                {"prompts", nlohmann::json::object()}
             }},
             {"serverInfo", {
                 {"name", "aimon"},

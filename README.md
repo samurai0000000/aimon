@@ -171,8 +171,10 @@ This starts:
 - The adaptive background poller (5m base / 10m idle).
 - The MQTT publisher for Home Assistant auto-discovery.
 
-### 3. Model Context Protocol (MCP) Server (Client-Server SSE)
-When `aimon` runs in `daemon` or `web` mode, it provides an official MCP Server-Sent Events (**SSE**) HTTP endpoint on port `3883`. This enables IDE AI assistants across your network to connect directly as HTTP clients without process spawning.
+### 3. Model Context Protocol (MCP) Server (Streamable HTTP & Legacy HTTP+SSE)
+When `aimon` runs in `daemon` or `web` mode, it provides an official Model Context Protocol server on port `3883` supporting the dual-transport engine:
+- **Streamable HTTP (`2025-03-26`) on `/mcp`**: Supports `POST /mcp` (JSON-RPC requests, `202 Accepted` notifications, and JSON-RPC 2.0 batching `[...]`), `GET /mcp` (standalone SSE push stream with `: keepalive` heartbeats and zero `event: endpoint` frames), `DELETE /mcp` (`204 No Content` session termination), and `Mcp-Session-Id` header lifecycle.
+- **Legacy HTTP+SSE (`2024-11-05`) on `/sse` and `/message`**: Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
 
 #### Scoped MCP Tool Profiles
 To prevent token exhaustion and eliminate irrelevant context in specialized workspaces, `aimon` supports scoped tool profiles:
@@ -189,28 +191,28 @@ To prevent token exhaustion and eliminate irrelevant context in specialized work
 
 `aimon` detects profiles automatically from workspace folder names during MCP client initialization (e.g. `boards` -> `embedded`, `pcb`/`robot`/`cad` -> `eda`), or you can explicitly select a profile via URL query parameter (`?profile=eda` or `?profile=cad`):
 
-#### Configuring in Cursor (SSE)
+#### Configuring in Cursor (Legacy HTTP+SSE)
 In Cursor **Settings > Features > MCP > Add New Server** (Type: `sse`):
-- **URL**: `http://localhost:3883/sse?profile=embedded` *(or `http://<server-host>:3883/sse?profile=core`)*
+- **URL**: `http://127.0.0.1:3883/sse?profile=embedded` *(or `http://localhost:3883/sse?profile=core`)*
 
 Or edit `~/.cursor/mcp.json`:
 ```json
 {
   "mcpServers": {
     "aimon": {
-      "url": "http://localhost:3883/sse?profile=core"
+      "url": "http://127.0.0.1:3883/sse?profile=core"
     }
   }
 }
 ```
 
-#### Configuring in Antigravity (SSE)
+#### Configuring in Antigravity (Streamable HTTP)
 Add `aimon` to your Antigravity MCP server configuration (`mcp_config.json`):
 ```json
 {
   "mcpServers": {
     "aimon": {
-      "serverUrl": "http://localhost:3883/sse?profile=embedded"
+      "serverUrl": "http://127.0.0.1:3883/mcp"
     }
   }
 }

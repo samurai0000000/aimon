@@ -178,6 +178,33 @@ static bool writeJsonFileAtomically(const std::string& targetPath, const nlohman
     }
 }
 
+static bool isAutomatedOctiBotSession(const std::string& workspacePath,
+                                      const std::string& firstPrompt) {
+    if (workspacePath.find("octibot-ai-sandbox") != std::string::npos) {
+        return true;
+    }
+    std::string prompt = firstPrompt;
+    auto startTag = prompt.find("<USER_REQUEST>");
+    auto endTag = prompt.find("</USER_REQUEST>");
+    if (startTag != std::string::npos && endTag != std::string::npos && endTag >= startTag + 14) {
+        prompt = prompt.substr(startTag + 14, endTag - (startTag + 14));
+    }
+    auto first = prompt.find_first_not_of(" \t\r\n");
+    if (first != std::string::npos) {
+        auto last = prompt.find_last_not_of(" \t\r\n");
+        prompt = prompt.substr(first, last - first + 1);
+    } else {
+        prompt.clear();
+    }
+    if (prompt.rfind("You are @octibot", 0) == 0 ||
+        prompt.find("an autonomous AI robot playing OCTI") != std::string::npos ||
+        prompt.find("Inspect OCTI skill guide with octibot_get_skill_guide and assist with move analysis") != std::string::npos ||
+        prompt.find("Reply in one short sentence as an OCTI tactical grandmaster robot") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
 static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
     std::vector<AgyProcessInfo> result;
     const char* envProcsFile = std::getenv("AIMON_AGY_PROCESSES_FILE");
@@ -215,6 +242,13 @@ static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
                         info.terminalPts = item.value("terminalPts", "");
                         info.httpPort = item.value("httpPort", 0);
                         info.httpsPort = item.value("httpsPort", 0);
+                        if (info.cwd.find("octibot-ai-sandbox") != std::string::npos) {
+                            continue;
+                        }
+                        std::string appDataDir = item.value("appDataDir", "");
+                        if (!appDataDir.empty() && appDataDir != "antigravity-cli") {
+                            continue;
+                        }
                         result.push_back(std::move(info));
                     }
                 }
@@ -255,6 +289,48 @@ static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
         }
         if (comm != "agy") continue;
 
+        bool skipByCmdline = false;
+        try {
+            std::ifstream cmdFile("/proc/" + dname + "/cmdline", std::ios::binary);
+            if (cmdFile.is_open()) {
+                std::string cmdContent((std::istreambuf_iterator<char>(cmdFile)),
+                                       std::istreambuf_iterator<char>());
+                std::vector<std::string> args;
+                size_t start = 0;
+                while (start < cmdContent.size()) {
+                    size_t end = cmdContent.find('\0', start);
+                    if (end == std::string::npos) end = cmdContent.size();
+                    if (end > start) {
+                        args.push_back(cmdContent.substr(start, end - start));
+                    }
+                    start = end + 1;
+                }
+                for (size_t i = 0; i < args.size(); ++i) {
+                    const std::string& arg = args[i];
+                    if (arg == "--hub") {
+                        skipByCmdline = true;
+                        break;
+                    }
+                    if (arg.rfind("--app_data_dir=", 0) == 0) {
+                        std::string val = arg.substr(15);
+                        if (!val.empty() && val != "antigravity-cli") {
+                            skipByCmdline = true;
+                            break;
+                        }
+                    } else if (arg == "--app_data_dir" && i + 1 < args.size()) {
+                        const std::string& val = args[i + 1];
+                        if (!val.empty() && val != "antigravity-cli") {
+                            skipByCmdline = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (...) {}
+        if (skipByCmdline) {
+            continue;
+        }
+
         AgyProcessInfo info;
         info.pid = pid;
         info.pidStr = dname;
@@ -263,6 +339,9 @@ static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
         auto cwdPath = fs::read_symlink("/proc/" + dname + "/cwd", symEc);
         if (!symEc) {
             info.cwd = cwdPath.string();
+        }
+        if (info.cwd.find("octibot-ai-sandbox") != std::string::npos) {
+            continue;
         }
 
         auto fd0Path = fs::read_symlink("/proc/" + dname + "/fd/0", symEc);
@@ -288,6 +367,10 @@ static std::vector<AgyProcessInfo> discoverRunningAgyProcesses() {
                 if (target.size() > deletedSuffix.size() &&
                     target.compare(target.size() - deletedSuffix.size(), deletedSuffix.size(), deletedSuffix) == 0) {
                     target.resize(target.size() - deletedSuffix.size());
+                }
+                if (target.find("/antigravity-octibot/") != std::string::npos ||
+                    target.find("/antigravity/") != std::string::npos) {
+                    continue;
                 }
 
                 auto presPos = target.find("/presence/");
@@ -6854,7 +6937,8 @@ void WebServer::setupRoutes() {
     };
 
     auto handleAgentConversations = [this, getIdeBrainDir, getCliBrainDir, getCliPresenceDir, stripUserRequestTags,
-                                     toLowerAscii, mapModelToHumanLabel, extractConversationModelById, discoverLsEndpoints](
+                                     toLowerAscii, mapModelToHumanLabel, extractConversationModelById,
+                                     discoverLsEndpoints, resolveSessionWorkspacePath](
                                         const httplib::Request& req, httplib::Response& res) {
         std::string reqId = extractOrGenerateRequestId(req);
         res.set_header("Access-Control-Allow-Origin", "*");
@@ -6956,7 +7040,8 @@ void WebServer::setupRoutes() {
                             if (cAg) ds.agentName = cAg;
                         }
 
-                        if (ds.nestingDepth > 0 || !ds.parentConversationId.empty() || !ds.agentName.empty()) {
+                        if (ds.nestingDepth > 0 || !ds.parentConversationId.empty() || !ds.agentName.empty() ||
+                            isAutomatedOctiBotSession(ds.workspacePath, ds.preview)) {
                             subagentIds.insert(ds.id);
                         }
                         if (ds.stepCount <= 0 && ds.title.empty() && ds.preview.empty()) {
@@ -7317,6 +7402,9 @@ void WebServer::setupRoutes() {
                 if (!norm.hasValidTurns) {
                     return false;
                 }
+                if (isAutomatedOctiBotSession(norm.workspacePath, norm.firstPrompt)) {
+                    return false;
+                }
                 if (norm.lastActivitySec > ts) {
                     ts = norm.lastActivitySec;
                 }
@@ -7586,6 +7674,16 @@ void WebServer::setupRoutes() {
                     workspacePath = agyIt->second.cwd;
                     workspaceShort = fs::path(workspacePath).filename().string();
                 }
+            }
+
+            if (workspacePath.empty() && hasTranscript) {
+                workspacePath = resolveSessionWorkspacePath(id);
+                if (!workspacePath.empty()) {
+                    workspaceShort = fs::path(workspacePath).filename().string();
+                }
+            }
+            if (isAutomatedOctiBotSession(workspacePath, firstPrompt)) {
+                return false;
             }
 
             if (ts == 0 && openInTerminal) {
@@ -10649,55 +10747,89 @@ void WebServer::setupRoutes() {
     });
 
 
-    _server->Get("/sse", [this](const httplib::Request& req, httplib::Response& res) {
-        std::string profile;
-        if (req.has_param("profile")) {
-            profile = req.get_param_value("profile");
-        } else if (req.has_header("X-Aimon-Profile")) {
-            profile = req.get_header_value("X-Aimon-Profile");
+    auto extractSessionId = [](const httplib::Request& req) -> std::string {
+        std::string sid;
+        if (req.has_header("Mcp-Session-Id")) {
+            sid = req.get_header_value("Mcp-Session-Id");
+        } else if (req.has_header("mcp-session-id")) {
+            sid = req.get_header_value("mcp-session-id");
+        } else if (req.has_param("sessionId")) {
+            sid = req.get_param_value("sessionId");
+        } else if (req.has_param("session_id")) {
+            sid = req.get_param_value("session_id");
         }
+        while (!sid.empty() && (sid.back() == '\r' || sid.back() == '\n' || sid.back() == ' ')) {
+            sid.pop_back();
+        }
+        return sid;
+    };
 
+    auto extractProfile = [](const httplib::Request& req) -> std::string {
+        if (req.has_param("profile")) {
+            return req.get_param_value("profile");
+        } else if (req.has_header("X-Aimon-Profile")) {
+            return req.get_header_value("X-Aimon-Profile");
+        }
+        return "";
+    };
+
+    auto setupSseStream = [this, extractSessionId, extractProfile](const httplib::Request& req, httplib::Response& res, bool forceStreamable) {
+        std::string profile = extractProfile(req);
         if (!_mcpServer && profile != "mobile") {
             res.status = 503;
             res.set_content("MCP service not configured", "text/plain");
             return;
         }
 
-        std::string sessionId = generateSessionId();
-        auto session = std::make_shared<SseSession>();
-        session->id = sessionId;
-        session->profile = profile;
+        bool isStreamable = forceStreamable ||
+            (req.has_param("transport") && req.get_param_value("transport") == "streamable") ||
+            (req.has_header("Mcp-Protocol-Version") && req.get_header_value("Mcp-Protocol-Version") == "2025-03-26");
 
-        {
+        std::string sessionId = extractSessionId(req);
+        std::shared_ptr<SseSession> session;
+        if (!sessionId.empty()) {
             std::lock_guard<std::mutex> lock(_sessionsMutex);
-            _sseSessions[sessionId] = session;
+            auto it = _sseSessions.find(sessionId);
+            if (it != _sseSessions.end()) {
+                session = it->second;
+                session->touch();
+                if (isStreamable) {
+                    session->isStreamableHttp = true;
+                }
+                session->closed.store(false);
+            }
         }
 
-        std::string remoteIp = req.remote_addr;
-        TaskRegistry::getInstance().registerSession(sessionId, remoteIp);
-
-        std::cout << "[WebServer] New SSE client connected from " << remoteIp
-                  << ", session: " << sessionId;
-        if (!profile.empty()) {
-            std::cout << ", profile: " << profile;
+        if (!session) {
+            session = createMcpSession(profile, isStreamable, req.remote_addr);
+            sessionId = session->id;
         }
-        std::cout << std::endl;
 
         res.set_header("Content-Type", "text/event-stream");
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
         res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id");
+        res.set_header("Mcp-Session-Id", session->id);
 
-        auto provider = [session, initialSent = false](size_t offset, httplib::DataSink& sink) mutable -> bool {
+        auto provider = [session, isStreamable, initialSent = false](size_t offset, httplib::DataSink& sink) mutable -> bool {
             (void)offset;
             if (!sink.is_writable() || session->closed.load()) {
                 return false;
             }
 
             if (!initialSent) {
-                std::string endpointMsg = "event: endpoint\ndata: /message?sessionId=" + session->id + (!session->profile.empty() ? ("&profile=" + session->profile) : "") + "\n\n";
                 initialSent = true;
-                return sink.write(endpointMsg.data(), endpointMsg.size());
+                if (!isStreamable) {
+                    // Legacy HTTP+SSE (2024-11-05): emit endpoint announcement
+                    std::string endpointMsg = "event: endpoint\ndata: /message?sessionId=" + session->id + (!session->profile.empty() ? ("&profile=" + session->profile) : "") + "\n\n";
+                    return sink.write(endpointMsg.data(), endpointMsg.size());
+                } else {
+                    // Streamable HTTP (2025-03-26): NEVER emit event: endpoint!
+                    // Flush immediate keepalive comment so HTTP headers & connection are established
+                    std::string ping = ": keepalive\n\n";
+                    return sink.write(ping.data(), ping.size());
+                }
             }
 
             std::unique_lock<std::mutex> lock(session->mutex);
@@ -10722,74 +10854,263 @@ void WebServer::setupRoutes() {
             return sink.write(sseData.data(), sseData.size());
         };
 
-        auto releaser = [this, sessionId, session](bool success) {
+        auto releaser = [this, sessionId, session, isStreamable](bool success) {
             (void)success;
-            session->closed.store(true);
-            session->cv.notify_all();
-            std::lock_guard<std::mutex> lock(_sessionsMutex);
-            _sseSessions.erase(sessionId);
-            TaskRegistry::getInstance().removeSession(sessionId);
-            std::cout << "[WebServer] SSE client disconnected, session: " << sessionId << std::endl;
+            session->touch();
+            if (!isStreamable) {
+                session->closed.store(true);
+                session->cv.notify_all();
+                std::lock_guard<std::mutex> lock(_sessionsMutex);
+                _sseSessions.erase(sessionId);
+                TaskRegistry::getInstance().removeSession(sessionId);
+                std::cout << "[WebServer] Legacy SSE client disconnected, session: " << sessionId << std::endl;
+            } else {
+                std::cout << "[WebServer] Streamable HTTP SSE stream disconnected for session: " << sessionId << std::endl;
+            }
         };
 
         res.set_chunked_content_provider("text/event-stream", provider, releaser);
+    };
+
+    _server->Get("/sse", [setupSseStream](const httplib::Request& req, httplib::Response& res) {
+        setupSseStream(req, res, false);
     });
 
-    auto handleMcpMessage = [this](const httplib::Request& req, httplib::Response& res) {
+    _server->Get("/mcp", [setupSseStream](const httplib::Request& req, httplib::Response& res) {
+        setupSseStream(req, res, true);
+    });
+
+    auto handleMcpMessage = [this, extractSessionId, extractProfile](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, mcp-session-id, X-Aimon-Profile");
+        res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, mcp-session-id, X-Aimon-Profile, Mcp-Protocol-Version");
+
         if (!_mcpServer) {
             res.status = 503;
             res.set_content("MCP service not configured", "text/plain");
             return;
         }
 
-        // Extract session ID from query parameters or headers
-        std::string sessionId;
-        if (req.has_param("sessionId")) {
-            sessionId = req.get_param_value("sessionId");
-        } else if (req.has_param("session_id")) {
-            sessionId = req.get_param_value("session_id");
-        } else if (req.has_header("Mcp-Session-Id")) {
-            sessionId = req.get_header_value("Mcp-Session-Id");
-        } else if (req.has_header("mcp-session-id")) {
-            sessionId = req.get_header_value("mcp-session-id");
-        }
+        bool isStreamableHttp = (req.path == "/mcp" || req.path == "/sse" ||
+            (req.has_header("Mcp-Protocol-Version") && req.get_header_value("Mcp-Protocol-Version") == "2025-03-26") ||
+            (req.has_param("transport") && req.get_param_value("transport") == "streamable"));
 
-        // Strip trailing carriage return, newline, or whitespace
-        while (!sessionId.empty() && (sessionId.back() == '\r' || sessionId.back() == '\n' || sessionId.back() == ' ')) {
-            sessionId.pop_back();
-        }
-
-        // Check if an SSE session exists for push notification
+        std::string sessionId = extractSessionId(req);
         std::shared_ptr<SseSession> session;
         if (!sessionId.empty()) {
             std::lock_guard<std::mutex> lock(_sessionsMutex);
             auto it = _sseSessions.find(sessionId);
             if (it != _sseSessions.end()) {
                 session = it->second;
+                session->touch();
+                if (session->isStreamableHttp) {
+                    isStreamableHttp = true;
+                }
             }
         }
 
-        // Extract profile from query params, headers, or existing SSE session
-        std::string profile;
-        if (req.has_param("profile")) {
-            profile = req.get_param_value("profile");
-        } else if (req.has_header("X-Aimon-Profile")) {
-            profile = req.get_header_value("X-Aimon-Profile");
-        } else if (session && !session->profile.empty()) {
+        std::string profile = extractProfile(req);
+        if (profile.empty() && session && !session->profile.empty()) {
             profile = session->profile;
         }
 
-        nlohmann::json reqJson;
-        try {
-            reqJson = nlohmann::json::parse(req.body);
-        } catch (const std::exception& e) {
+        // Parse JSON body safely without throwing exceptions
+        nlohmann::json reqJson = nlohmann::json::parse(req.body, nullptr, false);
+        if (reqJson.is_discarded()) {
+            nlohmann::json parseError = {
+                {"jsonrpc", "2.0"},
+                {"id", nullptr},
+                {"error", {
+                    {"code", -32700},
+                    {"message", "Parse error"}
+                }}
+            };
             res.status = 400;
-            res.set_content(std::string("Invalid JSON: ") + e.what(), "text/plain");
+            res.set_content(parseError.dump(), "application/json");
             return;
         }
 
+        // For Streamable HTTP, create or register session if not yet active
+        if (isStreamableHttp) {
+            if (!session) {
+                if (sessionId.empty()) {
+                    session = createMcpSession(profile, true, req.remote_addr);
+                    sessionId = session->id;
+                } else {
+                    reapIdleMcpSessions();
+                    {
+                        std::lock_guard<std::mutex> lock(_sessionsMutex);
+                        if (_sseSessions.size() >= MAX_MCP_SESSIONS) {
+                            auto oldestIt = _sseSessions.end();
+                            auto oldestTime = std::chrono::steady_clock::time_point::max();
+                            for (auto it = _sseSessions.begin(); it != _sseSessions.end(); ++it) {
+                                if (it->second->lastActive < oldestTime) {
+                                    oldestTime = it->second->lastActive;
+                                    oldestIt = it;
+                                }
+                            }
+                            if (oldestIt != _sseSessions.end()) {
+                                std::string evictedId = oldestIt->first;
+                                oldestIt->second->closed.store(true);
+                                oldestIt->second->cv.notify_all();
+                                TaskRegistry::getInstance().removeSession(evictedId);
+                                _sseSessions.erase(oldestIt);
+                                std::cout << "[WebServer] Evicted oldest idle MCP session: " << evictedId << std::endl;
+                            }
+                        }
+                        session = std::make_shared<SseSession>();
+                        session->id = sessionId;
+                        session->profile = profile;
+                        session->isStreamableHttp = true;
+                        session->createdAt = std::chrono::steady_clock::now();
+                        session->lastActive = session->createdAt;
+                        _sseSessions[sessionId] = session;
+                    }
+                    TaskRegistry::getInstance().registerSession(sessionId, req.remote_addr);
+                }
+            }
+        }
+
+        if (!sessionId.empty()) {
+            TaskRegistry::getInstance().touchSession(sessionId);
+        }
+
+        auto processMessageMetadata = [&](nlohmann::json& msg) {
+            if (!msg.is_object()) return;
+            std::string m = msg.value("method", "");
+            if (m == "initialize" && !sessionId.empty()) {
+                if (msg.contains("params") && msg["params"].is_object()) {
+                    const auto& p = msg["params"];
+                    if (p.contains("clientInfo") && p["clientInfo"].is_object()) {
+                        const auto& ci = p["clientInfo"];
+                        std::string cName = ci.value("name", "MCP Client");
+                        std::string cVer = ci.value("version", "");
+                        TaskRegistry::getInstance().updateSessionClientInfo(sessionId, cName, cVer);
+                        if (session) {
+                            session->clientName = cName;
+                            session->clientVersion = cVer;
+                        }
+                        std::cout << "[WebServer] MCP client identified for session " << sessionId
+                                  << ": name='" << cName << "', version='" << cVer << "'" << std::endl;
+                    }
+
+                    if (session && session->profile.empty()) {
+                        std::string detected;
+                        if (p.contains("rootUri") && p["rootUri"].is_string()) {
+                            detected = McpServer::detectProfileFromWorkspace(p["rootUri"].get<std::string>());
+                        }
+                        if (detected.empty() && p.contains("rootPath") && p["rootPath"].is_string()) {
+                            detected = McpServer::detectProfileFromWorkspace(p["rootPath"].get<std::string>());
+                        }
+                        if (detected.empty() && p.contains("workspaceFolders") && p["workspaceFolders"].is_array()) {
+                            for (const auto& wf : p["workspaceFolders"]) {
+                                if (wf.contains("uri") && wf["uri"].is_string()) {
+                                    detected = McpServer::detectProfileFromWorkspace(wf["uri"].get<std::string>());
+                                    if (!detected.empty()) break;
+                                }
+                            }
+                        }
+                        if (!detected.empty()) {
+                            session->profile = detected;
+                            profile = detected;
+                            std::cout << "[WebServer] Auto-scoped session " << sessionId
+                                      << " profile to: " << detected << std::endl;
+                        }
+                    }
+                }
+            }
+            if (m == "tools/call" && !sessionId.empty()) {
+                if (msg.contains("params") && msg["params"].is_object()) {
+                    auto& p = msg["params"];
+                    std::string tName = p.value("name", "");
+                    if (tName == "register_agent_task" ||
+                        tName == "agent_check_inbox" ||
+                        tName == "agent_send_reply") {
+                        if (!p.contains("arguments") || !p["arguments"].is_object()) {
+                            p["arguments"] = nlohmann::json::object();
+                        }
+                        p["arguments"]["sse_session_id"] = sessionId;
+                    }
+                }
+            }
+        };
+
+        // Negative Constraint 4: Batch Request Handling
+        if (reqJson.is_array()) {
+            if (reqJson.empty()) {
+                nlohmann::json err = {
+                    {"jsonrpc", "2.0"},
+                    {"id", nullptr},
+                    {"error", {{"code", -32600}, {"message", "Invalid Request"}}}
+                };
+                res.status = 400;
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+
+            nlohmann::json resArray = nlohmann::json::array();
+            bool hasRequests = false;
+            for (auto& item : reqJson) {
+                if (!item.is_object()) {
+                    resArray.push_back({
+                        {"jsonrpc", "2.0"},
+                        {"id", nullptr},
+                        {"error", {{"code", -32600}, {"message", "Invalid Request"}}}
+                    });
+                    hasRequests = true;
+                    continue;
+                }
+                if (!item.contains("id")) {
+                    // Notification in batch
+                    _mcpServer->handleMessage(item, profile, isStreamableHttp);
+                } else {
+                    hasRequests = true;
+                    processMessageMetadata(item);
+                    nlohmann::json respItem = _mcpServer->handleMessage(item, profile, isStreamableHttp);
+                    if (!respItem.is_null()) {
+                        resArray.push_back(respItem);
+                    }
+                }
+            }
+
+            if (!sessionId.empty()) {
+                res.set_header("Mcp-Session-Id", sessionId);
+            }
+            if (hasRequests) {
+                res.status = 200;
+                res.set_content(resArray.dump(), "application/json");
+            } else {
+                res.status = 202;
+                res.set_content("", "text/plain");
+            }
+            return;
+        }
+
+        // Payload is a single non-array entity
+        if (!reqJson.is_object()) {
+            nlohmann::json err = {
+                {"jsonrpc", "2.0"},
+                {"id", nullptr},
+                {"error", {{"code", -32600}, {"message", "Invalid Request"}}}
+            };
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        // Negative Constraint 2: JSON-RPC 2.0 Notification handling (no "id" member)
+        if (!reqJson.contains("id")) {
+            _mcpServer->handleMessage(reqJson, profile, isStreamableHttp);
+            if (!sessionId.empty()) {
+                res.set_header("Mcp-Session-Id", sessionId);
+            }
+            res.status = 202;
+            res.set_content("", "text/plain");
+            return;
+        }
+
+        // Standard Single Request
+        processMessageMetadata(reqJson);
         std::string method = reqJson.value("method", "");
         std::cout << "[WebServer] MCP POST: method=" << method << " session='" << sessionId << "'";
         if (!profile.empty()) {
@@ -10797,69 +11118,12 @@ void WebServer::setupRoutes() {
         }
         std::cout << std::endl;
 
-        if (!sessionId.empty()) {
-            TaskRegistry::getInstance().touchSession(sessionId);
-        }
-
-        if (method == "initialize" && !sessionId.empty()) {
-            if (reqJson.contains("params") && reqJson["params"].is_object()) {
-                const auto& p = reqJson["params"];
-                if (p.contains("clientInfo") && p["clientInfo"].is_object()) {
-                    const auto& ci = p["clientInfo"];
-                    std::string cName = ci.value("name", "MCP Client");
-                    std::string cVer = ci.value("version", "");
-                    TaskRegistry::getInstance().updateSessionClientInfo(sessionId, cName, cVer);
-                    std::cout << "[WebServer] MCP client identified for session " << sessionId
-                              << ": name='" << cName << "', version='" << cVer << "'" << std::endl;
-                }
-
-                // Auto-scope session profile from workspace if session has no explicit profile
-                if (session && session->profile.empty()) {
-                    std::string detected;
-                    if (p.contains("rootUri") && p["rootUri"].is_string()) {
-                        detected = McpServer::detectProfileFromWorkspace(p["rootUri"].get<std::string>());
-                    }
-                    if (detected.empty() && p.contains("rootPath") && p["rootPath"].is_string()) {
-                        detected = McpServer::detectProfileFromWorkspace(p["rootPath"].get<std::string>());
-                    }
-                    if (detected.empty() && p.contains("workspaceFolders") && p["workspaceFolders"].is_array()) {
-                        for (const auto& wf : p["workspaceFolders"]) {
-                            if (wf.contains("uri") && wf["uri"].is_string()) {
-                                detected = McpServer::detectProfileFromWorkspace(wf["uri"].get<std::string>());
-                                if (!detected.empty()) break;
-                            }
-                        }
-                    }
-                    if (!detected.empty()) {
-                        session->profile = detected;
-                        profile = detected;  // update for this request too
-                        std::cout << "[WebServer] Auto-scoped session " << sessionId
-                                  << " profile to: " << detected << std::endl;
-                    }
-                }
-            }
-        }
-
-        if (method == "tools/call" && !sessionId.empty()) {
-            if (reqJson.contains("params") && reqJson["params"].is_object()) {
-                auto& p = reqJson["params"];
-                std::string tName = p.value("name", "");
-                if (tName == "register_agent_task" ||
-                    tName == "agent_check_inbox" ||
-                    tName == "agent_send_reply") {
-                    if (!p.contains("arguments") || !p["arguments"].is_object()) {
-                        p["arguments"] = nlohmann::json::object();
-                    }
-                    p["arguments"]["sse_session_id"] = sessionId;
-                }
-            }
-        }
-
-        // Process message through MCP server engine with profile filtering
-        nlohmann::json respJson = _mcpServer->handleMessage(reqJson, profile);
+        nlohmann::json respJson = _mcpServer->handleMessage(reqJson, profile, isStreamableHttp);
         std::string respStr = respJson.is_null() ? "{}" : respJson.dump();
 
-        if (session && !respJson.is_null()) {
+        // Negative Constraint 3: For legacy HTTP+SSE (!isStreamableHttp), push to session messageQueue.
+        // For Streamable HTTP, synchronous responses are returned SOLELY in HTTP response body.
+        if (session && !isStreamableHttp && !respJson.is_null()) {
             {
                 std::lock_guard<std::mutex> lock(session->mutex);
                 session->messageQueue.push(respStr);
@@ -10867,7 +11131,6 @@ void WebServer::setupRoutes() {
             session->cv.notify_one();
         }
 
-        // Return JSON response directly in HTTP response body (supports Streamable HTTP)
         if (!sessionId.empty()) {
             res.set_header("Mcp-Session-Id", sessionId);
         }
@@ -10875,16 +11138,44 @@ void WebServer::setupRoutes() {
         res.set_content(respStr, "application/json");
     };
 
+    _server->Post("/mcp", handleMcpMessage);
+    _server->Post("/sse", handleMcpMessage);
     _server->Post("/message", handleMcpMessage);
     _server->Post("/messages", handleMcpMessage);
-    _server->Post("/sse", handleMcpMessage);
+
+    auto handleMcpDelete = [this, extractSessionId](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, mcp-session-id");
+
+        std::string sessionId = extractSessionId(req);
+        if (sessionId.empty()) {
+            res.status = 404;
+            res.set_content(nlohmann::json({{"error", "Session not found"}}).dump(), "application/json");
+            return;
+        }
+
+        if (!terminateMcpSession(sessionId)) {
+            res.status = 404;
+            res.set_content(nlohmann::json({{"error", "Session not found"}}).dump(), "application/json");
+            return;
+        }
+
+        res.status = 204;
+        res.set_content("", "text/plain");
+    };
+
+    _server->Delete("/mcp", handleMcpDelete);
+    _server->Delete("/sse", handleMcpDelete);
 
     auto handleOptions = [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, mcp-session-id");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, mcp-session-id, X-Aimon-Profile, Mcp-Protocol-Version");
+        res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id");
         res.status = 204;
     };
+    _server->Options("/mcp", handleOptions);
     _server->Options("/sse", handleOptions);
     _server->Options("/message", handleOptions);
     _server->Options("/messages", handleOptions);
@@ -11273,6 +11564,7 @@ bool WebServer::start(bool async) {
             lk.unlock();
             try {
                 scanTranscriptsForNotifications(false);
+                reapIdleMcpSessions();
             } catch (...) {}
         }
     });
@@ -11283,6 +11575,8 @@ bool WebServer::start(bool async) {
     std::cout << "[WebServer] Dashboard available at http://"
               << _config.host << ":" << _config.port << std::endl;
     if (_mcpServer) {
+        std::cout << "[WebServer] MCP Streamable HTTP endpoint available at http://"
+                  << _config.host << ":" << _config.port << "/mcp" << std::endl;
         std::cout << "[WebServer] MCP SSE endpoint available at http://"
                   << _config.host << ":" << _config.port << "/sse" << std::endl;
     }
@@ -11324,10 +11618,16 @@ bool WebServer::start(bool async) {
 }
 
 void WebServer::broadcastSseNotification(const std::string& jsonRpcNotification) {
+    bool isJsonRpc = (jsonRpcNotification.find("\"jsonrpc\":\"2.0\"") != std::string::npos ||
+                      jsonRpcNotification.find("\"jsonrpc\": \"2.0\"") != std::string::npos);
+
     std::lock_guard<std::mutex> lock(_sessionsMutex);
     for (auto& pair : _sseSessions) {
         auto& session = pair.second;
         if (session && !session->closed.load()) {
+            if (!isJsonRpc && session->profile != "mobile") {
+                continue;
+            }
             {
                 std::lock_guard<std::mutex> sLock(session->mutex);
                 session->messageQueue.push(jsonRpcNotification);
@@ -11376,6 +11676,7 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
     MobileGateway& gw = _mobileGateway ? *_mobileGateway : MobileGateway::getInstance();
 
     std::set<std::string> knownSubagentIds;
+    std::map<std::string, std::string> dbWorkspacesByConvId;
     for (const std::string& rPath : {cliBrain, ideBrain}) {
         if (rPath.empty()) continue;
         fs::path metaCachePath = fs::path(rPath).parent_path() / "cache" / "conversation_metadata.json";
@@ -11395,6 +11696,54 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                     }
                 }
             } catch (...) {}
+        }
+
+        fs::path sumDbPath = fs::path(rPath).parent_path() / "conversation_summaries.db";
+        if (!fs::exists(sumDbPath, mEc) || mEc) {
+            sumDbPath = fs::path(rPath) / "conversation_summaries.db";
+        }
+        if (fs::exists(sumDbPath, mEc) && !mEc) {
+            sqlite3* db = nullptr;
+            if (sqlite3_open_v2(sumDbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK && db) {
+                sqlite3_busy_timeout(db, 200);
+                sqlite3_stmt* stmt = nullptr;
+                const char* sql =
+                    "SELECT conversation_id, preview, workspace_uris, parent_conversation_id, nesting_depth "
+                    "FROM conversation_summaries";
+                if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK && stmt) {
+                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                        const char* cId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                        if (!cId || !*cId) continue;
+                        std::string cidStr(cId);
+                        const char* cPrev = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                        std::string prevStr = cPrev ? std::string(cPrev) : "";
+                        const char* cWs = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+                        std::string wsPath;
+                        if (cWs && *cWs) {
+                            auto wj = nlohmann::json::parse(cWs, nullptr, false);
+                            if (!wj.is_discarded() && wj.is_array() && !wj.empty() && wj[0].is_string()) {
+                                wsPath = wj[0].get<std::string>();
+                                if (wsPath.rfind("file://", 0) == 0) {
+                                    wsPath = wsPath.substr(7);
+                                }
+                            }
+                        }
+                        if (!wsPath.empty()) {
+                            dbWorkspacesByConvId[cidStr] = wsPath;
+                        }
+                        const char* cPar = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+                        std::string parStr = cPar ? std::string(cPar) : "";
+                        int nDepth = sqlite3_column_int(stmt, 4);
+                        if (nDepth > 0 || !parStr.empty() || isAutomatedOctiBotSession(wsPath, prevStr)) {
+                            knownSubagentIds.insert(cidStr);
+                        }
+                    }
+                    sqlite3_finalize(stmt);
+                }
+                sqlite3_close(db);
+            } else if (db) {
+                sqlite3_close(db);
+            }
         }
     }
 
@@ -11486,12 +11835,20 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                 }
             }
 
+            if (st.cachedWorkspace.empty()) {
+                auto wsIt = dbWorkspacesByConvId.find(cid);
+                if (wsIt != dbWorkspacesByConvId.end()) {
+                    st.cachedWorkspace = wsIt->second;
+                }
+            }
+
             std::ifstream in(tPath);
             if (!in.is_open()) continue;
 
             int maxStepIdx = -1;
             nlohmann::json lastStepObj;
             std::string prevGenericContent;
+            std::string firstUserPrompt;
             std::string line;
             bool seenFirstValidStep = false;
             bool seenUserInput = false;
@@ -11512,8 +11869,22 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                         break;
                     }
                 }
+                if (st.cachedWorkspace.empty()) {
+                    std::string rawContent = j.value("content", "");
+                    auto cwdPos = rawContent.find("Command Working Directory: ");
+                    if (cwdPos != std::string::npos) {
+                        size_t start = cwdPos + 27;
+                        size_t end = rawContent.find_first_of("\r\n\"", start);
+                        st.cachedWorkspace = trimText(
+                            (end == std::string::npos) ? rawContent.substr(start)
+                                                       : rawContent.substr(start, end - start));
+                    }
+                }
                 if (sType == "USER_INPUT") {
                     seenUserInput = true;
+                    if (firstUserPrompt.empty()) {
+                        firstUserPrompt = stripUserTags(j.value("content", ""));
+                    }
                 }
                 if (st.cachedTitle.empty() && sType == "USER_INPUT") {
                     std::string uText = stripUserTags(j.value("content", ""));
@@ -11533,6 +11904,9 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
                 lastStepObj = std::move(j);
             }
 
+            if (isAutomatedOctiBotSession(st.cachedWorkspace, firstUserPrompt)) {
+                st.isSubagent = true;
+            }
             if (st.isSubagent || !seenUserInput) {
                 st.pendingStepIndex = -1;
                 continue;
@@ -11778,6 +12152,11 @@ void WebServer::scanTranscriptsForNotifications(bool seedOnly) {
             st.pendingStepIndex = -1;
             continue;
         }
+        if (isAutomatedOctiBotSession(parsed.workspacePath, parsed.firstPrompt)) {
+            st.isSubagent = true;
+            st.pendingStepIndex = -1;
+            continue;
+        }
         if (st.cachedTitle.empty() && !parsed.firstPrompt.empty()) {
             st.cachedTitle = parsed.firstPrompt;
             auto nlPos = st.cachedTitle.find_first_of("\r\n");
@@ -11934,6 +12313,107 @@ void WebServer::stop() {
         _thread->join();
         _thread.reset();
     }
+}
+
+std::shared_ptr<SseSession> WebServer::createMcpSession(const std::string& profile,
+                                                       bool isStreamableHttp,
+                                                       const std::string& remoteIp) {
+    reapIdleMcpSessions();
+
+    std::lock_guard<std::mutex> lock(_sessionsMutex);
+
+    if (_sseSessions.size() >= MAX_MCP_SESSIONS) {
+        auto oldestIt = _sseSessions.end();
+        auto oldestTime = std::chrono::steady_clock::time_point::max();
+        for (auto it = _sseSessions.begin(); it != _sseSessions.end(); ++it) {
+            if (it->second->lastActive < oldestTime) {
+                oldestTime = it->second->lastActive;
+                oldestIt = it;
+            }
+        }
+        if (oldestIt != _sseSessions.end()) {
+            std::string evictedId = oldestIt->first;
+            oldestIt->second->closed.store(true);
+            oldestIt->second->cv.notify_all();
+            TaskRegistry::getInstance().removeSession(evictedId);
+            _sseSessions.erase(oldestIt);
+            std::cout << "[WebServer] Evicted oldest idle MCP session: " << evictedId << std::endl;
+        }
+    }
+
+    std::string sessionId = generateSessionId();
+    auto session = std::make_shared<SseSession>();
+    session->id = sessionId;
+    session->profile = profile;
+    session->isStreamableHttp = isStreamableHttp;
+    session->createdAt = std::chrono::steady_clock::now();
+    session->lastActive = session->createdAt;
+
+    _sseSessions[sessionId] = session;
+    TaskRegistry::getInstance().registerSession(sessionId, remoteIp);
+
+    std::cout << "[WebServer] Created " << (isStreamableHttp ? "Streamable HTTP" : "Legacy SSE")
+              << " session " << sessionId << " from " << remoteIp;
+    if (!profile.empty()) {
+        std::cout << ", profile: " << profile;
+    }
+    std::cout << std::endl;
+
+    return session;
+}
+
+bool WebServer::terminateMcpSession(const std::string& sessionId) {
+    std::shared_ptr<SseSession> session;
+    {
+        std::lock_guard<std::mutex> lock(_sessionsMutex);
+        auto it = _sseSessions.find(sessionId);
+        if (it == _sseSessions.end()) {
+            return false;
+        }
+        session = it->second;
+        _sseSessions.erase(it);
+    }
+
+    if (session) {
+        session->closed.store(true);
+        session->cv.notify_all();
+        TaskRegistry::getInstance().removeSession(sessionId);
+        std::cout << "[WebServer] Terminated MCP session " << sessionId << std::endl;
+        return true;
+    }
+    return false;
+}
+
+size_t WebServer::reapIdleMcpSessions(std::chrono::seconds maxIdle) {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<std::shared_ptr<SseSession>> toClose;
+    {
+        std::lock_guard<std::mutex> lock(_sessionsMutex);
+        for (auto it = _sseSessions.begin(); it != _sseSessions.end();) {
+            auto& session = it->second;
+            bool isIdle = (now - session->lastActive) > maxIdle;
+            bool isClosed = session->closed.load();
+            if (isIdle || isClosed) {
+                toClose.push_back(session);
+                TaskRegistry::getInstance().removeSession(it->first);
+                it = _sseSessions.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    for (auto& session : toClose) {
+        session->closed.store(true);
+        session->cv.notify_all();
+        std::cout << "[WebServer] Reaped idle/closed MCP session " << session->id << std::endl;
+    }
+    return toClose.size();
+}
+
+size_t WebServer::getActiveMcpSessionCount() const {
+    std::lock_guard<std::mutex> lock(_sessionsMutex);
+    return _sseSessions.size();
 }
 
 } // namespace aimon

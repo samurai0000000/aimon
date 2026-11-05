@@ -15,9 +15,19 @@ Modern software engineering workflows increasingly rely on AI pair programming a
 ### 1.3 The Solution
 `aimon` operates as a unified, privacy-first local monitoring engine and **Central MCP Tool Gateway Hub**:
 1. **AI Quota & Subscription Monitoring**: Directly gathers metrics from the Cursor Desktop API (`api2.cursor.sh`) and Antigravity Language Server loopback RPC (`127.0.0.1`).
-2. **Central MCP Tool Gateway**: Acts as the sole MCP integration point for AI agents (Antigravity and Cursor) over HTTP Server-Sent Events (SSE on port `3883`).
+2. **Central MCP Tool Gateway**: Acts as the sole MCP integration point for AI agents (Antigravity and Cursor) over Streamable HTTP (`/mcp`) and Legacy HTTP+SSE (`/sse`).
 3. **Multiplexed TCP Gateway for Subsystems**: Runs a TCP gateway server on port `3885` accepting connections from specialized network daemons (e.g. `meshmon` LoRa radio gateway, `netmon` LAN monitor). When daemons connect, they dynamically register their toolsets; `aimon` merges these tools into its global MCP registry and proxies RPC invocations transparently.
 4. **Embedded Web & Home Assistant Interfaces**: Real-time browser dashboard (`http://localhost:3883`) and native Home Assistant MQTT Auto-Discovery.
+
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
 
 ---
 
@@ -28,7 +38,7 @@ Modern software engineering workflows increasingly rely on AI pair programming a
 │                       AI Assistant / Agent Client                           │
 │                    (IDE Agents, Autonomous CLI, LLMs)                       │
 └──────────────────────────────────────┬──────────────────────────────────────┘
-                                       │ MCP over SSE (http://<host>:3883/sse)
+                                       │ Streamable HTTP (/mcp) & Legacy SSE (/sse) on port 3883
                                        │ (JSON-RPC 2.0)
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -63,6 +73,16 @@ Modern software engineering workflows increasingly rely on AI pair programming a
 │ - Gateway TCP Client (Exports meshmon_* tools)│ │ - Gateway TCP Client      │
 └───────────────────────────────────────────────┘ └───────────────────────────┘
 ```
+
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
 
 ---
 
@@ -252,10 +272,50 @@ The architecture implements a self-healing, loosely coupled state machine design
 #### Summary of Resilience Matrix:
 
 | Event | System Behavior | Impact on Developer / IDE |
-| :--- | :--- | :--- |
+| :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- | :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- | :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- |
 | **Add/Modify Tool in Satellite** | Satellite sends `gateway/updateTools` or restarts | **Zero disruption** to `aimon` or IDE |
 | **Satellite Crashes / Reboots** | `aimon` unbinds tools, returns clean error to in-flight calls; satellite auto-reconnects | **Self-healing**, no IDE restart required |
 | **Gateway (`aimon`) Restarts** | Satellites continue local tasks, auto-reconnect when `aimon` is back | **Self-healing**, satellites unaffected |
+
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
 
 ---
 
@@ -264,13 +324,53 @@ The architecture implements a self-healing, loosely coupled state machine design
 In production environments, `aimon` and its satellite daemons typically deploy across dedicated machines:
 
 | Node Type | Role | Connectivity to aimon |
-| :--- | :--- | :--- |
+| :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- | :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- | :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- |
 | **Gateway Host** | Runs `aimon`, exposes MCP over SSE (`:3883`), listens on TCP Gateway (`:3885`). | Local / Loopback |
 | **Radio Gateway Node** | Runs `meshmon`, physically connected to LoRa radios via USB/serial. | Outbound TCP to Gateway `:3885` |
 | **Network Monitor Node** | Runs `netmon`, situated on core LAN switch mirror port for promiscuous capture. | Outbound TCP to Gateway `:3885` |
 
 ### Process Lifecycle & Persistent Sessions
 All services typically run as systemd daemons or inside persistent terminal multiplexers (such as GNU `screen` or `tmux`) so human operators can attach for real-time diagnostic output while AI agents query the unified MCP interface.
+
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
 
 ---
 
@@ -279,7 +379,37 @@ All services typically run as systemd daemons or inside persistent terminal mult
 `aimon` exports a focused suite of native MCP tools designed for real-time developer quota awareness and hardware/network telemetry proxying:
 
 | Tool Name | Operation Mode | Utility Description |
-| :--- | :--- | :--- |
+| :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- | :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- | :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- |
 | `check_antigravity_quota` | **Analytics** | Queries remaining 5-hour rolling capacity %, prompt/flow credits, model tiers, and reset countdown timestamps for Google Antigravity / Gemini models. |
 | `check_cursor_usage` | **Analytics** | Queries fast requests used vs plan limit, total billing spend ($), per-category spend breakdown, and monthly billing cycle reset date for Cursor. |
 | `check_claude_usage` | **Analytics** | Estimated Claude Code tokens and cost per account over 5 hours, 7 days, the configured window and the billing cycle, per-model table, plan tier, and price freshness. Read from local transcripts; figures are estimates. |
@@ -347,6 +477,16 @@ Connected subsystem daemons dynamically export their domain-specific MCP tools t
 - **`netmon`** (Network Security & Sniffer): `firewall_*`, `lan_*`, `snmp_*` (13 tools).
 - **`meshmon`** (LoRa Radio Mesh): `meshmon_get_node_status`, `meshmon_get_rf_analytics`, `meshmon_query_db`, `meshmon_send_message`, etc. (6 tools).
 
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
 ---
 
 ## 6. Scoped MCP Tool Profiling & Auto-Scoping
@@ -354,7 +494,37 @@ Connected subsystem daemons dynamically export their domain-specific MCP tools t
 To prevent agent context pollution and minimize token consumption across diverse software workspaces, `aimon` provides compile-time and runtime profile filtering:
 
 | Profile | Purpose / Domain | Included Tools |
-| :--- | :--- | :--- |
+| :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- | :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- | :### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
+--- |
 | `core` | Default / general programming | Quota tools (`check_antigravity_quota`, `check_cursor_usage`, `check_claude_usage`, `get_combined_ai_status`) and Insights tools (`get_usage_insights`, `get_usage_report`, `export_usage_dataset`, `describe_usage_dataset`, `compare_experiment`) |
 | `eda` | PCB design & 3D robotics CAD (`kicad`, `freecad`, `easyeda`, `pcb`, `cad`, `robot`, `hw-`) | Core tools + all 36 EDA/CAD & CPU accelerator tools (`eda_calc_*`, `cad_calc_*`, `kicad_*`, `freecad_*`, `easyeda_*`) |
 | `embedded` | Target board bringup (`boards`, `embdevenv`) | Core tools + all `embdevenv_*` tools |
@@ -371,6 +541,16 @@ To prevent agent context pollution and minimize token consumption across diverse
 
 Tools invoked outside the active profile are rejected with JSON-RPC error code `-32601` (`Tool '<name>' is not available under active profile '<profile>'`).
 
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
 ---
 
 ## 7. Strict MCP Primacy & Direct API Access Control
@@ -379,6 +559,16 @@ All AI agents in the ecosystem must interact with `aimon` exclusively through th
 - Direct REST/HTTP endpoint queries (`/api/*`) are restricted and return HTTP `403 Forbidden` for non-dashboard clients.
 - Autonomous scripts or agents must never bypass MCP by calling raw socket, Telnet, or REST interfaces.
 - When an MCP tool call fails or times out, agents must adhere to the **Strict Stop-and-Report** protocol without attempting side-channel workarounds.
+
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
 
 ---
 
@@ -459,6 +649,16 @@ CREATE TABLE IF NOT EXISTS agent_hourly_rollups (
 ### 8.2 Dynamic Downsampling Engine
 When the web frontend or mobile app queries timeseries data over wide windows (`7d`, `30d`, `1y`), `AgentTelemetryDb::queryTimeseries(window, maxPoints)` dynamically downsamples the dataset into evenly spaced buckets to guarantee sub-millisecond query execution and bounded payload sizes.
 
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
 ---
 
 ## 9. Mobile Companion Authentication & Pairing (`MobileGateway`)
@@ -467,6 +667,16 @@ When the web frontend or mobile app queries timeseries data over wide windows (`
 - **128-bit Pairing Secrets**: Pairing generates a high-entropy 128-bit cryptographic secret formatted for QR code scanning or manual entry.
 - **256-bit Session Tokens**: Upon pairing, the mobile device receives a 256-bit session token persisted with `0600` POSIX permissions.
 - **Instant Revocation**: Devices can be audited and revoked individually from the web dashboard or CLI.
+
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
 
 ---
 
@@ -481,6 +691,16 @@ The `aimon` dashboard (`web/index.html`, `web/app.js`, `web/style.css`, `include
 5. **Mobile Pairing (`#subpanel-approvals`)**: 128-bit mobile pairing QR interface and paired device management.
 6. **Dynamic Satellite Panels (`#panel-<id>`)**: Seamless embedded iframe monitors for connected subsystems (`netmon`, `meshmon`, `embdevenv`, `abc80`).
 
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
+
 ---
 
 ## 11. Android Companion Application Architecture
@@ -489,6 +709,16 @@ The Android companion application (`com.selfso.aimon`) is built using Kotlin and
 - **`AimonWebSocketClient` & `AimonSseService`**: Persistent foreground service with OkHttp SSE/WebSocket streaming, automatic exponential backoff reconnection, and 15s heartbeats.
 - **`AimonNotificationManager`**: Native Android `NotificationCompat` builder delivering agent step notifications and foreground service status.
 - **Glance AppWidget**: Android home-screen widget displaying real-time AI quota balances and active agent session counts.
+
+### 2.1 Dual-Transport MCP Engine (Streamable HTTP 2025-03-26 & Legacy HTTP+SSE 2024-11-05)
+`aimon` embeds a high-performance HTTP and SSE server supporting dual-transport operation on port `3883`:
+1. **Streamable HTTP Transport (`2025-03-26`) on `/mcp`**:
+   - **`POST /mcp`**: Accepts individual JSON-RPC requests, JSON-RPC 2.0 batch requests (`[...]`), and notifications (`202 Accepted` with empty body).
+   - **`GET /mcp`**: Establishes a standalone SSE push stream for server-to-client notifications with periodic `: keepalive` heartbeats and zero legacy `event: endpoint` frames.
+   - **`DELETE /mcp`**: Terminates active sessions with `204 No Content`.
+   - **`Mcp-Session-Id` Lifecycle**: Enforces session tracking, supporting up to 256 concurrent sessions with a 15-minute sliding idle reaper.
+2. **Legacy HTTP+SSE Transport (`2024-11-05`) on `/sse` and `/message`**:
+   - Retained with 100% backward compatibility for Cursor IDE and Claude Code (`GET /sse` emits `event: endpoint\ndata: /message?sessionId=...`), plus resilient Streamable HTTP auto-detection on `POST /sse`.
 
 ---
 

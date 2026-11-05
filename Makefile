@@ -70,6 +70,7 @@ test: all
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_eda_bridge_daemon
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_easyeda_converter_props
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_eda_surfaces
+	@$(TEST_ENV) ./$(BUILD_DIR)/test_mcp_streamable_http
 ifeq ($(SANITIZE_CANARY),1)
 	@$(TEST_ENV) ./$(BUILD_DIR)/test_sanitizer_canary
 endif

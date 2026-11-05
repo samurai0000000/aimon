@@ -26,7 +26,7 @@ public:
                        TcpGateway* tcpGateway = nullptr);
 
     void run();
-    nlohmann::json handleMessage(const nlohmann::json& request, const std::string& profile = "");
+    nlohmann::json handleMessage(const nlohmann::json& request, const std::string& profile = "", bool isStreamableHttp = false);
 
     void setDynamicRegistry(DynamicToolRegistry* reg) { _dynamicRegistry = reg; }
     void setTcpGateway(TcpGateway* gw) { _tcpGateway = gw; }
@@ -45,7 +45,7 @@ public:
     static std::string detectProfileFromWorkspace(const std::string& workspacePath);
 
 private:
-    nlohmann::json handleInitialize(const nlohmann::json& id, const nlohmann::json& params);
+    nlohmann::json handleInitialize(const nlohmann::json& id, const nlohmann::json& params, bool isStreamableHttp = false);
     nlohmann::json handleToolsList(const nlohmann::json& id, const std::string& profile);
     nlohmann::json handleToolsCall(const nlohmann::json& id, const nlohmann::json& params, const std::string& profile);
     bool isEdaToolEnabledInConfig(const std::string& toolName) const;

@@ -16,6 +16,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
 #include "StateStore.hxx"
 #include "HistoryStore.hxx"
 #include "ConfigManager.hxx"
@@ -37,15 +38,25 @@ class EdaBridge;
 struct SseSession {
     std::string id;
     std::string profile;
+    bool isStreamableHttp = false;
+    std::string clientName;
+    std::string clientVersion;
+    std::chrono::steady_clock::time_point createdAt{std::chrono::steady_clock::now()};
+    std::chrono::steady_clock::time_point lastActive{std::chrono::steady_clock::now()};
     std::queue<std::string> messageQueue;
     std::mutex mutex;
     std::condition_variable cv;
     std::atomic<bool> closed{false};
+
+    void touch() {
+        lastActive = std::chrono::steady_clock::now();
+    }
 };
 
 class WebServer {
 public:
     using RefreshCallback = std::function<void()>;
+    static constexpr size_t MAX_MCP_SESSIONS = 256;
 
     WebServer(StateStore& stateStore, HistoryStore& historyStore,
               const WebConfig& config, RefreshCallback onRefresh = nullptr,
@@ -57,6 +68,13 @@ public:
     void stop();
     void broadcastSseNotification(const std::string& jsonRpcNotification);
     void scanTranscriptsForNotifications(bool seedOnly = false);
+
+    std::shared_ptr<SseSession> createMcpSession(const std::string& profile,
+                                                 bool isStreamableHttp,
+                                                 const std::string& remoteIp = "127.0.0.1");
+    bool terminateMcpSession(const std::string& sessionId);
+    size_t reapIdleMcpSessions(std::chrono::seconds maxIdle = std::chrono::seconds(900));
+    size_t getActiveMcpSessionCount() const;
 
     void setInsightEngine(InsightEngine* engine) {
         _insightEngine = engine;
@@ -129,7 +147,7 @@ private:
     std::map<std::string, time_t> _uiSessions;
 
     std::map<std::string, std::shared_ptr<SseSession>> _sseSessions;
-    std::mutex _sessionsMutex;
+    mutable std::mutex _sessionsMutex;
 
     struct WatchedTranscriptState {
         int64_t lastMtimeTicks = 0;
