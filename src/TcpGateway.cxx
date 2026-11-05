@@ -390,6 +390,7 @@ void TcpGateway::handleIncomingJson(std::shared_ptr<ClientConnection> client,
                 for (auto it = _retainedMonitors.begin(); it != _retainedMonitors.end(); ) {
                     if (!it->second.connected &&
                         it->second.subsystem == client->subsystem &&
+                        (it->second.shortName.empty() || it->second.shortName == client->shortName) &&
                         it->second.host == peerIp &&
                         it->first != key) {
                         it = _retainedMonitors.erase(it);
@@ -765,7 +766,11 @@ std::vector<DiscoveredMonitor> TcpGateway::getDiscoveredMonitors(int selfWebPort
 
         if (hasMultiple) {
             mon.name = baseName + " (" + mon.host + ")";
-            mon.shortName = baseShort + "@" + mon.host;
+            if (baseShort == mon.subsystem) {
+                mon.shortName = baseShort + "@" + mon.host;
+            } else {
+                mon.shortName = baseShort;
+            }
         } else {
             mon.name = baseName;
             mon.shortName = baseShort;

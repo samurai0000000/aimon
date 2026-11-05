@@ -2128,6 +2128,43 @@ body {
     flex-shrink: 0;
 }
 
+.frame-subtabs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    padding: 0 4px;
+}
+
+.frame-subtab-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 0.76rem;
+    font-weight: 500;
+    font-family: var(--font-sans);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.18s ease;
+}
+
+.frame-subtab-btn:hover {
+    background: rgba(255, 255, 255, 0.09);
+    color: var(--text-primary);
+}
+
+.frame-subtab-btn.active {
+    background: rgba(59, 130, 246, 0.18);
+    border-color: rgba(59, 130, 246, 0.45);
+    color: #ffffff;
+    font-weight: 600;
+}
+
 .btn-frame-action {
     display: inline-flex;
     align-items: center;

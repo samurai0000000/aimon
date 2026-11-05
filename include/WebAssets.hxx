@@ -2989,6 +2989,43 @@ body {
     flex-shrink: 0;
 }
 
+.frame-subtabs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    padding: 0 4px;
+}
+
+.frame-subtab-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 0.76rem;
+    font-weight: 500;
+    font-family: var(--font-sans);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.18s ease;
+}
+
+.frame-subtab-btn:hover {
+    background: rgba(255, 255, 255, 0.09);
+    color: var(--text-primary);
+}
+
+.frame-subtab-btn.active {
+    background: rgba(59, 130, 246, 0.18);
+    border-color: rgba(59, 130, 246, 0.45);
+    color: #ffffff;
+    font-weight: 600;
+}
+
 .btn-frame-action {
     display: inline-flex;
     align-items: center;
@@ -5391,6 +5428,7 @@ async function fetchMonitors() {
 }
 
 let activeSubpanelId = 'quotas';
+let activeSubsystemInstance = {};
 
 function renderMonitorTabs(monitors) {
     const satelliteNavEl = document.getElementById('satellite-tabs');
@@ -5416,19 +5454,51 @@ function renderMonitorTabs(monitors) {
         dividerEl.style.display = externalMonitors.length > 0 ? 'block' : 'none';
     }
 
-    // Render satellite tabs strictly in lowercase
-    satelliteNavEl.innerHTML = externalMonitors.map(m => {
+    // Group externalMonitors by subsystem
+    const groupsBySub = new Map();
+    externalMonitors.forEach(m => {
         const sub = (m.subsystem || m.short_name || m.name || m.id || '').toLowerCase();
-        const fullId = m.id;
-        const isActive = (activeMonitorId === fullId || activeMonitorId === sub);
-        const activeClass = isActive ? ' active' : '';
-        const isOnline = Boolean(m.connected && m.reachable);
+        if (!groupsBySub.has(sub)) {
+            groupsBySub.set(sub, []);
+        }
+        groupsBySub.get(sub).push(m);
+    });
+
+    // Ensure activeSubsystemInstance has a valid selection per subsystem
+    groupsBySub.forEach((group, sub) => {
+        const cur = activeSubsystemInstance[sub];
+        if (!cur || !group.some(m => m.id === cur)) {
+            const onlineOne = group.find(m => m.connected && m.reachable);
+            activeSubsystemInstance[sub] = (onlineOne || group[0]).id;
+        }
+    });
+
+    // Determine currently active panel ID if activeMonitorId is a subsystem or instance id
+    let resolvedActivePanelId = activeMonitorId;
+    if (groupsBySub.has(activeMonitorId)) {
+        resolvedActivePanelId = activeSubsystemInstance[activeMonitorId];
+    } else {
+        const matchedMon = externalMonitors.find(m => m.id === activeMonitorId);
+        if (matchedMon) {
+            const mSub = (matchedMon.subsystem || '').toLowerCase();
+            if (mSub) activeSubsystemInstance[mSub] = matchedMon.id;
+        }
+    }
+
+    // Render one top-level satellite tab button per unique subsystem
+    satelliteNavEl.innerHTML = Array.from(groupsBySub.entries()).map(([sub, group]) => {
+        const isOnline = group.some(m => Boolean(m.connected && m.reachable));
         const indClass = isOnline ? 'tab-indicator-online' : 'tab-indicator-offline';
+        const isGroupActive = (activeMonitorId === sub || group.some(m => m.id === activeMonitorId));
+        const activeClass = isGroupActive ? ' active' : '';
+        const selId = activeSubsystemInstance[sub] || group[0].id;
+        const countBadge = group.length > 1 ? ` (${group.length})` : '';
+        const titleNames = group.map(m => m.short_name || m.name || m.id).join(', ');
 
         return `
-            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(sub)}" data-full-id="${escapeHtml(fullId)}" title="${escapeHtml(m.name || m.id)}">
+            <button type="button" class="monitor-tab${activeClass}" data-id="${escapeHtml(sub)}" data-full-id="${escapeHtml(selId)}" title="${escapeHtml(titleNames)}">
                 <span class="tab-indicator ${indClass}"></span>
-                <span class="tab-title">${escapeHtml(sub)}</span>
+                <span class="tab-title">${escapeHtml(sub)}${escapeHtml(countBadge)}</span>
             </button>
         `;
     }).join('');
@@ -5436,8 +5506,8 @@ function renderMonitorTabs(monitors) {
     // Attach tab click handlers
     satelliteNavEl.querySelectorAll('.monitor-tab').forEach(tabBtn => {
         tabBtn.addEventListener('click', () => {
-            const id = tabBtn.getAttribute('data-id');
-            switchToMonitor(id);
+            const sub = tabBtn.getAttribute('data-id');
+            switchToMonitor(sub);
         });
     });
 
@@ -5454,24 +5524,54 @@ function renderMonitorTabs(monitors) {
         externalMonitors.forEach(m => {
             if (m.is_self || m.isSelf) return;
 
+            const sub = (m.subsystem || m.short_name || m.name || m.id || '').toLowerCase();
+            const group = groupsBySub.get(sub) || [m];
             let panel = document.getElementById(`panel-${m.id}`);
             const targetUrl = getResolvedMonitorUrl(m);
             const isOnline = Boolean(m.connected && m.reachable);
+            const isSelected = (m.id === resolvedActivePanelId);
+
+            const buildSubtabsHtml = () => {
+                if (group.length <= 1) return '';
+                return `<div class="frame-subtabs">` + group.map(gm => {
+                    const gOnline = Boolean(gm.connected && gm.reachable);
+                    const gActive = (gm.id === m.id) ? ' active' : '';
+                    const label = gm.short_name || gm.name || gm.id;
+                    return `<button type="button" class="frame-subtab-btn${gActive}" data-sub="${escapeHtml(sub)}" data-target-id="${escapeHtml(gm.id)}">
+                        <span class="dot-status ${gOnline ? 'dot-online' : 'dot-offline'}"></span>
+                        <span>${escapeHtml(label)}</span>
+                    </button>`;
+                }).join('') + `</div>`;
+            };
+
+            const bindSubtabClicks = (container) => {
+                if (!container) return;
+                container.querySelectorAll('.frame-subtab-btn').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        const targetSub = btn.getAttribute('data-sub');
+                        const targetId = btn.getAttribute('data-target-id');
+                        if (targetSub && targetId) {
+                            activeSubsystemInstance[targetSub] = targetId;
+                            switchToMonitor(targetId);
+                        }
+                    });
+                });
+            };
 
             if (!panel) {
                 panel = document.createElement('div');
                 panel.id = `panel-${m.id}`;
-                panel.setAttribute('data-subsystem', m.subsystem || m.id);
-                const isSelected = (m.id === activeMonitorId || (m.subsystem && m.subsystem === activeMonitorId));
+                panel.setAttribute('data-subsystem', sub);
                 panel.className = `monitor-frame-panel view-panel${isSelected ? ' active' : ' hidden'}`;
                 panel.innerHTML = `
                     <div class="frame-toolbar">
                         <div class="frame-info">
                             <span class="dot-status ${isOnline ? 'dot-online' : 'dot-offline'}" id="dot-${m.id}"></span>
-                            <span class="frame-title">${escapeHtml(m.name || m.id)}</span>
+                            <span class="frame-title">${escapeHtml(m.short_name || m.name || m.id)}</span>
                             <span class="frame-badge">${escapeHtml(m.subsystem || 'Satellite')}</span>
                             <span class="frame-url">${escapeHtml(targetUrl)}</span>
                         </div>
+                        <div class="frame-subtabs-slot" id="subtabs-${m.id}">${buildSubtabsHtml()}</div>
                         <div class="frame-actions">
                             <button type="button" class="btn-frame-action btn-panel-reload" data-id="${m.id}" title="Reload Tab">
                                 <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
@@ -5521,6 +5621,7 @@ function renderMonitorTabs(monitors) {
                     </div>
                 `;
                 dynamicPanelsEl.appendChild(panel);
+                bindSubtabClicks(panel.querySelector(`#subtabs-${m.id}`));
 
                 const attachReload = (btn) => {
                     if (!btn) return;
@@ -5540,10 +5641,15 @@ function renderMonitorTabs(monitors) {
                 attachReload(panel.querySelector('.btn-panel-reload'));
                 attachReload(panel.querySelector('.btn-overlay-reload'));
             } else {
-                // Update existing panel state
+                // Update existing panel state and subtabs
                 const dot = panel.querySelector(`#dot-${m.id}`);
                 if (dot) {
                     dot.className = isOnline ? 'dot-status dot-online' : 'dot-status dot-offline';
+                }
+                const subtabsSlot = panel.querySelector(`#subtabs-${m.id}`);
+                if (subtabsSlot) {
+                    subtabsSlot.innerHTML = buildSubtabsHtml();
+                    bindSubtabClicks(subtabsSlot);
                 }
                 const iframe = panel.querySelector('iframe');
                 if (iframe) {
@@ -5570,9 +5676,17 @@ function renderMonitorTabs(monitors) {
 
         if (window.location.hash) {
             const hash = window.location.hash.replace(/^#/, '');
-            const target = externalMonitors.find(m => m.id === hash || m.subsystem === hash);
-            if (target && activeMonitorId !== target.id) {
-                switchToMonitor(target.id);
+            const hashLower = hash.toLowerCase();
+            if (groupsBySub.has(hashLower)) {
+                const desiredId = activeSubsystemInstance[hashLower];
+                if (desiredId && activeMonitorId !== desiredId) {
+                    switchToMonitor(desiredId);
+                }
+            } else {
+                const target = externalMonitors.find(m => m.id === hash || m.subsystem === hash);
+                if (target && activeMonitorId !== target.id) {
+                    switchToMonitor(target.id);
+                }
             }
         }
     }
@@ -6842,10 +6956,33 @@ function switchToMonitor(monitorId) {
         return;
     }
 
-    activeMonitorId = monitorId;
+    let resolvedSubsystem = monitorId.toLowerCase();
+    let resolvedPanelId = monitorId;
+
+    if (Array.isArray(discoveredMonitors) && discoveredMonitors.length > 0) {
+        const exactMatch = discoveredMonitors.find(m => m.id === monitorId);
+        if (exactMatch) {
+            resolvedSubsystem = (exactMatch.subsystem || exactMatch.short_name || exactMatch.name || exactMatch.id || '').toLowerCase();
+            resolvedPanelId = exactMatch.id;
+            activeSubsystemInstance[resolvedSubsystem] = exactMatch.id;
+        } else {
+            const subGroup = discoveredMonitors.filter(m => {
+                const s = (m.subsystem || m.short_name || m.name || m.id || '').toLowerCase();
+                return s === resolvedSubsystem;
+            });
+            if (subGroup.length > 0) {
+                const curSel = activeSubsystemInstance[resolvedSubsystem];
+                const validSel = subGroup.find(m => m.id === curSel) || subGroup.find(m => m.connected && m.reachable) || subGroup[0];
+                resolvedPanelId = validSel.id;
+                activeSubsystemInstance[resolvedSubsystem] = validSel.id;
+            }
+        }
+    }
+
+    activeMonitorId = resolvedPanelId;
 
     try {
-        history.replaceState(null, '', '#' + monitorId);
+        history.replaceState(null, '', '#' + resolvedSubsystem);
     } catch (_) {}
 
     // 1. Update top monitor tab active states
@@ -6854,7 +6991,7 @@ function switchToMonitor(monitorId) {
         navEl.querySelectorAll('.monitor-tab').forEach(tab => {
             const tabId = tab.getAttribute('data-id');
             const fullId = tab.getAttribute('data-full-id');
-            const isMatch = (tabId === monitorId || fullId === monitorId || (fullId && fullId.startsWith(monitorId + '-')));
+            const isMatch = (tabId === resolvedSubsystem || fullId === resolvedPanelId);
             tab.classList.toggle('active', isMatch);
         });
     }
@@ -6866,13 +7003,12 @@ function switchToMonitor(monitorId) {
         viewAimon.classList.add('hidden');
     }
 
-    // 3. Show matching satellite frame panel
+    // 3. Show matching satellite frame panel (only the selected instance)
     const dynamicPanelsEl = document.getElementById('dynamic-panels');
     if (dynamicPanelsEl) {
         dynamicPanelsEl.querySelectorAll('.monitor-frame-panel').forEach(panel => {
             const panelId = panel.id;
-            const subsystem = panel.getAttribute('data-subsystem');
-            const isMatch = (panelId === `panel-${monitorId}` || panelId.startsWith(`panel-${monitorId}-`) || (subsystem && (subsystem === monitorId || monitorId.startsWith(subsystem))));
+            const isMatch = (panelId === `panel-${resolvedPanelId}`);
             panel.classList.toggle('active', isMatch);
             panel.classList.toggle('hidden', !isMatch);
         });
