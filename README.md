@@ -191,20 +191,21 @@ To prevent token exhaustion and eliminate irrelevant context in specialized work
 
 `aimon` detects profiles automatically from workspace folder names during MCP client initialization (e.g. `boards` -> `embedded`, `pcb`/`robot`/`cad` -> `eda`), or you can explicitly select a profile via URL query parameter (`?profile=eda` or `?profile=cad`):
 
-#### Configuring in Cursor (Legacy HTTP+SSE)
-In Cursor **Settings > Features > MCP > Add New Server** (Type: `sse`):
-- **URL**: `http://127.0.0.1:3883/sse?profile=embedded` *(or `http://localhost:3883/sse?profile=core`)*
+#### Configuring in Cursor (Streamable HTTP / SSE)
+In Cursor **Settings > Features > MCP > Add New Server**:
+- **URL**: `http://127.0.0.1:3883/mcp?profile=core` *(or legacy `http://localhost:3883/sse?profile=core`)*
 
 Or edit `~/.cursor/mcp.json`:
 ```json
 {
   "mcpServers": {
     "aimon": {
-      "url": "http://127.0.0.1:3883/sse?profile=core"
+      "url": "http://127.0.0.1:3883/mcp?profile=core"
     }
   }
 }
 ```
+*(Note: `/sse` remains fully supported for backward compatibility with legacy clients.)*
 
 #### Configuring in Antigravity (Streamable HTTP)
 Add `aimon` to your Antigravity MCP server configuration (`mcp_config.json`):

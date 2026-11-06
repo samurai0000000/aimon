@@ -5096,8 +5096,8 @@ void WebServer::setupRoutes() {
             return httplib::Server::HandlerResponse::Unhandled;
         }
 
-        // Mobile SSE push stream requires a valid mobile token or UI session
-        if (req.path == "/sse") {
+        // Mobile MCP / SSE stream requires a valid mobile token or UI session
+        if (req.path == "/sse" || req.path == "/mcp") {
             std::string profile;
             if (req.has_param("profile")) {
                 profile = req.get_param_value("profile");
